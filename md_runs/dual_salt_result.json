@@ -1,0 +1,22 @@
+{
+  "recipe": {
+    "salts": {
+      "LiPF6": 0.198,
+      "LiFSI": 0.78
+    },
+    "solvents": {
+      "EC": 0.3191,
+      "DMC": 0.6809
+    },
+    "additives": {
+      "FEC": 0.0518
+    }
+  },
+  "conductivity_mS_cm": 27.68940570065817,
+  "conductivity_std_mS_cm": 10.682595847285256,
+  "density_g_ml": 1.1793347186401522,
+  "temperature_k": 297.2401653540621,
+  "haven_ratio": 1.4092139722834112,
+  "wall_time_s": 13072.362424135208,
+  "target_conductivity_mS_cm": 11.91
+}

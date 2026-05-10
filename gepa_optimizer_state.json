@@ -1,0 +1,95 @@
+{
+  "proposer.predict": {
+    "traces": [],
+    "train": [],
+    "demos": [],
+    "signature": {
+      "instructions": "Propose an electrolyte formulation given cell requirements and RAG-derived bounds.\n\nThe proposer considers:\n- Cell chemistry (cathode/anode materials, voltage window)\n- Performance requirements (conductivity, viscosity, safety)\n- RAG-derived bounds from knowledge retrieval\n- Viable species from physics filtering\n- Previous attempts and their outcomes (for diversity)\n\nOutput must be valid JSON that can be parsed for physics evaluation.",
+      "fields": [
+        {
+          "prefix": "Cell Config Json:",
+          "description": "Cell configuration JSON with cathode/anode chemistry, voltage window"
+        },
+        {
+          "prefix": "Perf Requirements Json:",
+          "description": "Performance requirements JSON with conductivity, viscosity, safety targets"
+        },
+        {
+          "prefix": "Rag Bounds Json:",
+          "description": "RAG-derived bounds JSON with solvent/salt/additive ranges from knowledge retrieval"
+        },
+        {
+          "prefix": "Viable Species Json:",
+          "description": "JSON of viable solvents, salts, additives from physics filtering"
+        },
+        {
+          "prefix": "Previous Attempts Json:",
+          "description": "JSON array of previous formulation attempts with scores and violations for diversity"
+        },
+        {
+          "prefix": "Constraints Json:",
+          "description": "JSON of hard constraints derived from cell_config and perf_requirements"
+        },
+        {
+          "prefix": "Reasoning:",
+          "description": "Step-by-step reasoning explaining component selection and ratios based on physics and requirements"
+        },
+        {
+          "prefix": "Formulation Json:",
+          "description": "JSON dict with solvents (fractions), salts (molarities), additives (wt_fracs). Example: {\"solvents\": {\"EC\": 0.3, \"DMC\": 0.5, \"EMC\": 0.2}, \"salts\": {\"LiPF6\": 1.0}, \"additives\": {\"FEC\": 0.05}}"
+        }
+      ]
+    },
+    "lm": null
+  },
+  "refiner.predict": {
+    "traces": [],
+    "train": [],
+    "demos": [],
+    "signature": {
+      "instructions": "Refine a formulation based on physics evaluation feedback.\n\nThe refiner analyzes:\n- Current formulation and its evaluation results\n- Specific constraint violations with quantitative gaps\n- Antagonistic interactions detected\n- Synergies that could be exploited\n- RAG bounds for valid adjustment ranges\n\nOutput must preserve valid formulation structure while improving metrics.",
+      "fields": [
+        {
+          "prefix": "Current Formulation Json:",
+          "description": "Current formulation JSON with solvents, salts, additives"
+        },
+        {
+          "prefix": "Evaluation Result Json:",
+          "description": "Physics evaluation result JSON with conductivity, viscosity, flash_point, ice_pct, violations"
+        },
+        {
+          "prefix": "Violation Feedback:",
+          "description": "Textual feedback describing specific violations and how far from targets. Example: 'conductivity 8.5 mS/cm below target 10.0 mS/cm; flash_point satisfied'"
+        },
+        {
+          "prefix": "Rag Bounds Json:",
+          "description": "RAG-derived bounds JSON constraining valid adjustments"
+        },
+        {
+          "prefix": "Constraints Json:",
+          "description": "JSON of hard constraints that must be satisfied"
+        },
+        {
+          "prefix": "Reasoning: Let's think step by step in order to",
+          "description": "${reasoning}"
+        },
+        {
+          "prefix": "Refined Formulation Json:",
+          "description": "Refined formulation JSON with adjusted solvents, salts, additives. Same structure as input."
+        },
+        {
+          "prefix": "Refinement Reasoning:",
+          "description": "Explanation of what was changed and why, referencing physics principles and constraint gaps"
+        }
+      ]
+    },
+    "lm": null
+  },
+  "metadata": {
+    "dependency_versions": {
+      "python": "3.10",
+      "dspy": "3.1.0",
+      "cloudpickle": "3.1"
+    }
+  }
+}
