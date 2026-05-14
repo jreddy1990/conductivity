@@ -1,0 +1,83 @@
+{
+  "datasets": {
+    "OEDB-v1": {
+      "name": "OEDB-v1",
+      "n_rows": 5595,
+      "sigma": {
+        "log10_mean": 0.12692775900548114,
+        "log10_std": 0.8737790807377825,
+        "log10_p01": -2.170805750861465,
+        "log10_p99": 1.8166035120921764,
+        "n_below_min": 0,
+        "n_above_max": 0
+      },
+      "temperature": {
+        "min": 298.15,
+        "max": 298.15,
+        "n_out_of_range": 0
+      },
+      "n_species_per_composition": {
+        "min": 3,
+        "max": 3,
+        "mean": 3.0
+      },
+      "method_counts": {
+        "GK": 5595
+      },
+      "aux_observable_coverage": {
+        "viscosity_mPas": 5595,
+        "diffusion_cation_m2s": 5595,
+        "diffusion_anion_m2s": 5595,
+        "density_gcm3": 5595
+      }
+    },
+    "BAMBOO-Mix-exp": {
+      "name": "BAMBOO-Mix-exp",
+      "n_rows": 10407,
+      "sigma": {
+        "log10_mean": 0.37201574604083787,
+        "log10_std": 0.5758652990142439,
+        "log10_p01": -1.48048032036,
+        "log10_p99": 1.2143246437600004,
+        "n_below_min": 0,
+        "n_above_max": 0
+      },
+      "temperature": {
+        "min": 194.14999999999998,
+        "max": 393.17942109999996,
+        "n_out_of_range": 153
+      },
+      "n_species_per_composition": {
+        "min": 3,
+        "max": 10,
+        "mean": 3.954549822235034
+      },
+      "method_counts": {
+        "EIS-exp": 10407
+      },
+      "aux_observable_coverage": {
+        "viscosity_mPas": 0,
+        "diffusion_cation_m2s": 0,
+        "diffusion_anion_m2s": 0,
+        "density_gcm3": 0
+      }
+    }
+  },
+  "cross_db_duplicates": 0,
+  "cleaning_drops": {
+    "sigma_nonpositive": 0,
+    "sigma_out_of_range": 0,
+    "temperature_out_of_range": 153,
+    "mole_fraction_sum_off": 0,
+    "mole_fraction_invalid": 0,
+    "missing_smiles": 0
+  },
+  "n_after_cleaning": 15849,
+  "n_after_dedup": 15849,
+  "method_counts_after_dedup": {
+    "GK": 5595,
+    "NE": 0,
+    "NE-Haven": 0,
+    "EIS-exp": 10254
+  }
+}
