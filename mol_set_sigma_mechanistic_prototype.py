@@ -70,10 +70,8 @@ CURRENT_HEAD_NAMES = (
     "density_log_ratio_head",
     "viscosity_log_ratio_head",
     "dielectric_log_ratio_head",
-    "activity_log_ratio_head",
     "association_logit_delta_head",
     "additive_shell_logit_delta_head",
-    "crowding_log_ratio_head",
     "cluster_population_logit_delta_head",
     "cluster_persistence_log_ratio_head",
     "cation_self_mobility_gate",
@@ -83,6 +81,13 @@ CURRENT_HEAD_NAMES = (
     "anion_anion_gate",
     "cluster_drift_gate",
     "relaxation_tail_gate",
+    "ionic_network_gate",
+)
+NEUTRAL_ADDITIVE_INVARIANT_HEAD_NAMES = (
+    "viscosity_log_ratio_head",
+    "association_logit_delta_head",
+    "cluster_population_logit_delta_head",
+    "cluster_persistence_log_ratio_head",
 )
 
 PHYSICAL_FEATURE_NAMES = (
@@ -96,6 +101,8 @@ PHYSICAL_FEATURE_NAMES = (
     "salt_volume_fraction",
     "eta_liquid_prior_cP",
     "eta_solution_prior_cP",
+    "eta_salt_solvent_prior_cP",
+    "neutral_additive_viscosity_excess_factor",
     "epsilon_liquid",
     "epsilon_effective",
     "dielectric_decrement_fraction",
@@ -177,15 +184,29 @@ MECHANISM_FEATURE_NAMES = (
     "cluster_population",
     "cluster_persistence",
     "additive_transport_drag",
+    "temperature_viscosity_factor",
+    "additive_anticorrelation_screening_support",
+    "transport_association_fraction",
+    "transport_free_ion_fraction",
+    "mobile_carrier_density_M",
+    "cation_viscosity_friction_factor",
+    "anion_viscosity_friction_factor",
+    "free_solvent_mobility_factor",
+    "finite_concentration_mobility_factor",
+    "finite_concentration_correlation_drive",
     "anticorrelation_screening",
     "like_current_support",
     "cluster_transport_support",
     "positive_current_support_fraction",
+    "self_current_scale_prior_mS_cm",
+    "cation_self_mobility_gate_factor",
+    "anion_self_mobility_gate_factor",
     "cation_self_current_mS_cm",
     "anion_self_current_mS_cm",
     "sigma_self_mS_cm",
     "cation_anion_distinct_fraction",
     "cation_anion_distinct_mS_cm",
+    "mixed_anion_anticorrelation_mS_cm",
     "cation_cation_distinct_fraction",
     "cation_cation_distinct_mS_cm",
     "anion_anion_distinct_fraction",
@@ -196,6 +217,7 @@ MECHANISM_FEATURE_NAMES = (
     "mixed_anion_additive_current_mS_cm",
     "relaxation_tail_fraction",
     "relaxation_tail_mS_cm",
+    "distinct_current_correction_mS_cm",
     "current_correlation_integral_mS_cm",
     "sigma_mS_cm",
 )
@@ -278,6 +300,9 @@ def init_mechanistic_params(
 
     params["physical_mean"] = jnp.asarray(physical_mean)
     params["physical_std"] = jnp.asarray(physical_std)
+    params["generic_positive_current_scale"] = jnp.asarray(1.0)
+    params["mixed_anion_anticorrelation_logit"] = jnp.asarray(0.0)
+    params["temperature_transport_activation_K"] = jnp.asarray(0.0)
     return params
 
 
@@ -440,7 +465,17 @@ def forward_single(
     head = head.at[CURRENT_HEAD_NAMES.index("anion_self_mobility_gate")].set(
         _head_value(self_head, "anion_self_mobility_gate")
     )
-    mechanism = _mechanism_readout(head, physical)
+    for head_name in NEUTRAL_ADDITIVE_INVARIANT_HEAD_NAMES:
+        head = head.at[CURRENT_HEAD_NAMES.index(head_name)].set(
+            _head_value(self_head, head_name)
+        )
+    mechanism = _mechanism_readout(
+        head,
+        physical,
+        params["generic_positive_current_scale"],
+        params["mixed_anion_anticorrelation_logit"],
+        params["temperature_transport_activation_K"],
+    )
     feature_vector = jnp.concatenate([physical, mechanism], axis=0)
     sigma_mS_cm = mechanism[FEATURE_IDX_SIGMA - len(PHYSICAL_FEATURE_NAMES)]
     return jnp.log(sigma_mS_cm), feature_vector
@@ -531,7 +566,7 @@ def loss_fn(
         association_fraction_target,
         association_fraction_mask,
     ) = batch_tuple
-    pred_log_sigma, features = forward_batch(
+    _pred_log_sigma, features = forward_batch(
         params=params,
         species_props_norm=species_props_norm,
         species_props_raw=species_props_raw,
@@ -541,30 +576,128 @@ def loss_fn(
         mask=mask,
         temperature_K=temperature_K,
     )
-    weighted_sigma_mask = conductivity_mask * weights
-    weighted_sigma_loss = weighted_sigma_mask * (pred_log_sigma - log_sigma_target) ** 2
-    sigma_loss = jnp.sum(weighted_sigma_loss) / (jnp.sum(weighted_sigma_mask) + NUMERICAL_EPS)
     density_pred = features[:, FEATURE_IDX_DENSITY]
+    eta_prior = features[:, PHYSICAL_FEATURE_NAMES.index("eta_solution_prior_cP")]
+    activity_prior = features[:, PHYSICAL_FEATURE_NAMES.index("activity_prior_M")]
+    ionic_row_mask = jnp.where(
+        features[:, PHYSICAL_FEATURE_NAMES.index("ionic_strength_M")] > 0.0,
+        1.0,
+        0.0,
+    )
+    contact_pair_prior = features[:, PHYSICAL_FEATURE_NAMES.index("contact_pair_prior")]
+    cluster_population_prior = features[:, PHYSICAL_FEATURE_NAMES.index("cluster_population_prior")]
+    cluster_population_prior_fraction = cluster_population_prior / (1.0 + cluster_population_prior)
+    cluster_persistence_prior = features[:, PHYSICAL_FEATURE_NAMES.index("cluster_persistence_prior")]
     viscosity_pred = features[:, _model_feature_idx("eta_supervised_fit_cP")]
+    temperature_viscosity_factor_pred = features[
+        :, _model_feature_idx("temperature_viscosity_factor")
+    ]
     dielectric_pred = features[:, _model_feature_idx("epsilon_effective_pred")]
     cation_self_pred = features[:, _model_feature_idx("cation_self_current_mS_cm")]
     anion_self_pred = features[:, _model_feature_idx("anion_self_current_mS_cm")]
-    cation_anion_distinct_pred = features[:, _model_feature_idx("cation_anion_distinct_mS_cm")]
     sigma_self_pred = features[:, _model_feature_idx("sigma_self_mS_cm")]
+    cation_self_gate_pred = features[:, _model_feature_idx("cation_self_mobility_gate_factor")]
+    anion_self_gate_pred = features[:, _model_feature_idx("anion_self_mobility_gate_factor")]
+    cation_anion_distinct_pred = features[:, _model_feature_idx("cation_anion_distinct_mS_cm")]
     current_integral_pred = features[:, _model_feature_idx("current_correlation_integral_mS_cm")]
-    current_distinct_pred = current_integral_pred - sigma_self_pred
+    current_distinct_pred = features[:, _model_feature_idx("distinct_current_correction_mS_cm")]
+    effective_ion_concentration_pred = features[:, _model_feature_idx("effective_ion_concentration_M")]
     association_fraction_pred = features[:, _model_feature_idx("association_fraction")]
+    transport_association_fraction_pred = features[:, _model_feature_idx("transport_association_fraction")]
+    cluster_population_pred = features[:, _model_feature_idx("cluster_population")]
+    cluster_persistence_pred = features[:, _model_feature_idx("cluster_persistence")]
+    sigma_target = jnp.exp(log_sigma_target)
+    cation_self_gate_base = cation_self_pred / (cation_self_gate_pred + NUMERICAL_EPS)
+    anion_self_gate_base = anion_self_pred / (anion_self_gate_pred + NUMERICAL_EPS)
+    cation_self_gate_only_pred = (
+        jax.lax.stop_gradient(cation_self_gate_base) * cation_self_gate_pred
+    )
+    anion_self_gate_only_pred = (
+        jax.lax.stop_gradient(anion_self_gate_base) * anion_self_gate_pred
+    )
+    scalar_only_self_pred = (
+        cation_self_gate_only_pred
+        + anion_self_gate_only_pred
+    )
+    scalar_sigma_pred = jnp.where(
+        current_distinct_mask > 0.0,
+        current_integral_pred,
+        scalar_only_self_pred + jax.lax.stop_gradient(current_distinct_pred),
+    )
+    routed_log_sigma = jnp.log(scalar_sigma_pred + NUMERICAL_EPS)
+    sigma_target_log = jnp.log(sigma_target + NUMERICAL_EPS)
+    routed_sigma_error = (routed_log_sigma - sigma_target_log) ** 2
+    weighted_sigma_mask = conductivity_mask * weights
+    weighted_log_sigma_loss = weighted_sigma_mask * routed_sigma_error
+    log_sigma_loss = jnp.sum(weighted_log_sigma_loss) / (
+        jnp.sum(weighted_sigma_mask) + NUMERICAL_EPS
+    )
+    sigma_current_scale_loss = _masked_current_scale_loss(
+        scalar_sigma_pred,
+        sigma_target,
+        sigma_target,
+        conductivity_mask,
+        weights,
+    )
+    decomposed_sigma_mask = conductivity_mask * current_distinct_mask
+    decomposed_sigma_identity_loss = _masked_squared_current_loss(
+        current_integral_pred,
+        sigma_target,
+        decomposed_sigma_mask,
+        weights,
+    )
+    sigma_loss = log_sigma_loss + sigma_current_scale_loss + decomposed_sigma_identity_loss
     density_loss = _masked_log_loss(density_pred, density_target, density_mask, weights)
     viscosity_loss = _masked_log_loss(viscosity_pred, viscosity_target, viscosity_mask, weights)
+    viscosity_prior_loss = _masked_log_loss(
+        viscosity_pred,
+        eta_prior * temperature_viscosity_factor_pred,
+        1.0 - viscosity_mask,
+        weights,
+    )
+    activity_prior_loss = _masked_log_loss(
+        effective_ion_concentration_pred,
+        activity_prior,
+        ionic_row_mask,
+        weights,
+    )
+    association_prior_loss = _masked_fraction_loss(
+        association_fraction_pred,
+        contact_pair_prior,
+        (1.0 - association_fraction_mask) * ionic_row_mask,
+        weights,
+    )
+    cluster_population_prior_loss = _masked_fraction_loss(
+        cluster_population_pred,
+        cluster_population_prior_fraction,
+        ionic_row_mask,
+        weights,
+    )
+    cluster_persistence_prior_loss = _masked_log_loss(
+        cluster_persistence_pred,
+        cluster_persistence_prior,
+        ionic_row_mask,
+        weights,
+    )
     dielectric_loss = _masked_log_loss(dielectric_pred, dielectric_target, dielectric_mask, weights)
-    cation_self_loss = _masked_log_loss(
+    cation_self_loss_pred = jnp.where(
+        association_fraction_mask > 0.0,
         cation_self_pred,
+        cation_self_gate_only_pred,
+    )
+    anion_self_loss_pred = jnp.where(
+        association_fraction_mask > 0.0,
+        anion_self_pred,
+        anion_self_gate_only_pred,
+    )
+    cation_self_loss = _masked_log_loss(
+        cation_self_loss_pred,
         cation_self_current_target,
         cation_self_current_mask,
         weights,
     )
     anion_self_loss = _masked_log_loss(
-        anion_self_pred,
+        anion_self_loss_pred,
         anion_self_current_target,
         anion_self_current_mask,
         weights,
@@ -575,15 +708,21 @@ def loss_fn(
         cation_anion_distinct_mask,
         weights,
     )
+    self_current_scale = cation_self_current_target + anion_self_current_target
+    current_distinct_scale = jnp.where(
+        (cation_self_current_mask > 0.0) & (anion_self_current_mask > 0.0),
+        self_current_scale,
+        current_distinct_target,
+    )
     current_distinct_loss = _masked_current_scale_loss(
         current_distinct_pred,
         current_distinct_target,
-        cation_self_current_target + anion_self_current_target,
+        current_distinct_scale,
         current_distinct_mask,
         weights,
     )
     association_fraction_loss = _masked_fraction_loss(
-        association_fraction_pred,
+        transport_association_fraction_pred,
         association_fraction_target,
         association_fraction_mask,
         weights,
@@ -592,6 +731,11 @@ def loss_fn(
         sigma_loss
         + density_loss
         + viscosity_loss
+        + viscosity_prior_loss
+        + activity_prior_loss
+        + association_prior_loss
+        + cluster_population_prior_loss
+        + cluster_persistence_prior_loss
         + dielectric_loss
         + cation_self_loss
         + anion_self_loss
@@ -824,13 +968,28 @@ def _compute_physical_features(
         jnp.sum(additive_volumes_ml * neutral_additive_mask) / neutral_volume_total_ml
     )
     eta_liquid = jnp.exp(jnp.sum(neutral_phi * jnp.log(viscosity + NUMERICAL_EPS)))
+    solvent_volume_total_ml = jnp.sum(solvent_volumes_ml) + NUMERICAL_EPS
+    solvent_only_phi = solvent_volumes_ml / solvent_volume_total_ml
+    eta_salt_solvent_liquid = jnp.exp(
+        jnp.sum(solvent_only_phi * jnp.log(viscosity + NUMERICAL_EPS))
+    )
     neutral_moles = solvent_volumes_ml * density / (mw + NUMERICAL_EPS) + additive_moles * neutral_additive_mask
+    solvent_only_moles = solvent_volumes_ml * density / (mw + NUMERICAL_EPS)
     dimer_fraction = dimerization * neutral_moles / (1.0 + dimerization * neutral_moles)
+    solvent_only_dimer_fraction = dimerization * solvent_only_moles / (
+        1.0 + dimerization * solvent_only_moles
+    )
     shell_strength = coord_affinity * neutral_moles
     shell_strength_sum = jnp.sum(shell_strength) + NUMERICAL_EPS
     shell_fraction = shell_strength / shell_strength_sum
     shell_steric = jnp.sum(shell_fraction * steric)
     shell_dimer_fraction = jnp.sum(shell_fraction * dimer_fraction)
+    solvent_shell_strength = coord_affinity * solvent_only_moles
+    solvent_shell_strength_sum = jnp.sum(solvent_shell_strength) + NUMERICAL_EPS
+    solvent_shell_fraction = solvent_shell_strength / solvent_shell_strength_sum
+    salt_solvent_shell_dimer_fraction = jnp.sum(
+        solvent_shell_fraction * solvent_only_dimer_fraction
+    )
     additive_shell_fraction = jnp.sum(shell_strength * neutral_additive_mask) / shell_strength_sum
     neutral_shell_persistence = jnp.sum(shell_fraction * residence_time)
 
@@ -848,6 +1007,14 @@ def _compute_physical_features(
     mean_dielectric_decrement = jnp.sum(ionic_source_molarity * dielectric_decrement)
     salt_viscosity_factor = jnp.exp(mean_jones_dole * total_ionic_source_M)
     eta_solution_prior = eta_liquid * salt_viscosity_factor * (1.0 + shell_dimer_fraction)
+    eta_salt_solvent_prior = (
+        eta_salt_solvent_liquid
+        * salt_viscosity_factor
+        * (1.0 + salt_solvent_shell_dimer_fraction)
+    )
+    neutral_additive_viscosity_excess_factor = eta_solution_prior / (
+        eta_salt_solvent_prior + NUMERICAL_EPS
+    )
     epsilon_liquid = jnp.sum(neutral_phi * epsilon)
     epsilon_effective = epsilon_liquid / (1.0 + mean_dielectric_decrement)
 
@@ -948,10 +1115,13 @@ def _compute_physical_features(
         / (1.0 + salt_additive_saturation + additive_transport_drag)
     )
     mixed_anion_additive_current_support = (
-        ionic_source_diversity
-        * salt_additive_anticorrelation_screening
-        * (1.0 + salt_pair_transport_contrast + additive_dielectric_enrichment)
-        / (1.0 + crowding_prior + salt_additive_saturation + additive_transport_drag)
+        salt_additive_anticorrelation_screening
+        * (
+            salt_pair_transport_contrast
+            + additive_dielectric_enrichment
+            + mixed_anion_competition
+        )
+        / (1.0 + salt_additive_saturation + additive_transport_drag)
     )
     salt_additive_dielectric_screening = (
         salt_total_M
@@ -984,6 +1154,8 @@ def _compute_physical_features(
             salt_volume_fraction,
             eta_liquid,
             eta_solution_prior,
+            eta_salt_solvent_prior,
+            neutral_additive_viscosity_excess_factor,
             epsilon_liquid,
             epsilon_effective,
             mean_dielectric_decrement,
@@ -1039,10 +1211,32 @@ def _compute_physical_features(
 def _mechanism_readout(
     head: jnp.ndarray,
     physical: jnp.ndarray,
+    generic_positive_current_scale: jnp.ndarray,
+    mixed_anion_anticorrelation_logit: jnp.ndarray,
+    temperature_transport_activation_K: jnp.ndarray,
 ) -> jnp.ndarray:
     density_prior = physical[PHYSICAL_FEATURE_NAMES.index("density_prior_g_ml")]
-    eta_prior = physical[PHYSICAL_FEATURE_NAMES.index("eta_solution_prior_cP")]
-    eta_liquid_prior = physical[PHYSICAL_FEATURE_NAMES.index("eta_liquid_prior_cP")]
+    eta_base_prior = physical[PHYSICAL_FEATURE_NAMES.index("eta_solution_prior_cP")]
+    eta_salt_solvent_base_prior = physical[
+        PHYSICAL_FEATURE_NAMES.index("eta_salt_solvent_prior_cP")
+    ]
+    neutral_additive_viscosity_excess_factor = physical[
+        PHYSICAL_FEATURE_NAMES.index("neutral_additive_viscosity_excess_factor")
+    ]
+    eta_liquid_base_prior = physical[PHYSICAL_FEATURE_NAMES.index("eta_liquid_prior_cP")]
+    salt_volume_fraction = physical[PHYSICAL_FEATURE_NAMES.index("salt_volume_fraction")]
+    temperature_scaled = physical[PHYSICAL_FEATURE_NAMES.index("temperature_scaled")]
+    temperature_K = temperature_scaled * T_REF_K
+    temperature_viscosity_factor = jnp.exp(
+        temperature_transport_activation_K
+        * ((1.0 / (temperature_K + NUMERICAL_EPS)) - (1.0 / T_REF_K))
+    )
+    eta_prior = eta_base_prior * temperature_viscosity_factor
+    eta_salt_solvent_prior = eta_salt_solvent_base_prior * temperature_viscosity_factor
+    eta_liquid_prior = eta_liquid_base_prior * temperature_viscosity_factor
+    neutral_additive_volume_fraction = physical[
+        PHYSICAL_FEATURE_NAMES.index("neutral_additive_volume_fraction")
+    ]
     epsilon_effective_prior = physical[PHYSICAL_FEATURE_NAMES.index("epsilon_effective")]
     activity_prior = physical[PHYSICAL_FEATURE_NAMES.index("activity_prior_M")]
     mean_lambda0 = physical[PHYSICAL_FEATURE_NAMES.index("mean_lambda0_S_cm2_mol")]
@@ -1051,8 +1245,11 @@ def _mechanism_readout(
     mean_stokes_alpha = physical[PHYSICAL_FEATURE_NAMES.index("mean_stokes_alpha_anion")]
     cation_solvation_strength = physical[PHYSICAL_FEATURE_NAMES.index("cation_solvation_strength_M")]
     crowding_prior = physical[PHYSICAL_FEATURE_NAMES.index("crowding_prior")]
+    free_solvent_availability = physical[PHYSICAL_FEATURE_NAMES.index("free_solvent_availability")]
+    solvent_starvation = physical[PHYSICAL_FEATURE_NAMES.index("solvent_starvation")]
     additive_shell_prior = physical[PHYSICAL_FEATURE_NAMES.index("additive_shell_fraction")]
     contact_pair_prior = physical[PHYSICAL_FEATURE_NAMES.index("contact_pair_prior")]
+    free_ion_prior = physical[PHYSICAL_FEATURE_NAMES.index("free_ion_prior")]
     cluster_population_prior = physical[PHYSICAL_FEATURE_NAMES.index("cluster_population_prior")]
     cluster_persistence_prior = physical[PHYSICAL_FEATURE_NAMES.index("cluster_persistence_prior")]
     ionic_network_transport_support = physical[
@@ -1072,6 +1269,8 @@ def _mechanism_readout(
     salt_additive_anticorrelation_screening = physical[
         PHYSICAL_FEATURE_NAMES.index("salt_additive_anticorrelation_screening")
     ]
+    mixed_anion_competition = physical[PHYSICAL_FEATURE_NAMES.index("mixed_anion_competition")]
+    salt_pair_transport_contrast = physical[PHYSICAL_FEATURE_NAMES.index("salt_pair_transport_contrast")]
     mixed_anion_additive_current_support = physical[
         PHYSICAL_FEATURE_NAMES.index("mixed_anion_additive_current_support")
     ]
@@ -1084,15 +1283,15 @@ def _mechanism_readout(
     additive_transport_drag = physical[PHYSICAL_FEATURE_NAMES.index("additive_transport_drag")]
 
     density_pred = density_prior * _positive_unit_multiplier(_head_value(head, "density_log_ratio_head"))
-    eta_solution = eta_prior * _positive_unit_multiplier(_head_value(head, "viscosity_log_ratio_head"))
+    viscosity_multiplier = _positive_unit_multiplier(_head_value(head, "viscosity_log_ratio_head"))
+    eta_baseline_fit = eta_salt_solvent_prior * viscosity_multiplier
+    eta_solution = eta_baseline_fit * neutral_additive_viscosity_excess_factor
     eta_supervised_fit = eta_solution
-    eta_transport = jax.lax.stop_gradient(eta_solution)
+    eta_transport = eta_solution
     epsilon_effective_pred = epsilon_effective_prior * _positive_unit_multiplier(
         _head_value(head, "dielectric_log_ratio_head")
     )
-    effective_ion_concentration = activity_prior * _positive_unit_multiplier(
-        _head_value(head, "activity_log_ratio_head")
-    )
+    effective_ion_concentration = activity_prior
     association_fraction = jax.nn.sigmoid(
         _safe_logit(contact_pair_prior) + _head_value(head, "association_logit_delta_head")
     )
@@ -1101,7 +1300,7 @@ def _mechanism_readout(
         _safe_logit(additive_shell_prior)
         + _head_value(head, "additive_shell_logit_delta_head")
     )
-    crowding = crowding_prior * _positive_unit_multiplier(_head_value(head, "crowding_log_ratio_head"))
+    crowding = crowding_prior
     cluster_population_prior_fraction = cluster_population_prior / (1.0 + cluster_population_prior)
     cluster_population = jax.nn.sigmoid(
         _safe_logit(cluster_population_prior_fraction)
@@ -1110,62 +1309,226 @@ def _mechanism_readout(
     cluster_persistence = cluster_persistence_prior * _positive_unit_multiplier(
         _head_value(head, "cluster_persistence_log_ratio_head")
     )
-    activity_transport = activity_prior
-    association_transport = contact_pair_prior
+    additive_anticorrelation_screening_support = (
+        salt_additive_dielectric_screening
+        + salt_additive_anticorrelation_screening
+    )
+    activity_transport = effective_ion_concentration
+    association_transport = association_fraction / (
+        1.0 + additive_anticorrelation_screening_support
+    )
     free_ion_transport = 1.0 - association_transport
-    crowding_transport = crowding_prior
-    cluster_population_transport = cluster_population_prior_fraction
-    cluster_persistence_transport = cluster_persistence_prior
+    crowding_transport = crowding
+    cluster_population_transport = cluster_population
+    cluster_persistence_transport = cluster_persistence
 
     shell_occupancy = cation_solvation_strength / (1.0 + cation_solvation_strength)
+    viscosity_ratio = eta_liquid_base_prior / (eta_transport + NUMERICAL_EPS)
+    viscosity_coupling = (
+        crowding_transport
+        + cluster_population_transport
+    ) / (
+        1.0
+        + crowding_transport
+        + cluster_population_transport
+    )
+    cation_viscosity_friction = jnp.exp(
+        shell_occupancy * viscosity_coupling * jnp.log(viscosity_ratio + NUMERICAL_EPS)
+    )
+    anion_stokes_drag = _positive_part(mean_stokes_alpha)
+    anion_viscosity_friction = jnp.exp(
+        anion_stokes_drag * viscosity_coupling * jnp.log(viscosity_ratio + NUMERICAL_EPS)
+    )
+    free_solvent_mobility = free_solvent_availability / (
+        free_solvent_availability
+        + salt_volume_fraction
+        + cluster_persistence_transport
+        + NUMERICAL_EPS
+    )
+    finite_concentration_drag = (
+        1.0
+        + crowding_transport * (association_transport + cluster_population_transport)
+        + cluster_persistence_transport
+        + solvent_starvation * cluster_population_transport
+        + additive_transport_drag
+    )
+    finite_concentration_mobility = free_solvent_mobility / finite_concentration_drag
+    finite_concentration_correlation_drive = (
+        association_transport
+        * (
+            crowding_transport
+            + cluster_population_transport
+            + cluster_persistence_transport
+            + solvent_starvation
+        )
+    )
     cation_mobility_weight = 1.0 / (
         mean_cation_radius * (1.0 + shell_occupancy) + NUMERICAL_EPS
     )
-    anion_stokes_drag = _positive_part(mean_stokes_alpha)
     anion_mobility_weight = 1.0 / (
         mean_anion_radius * (1.0 + anion_stokes_drag * crowding_transport) + NUMERICAL_EPS
     )
     mobility_weight_sum = cation_mobility_weight + anion_mobility_weight + NUMERICAL_EPS
+    cation_self_mobility_gate = jax.nn.sigmoid(
+        _head_value(head, "cation_self_mobility_gate")
+    )
+    anion_self_mobility_gate = jax.nn.sigmoid(
+        _head_value(head, "anion_self_mobility_gate")
+    )
     cation_lambda = (
         mean_lambda0
         * cation_mobility_weight
         / mobility_weight_sum
-        * jax.nn.sigmoid(_head_value(head, "cation_self_mobility_gate"))
+        * cation_self_mobility_gate
     )
     anion_lambda = (
         mean_lambda0
         * anion_mobility_weight
         / mobility_weight_sum
-        * jax.nn.sigmoid(_head_value(head, "anion_self_mobility_gate"))
+        * anion_self_mobility_gate
     )
     current_common = (
         (activity_transport + NUMERICAL_EPS)
         * (free_ion_transport + NUMERICAL_EPS)
-        * (1.0 / (eta_transport + NUMERICAL_EPS))
+    )
+    cation_self = (
+        current_common
+        * cation_lambda
+        * cation_viscosity_friction
         / (1.0 + additive_transport_drag)
     )
-    cation_self = current_common * cation_lambda
-    anion_self = current_common * anion_lambda
+    anion_self = (
+        current_common
+        * anion_lambda
+        * anion_viscosity_friction
+        / (1.0 + additive_transport_drag)
+    )
     sigma_self = cation_self + anion_self
+    self_current_scale_prior = (
+        (activity_transport + NUMERICAL_EPS)
+        * (mean_lambda0 + NUMERICAL_EPS)
+        * (free_ion_transport + NUMERICAL_EPS)
+        * (cation_viscosity_friction + anion_viscosity_friction)
+        / (2.0 * (1.0 + additive_transport_drag))
+    )
 
     anticorrelation_screening = (
         salt_pair_anticorrelation_screening
-        + salt_additive_dielectric_screening
-        + salt_additive_anticorrelation_screening
-        + mixed_anion_additive_current_support
+        + additive_anticorrelation_screening_support
     )
-    like_current_support = salt_pair_like_current_support + salt_additive_like_current_support
+    like_current_support = salt_pair_like_current_support
     cluster_transport_support = (
         salt_pair_cluster_transport_support
-        + salt_additive_cluster_transport_support
         + ionic_network_transport_support
     )
-    collective_current_support = like_current_support + cluster_transport_support + anticorrelation_screening
-    ca_drive = association_transport * (1.0 + crowding_transport + additive_transport_drag) / (
-        1.0 + anticorrelation_screening
+    generic_anticorrelation_support = salt_pair_anticorrelation_screening
+    collective_current_support = (
+        like_current_support
+        + cluster_transport_support
+        + generic_anticorrelation_support
     )
-    ca_prior_fraction = ca_drive / (1.0 + ca_drive)
-    cation_anion_fraction = -ca_prior_fraction * jax.nn.sigmoid(_head_value(head, "cation_anion_gate"))
+    ca_drive = (
+        association_transport
+        * (1.0 + finite_concentration_correlation_drive + additive_transport_drag)
+        / (1.0 + anticorrelation_screening)
+    )
+    ca_drive_without_additive_screening = (
+        association_fraction
+        * (1.0 + finite_concentration_correlation_drive + additive_transport_drag)
+        / (1.0 + salt_pair_anticorrelation_screening)
+    )
+    distinct_current_scale = sigma_self
+    ca_negative_drive = (
+        ca_drive
+        * jax.nn.sigmoid(_head_value(head, "cation_anion_gate"))
+    )
+    ca_negative_drive_without_additive_screening = (
+        ca_drive_without_additive_screening
+        * jax.nn.sigmoid(_head_value(head, "cation_anion_gate"))
+    )
+    mixed_anion_drive = (
+        mixed_anion_competition
+        * (1.0 + salt_pair_transport_contrast)
+        * association_transport
+        * (1.0 + finite_concentration_correlation_drive)
+        / (1.0 + anticorrelation_screening + additive_transport_drag)
+    )
+    mixed_anion_drive_without_additive_screening = (
+        mixed_anion_competition
+        * (1.0 + salt_pair_transport_contrast)
+        * association_fraction
+        * (1.0 + finite_concentration_correlation_drive)
+        / (1.0 + salt_pair_anticorrelation_screening + additive_transport_drag)
+    )
+    mixed_anion_negative_drive = (
+        mixed_anion_drive
+        * jax.nn.sigmoid(mixed_anion_anticorrelation_logit)
+    )
+    mixed_anion_negative_drive_without_additive_screening = (
+        mixed_anion_drive_without_additive_screening
+        * jax.nn.sigmoid(mixed_anion_anticorrelation_logit)
+    )
+    total_negative_drive = ca_negative_drive + mixed_anion_negative_drive + NUMERICAL_EPS
+    total_negative_drive_without_additive_screening = (
+        ca_negative_drive_without_additive_screening
+        + mixed_anion_negative_drive_without_additive_screening
+        + NUMERICAL_EPS
+    )
+    total_negative_fraction = total_negative_drive / (1.0 + total_negative_drive)
+    total_negative_fraction_without_additive_screening = (
+        total_negative_drive_without_additive_screening
+        / (1.0 + total_negative_drive_without_additive_screening)
+    )
+    cation_anion_fraction = (
+        -total_negative_fraction * ca_negative_drive / total_negative_drive
+    )
+    mixed_anion_anticorrelation_fraction = (
+        -total_negative_fraction * mixed_anion_negative_drive / total_negative_drive
+    )
+    cation_anion_fraction_without_additive_screening = (
+        -total_negative_fraction_without_additive_screening
+        * ca_negative_drive_without_additive_screening
+        / total_negative_drive_without_additive_screening
+    )
+    mixed_anion_anticorrelation_fraction_without_additive_screening = (
+        -total_negative_fraction_without_additive_screening
+        * mixed_anion_negative_drive_without_additive_screening
+        / total_negative_drive_without_additive_screening
+    )
+    cation_cation_score = (
+        free_ion_transport
+        * (like_current_support + generic_anticorrelation_support)
+        * jax.nn.sigmoid(_head_value(head, "cation_cation_gate"))
+    )
+    anion_anion_score = (
+        free_ion_transport
+        * (like_current_support + generic_anticorrelation_support)
+        * jax.nn.sigmoid(_head_value(head, "anion_anion_gate"))
+    )
+    cluster_drift_score = (
+        cluster_population_transport
+        * (cluster_transport_support + generic_anticorrelation_support)
+        * jax.nn.sigmoid(_head_value(head, "cluster_drift_gate"))
+    )
+    relaxation_tail_score = (
+        cluster_population_transport
+        * cluster_persistence_transport
+        * (cluster_transport_support + generic_anticorrelation_support)
+        * jax.nn.sigmoid(_head_value(head, "relaxation_tail_gate"))
+    )
+    ionic_network_score = (
+        cluster_population_transport
+        * ionic_network_transport_support
+        * jax.nn.sigmoid(_head_value(head, "ionic_network_gate"))
+    )
+    positive_score_sum = (
+        cation_cation_score
+        + anion_anion_score
+        + cluster_drift_score
+        + relaxation_tail_score
+        + ionic_network_score
+        + NUMERICAL_EPS
+    )
     positive_current_support_fraction = (
         collective_current_support
     ) / (
@@ -1175,69 +1538,87 @@ def _mechanism_readout(
         + salt_additive_saturation
         + additive_transport_drag
     )
-    cation_cation_score = (
-        free_ion_transport
-        * (like_current_support + anticorrelation_screening)
-        * jax.nn.sigmoid(_head_value(head, "cation_cation_gate"))
-    )
-    anion_anion_score = (
-        free_ion_transport
-        * (like_current_support + anticorrelation_screening)
-        * jax.nn.sigmoid(_head_value(head, "anion_anion_gate"))
-    )
-    cluster_drift_score = (
-        cluster_population_transport
-        * (cluster_transport_support + anticorrelation_screening)
-        * jax.nn.sigmoid(_head_value(head, "cluster_drift_gate"))
-    )
-    relaxation_tail_score = (
-        cluster_population_transport
-        * cluster_persistence_transport
-        * (cluster_transport_support + anticorrelation_screening)
-        * jax.nn.sigmoid(_head_value(head, "relaxation_tail_gate"))
-    )
-    positive_score_sum = (
-        cation_cation_score
-        + anion_anion_score
-        + cluster_drift_score
-        + relaxation_tail_score
-        + NUMERICAL_EPS
-    )
+    positive_current_capacity = distinct_current_scale * positive_current_support_fraction
     cation_cation_fraction = (
-        positive_current_support_fraction * cation_cation_score / positive_score_sum
+        generic_positive_current_scale * cation_cation_score / positive_score_sum
     )
-    anion_anion_fraction = positive_current_support_fraction * anion_anion_score / positive_score_sum
-    cluster_drift_fraction = positive_current_support_fraction * cluster_drift_score / positive_score_sum
+    anion_anion_fraction = (
+        generic_positive_current_scale * anion_anion_score / positive_score_sum
+    )
+    cluster_drift_fraction = (
+        generic_positive_current_scale * cluster_drift_score / positive_score_sum
+    )
     relaxation_tail_fraction = (
-        positive_current_support_fraction * relaxation_tail_score / positive_score_sum
+        generic_positive_current_scale * relaxation_tail_score / positive_score_sum
+    )
+    ionic_network_fraction = ionic_network_score / positive_score_sum
+    additive_compensation_support = (
+        mixed_anion_additive_current_support
+        + salt_additive_like_current_support
+        + salt_additive_cluster_transport_support
+    )
+    mixed_anion_additive_drive = additive_compensation_support / (
+        1.0
+        + association_transport
+        + mixed_anion_competition
+        + salt_additive_saturation
+        + additive_transport_drag
+    )
+    mixed_anion_additive_fraction = mixed_anion_additive_drive / (
+        1.0 + mixed_anion_additive_drive
     )
 
     cation_anion_distinct = sigma_self * cation_anion_fraction
-    cation_cation_distinct = sigma_self * cation_cation_fraction
-    anion_anion_distinct = sigma_self * anion_anion_fraction
-    cluster_drift = sigma_self * cluster_drift_fraction
-    ionic_network_current = (
-        mean_lambda0
-        * ionic_network_transport_support
-        * cluster_drift_fraction
-        / (eta_liquid_prior + NUMERICAL_EPS)
+    mixed_anion_anticorrelation_current = (
+        sigma_self * mixed_anion_anticorrelation_fraction
+    )
+    cation_anion_distinct_without_additive_screening = (
+        sigma_self * cation_anion_fraction_without_additive_screening
+    )
+    mixed_anion_anticorrelation_current_without_additive_screening = (
+        sigma_self * mixed_anion_anticorrelation_fraction_without_additive_screening
+    )
+    cation_cation_distinct = positive_current_capacity * cation_cation_fraction
+    anion_anion_distinct = positive_current_capacity * anion_anion_fraction
+    cluster_drift = positive_current_capacity * cluster_drift_fraction
+    ionic_network_current = positive_current_capacity * ionic_network_fraction
+    anticorrelation_loss = -(cation_anion_distinct + mixed_anion_anticorrelation_current)
+    anticorrelation_loss_without_additive_screening = -(
+        cation_anion_distinct_without_additive_screening
+        + mixed_anion_anticorrelation_current_without_additive_screening
+    )
+    avoided_anticorrelation_loss = _positive_part(
+        anticorrelation_loss_without_additive_screening - anticorrelation_loss
     )
     mixed_anion_additive_current = (
-        mean_lambda0
-        * mixed_anion_additive_current_support
-        * relaxation_tail_fraction
-        / (eta_liquid_prior + NUMERICAL_EPS)
-    )
-    relaxation_tail = sigma_self * relaxation_tail_fraction
-    current_integral = (
-        sigma_self
-        + cation_anion_distinct
+        avoided_anticorrelation_loss
+    ) * mixed_anion_additive_fraction
+
+    relaxation_tail = positive_current_capacity * relaxation_tail_fraction
+    raw_distinct_current_correction = (
+        cation_anion_distinct
+        + mixed_anion_anticorrelation_current
         + cation_cation_distinct
         + anion_anion_distinct
         + cluster_drift
         + ionic_network_current
         + mixed_anion_additive_current
         + relaxation_tail
+    )
+    distinct_ratio = raw_distinct_current_correction / (sigma_self + NUMERICAL_EPS)
+    distinct_scale = 1.0 / (1.0 + jnp.abs(distinct_ratio))
+    cation_anion_distinct = cation_anion_distinct * distinct_scale
+    mixed_anion_anticorrelation_current = mixed_anion_anticorrelation_current * distinct_scale
+    cation_cation_distinct = cation_cation_distinct * distinct_scale
+    anion_anion_distinct = anion_anion_distinct * distinct_scale
+    cluster_drift = cluster_drift * distinct_scale
+    ionic_network_current = ionic_network_current * distinct_scale
+    mixed_anion_additive_current = mixed_anion_additive_current * distinct_scale
+    relaxation_tail = relaxation_tail * distinct_scale
+    distinct_current_correction = raw_distinct_current_correction * distinct_scale
+    current_integral = (
+        sigma_self
+        + distinct_current_correction
     )
     sigma_mS_cm = current_integral
     return jnp.asarray(
@@ -1254,15 +1635,29 @@ def _mechanism_readout(
             cluster_population,
             cluster_persistence,
             additive_transport_drag,
+            temperature_viscosity_factor,
+            additive_anticorrelation_screening_support,
+            association_transport,
+            free_ion_transport,
+            current_common,
+            cation_viscosity_friction,
+            anion_viscosity_friction,
+            free_solvent_mobility,
+            finite_concentration_mobility,
+            finite_concentration_correlation_drive,
             anticorrelation_screening,
             like_current_support,
             cluster_transport_support,
             positive_current_support_fraction,
+            self_current_scale_prior,
+            cation_self_mobility_gate,
+            anion_self_mobility_gate,
             cation_self,
             anion_self,
             sigma_self,
             cation_anion_fraction,
             cation_anion_distinct,
+            mixed_anion_anticorrelation_current,
             cation_cation_fraction,
             cation_cation_distinct,
             anion_anion_fraction,
@@ -1273,6 +1668,7 @@ def _mechanism_readout(
             mixed_anion_additive_current,
             relaxation_tail_fraction,
             relaxation_tail,
+            distinct_current_correction,
             current_integral,
             sigma_mS_cm,
         ]
@@ -1295,25 +1691,15 @@ def _model_feature_idx(name: str) -> int:
 def _physical_consistency_loss(features: jnp.ndarray) -> jnp.ndarray:
     cation_self = features[:, _model_feature_idx("cation_self_current_mS_cm")]
     anion_self = features[:, _model_feature_idx("anion_self_current_mS_cm")]
+    sigma = features[:, _model_feature_idx("sigma_mS_cm")]
     cation_anion_fraction = features[:, _model_feature_idx("cation_anion_distinct_fraction")]
-    cation_cation_fraction = features[:, _model_feature_idx("cation_cation_distinct_fraction")]
-    anion_anion_fraction = features[:, _model_feature_idx("anion_anion_distinct_fraction")]
-    cluster_drift_fraction = features[:, _model_feature_idx("cluster_drift_fraction")]
-    relaxation_tail_fraction = features[:, _model_feature_idx("relaxation_tail_fraction")]
-    positive_support_fraction = features[:, _model_feature_idx("positive_current_support_fraction")]
-    positive_fraction_sum = (
-        cation_cation_fraction
-        + anion_anion_fraction
-        + cluster_drift_fraction
-        + relaxation_tail_fraction
-    )
-    support_budget_violation = jax.nn.relu(positive_fraction_sum - positive_support_fraction)
     sign_violation = (
         jax.nn.relu(-cation_self)
         + jax.nn.relu(-anion_self)
         + jax.nn.relu(cation_anion_fraction)
+        + jax.nn.relu(-sigma)
     )
-    return jnp.mean(support_budget_violation * support_budget_violation + sign_violation * sign_violation)
+    return jnp.mean(sign_violation * sign_violation)
 
 
 def _masked_log_loss(
@@ -1370,6 +1756,23 @@ def _masked_current_scale_loss(
     return jnp.where(
         mask_sum > 0.0,
         jnp.sum(weighted_mask * scaled_error * scaled_error) / (mask_sum + NUMERICAL_EPS),
+        0.0,
+    )
+
+
+def _masked_squared_current_loss(
+    prediction: jnp.ndarray,
+    target: jnp.ndarray,
+    mask: jnp.ndarray,
+    weights: jnp.ndarray,
+) -> jnp.ndarray:
+    weighted_mask = mask * weights
+    mask_sum = jnp.sum(weighted_mask)
+    active = weighted_mask > 0.0
+    error = jnp.where(active, prediction - target, 0.0)
+    return jnp.where(
+        mask_sum > 0.0,
+        jnp.sum(weighted_mask * error * error) / (mask_sum + NUMERICAL_EPS),
         0.0,
     )
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -15,6 +15,7 @@ import optax
 
 from constants import T_REF_K
 from conductivity.mol_set_sigma_mechanistic_prototype import (
+    CURRENT_HEAD_NAMES,
     MECHANISM_FEATURE_NAMES,
     MODEL_FEATURE_NAMES,
     PHYSICAL_FEATURE_NAMES,
@@ -57,6 +58,7 @@ DEFAULT_DATA_SOURCES = (
     "bamboo_mix_eis",
     "clean_oedb_li_aux",
 )
+DERIVED_MECHANISM_TARGET_SOURCES = ("property_db",)
 LOG_INTERVAL = 250
 INTERACTION_DIAGNOSTIC_FEATURE_NAMES = (
     "mixed_anion_competition",
@@ -87,7 +89,6 @@ INTERACTION_DIAGNOSTIC_INDICES = tuple(
     PHYSICAL_FEATURE_NAMES.index(name) for name in INTERACTION_DIAGNOSTIC_FEATURE_NAMES
 )
 
-
 @dataclass(frozen=True)
 class FitMetrics:
     """Scalar fit metrics for a trained prototype batch."""
@@ -98,6 +99,35 @@ class FitMetrics:
     mape_percent: float
     max_abs_mS_cm: float
     density_mae_g_ml: float
+
+
+@dataclass(frozen=True)
+class ConductivityStratumMetrics:
+    """Scalar conductivity metrics for an evaluation stratum."""
+
+    stratum: str
+    rows: int
+    labels: int
+    mae_mS_cm: float
+    rmse_mS_cm: float
+    mape_percent: float
+    max_abs_mS_cm: float
+    min_temperature_K: float
+    max_temperature_K: float
+    min_sigma_mS_cm: float
+    max_sigma_mS_cm: float
+
+
+@dataclass(frozen=True)
+class HighConductivityAuditRow:
+    """High-conductivity labeled row shown to prevent aggregate-metric ambiguity."""
+
+    source: str
+    row_index: int
+    temperature_K: float
+    conductivity_mS_cm: float
+    stratum: str
+    recipe: Mapping[str, object]
 
 
 @dataclass(frozen=True)
@@ -122,17 +152,23 @@ class AuditRow:
     observed_mS_cm: float | None
     predicted_mS_cm: float
     eta_cP: float
+    self_current_scale_prior_mS_cm: float
     sigma_self_mS_cm: float
     cation_anion_distinct_mS_cm: float
+    mixed_anion_anticorrelation_mS_cm: float
     cation_cation_distinct_mS_cm: float
     anion_anion_distinct_mS_cm: float
     cluster_drift_mS_cm: float
     ionic_network_current_mS_cm: float
     mixed_anion_additive_current_mS_cm: float
     relaxation_tail_mS_cm: float
+    distinct_current_correction_mS_cm: float
     association_fraction: float
     crowding: float
     activity_M: float
+    mobile_carrier_density_M: float
+    finite_concentration_mobility_factor: float
+    finite_concentration_correlation_drive: float
     species_property_distance: float
     loading_distance: float
     interaction_distance: float
@@ -162,6 +198,51 @@ class TrainingResult:
     history: tuple[tuple[int, float], ...]
     batch_size: int
     batching_policy: str
+    temperature_calibration: "TemperatureCalibrationAudit"
+    current_gate_calibration: "CurrentGateCalibration"
+    derived_target_audit: "DerivedMechanismTargetAudit"
+
+
+@dataclass(frozen=True)
+class CurrentGateCalibration:
+    """Data-derived current-gate initialization from auxiliary distinct-current labels."""
+
+    labels: int
+    negative_label_fraction: float
+    positive_signed_fraction: float
+    cation_anion_gate_probability: float
+    positive_gate_probability: float
+    generic_positive_current_scale: float
+    mixed_anion_anticorrelation_gate_probability: float
+
+
+@dataclass(frozen=True)
+class TemperatureCalibrationAudit:
+    """Data-derived temperature/friction calibration from same-recipe series."""
+
+    grouped_recipe_series: int
+    candidate_pairs: int
+    accepted_pairs: int
+    rejected_nonmonotone_pairs: int
+    activation_min_K: float
+    activation_median_K: float
+    activation_max_K: float
+
+
+@dataclass(frozen=True)
+class DerivedMechanismTargetAudit:
+    """Audit for mechanism targets derived from measured sigma plus property priors."""
+
+    candidate_rows: int
+    viscosity_targets: int
+    association_targets: int
+    current_distinct_targets: int
+    viscosity_min_cP: float
+    viscosity_max_cP: float
+    association_min: float
+    association_max: float
+    current_distinct_min_mS_cm: float
+    current_distinct_max_mS_cm: float
 
 
 @dataclass(frozen=True)
@@ -196,10 +277,14 @@ def train_mechanistic_prototype(
     holdout_batch = None
     if holdout_rows:
         holdout_batch = build_mechanistic_batch(holdout_rows, norm_mean, norm_std)
+    train_batch, derived_target_audit = _apply_property_derived_mechanism_targets(train_batch)
+    temperature_calibration = _calibrate_temperature_transport_activation(train_rows)
     physical_mean, physical_std = compute_physical_feature_stats(train_batch)
     params = init_mechanistic_params(jax.random.PRNGKey(seed), physical_mean, physical_std)
+    params = _set_temperature_transport_activation(params, temperature_calibration)
+    params, current_gate_calibration = _initialize_current_gates_from_auxiliary_labels(params, train_batch)
     batch_tuple = batch_tuple_from_mechanistic_batch(train_batch)
-    source_index_groups = _source_index_groups(train_batch.sources)
+    training_index_groups = _source_index_groups(train_batch.sources)
     fixed_physical_mean = jnp.asarray(physical_mean)
     fixed_physical_std = jnp.asarray(physical_std)
     optimizer = optax.chain(
@@ -217,6 +302,12 @@ def train_mechanistic_prototype(
         frozen_grads = dict(grads)
         frozen_grads["physical_mean"] = jnp.zeros_like(grads["physical_mean"])
         frozen_grads["physical_std"] = jnp.zeros_like(grads["physical_std"])
+        frozen_grads["generic_positive_current_scale"] = jnp.zeros_like(
+            grads["generic_positive_current_scale"]
+        )
+        frozen_grads["temperature_transport_activation_K"] = jnp.zeros_like(
+            grads["temperature_transport_activation_K"]
+        )
         updates, next_opt_state = optimizer.update(frozen_grads, step_opt_state, step_params)
         next_params = optax.apply_updates(step_params, updates)
         restored_params = dict(next_params)
@@ -234,7 +325,7 @@ def train_mechanistic_prototype(
                 batch_size,
                 step_idx + n_steps + 1,
                 seed,
-                source_index_groups,
+                training_index_groups,
             )
             current_loss = float(loss_fn(params, history_batch_tuple))
             history.append((step_idx, current_loss))
@@ -246,7 +337,7 @@ def train_mechanistic_prototype(
             batch_size,
             step_idx,
             seed,
-            source_index_groups,
+            training_index_groups,
         )
         params, opt_state, _loss_value = jit_train_step(params, opt_state, step_batch_tuple)
 
@@ -273,7 +364,255 @@ def train_mechanistic_prototype(
         history=tuple(history),
         batch_size=batch_size,
         batching_policy="source-balanced",
+        temperature_calibration=temperature_calibration,
+        current_gate_calibration=current_gate_calibration,
+        derived_target_audit=derived_target_audit,
     )
+
+
+def _apply_property_derived_mechanism_targets(
+    batch: MechanisticBatch,
+) -> tuple[MechanisticBatch, DerivedMechanismTargetAudit]:
+    physical = compute_physical_features_for_batch(batch)
+    candidate_mask = _derived_mechanism_candidate_mask(batch)
+    candidate_count = int(np.sum(candidate_mask))
+    if candidate_count == 0:
+        return batch, _empty_derived_target_audit()
+
+    eta_prior = _physical_column(physical, "eta_solution_prior_cP")
+    contact_pair_prior = _physical_column(physical, "contact_pair_prior")
+    activity_prior = _physical_column(physical, "activity_prior_M")
+    mean_lambda0 = _physical_column(physical, "mean_lambda0_S_cm2_mol")
+    crowding_prior = _physical_column(physical, "crowding_prior")
+    additive_transport_drag = _physical_column(physical, "additive_transport_drag")
+    screening_support = (
+        _physical_column(physical, "salt_additive_dielectric_screening")
+        + _physical_column(physical, "salt_additive_anticorrelation_screening")
+    )
+
+    _require_positive_finite_targets(eta_prior[candidate_mask], "derived viscosity target")
+    _require_nonnegative_finite_targets(screening_support[candidate_mask], "derived screening support")
+    association_target = contact_pair_prior / (1.0 + screening_support)
+    _require_fraction_targets(association_target[candidate_mask], "derived association target")
+    free_ion_target = 1.0 - association_target
+    denominator = eta_prior * (1.0 + crowding_prior + additive_transport_drag)
+    _require_positive_finite_targets(denominator[candidate_mask], "derived sigma-backbone denominator")
+    self_current_scale_prior_target = (
+        activity_prior
+        * mean_lambda0
+        * free_ion_target
+        / denominator
+    )
+    _require_positive_finite_targets(
+        self_current_scale_prior_target[candidate_mask],
+        "derived self-current scale prior target",
+    )
+    current_distinct_target = batch.sigma_mS_cm - self_current_scale_prior_target
+    _require_finite_targets(current_distinct_target[candidate_mask], "derived distinct-current target")
+
+    viscosity_target_mask = candidate_mask & (batch.viscosity_mask <= 0.0)
+    association_target_mask = candidate_mask & (batch.association_fraction_mask <= 0.0)
+    current_distinct_target_mask = candidate_mask & (batch.current_distinct_mask <= 0.0)
+
+    viscosity_cP = np.where(viscosity_target_mask, eta_prior, batch.viscosity_cP)
+    viscosity_mask = np.where(viscosity_target_mask, 1.0, batch.viscosity_mask)
+    association_fraction = np.where(
+        association_target_mask,
+        association_target,
+        batch.association_fraction,
+    )
+    association_fraction_mask = np.where(
+        association_target_mask,
+        1.0,
+        batch.association_fraction_mask,
+    )
+    current_distinct_mS_cm = np.where(
+        current_distinct_target_mask,
+        current_distinct_target,
+        batch.current_distinct_mS_cm,
+    )
+    current_distinct_mask = np.where(
+        current_distinct_target_mask,
+        1.0,
+        batch.current_distinct_mask,
+    )
+
+    updated_batch = replace(
+        batch,
+        viscosity_cP=viscosity_cP,
+        viscosity_mask=viscosity_mask,
+        association_fraction=association_fraction,
+        association_fraction_mask=association_fraction_mask,
+        current_distinct_mS_cm=current_distinct_mS_cm,
+        current_distinct_mask=current_distinct_mask,
+    )
+    return (
+        updated_batch,
+        DerivedMechanismTargetAudit(
+            candidate_rows=candidate_count,
+            viscosity_targets=int(np.sum(viscosity_target_mask)),
+            association_targets=int(np.sum(association_target_mask)),
+            current_distinct_targets=int(np.sum(current_distinct_target_mask)),
+            viscosity_min_cP=_masked_min(eta_prior, viscosity_target_mask),
+            viscosity_max_cP=_masked_max(eta_prior, viscosity_target_mask),
+            association_min=_masked_min(association_target, association_target_mask),
+            association_max=_masked_max(association_target, association_target_mask),
+            current_distinct_min_mS_cm=_masked_min(
+                current_distinct_target,
+                current_distinct_target_mask,
+            ),
+            current_distinct_max_mS_cm=_masked_max(
+                current_distinct_target,
+                current_distinct_target_mask,
+            ),
+        ),
+    )
+
+
+def _calibrate_temperature_transport_activation(
+    rows: Sequence[MechanisticRow],
+) -> TemperatureCalibrationAudit:
+    grouped: dict[tuple[str, str], dict[float, list[float]]] = {}
+    for row in rows:
+        if row.has_conductivity <= 0.0:
+            continue
+        if row.conductivity_mS_cm <= 0.0:
+            raise ValueError("Temperature calibration requires positive conductivity labels")
+        if row.temperature_K <= 0.0:
+            raise ValueError("Temperature calibration requires positive temperatures")
+        key = (row.source, row.recipe_key)
+        if key not in grouped:
+            grouped[key] = {}
+        if row.temperature_K not in grouped[key]:
+            grouped[key][row.temperature_K] = []
+        grouped[key][row.temperature_K].append(row.conductivity_mS_cm)
+
+    grouped_recipe_series = 0
+    candidate_pairs = 0
+    rejected_nonmonotone_pairs = 0
+    activations: list[float] = []
+    for temperature_to_sigma in grouped.values():
+        if len(temperature_to_sigma) < 2:
+            continue
+        grouped_recipe_series += 1
+        sorted_temperatures = sorted(temperature_to_sigma)
+        mean_sigmas = [
+            float(np.mean(np.asarray(temperature_to_sigma[temperature], dtype=np.float64)))
+            for temperature in sorted_temperatures
+        ]
+        for idx in range(len(sorted_temperatures) - 1):
+            lower_T = float(sorted_temperatures[idx])
+            upper_T = float(sorted_temperatures[idx + 1])
+            lower_sigma = float(mean_sigmas[idx])
+            upper_sigma = float(mean_sigmas[idx + 1])
+            candidate_pairs += 1
+            if upper_sigma <= lower_sigma:
+                rejected_nonmonotone_pairs += 1
+                continue
+            denominator = (1.0 / lower_T) - (1.0 / upper_T)
+            if denominator <= 0.0:
+                raise ValueError("Temperature calibration encountered non-increasing temperature order")
+            activation_K = float(np.log(upper_sigma / lower_sigma) / denominator)
+            if not np.isfinite(activation_K) or activation_K <= 0.0:
+                raise ValueError("Temperature calibration produced a non-positive activation value")
+            activations.append(activation_K)
+
+    if not activations:
+        raise ValueError(
+            "Temperature calibration found no monotone same-source same-recipe conductivity-temperature pairs"
+        )
+    activation_array = np.asarray(activations, dtype=np.float64)
+    return TemperatureCalibrationAudit(
+        grouped_recipe_series=grouped_recipe_series,
+        candidate_pairs=candidate_pairs,
+        accepted_pairs=len(activations),
+        rejected_nonmonotone_pairs=rejected_nonmonotone_pairs,
+        activation_min_K=float(np.min(activation_array)),
+        activation_median_K=float(np.median(activation_array)),
+        activation_max_K=float(np.max(activation_array)),
+    )
+
+
+def _set_temperature_transport_activation(
+    params: Mapping[str, jnp.ndarray],
+    audit: TemperatureCalibrationAudit,
+) -> Mapping[str, jnp.ndarray]:
+    next_params = dict(params)
+    next_params["temperature_transport_activation_K"] = jnp.asarray(
+        audit.activation_median_K
+    )
+    return next_params
+
+
+def _derived_mechanism_candidate_mask(batch: MechanisticBatch) -> np.ndarray:
+    additive_rows = np.sum(batch.additive_weight_fraction, axis=1) > 0.0
+    multi_salt_rows = np.sum(batch.salt_molarity > 0.0, axis=1) > 1
+    ionic_rows = np.sum(batch.salt_molarity, axis=1) > 0.0
+    source_rows = np.isin(np.asarray(batch.sources), np.asarray(DERIVED_MECHANISM_TARGET_SOURCES))
+    return (
+        (batch.conductivity_mask > 0.0)
+        & ionic_rows
+        & source_rows
+        & (additive_rows | multi_salt_rows)
+    )
+
+
+def _physical_column(physical: np.ndarray, name: str) -> np.ndarray:
+    return physical[:, PHYSICAL_FEATURE_NAMES.index(name)]
+
+
+def _empty_derived_target_audit() -> DerivedMechanismTargetAudit:
+    return DerivedMechanismTargetAudit(
+        candidate_rows=0,
+        viscosity_targets=0,
+        association_targets=0,
+        current_distinct_targets=0,
+        viscosity_min_cP=0.0,
+        viscosity_max_cP=0.0,
+        association_min=0.0,
+        association_max=0.0,
+        current_distinct_min_mS_cm=0.0,
+        current_distinct_max_mS_cm=0.0,
+    )
+
+
+def _require_finite_targets(values: np.ndarray, context: str) -> None:
+    if np.any(~np.isfinite(values)):
+        raise ValueError(f"{context} contains non-finite values")
+
+
+def _require_positive_finite_targets(values: np.ndarray, context: str) -> None:
+    _require_finite_targets(values, context)
+    if np.any(values <= 0.0):
+        raise ValueError(f"{context} must be positive")
+
+
+def _require_nonnegative_finite_targets(values: np.ndarray, context: str) -> None:
+    _require_finite_targets(values, context)
+    if np.any(values < 0.0):
+        raise ValueError(f"{context} must be nonnegative")
+
+
+def _require_fraction_targets(values: np.ndarray, context: str) -> None:
+    _require_finite_targets(values, context)
+    if np.any(values < 0.0) or np.any(values > 1.0):
+        raise ValueError(f"{context} must be in [0, 1]")
+
+
+def _masked_min(values: np.ndarray, mask: np.ndarray) -> float:
+    selected = values[mask]
+    if selected.size == 0:
+        return 0.0
+    _require_finite_targets(selected, "masked minimum")
+    return float(np.min(selected))
+
+
+def _masked_max(values: np.ndarray, mask: np.ndarray) -> float:
+    selected = values[mask]
+    if selected.size == 0:
+        return 0.0
+    _require_finite_targets(selected, "masked maximum")
+    return float(np.max(selected))
 
 
 def _training_step_batch_tuple(
@@ -293,7 +632,9 @@ def _training_step_batch_tuple(
 
 def _source_index_groups(sources: Sequence[str]) -> tuple[np.ndarray, ...]:
     source_array = np.asarray(sources)
-    groups = tuple(np.flatnonzero(source_array == source) for source in sorted(set(sources)))
+    groups = tuple(
+        np.flatnonzero(source_array == source) for source in sorted(set(sources))
+    )
     if not groups:
         raise ValueError("At least one source group is required for source-balanced batching")
     for group in groups:
@@ -326,6 +667,95 @@ def _source_balanced_indices(
     indices = np.concatenate(selected)
     rng.shuffle(indices)
     return indices
+
+
+def _initialize_current_gates_from_auxiliary_labels(
+    params: Mapping[str, jnp.ndarray],
+    batch: MechanisticBatch,
+) -> tuple[Mapping[str, jnp.ndarray], CurrentGateCalibration]:
+    current_label_mask = (
+        (batch.current_distinct_mask > 0.0)
+        & (batch.cation_self_current_mask > 0.0)
+        & (batch.anion_self_current_mask > 0.0)
+    )
+    label_count = int(np.sum(current_label_mask))
+    if label_count == 0:
+        return (
+            params,
+            CurrentGateCalibration(
+                labels=0,
+                negative_label_fraction=0.0,
+                positive_signed_fraction=0.0,
+                cation_anion_gate_probability=0.5,
+                positive_gate_probability=0.5,
+                generic_positive_current_scale=1.0,
+                mixed_anion_anticorrelation_gate_probability=0.5,
+            ),
+        )
+
+    self_current = (
+        batch.cation_self_current_mS_cm[current_label_mask]
+        + batch.anion_self_current_mS_cm[current_label_mask]
+    )
+    if np.any(self_current <= 0.0) or np.any(~np.isfinite(self_current)):
+        raise ValueError("Current-gate calibration requires positive finite self-current labels")
+    distinct_ratio = batch.current_distinct_mS_cm[current_label_mask] / self_current
+    if np.any(~np.isfinite(distinct_ratio)):
+        raise ValueError("Current-gate calibration found non-finite distinct/self ratios")
+
+    negative_label_fraction = float(np.mean(distinct_ratio < 0.0))
+    positive_signed_fraction = float(np.mean(np.maximum(distinct_ratio, 0.0)))
+    cation_anion_gate_probability = _strict_open_probability(
+        negative_label_fraction,
+        "negative distinct-current label fraction",
+    )
+    positive_gate_probability = _strict_open_probability(
+        positive_signed_fraction,
+        "mean positive distinct/self fraction",
+    )
+    next_params = dict(params)
+    bias = np.asarray(params["mech_out_b"]).copy()
+    bias[CURRENT_HEAD_NAMES.index("cation_anion_gate")] = _logit_probability(
+        cation_anion_gate_probability
+    )
+    for gate_name in (
+        "cation_cation_gate",
+        "anion_anion_gate",
+        "cluster_drift_gate",
+        "relaxation_tail_gate",
+        "ionic_network_gate",
+    ):
+        bias[CURRENT_HEAD_NAMES.index(gate_name)] = _logit_probability(positive_gate_probability)
+    next_params["mech_out_b"] = jnp.asarray(bias)
+    next_params["generic_positive_current_scale"] = jnp.asarray(positive_signed_fraction)
+    next_params["mixed_anion_anticorrelation_logit"] = jnp.asarray(
+        _logit_probability(cation_anion_gate_probability)
+    )
+    return (
+        next_params,
+        CurrentGateCalibration(
+            labels=label_count,
+            negative_label_fraction=negative_label_fraction,
+            positive_signed_fraction=positive_signed_fraction,
+            cation_anion_gate_probability=cation_anion_gate_probability,
+            positive_gate_probability=positive_gate_probability,
+            generic_positive_current_scale=positive_signed_fraction,
+            mixed_anion_anticorrelation_gate_probability=cation_anion_gate_probability,
+        ),
+    )
+
+
+def _strict_open_probability(value: float, context: str) -> float:
+    parsed = float(value)
+    if not np.isfinite(parsed):
+        raise ValueError(f"{context} must be finite")
+    if parsed <= 0.0 or parsed >= 1.0:
+        raise ValueError(f"{context} must be in the open unit interval, got {parsed}")
+    return parsed
+
+
+def _logit_probability(probability: float) -> float:
+    return float(np.log(probability / (1.0 - probability)))
 
 
 def _batch_physical_z(
@@ -392,6 +822,104 @@ def compute_fit_metrics(
         max_abs_mS_cm=float(np.max(np.abs(err))),
         density_mae_g_ml=density_mae,
     )
+
+
+def conductivity_stratum_metrics(training: TrainingResult) -> tuple[ConductivityStratumMetrics, ...]:
+    """Compute scalar conductivity metrics by evaluation stratum."""
+
+    if len(training.train_rows) != len(training.train_batch.sources):
+        raise ValueError("Training rows and batch rows must have matching order for stratum metrics")
+    log_pred, _features = forward_batch(
+        params=training.params,
+        species_props_norm=jnp.asarray(training.train_batch.species_props_norm),
+        species_props_raw=jnp.asarray(training.train_batch.species_props_raw),
+        solvent_volume_fraction=jnp.asarray(training.train_batch.solvent_volume_fraction),
+        salt_molarity=jnp.asarray(training.train_batch.salt_molarity),
+        additive_weight_fraction=jnp.asarray(training.train_batch.additive_weight_fraction),
+        mask=jnp.asarray(training.train_batch.mask),
+        temperature_K=jnp.asarray(training.train_batch.temperature_K),
+    )
+    pred = np.asarray(jnp.exp(log_pred))
+    strata = np.asarray([_evaluation_stratum(row) for row in training.train_rows])
+    metrics: list[ConductivityStratumMetrics] = []
+    for stratum in sorted(set(strata)):
+        stratum_mask = strata == stratum
+        label_mask = stratum_mask & (training.train_batch.conductivity_mask > 0.0)
+        row_count = int(np.sum(stratum_mask))
+        label_count = int(np.sum(label_mask))
+        temperatures = training.train_batch.temperature_K[stratum_mask]
+        if label_count == 0:
+            metrics.append(
+                ConductivityStratumMetrics(
+                    stratum=stratum,
+                    rows=row_count,
+                    labels=0,
+                    mae_mS_cm=0.0,
+                    rmse_mS_cm=0.0,
+                    mape_percent=0.0,
+                    max_abs_mS_cm=0.0,
+                    min_temperature_K=float(np.min(temperatures)),
+                    max_temperature_K=float(np.max(temperatures)),
+                    min_sigma_mS_cm=0.0,
+                    max_sigma_mS_cm=0.0,
+                )
+            )
+            continue
+        target = training.train_batch.sigma_mS_cm[label_mask]
+        error = pred[label_mask] - target
+        metrics.append(
+            ConductivityStratumMetrics(
+                stratum=stratum,
+                rows=row_count,
+                labels=label_count,
+                mae_mS_cm=float(np.mean(np.abs(error))),
+                rmse_mS_cm=float(np.sqrt(np.mean(error * error))),
+                mape_percent=float(100.0 * np.mean(np.abs(error) / target)),
+                max_abs_mS_cm=float(np.max(np.abs(error))),
+                min_temperature_K=float(np.min(training.train_batch.temperature_K[label_mask])),
+                max_temperature_K=float(np.max(training.train_batch.temperature_K[label_mask])),
+                min_sigma_mS_cm=float(np.min(target)),
+                max_sigma_mS_cm=float(np.max(target)),
+            )
+        )
+    return tuple(metrics)
+
+
+def high_conductivity_audit_rows(
+    rows: Sequence[MechanisticRow],
+    max_rows: int,
+) -> tuple[HighConductivityAuditRow, ...]:
+    """Highest-conductivity labeled rows shown to prevent aggregate-metric ambiguity."""
+
+    if max_rows <= 0:
+        raise ValueError("max_rows must be positive")
+    selected = [
+        row
+        for row in rows
+        if row.has_conductivity > 0.0
+    ]
+    selected.sort(key=lambda row: row.conductivity_mS_cm, reverse=True)
+    return tuple(
+        HighConductivityAuditRow(
+            source=row.source,
+            row_index=row.row_index,
+            temperature_K=row.temperature_K,
+            conductivity_mS_cm=row.conductivity_mS_cm,
+            stratum=_evaluation_stratum(row),
+            recipe=row.recipe,
+        )
+        for row in selected[:max_rows]
+    )
+
+
+def _evaluation_stratum(row: MechanisticRow) -> str:
+    if row.has_conductivity <= 0.0:
+        return f"auxiliary_only|{_temperature_key(row.temperature_K)}"
+    return f"conductivity|{_temperature_key(row.temperature_K)}"
+
+
+def _temperature_key(temperature_K: float) -> str:
+    return f"T={float(temperature_K):.2f}K"
 
 
 def empirical_lifsi_fec_audit(
@@ -474,6 +1002,41 @@ def print_training_report(training: TrainingResult, include_fit_metrics: bool) -
     print(f"  holdout rows: {len(training.holdout_rows)}")
     print(f"  batch size: {training.batch_size}")
     print(f"  batching policy: {training.batching_policy}")
+    print(
+        "  derived mechanism-target audit: "
+        f"candidates={training.derived_target_audit.candidate_rows}, "
+        f"viscosity={training.derived_target_audit.viscosity_targets} "
+        f"[{training.derived_target_audit.viscosity_min_cP:.3f},"
+        f"{training.derived_target_audit.viscosity_max_cP:.3f}] cP, "
+        f"association={training.derived_target_audit.association_targets} "
+        f"[{training.derived_target_audit.association_min:.3f},"
+        f"{training.derived_target_audit.association_max:.3f}], "
+        f"distinct={training.derived_target_audit.current_distinct_targets} "
+        f"[{training.derived_target_audit.current_distinct_min_mS_cm:.3f},"
+        f"{training.derived_target_audit.current_distinct_max_mS_cm:.3f}] mS/cm"
+    )
+    print(
+        "  temperature/friction calibration: "
+        f"series={training.temperature_calibration.grouped_recipe_series}, "
+        f"pairs={training.temperature_calibration.candidate_pairs}, "
+        f"accepted={training.temperature_calibration.accepted_pairs}, "
+        f"rejected_nonmonotone={training.temperature_calibration.rejected_nonmonotone_pairs}, "
+        f"activation_K=[{training.temperature_calibration.activation_min_K:.1f},"
+        f"{training.temperature_calibration.activation_median_K:.1f},"
+        f"{training.temperature_calibration.activation_max_K:.1f}]"
+    )
+    print(
+        "  current-gate calibration: "
+        f"labels={training.current_gate_calibration.labels}, "
+        f"negative_fraction={training.current_gate_calibration.negative_label_fraction:.3f}, "
+        f"positive_signed_fraction={training.current_gate_calibration.positive_signed_fraction:.3f}, "
+        f"ca_gate={training.current_gate_calibration.cation_anion_gate_probability:.3f}, "
+        f"positive_gate={training.current_gate_calibration.positive_gate_probability:.3f}, "
+        f"generic_positive_scale={training.current_gate_calibration.generic_positive_current_scale:.3f}, "
+        "mixed_ca_gate="
+        f"{training.current_gate_calibration.mixed_anion_anticorrelation_gate_probability:.3f}, "
+        "mixed_additive=physical_support"
+    )
     print(f"  density-labeled train rows: {int(np.sum(training.train_batch.density_mask))}")
     print(f"  viscosity-labeled train rows: {int(np.sum(training.train_batch.viscosity_mask))}")
     print(f"  dielectric-labeled train rows: {int(np.sum(training.train_batch.dielectric_mask))}")
@@ -496,11 +1059,14 @@ def print_training_report(training: TrainingResult, include_fit_metrics: bool) -
         _print_metrics("train", compute_fit_metrics(training.params, training.train_batch))
         if training.holdout_batch is not None:
             _print_metrics("holdout", compute_fit_metrics(training.params, training.holdout_batch))
+        _print_conductivity_stratum_metrics(conductivity_stratum_metrics(training))
+        _print_high_conductivity_rows(high_conductivity_audit_rows(training.train_rows, max_rows=12))
         print("")
     else:
         print("fit metrics: skipped by --skip-fit-metrics")
         print("")
     _print_audit_table("Empirical LiFSI-dominant mixed-salt + FEC", empirical_lifsi_fec_audit(training))
+    _print_lifsi_calibration_ablation(training)
     _print_audit_table(
         "Generated EC:DMC 30:70 + LiFSI 1.0 M + FEC",
         generated_sweep_audit(training, "LiFSI", fec_single_salt_sweep("LiFSI")),
@@ -525,7 +1091,10 @@ def _print_acceptance_summary(training: TrainingResult) -> None:
     lifsi_observed = np.asarray([row.observed_mS_cm for row in lifsi_rows], dtype=np.float64)
     lifsi_predicted = np.asarray([row.predicted_mS_cm for row in lifsi_rows], dtype=np.float64)
     lifsi_eta = np.asarray([row.eta_cP for row in lifsi_rows], dtype=np.float64)
-    lifsi_ca = np.asarray([row.cation_anion_distinct_mS_cm for row in lifsi_rows], dtype=np.float64)
+    lifsi_mix_add = np.asarray(
+        [row.mixed_anion_additive_current_mS_cm for row in lifsi_rows],
+        dtype=np.float64,
+    )
     lifsi_max_abs = float(np.max(np.abs(lifsi_predicted - lifsi_observed)))
     lifsi_pass = (
         lifsi_max_abs <= 0.1
@@ -533,7 +1102,8 @@ def _print_acceptance_summary(training: TrainingResult) -> None:
         and lifsi_predicted[2] > lifsi_predicted[0]
         and lifsi_predicted[3] > lifsi_predicted[0] - 0.25
         and bool(np.all(np.diff(lifsi_eta) > 0.0))
-        and lifsi_ca[-1] > lifsi_ca[0]
+        and lifsi_mix_add[1] > lifsi_mix_add[0]
+        and lifsi_mix_add[2] >= lifsi_mix_add[1]
     )
 
     lifsi_generated = generated_sweep_audit(training, "LiFSI", fec_single_salt_sweep("LiFSI"))
@@ -579,6 +1149,37 @@ def _print_acceptance_summary(training: TrainingResult) -> None:
     print(f"  LiPF6/FEC control contrast: pass={lipf6_control_pass}")
     print(f"  TTFP FR sweep: pass={fr_pass}")
     print(f"  LiPF6 salt dome: peak_idx={peak_idx}, pass={salt_pass}")
+
+
+def _print_lifsi_calibration_ablation(training: TrainingResult) -> None:
+    variants = (
+        ("add-support", False),
+        ("mixed-ca+add", True),
+    )
+    print("LiFSI empirical two-effect ablation")
+    for label, mixed_ca_active in variants:
+        variant_params = _calibration_variant_params(
+            params=training.params,
+            mixed_ca_active=mixed_ca_active,
+        )
+        variant_training = replace(training, params=variant_params)
+        rows = empirical_lifsi_fec_audit(variant_training)
+        observed = np.asarray([row.observed_mS_cm for row in rows], dtype=np.float64)
+        predicted = np.asarray([row.predicted_mS_cm for row in rows], dtype=np.float64)
+        max_abs = float(np.max(np.abs(predicted - observed)))
+        pred_text = ", ".join(f"{value:.3f}" for value in predicted)
+        print(f"  {label:<9} max_abs={max_abs:.3f} mS/cm, pred=[{pred_text}]")
+    print("")
+
+
+def _calibration_variant_params(
+    params: Mapping[str, jnp.ndarray],
+    mixed_ca_active: bool,
+) -> Mapping[str, jnp.ndarray]:
+    variant = dict(params)
+    if not mixed_ca_active:
+        variant["mixed_anion_anticorrelation_logit"] = jnp.asarray(-jnp.inf)
+    return variant
 
 
 def main() -> None:
@@ -668,17 +1269,23 @@ def _audit_recipe(
         observed_mS_cm=observed_mS_cm,
         predicted_mS_cm=result.sigma_mS_cm,
         eta_cP=features["eta_solution_cP"],
+        self_current_scale_prior_mS_cm=features["self_current_scale_prior_mS_cm"],
         sigma_self_mS_cm=features["sigma_self_mS_cm"],
         cation_anion_distinct_mS_cm=features["cation_anion_distinct_mS_cm"],
+        mixed_anion_anticorrelation_mS_cm=features["mixed_anion_anticorrelation_mS_cm"],
         cation_cation_distinct_mS_cm=features["cation_cation_distinct_mS_cm"],
         anion_anion_distinct_mS_cm=features["anion_anion_distinct_mS_cm"],
         cluster_drift_mS_cm=features["cluster_drift_mS_cm"],
         ionic_network_current_mS_cm=features["ionic_network_current_mS_cm"],
         mixed_anion_additive_current_mS_cm=features["mixed_anion_additive_current_mS_cm"],
         relaxation_tail_mS_cm=features["relaxation_tail_mS_cm"],
-        association_fraction=features["association_fraction"],
+        distinct_current_correction_mS_cm=features["distinct_current_correction_mS_cm"],
+        association_fraction=features["transport_association_fraction"],
         crowding=features["crowding"],
         activity_M=features["effective_ion_concentration_M"],
+        mobile_carrier_density_M=features["mobile_carrier_density_M"],
+        finite_concentration_mobility_factor=features["finite_concentration_mobility_factor"],
+        finite_concentration_correlation_drive=features["finite_concentration_correlation_drive"],
         species_property_distance=diagnostics.species_property_distance,
         loading_distance=diagnostics.loading_distance,
         interaction_distance=diagnostics.interaction_distance,
@@ -740,11 +1347,58 @@ def _print_metrics(name: str, metrics: FitMetrics) -> None:
     )
 
 
+def _print_conductivity_stratum_metrics(
+    metrics: Sequence[ConductivityStratumMetrics],
+) -> None:
+    print("conductivity strata:")
+    print(
+        "  stratum                            rows labels   MAE   RMSE   MAPE max_abs "
+        "T_min T_max sigma_min sigma_max"
+    )
+    for item in metrics:
+        if item.labels == 0:
+            print(
+                f"  {item.stratum:<34} {item.rows:5d} {item.labels:6d} "
+                "    --     --     --      -- "
+                f"{item.min_temperature_K:5.2f} {item.max_temperature_K:5.2f}       --       --"
+            )
+            continue
+        print(
+            f"  {item.stratum:<34} {item.rows:5d} {item.labels:6d} "
+            f"{item.mae_mS_cm:6.3f} "
+            f"{item.rmse_mS_cm:6.3f} "
+            f"{item.mape_percent:6.2f} "
+            f"{item.max_abs_mS_cm:7.3f} "
+            f"{item.min_temperature_K:5.2f} "
+            f"{item.max_temperature_K:5.2f} "
+            f"{item.min_sigma_mS_cm:9.3f} "
+            f"{item.max_sigma_mS_cm:9.3f}"
+        )
+
+
+def _print_high_conductivity_rows(
+    rows: Sequence[HighConductivityAuditRow],
+) -> None:
+    print("highest-conductivity labeled rows:")
+    if not rows:
+        print("  none")
+        return
+    for row in rows:
+        print(
+            f"  sigma={row.conductivity_mS_cm:7.3f} "
+            f"source={row.source:<18} "
+            f"row={row.row_index:<6d} "
+            f"T={row.temperature_K:6.2f} "
+            f"stratum={row.stratum} "
+            f"recipe={row.recipe}"
+        )
+
+
 def _print_audit_table(title: str, rows: Sequence[AuditRow]) -> None:
     print(title)
     print(
-        "  label                  obs     pred    eta    self     ca     cc     aa    "
-        "cluster network mixed relax assoc crowd actM  propOOD loadOOD intOOD nearOOD support unsupported"
+        "  label                  obs     pred    eta  prior    self  dCorr     ca  mixCA     cc     aa    "
+        "cluster network mixAdd relax assoc crowd actM  mCar  fMob corrD  propOOD loadOOD intOOD nearOOD support unsupported"
     )
     for row in rows:
         observed = "   --"
@@ -754,8 +1408,11 @@ def _print_audit_table(title: str, rows: Sequence[AuditRow]) -> None:
             f"  {row.label:<20} {observed} "
             f"{row.predicted_mS_cm:8.3f} "
             f"{row.eta_cP:6.3f} "
+            f"{row.self_current_scale_prior_mS_cm:7.3f} "
             f"{row.sigma_self_mS_cm:7.3f} "
+            f"{row.distinct_current_correction_mS_cm:7.3f} "
             f"{row.cation_anion_distinct_mS_cm:7.3f} "
+            f"{row.mixed_anion_anticorrelation_mS_cm:7.3f} "
             f"{row.cation_cation_distinct_mS_cm:7.3f} "
             f"{row.anion_anion_distinct_mS_cm:7.3f} "
             f"{row.cluster_drift_mS_cm:7.3f} "
@@ -765,6 +1422,9 @@ def _print_audit_table(title: str, rows: Sequence[AuditRow]) -> None:
             f"{row.association_fraction:5.3f} "
             f"{row.crowding:5.3f} "
             f"{row.activity_M:5.3f} "
+            f"{row.mobile_carrier_density_M:5.3f} "
+            f"{row.finite_concentration_mobility_factor:5.3f} "
+            f"{row.finite_concentration_correlation_drive:5.3f} "
             f"{row.species_property_distance:7.3f} "
             f"{row.loading_distance:7.3f} "
             f"{row.interaction_distance:7.3f} "
