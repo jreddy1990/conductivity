@@ -937,16 +937,22 @@ def _compute_mixture_physics(species_props, fracs, mask, T_K=T_REF_K):
     coord_dn = jnp.sum(P_coord_per * species_props[:, IDX_DONOR])
 
     max_anion_r = jnp.max(jnp.where(mask > 0, r_an, 0.0))
-    f_flex = jnp.where(
-        max_anion_r < ANTICORR_R_CUTOFF_A, 0.0,
-        jnp.where(
-            max_anion_r >= ANTICORR_R_FLEX_REF_A, 1.0,
-            ((max_anion_r - ANTICORR_R_CUTOFF_A)
-             / (ANTICORR_R_FLEX_REF_A - ANTICORR_R_CUTOFF_A)) ** ANTICORR_ALPHA_FLEX
-        ))
+    anion_flexibility_ramp = (
+        (max_anion_r - ANTICORR_R_CUTOFF_A)
+        / (ANTICORR_R_FLEX_REF_A - ANTICORR_R_CUTOFF_A)
+    )
+    anion_flexibility_fraction = (
+        jnp.minimum(jnp.maximum(anion_flexibility_ramp, 0.0), 1.0)
+        ** ANTICORR_ALPHA_FLEX
+    )
 
     K_A_effective = jnp.maximum(fuoss_K_A - ANTICORR_K_A_MIN, 0.0)
-    anticorr_boost = ANTICORR_COEFFICIENT * K_A_effective * P_coord_max * f_flex
+    anticorr_boost = (
+        ANTICORR_COEFFICIENT
+        * K_A_effective
+        * P_coord_max
+        * anion_flexibility_fraction
+    )
 
     # Ion pairing fraction from Fuoss K_A: f_pair = K_A * c / (1 + K_A * c)
     ion_pair_frac = fuoss_K_A * c_safe / (1.0 + fuoss_K_A * c_safe)
@@ -1062,7 +1068,7 @@ def _compute_mixture_physics(species_props, fracs, mask, T_K=T_REF_K):
         walden, dh_log_gamma, ion_pair_frac, jones_dole_correction,
         # GROUP 10: Fuoss + anticorrelation (7)
         jnp.log1p(fuoss_K_A), P_coord_max, coord_eps, coord_dn,
-        f_flex, jnp.log1p(anticorr_boost), max_anion_r,
+        anion_flexibility_fraction, jnp.log1p(anticorr_boost), max_anion_r,
         # GROUP 11: Coordination drag (2)
         coord_jones_dole,
         jnp.sign(net_anticorr) * jnp.log1p(jnp.abs(net_anticorr)),
