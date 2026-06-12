@@ -17,6 +17,14 @@ from constants import BJERRUM_LENGTH_NM, R, T_REF_K
 from data.species_data import ADDITIVES, CATION_PROPERTIES, SALTS, SOLVENTS
 from electrolyte_model import ElectrolyteRecipeModel
 from utils.config_cache import load_physics_config
+from utils.strict_validation import (
+    require_float,
+    require_float as _require_float,
+    require_mapping,
+    require_mapping as _require_mapping,
+    require_string,
+    require_string as _require_string,
+)
 
 
 LITER_TO_ML = 1000.0
@@ -195,9 +203,9 @@ def fit_global_mobility_scale(
     unit_params = OnsagerConductivityParams(mobility_scale=1.0)
 
     for idx, entry in enumerate(entries):
-        recipe = _require_mapping(entry, "recipe", f"entry[{idx}]")
-        properties = _require_mapping(entry, "properties", f"entry[{idx}]")
-        measured = _require_float(properties, "conductivity_mS_cm", f"entry[{idx}].properties")
+        recipe = require_mapping(entry, "recipe", f"entry[{idx}]")
+        properties = require_mapping(entry, "properties", f"entry[{idx}]")
+        measured = require_float(properties, "conductivity_mS_cm", f"entry[{idx}].properties")
         if measured <= 0.0:
             raise ValueError(f"entry[{idx}].properties.conductivity_mS_cm must be positive")
         prediction = evaluate_onsager_conductivity(
@@ -256,9 +264,9 @@ def fit_mechanism_params(
     rows: list[tuple[Mapping[str, Any], float]] = []
     active_sources: set[str] = set()
     for idx, entry in enumerate(entries):
-        recipe = _require_mapping(entry, "recipe", f"entry[{idx}]")
-        properties = _require_mapping(entry, "properties", f"entry[{idx}]")
-        measured = _require_float(properties, "conductivity_mS_cm", f"entry[{idx}].properties")
+        recipe = require_mapping(entry, "recipe", f"entry[{idx}]")
+        properties = require_mapping(entry, "properties", f"entry[{idx}]")
+        measured = require_float(properties, "conductivity_mS_cm", f"entry[{idx}].properties")
         if measured <= 0.0:
             raise ValueError(f"entry[{idx}].properties.conductivity_mS_cm must be positive")
         evaluated = evaluate_onsager_conductivity(
@@ -1004,32 +1012,13 @@ def _unit_vector(dimension: int, index: int) -> np.ndarray:
     return vector
 
 
-def _require_mapping(mapping: Mapping[str, Any], key: str, context: str) -> Mapping[str, Any]:
-    if key not in mapping:
-        raise ValueError(f"Missing required key {context}.{key}")
-    value = mapping[key]
-    if not isinstance(value, Mapping):
-        raise ValueError(f"{context}.{key} must be a mapping")
-    return value
-
-
-def _require_species(registry: Mapping[str, Mapping[str, Any]], name: str, role: str) -> Mapping[str, Any]:
+def species_record(registry: Mapping[str, Mapping[str, Any]], name: str, role: str) -> Mapping[str, Any]:
     if name not in registry:
         raise ValueError(f"Unknown {role} species {name}")
     return registry[name]
 
 
-def _require_float(mapping: Mapping[str, Any], key: str, context: str) -> float:
-    if key not in mapping:
-        raise ValueError(f"Missing required key {context}.{key}")
-    value = mapping[key]
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{context}.{key} must be numeric, got {value!r}") from exc
-    if not math.isfinite(parsed):
-        raise ValueError(f"{context}.{key} must be finite, got {parsed}")
-    return parsed
+_require_species = species_record
 
 
 def _optional_float(mapping: Mapping[str, Any], key: str, context: str) -> float:
@@ -1043,15 +1032,6 @@ def _optional_float(mapping: Mapping[str, Any], key: str, context: str) -> float
     if not math.isfinite(parsed):
         raise ValueError(f"{context}.{key} must be finite, got {parsed}")
     return parsed
-
-
-def _require_string(mapping: Mapping[str, Any], key: str, context: str) -> str:
-    if key not in mapping:
-        raise ValueError(f"Missing required key {context}.{key}")
-    value = mapping[key]
-    if not isinstance(value, str) or not value:
-        raise ValueError(f"{context}.{key} must be a non-empty string")
-    return value
 
 
 def _validate_params(params: OnsagerConductivityParams) -> None:

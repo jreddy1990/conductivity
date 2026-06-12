@@ -39,7 +39,14 @@ from conductivity.molset_mechanistic_data import (
     normalization_from_registered_species,
     source_counts,
 )
-from utils.strict_validation import require_mapping
+from utils.strict_validation import (
+    require_mapping,
+    strict_finite_array,
+    strict_fraction_closed_array,
+    strict_fraction_open_interval,
+    strict_nonnegative_finite_array,
+    strict_positive_finite_array,
+)
 
 
 DEFAULT_STEPS = 1500
@@ -390,25 +397,33 @@ def _apply_property_derived_mechanism_targets(
         + _physical_column(physical, "salt_additive_anticorrelation_screening")
     )
 
-    _require_positive_finite_targets(eta_prior[candidate_mask], "derived viscosity target")
-    _require_nonnegative_finite_targets(screening_support[candidate_mask], "derived screening support")
+    strict_positive_finite_array(eta_prior[candidate_mask], "derived viscosity target")
+    strict_nonnegative_finite_array(
+        screening_support[candidate_mask], "derived screening support"
+    )
     association_target = contact_pair_prior / (1.0 + screening_support)
-    _require_fraction_targets(association_target[candidate_mask], "derived association target")
+    strict_fraction_closed_array(
+        association_target[candidate_mask], "derived association target"
+    )
     free_ion_target = 1.0 - association_target
     denominator = eta_prior * (1.0 + crowding_prior + additive_transport_drag)
-    _require_positive_finite_targets(denominator[candidate_mask], "derived sigma-backbone denominator")
+    strict_positive_finite_array(
+        denominator[candidate_mask], "derived sigma-backbone denominator"
+    )
     self_current_scale_prior_target = (
         activity_prior
         * mean_lambda0
         * free_ion_target
         / denominator
     )
-    _require_positive_finite_targets(
+    strict_positive_finite_array(
         self_current_scale_prior_target[candidate_mask],
         "derived self-current scale prior target",
     )
     current_distinct_target = batch.sigma_mS_cm - self_current_scale_prior_target
-    _require_finite_targets(current_distinct_target[candidate_mask], "derived distinct-current target")
+    strict_finite_array(
+        current_distinct_target[candidate_mask], "derived distinct-current target"
+    )
 
     viscosity_target_mask = candidate_mask & (batch.viscosity_mask <= 0.0)
     association_target_mask = candidate_mask & (batch.association_fraction_mask <= 0.0)
@@ -576,34 +591,11 @@ def _empty_derived_target_audit() -> DerivedMechanismTargetAudit:
     )
 
 
-def _require_finite_targets(values: np.ndarray, context: str) -> None:
-    if np.any(~np.isfinite(values)):
-        raise ValueError(f"{context} contains non-finite values")
-
-
-def _require_positive_finite_targets(values: np.ndarray, context: str) -> None:
-    _require_finite_targets(values, context)
-    if np.any(values <= 0.0):
-        raise ValueError(f"{context} must be positive")
-
-
-def _require_nonnegative_finite_targets(values: np.ndarray, context: str) -> None:
-    _require_finite_targets(values, context)
-    if np.any(values < 0.0):
-        raise ValueError(f"{context} must be nonnegative")
-
-
-def _require_fraction_targets(values: np.ndarray, context: str) -> None:
-    _require_finite_targets(values, context)
-    if np.any(values < 0.0) or np.any(values > 1.0):
-        raise ValueError(f"{context} must be in [0, 1]")
-
-
 def _masked_min(values: np.ndarray, mask: np.ndarray) -> float:
     selected = values[mask]
     if selected.size == 0:
         return 0.0
-    _require_finite_targets(selected, "masked minimum")
+    strict_finite_array(selected, "masked minimum")
     return float(np.min(selected))
 
 
@@ -611,7 +603,7 @@ def _masked_max(values: np.ndarray, mask: np.ndarray) -> float:
     selected = values[mask]
     if selected.size == 0:
         return 0.0
-    _require_finite_targets(selected, "masked maximum")
+    strict_finite_array(selected, "masked maximum")
     return float(np.max(selected))
 
 
@@ -705,11 +697,11 @@ def _initialize_current_gates_from_auxiliary_labels(
 
     negative_label_fraction = float(np.mean(distinct_ratio < 0.0))
     positive_signed_fraction = float(np.mean(np.maximum(distinct_ratio, 0.0)))
-    cation_anion_gate_probability = _strict_open_probability(
+    cation_anion_gate_probability = strict_fraction_open_interval(
         negative_label_fraction,
         "negative distinct-current label fraction",
     )
-    positive_gate_probability = _strict_open_probability(
+    positive_gate_probability = strict_fraction_open_interval(
         positive_signed_fraction,
         "mean positive distinct/self fraction",
     )
@@ -743,15 +735,6 @@ def _initialize_current_gates_from_auxiliary_labels(
             mixed_anion_anticorrelation_gate_probability=cation_anion_gate_probability,
         ),
     )
-
-
-def _strict_open_probability(value: float, context: str) -> float:
-    parsed = float(value)
-    if not np.isfinite(parsed):
-        raise ValueError(f"{context} must be finite")
-    if parsed <= 0.0 or parsed >= 1.0:
-        raise ValueError(f"{context} must be in the open unit interval, got {parsed}")
-    return parsed
 
 
 def _logit_probability(probability: float) -> float:
@@ -1201,7 +1184,7 @@ def main() -> None:
     )
     parser.add_argument("--checkpoint", type=Path)
     args = parser.parse_args()
-    data_sources = _parse_data_sources(args.data_sources)
+    data_sources = data_sources_from_cli(args.data_sources)
     training = train_mechanistic_prototype(
         n_steps=args.steps,
         learning_rate=args.learning_rate,
@@ -1236,7 +1219,7 @@ def _split_rows(
     return train, holdout
 
 
-def _parse_data_sources(raw_sources: str) -> tuple[str, ...]:
+def data_sources_from_cli(raw_sources: str) -> tuple[str, ...]:
     parsed = tuple(part.strip() for part in raw_sources.split(",") if part.strip())
     if not parsed:
         raise ValueError("--data-sources must contain at least one source")

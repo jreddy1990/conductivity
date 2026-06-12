@@ -1426,7 +1426,7 @@ if model is not None:
 # %% CELL 9 — VALIDATION ====================================================
 # Predict energy/forces for known molecule and sanity-check magnitudes.
 
-def validate_model():
+def assess_model():
     """Run basic sanity checks on the trained model."""
     best_ckpt = f"{WORK_DIR}/checkpoints/best_model.pt"
     if not os.path.exists(best_ckpt):
@@ -1473,7 +1473,7 @@ def validate_model():
         print(f"  Energy: POSITIVE — model NOT trained properly")
 
 
-validate_model()
+assess_model()
 
 
 # %% CELL 10 — USAGE INSTRUCTIONS ============================================
