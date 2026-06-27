@@ -15,6 +15,7 @@ from conductivity.finite_markov_conductivity import (
     ChemicalMotif,
     ChemicalMotifKind,
     FiniteMarkovConductivityResult,
+    GAUSSIAN_SELF_FORM_FACTOR_SQUARED_DENOMINATOR,
     KernelDerivedMarkovModel,
     TransportState,
     evaluate_finite_markov_conductivity,
@@ -38,6 +39,47 @@ FAMILY_OWNER_CORRELATION_THRESHOLD = 0.5  # User-declared reporting threshold fo
 LOWER_QUARTILE_FRACTION = 0.25  # Analytical lower quartile fraction for quantile bins, not a physics parameter.
 MEDIAN_QUARTILE_FRACTION = 0.50  # Analytical median fraction for quantile bins, not a physics parameter.
 UPPER_QUARTILE_FRACTION = 0.75  # Analytical upper quartile fraction for quantile bins, not a physics parameter.
+REQUIRED_FACTOR_BISECTION_STEPS = int(math.ceil(-math.log2(np.finfo(float).eps)))
+ANION_DIAG_REQUIRED_MATCHED = "matched"
+ANION_DIAG_REQUIRED_STRONGER_RELAXATION = "requires_stronger_anion_diag_relaxation"
+ANION_DIAG_REQUIRED_BELOW_ZERO = "requires_weaker_than_zero_anion_diag_relaxation"
+ANION_DIAG_REQUIRED_NO_SENSITIVITY = "no_anion_diag_sensitivity"
+ANION_DIAG_REQUIRED_STATUSES = (
+    ANION_DIAG_REQUIRED_MATCHED,
+    ANION_DIAG_REQUIRED_STRONGER_RELAXATION,
+    ANION_DIAG_REQUIRED_BELOW_ZERO,
+    ANION_DIAG_REQUIRED_NO_SENSITIVITY,
+)
+PROMOTION_DECISION_PROMOTE_CANDIDATE = "promote_candidate"
+PROMOTION_DECISION_DIAGNOSTIC_ONLY = "diagnostic_only"
+PROMOTION_DECISION_REJECT = "reject"
+PROMOTION_DECISION_INSUFFICIENT_EVIDENCE = "insufficient_evidence"
+PROMOTION_DECISION_STATUSES = (
+    PROMOTION_DECISION_PROMOTE_CANDIDATE,
+    PROMOTION_DECISION_DIAGNOSTIC_ONLY,
+    PROMOTION_DECISION_REJECT,
+    PROMOTION_DECISION_INSUFFICIENT_EVIDENCE,
+)
+PROMOTION_MINIMUM_GROUP_COUNT = 5  # Explicit user-requested audit threshold: `count >= 5`.
+PREDICTIVE_VALIDATION_MINIMUM_GROUP_COUNT = 5  # Explicit user-requested validation threshold: `count >= 5`.
+PREDICTIVE_HOLDOUT_MAE_GATE_MILLI_SIEMENS_PER_CM = 2.0  # Explicit user-requested validation threshold.
+PREDICTIVE_HOLDOUT_ABS_BIAS_GATE_MILLI_SIEMENS_PER_CM = 1.0  # Explicit user-requested validation threshold.
+PREDICTIVE_HOLDOUT_PEARSON_GATE = 0.6  # Explicit user-requested validation threshold: `r > 0.6`.
+PREDICTIVE_TOP_QUARTILE_ENRICHMENT_GATE = 2.0  # Explicit user-requested validation threshold: `> 2x random`.
+CONFORMAL_COVERAGE_80 = 0.80  # Named statistical conformal reporting level: 80% interval.
+CONFORMAL_COVERAGE_90 = 0.90  # Named statistical conformal reporting level: 90% interval.
+PREDICTIVE_DECISION_ACTIVE_SUPPORTED = "active_prediction_supported"
+PREDICTIVE_DECISION_RANKING_ONLY = "ranking_only"
+PREDICTIVE_DECISION_UNSUPPORTED_HOLDOUT = "unsupported_holdout"
+PREDICTIVE_DECISION_INSUFFICIENT_EVIDENCE = "insufficient_evidence"
+PREDICTIVE_DECISION_STATUSES = (
+    PREDICTIVE_DECISION_ACTIVE_SUPPORTED,
+    PREDICTIVE_DECISION_RANKING_ONLY,
+    PREDICTIVE_DECISION_UNSUPPORTED_HOLDOUT,
+    PREDICTIVE_DECISION_INSUFFICIENT_EVIDENCE,
+)
+ACTIVE_UTILITY_DECISION_SUPPORTED = "active_learning_supported"
+ACTIVE_UTILITY_DECISION_NOT_PROVEN = "active_learning_not_proven"
 
 
 @dataclass(frozen=True)
@@ -108,6 +150,7 @@ class StateContribution:
     atmosphere_lifetime_gate: float
     atmosphere_diagnostic_lifetime_gate: float
     relaxation_dynamic_response: str
+    anion_diagonal_relaxation_form_factor: str
     relaxation_lifetime_gate: float
     raw_atmosphere_form_factor: float
     effective_atmosphere_form_factor: float
@@ -137,6 +180,17 @@ class StateContribution:
     structure_factor_charge_mode: float
     stationary_probability: float
     charge: float
+    g_anion_diag_required: float
+    g_anion_diag_current: float
+    g_anion_diag_required_status: str
+    anion_charge_cloud_radius_required_A: float
+    hydrodynamic_radius_A: float
+    shape_factor: float
+    current_self_form_factor: float
+    charge_cloud_radius_available: bool
+    charge_cloud_radius_A: float
+    charge_cloud_source: str
+    charge_cloud_site_count: int
 
 
 @dataclass(frozen=True)
@@ -147,6 +201,13 @@ class EdgeContribution:
     rate_s_inv: float
     raw_delta2_m2: float
     corrected_delta2_m2: float
+
+
+@dataclass(frozen=True)
+class AnionDiagonalRequiredFactorAudit:
+    required_factor: float
+    current_factor: float
+    status: str
 
 
 @dataclass(frozen=True)
@@ -216,6 +277,7 @@ class BiasLedgerRow:
     r_atmosphere_current_over_target: float
     atmosphere_bath_basis: str
     relaxation_dynamic_response: str
+    anion_diagonal_relaxation_form_factor: str
     mean_relaxation_lifetime_gate: float
     ionic_strength_total_mol_m3: float
     ionic_strength_external_mol_m3: float
@@ -229,6 +291,17 @@ class BiasLedgerRow:
     association_required_deltaG_kJ_mol: float
     base_mobility_required_multiplier: float
     base_mobility_required_deltaG_kJ_mol: float
+    g_anion_diag_required: float
+    g_anion_diag_current: float
+    g_anion_diag_required_status: str
+    anion_charge_cloud_radius_required_A: float
+    hydrodynamic_radius_A: float
+    shape_factor: float
+    current_self_form_factor: float
+    charge_cloud_radius_available: bool
+    charge_cloud_radius_A: float
+    charge_cloud_source: str
+    charge_cloud_site_count: int
     H_state: float
     D_uncorr_m2_s: float
     D_Q_m2_s: float
@@ -315,11 +388,93 @@ class FamilyAtmosphereMetrics:
     mean_drag_rel_before_gate_current_over_target: float
     mean_drag_rel_after_gate_current_over_target: float
     mean_relaxation_lifetime_gate: float
+    mean_g_anion_diag_required: float
+    mean_anion_charge_cloud_radius_required_A: float
+    mean_hydrodynamic_radius_A: float
+    mean_shape_factor: float
+    mean_current_self_form_factor: float
     mean_eta_rel: float
     mean_kappa_inv_A: float
     mean_ionic_strength_mol_m3: float
     dominant_top_state: str
     owner: str
+
+
+@dataclass(frozen=True)
+class RequiredAnionDiagFactorMetrics:
+    group_name: str
+    group_value: str
+    count: int
+    median_g_required: float
+    iqr_g_required: float
+    status_counts: dict[str, int]
+    median_charge_cloud_radius_required_A: float
+    median_hydrodynamic_radius_A: float
+    median_shape_factor: float
+    median_current_self_form_factor: float
+    charge_cloud_descriptor_covered_count: int
+    median_charge_cloud_descriptor_radius_A: float
+    charge_cloud_source_counts: dict[str, int]
+    mean_signed_error_mS_cm: float
+
+
+@dataclass(frozen=True)
+class BaseSpeciationInverseMetrics:
+    group_name: str
+    group_value: str
+    count: int
+    median_association_required_deltaG_kJ_mol: float
+    iqr_association_required_deltaG_kJ_mol: float
+    median_base_mobility_required_deltaG_kJ_mol: float
+    iqr_base_mobility_required_deltaG_kJ_mol: float
+    mean_signed_error_mS_cm: float
+
+
+@dataclass(frozen=True)
+class PromotionDecisionMetrics:
+    branch_name: str
+    group_name: str
+    group_value: str
+    count: int
+    decision: str
+    candidate: str
+    rationale: str
+
+
+@dataclass(frozen=True)
+class PredictiveValidationGroupMetrics:
+    group_name: str
+    group_value: str
+    count: int
+    calibration_count: int
+    mae_mS_cm: float
+    rmse_mS_cm: float
+    bias_mS_cm: float
+    pearson_r_available: bool
+    pearson_r: float
+    conformal_abs_error_80_mS_cm: float
+    conformal_coverage_80: float
+    conformal_abs_error_90_mS_cm: float
+    conformal_coverage_90: float
+    decision: str
+    rationale: str
+
+
+@dataclass(frozen=True)
+class ActiveLearningUtilityMetrics:
+    candidate_count: int
+    selected_count: int
+    hit_threshold_mS_cm: float
+    selected_hit_count: int
+    true_hit_count: int
+    selected_hit_rate: float
+    random_hit_rate: float
+    enrichment_over_random: float
+    best_measured_mS_cm: float
+    best_selected_measured_mS_cm: float
+    regret_mS_cm: float
+    decision: str
+    rationale: str
 
 
 @dataclass(frozen=True)
@@ -340,6 +495,11 @@ class DatasetAuditResult:
     failures: tuple[FailedDatasetRow, ...]
     salt_family_metrics: dict[str, SaltFamilyMetrics]
     family_atmosphere_metrics: tuple[FamilyAtmosphereMetrics, ...]
+    required_anion_diag_factor_metrics: tuple[RequiredAnionDiagFactorMetrics, ...]
+    base_speciation_inverse_metrics: tuple[BaseSpeciationInverseMetrics, ...]
+    promotion_decision_metrics: tuple[PromotionDecisionMetrics, ...]
+    predictive_validation_group_metrics: tuple[PredictiveValidationGroupMetrics, ...]
+    active_learning_utility_metrics: ActiveLearningUtilityMetrics
 
 
 def canonicalize_empirical_recipe(empirical_recipe: Mapping[str, object]) -> EmpiricalRecipeCanonicalization:
@@ -537,8 +697,42 @@ def build_bias_ledger_row(
 
     motif_lifetimes = _motif_lifetimes_s(model)
     motif_populations = _motif_population_rollup(model)
-    top_state_contributions = _top_state_contributions(model, temperature_K)
+    anion_diag_required_audit = _required_anion_diag_factor_audit(
+        model,
+        temperature_K,
+        target_D_Q_m2_s,
+        result.jump_D_Q_m2_s,
+    )
+    top_state_contributions = _top_state_contributions(
+        model,
+        temperature_K,
+        anion_diag_required_audit.required_factor,
+        anion_diag_required_audit.current_factor,
+        anion_diag_required_audit.status,
+    )
     top_state_resolved_charge_count = _top_state_resolved_charge_count(top_state_contributions)
+    top_state_required_charge_cloud_radius_A = _top_state_required_charge_cloud_radius_A(
+        top_state_contributions,
+    )
+    top_state_hydrodynamic_radius_A = _top_state_hydrodynamic_radius_A(
+        top_state_contributions,
+    )
+    top_state_shape_factor = _top_state_shape_factor(top_state_contributions)
+    top_state_current_self_form_factor = _top_state_current_self_form_factor(
+        top_state_contributions,
+    )
+    top_state_charge_cloud_radius_available = _top_state_charge_cloud_radius_available(
+        top_state_contributions,
+    )
+    top_state_charge_cloud_radius_A = _top_state_charge_cloud_radius_A(
+        top_state_contributions,
+    )
+    top_state_charge_cloud_source = _top_state_charge_cloud_source(
+        top_state_contributions,
+    )
+    top_state_charge_cloud_site_count = _top_state_charge_cloud_site_count(
+        top_state_contributions,
+    )
     total_ionic_strength_mol_m3 = _concentration_weighted_total_ionic_strength_mol_m3(model)
     ionic_strength_external_mol_m3 = _concentration_weighted_external_ionic_strength_mol_m3(model)
     external_over_total_ionic_strength = _ratio_with_zero_denominator_convention(
@@ -639,6 +833,7 @@ def build_bias_ledger_row(
         r_atmosphere_current_over_target=atmosphere_current_over_target_drag_ratio,
         atmosphere_bath_basis=model.atmosphere_bath_basis,
         relaxation_dynamic_response=model.relaxation_dynamic_response,
+        anion_diagonal_relaxation_form_factor=model.anion_diagonal_relaxation_form_factor,
         mean_relaxation_lifetime_gate=_state_concentration_weighted_relaxation_gate(model),
         ionic_strength_total_mol_m3=total_ionic_strength_mol_m3,
         ionic_strength_external_mol_m3=ionic_strength_external_mol_m3,
@@ -656,6 +851,17 @@ def build_bias_ledger_row(
         base_mobility_required_deltaG_kJ_mol=(
             -R * temperature_K * math.log(base_mobility_required_multiplier) / 1000.0
         ),
+        g_anion_diag_required=anion_diag_required_audit.required_factor,
+        g_anion_diag_current=anion_diag_required_audit.current_factor,
+        g_anion_diag_required_status=anion_diag_required_audit.status,
+        anion_charge_cloud_radius_required_A=top_state_required_charge_cloud_radius_A,
+        hydrodynamic_radius_A=top_state_hydrodynamic_radius_A,
+        shape_factor=top_state_shape_factor,
+        current_self_form_factor=top_state_current_self_form_factor,
+        charge_cloud_radius_available=top_state_charge_cloud_radius_available,
+        charge_cloud_radius_A=top_state_charge_cloud_radius_A,
+        charge_cloud_source=top_state_charge_cloud_source,
+        charge_cloud_site_count=top_state_charge_cloud_site_count,
         H_state=state_resistance_factor,
         D_uncorr_m2_s=uncorrelated_D_Q_m2_s,
         D_Q_m2_s=result.D_Q_m2_s,
@@ -701,6 +907,7 @@ def audit_empirical_conductivity_dataset(
     temperature_K: float,
     atmosphere_bath_basis: str = "total_formal",
     relaxation_dynamic_response: str = "off",
+    anion_diagonal_relaxation_form_factor: str = "off",
 ) -> DatasetAuditResult:
     _assert_positive_finite(temperature_K, "temperature_K")
     ledger_rows: list[BiasLedgerRow] = []
@@ -725,6 +932,7 @@ def audit_empirical_conductivity_dataset(
                 temperature_K,
                 atmosphere_bath_basis,
                 relaxation_dynamic_response,
+                anion_diagonal_relaxation_form_factor,
             )
             ledger_rows.append(
                 build_bias_ledger_row(
@@ -739,6 +947,9 @@ def audit_empirical_conductivity_dataset(
             failures.append(FailedDatasetRow(row_id=row_id, error=str(exc)))
 
     metrics = _dataset_metrics(ledger_rows)
+    required_anion_diag_metrics = _required_anion_diag_factor_metrics(ledger_rows)
+    base_speciation_metrics = _base_speciation_inverse_metrics(ledger_rows)
+    predictive_validation_metrics = _predictive_validation_group_metrics(ledger_rows)
     return DatasetAuditResult(
         labeled_rows=labeled_rows,
         evaluated_rows=len(ledger_rows),
@@ -756,6 +967,14 @@ def audit_empirical_conductivity_dataset(
         failures=tuple(failures),
         salt_family_metrics=_salt_family_metrics(ledger_rows),
         family_atmosphere_metrics=_family_atmosphere_metrics(ledger_rows),
+        required_anion_diag_factor_metrics=required_anion_diag_metrics,
+        base_speciation_inverse_metrics=base_speciation_metrics,
+        promotion_decision_metrics=_promotion_decision_metrics(
+            required_anion_diag_metrics,
+            base_speciation_metrics,
+        ),
+        predictive_validation_group_metrics=predictive_validation_metrics,
+        active_learning_utility_metrics=_active_learning_utility_metrics(ledger_rows),
     )
 
 
@@ -885,6 +1104,143 @@ def _state_component_atmosphere_diffusivity_m2_s(
     )
 
 
+def _required_anion_diag_factor_audit(
+    model: KernelDerivedMarkovModel,
+    temperature_K: float,
+    target_D_Q_m2_s: float,
+    unchanged_jump_D_Q_m2_s: float,
+) -> AnionDiagonalRequiredFactorAudit:
+    _assert_positive_finite(target_D_Q_m2_s, "target_D_Q_m2_s")
+    _assert_nonnegative_finite(unchanged_jump_D_Q_m2_s, "unchanged_jump_D_Q_m2_s")
+    current_state_D_Q_m2_s = _state_anion_diag_scaled_diffusivity_m2_s(
+        model,
+        temperature_K,
+        1.0,
+    )
+    no_anion_diag_state_D_Q_m2_s = _state_anion_diag_scaled_diffusivity_m2_s(
+        model,
+        temperature_K,
+        0.0,
+    )
+    current_total_D_Q_m2_s = current_state_D_Q_m2_s + unchanged_jump_D_Q_m2_s
+    no_anion_diag_total_D_Q_m2_s = no_anion_diag_state_D_Q_m2_s + unchanged_jump_D_Q_m2_s
+    tolerance_m2_s = _required_factor_diffusivity_tolerance_m2_s(
+        current_total_D_Q_m2_s,
+        no_anion_diag_total_D_Q_m2_s,
+        target_D_Q_m2_s,
+    )
+    if abs(no_anion_diag_total_D_Q_m2_s - current_total_D_Q_m2_s) <= tolerance_m2_s:
+        return AnionDiagonalRequiredFactorAudit(
+            required_factor=1.0,
+            current_factor=1.0,
+            status=ANION_DIAG_REQUIRED_NO_SENSITIVITY,
+        )
+    if target_D_Q_m2_s <= current_total_D_Q_m2_s + tolerance_m2_s:
+        return AnionDiagonalRequiredFactorAudit(
+            required_factor=1.0,
+            current_factor=1.0,
+            status=ANION_DIAG_REQUIRED_STRONGER_RELAXATION,
+        )
+    if target_D_Q_m2_s >= no_anion_diag_total_D_Q_m2_s - tolerance_m2_s:
+        return AnionDiagonalRequiredFactorAudit(
+            required_factor=0.0,
+            current_factor=1.0,
+            status=ANION_DIAG_REQUIRED_BELOW_ZERO,
+        )
+
+    lower_factor = 0.0
+    upper_factor = 1.0
+    for _iteration_index in range(REQUIRED_FACTOR_BISECTION_STEPS):
+        midpoint_factor = 0.5 * (lower_factor + upper_factor)
+        midpoint_total_D_Q_m2_s = (
+            _state_anion_diag_scaled_diffusivity_m2_s(
+                model,
+                temperature_K,
+                midpoint_factor,
+            )
+            + unchanged_jump_D_Q_m2_s
+        )
+        if midpoint_total_D_Q_m2_s > target_D_Q_m2_s:
+            lower_factor = midpoint_factor
+        else:
+            upper_factor = midpoint_factor
+    required_factor = 0.5 * (lower_factor + upper_factor)
+    _assert_unit_interval(required_factor, "g_anion_diag_required")
+    return AnionDiagonalRequiredFactorAudit(
+        required_factor=required_factor,
+        current_factor=1.0,
+        status=ANION_DIAG_REQUIRED_MATCHED,
+    )
+
+
+def _state_anion_diag_scaled_diffusivity_m2_s(
+    model: KernelDerivedMarkovModel,
+    temperature_K: float,
+    anion_diag_factor: float,
+) -> float:
+    _assert_unit_interval(anion_diag_factor, "anion_diag_factor")
+    cation_concentration_mol_m3 = _model_cation_concentration_mol_m3(model)
+    return float(
+        math.fsum(
+            float(model.state_concentrations_mol_m3[state_index])
+            * _transport_state_trace_average_with_anion_diag_factor_m2_s(
+                transport_state,
+                temperature_K,
+                anion_diag_factor,
+            )
+            for state_index, transport_state in enumerate(model.transport_states)
+        )
+        / cation_concentration_mol_m3
+    )
+
+
+def _transport_state_trace_average_with_anion_diag_factor_m2_s(
+    transport_state: TransportState,
+    temperature_K: float,
+    anion_diag_factor: float,
+) -> float:
+    _assert_unit_interval(anion_diag_factor, "anion_diag_factor")
+    current_atmosphere_matrix_kg_s = _transport_state_atmosphere_matrix_kg_s(
+        transport_state,
+    )
+    anion_diag_relaxation_matrix_kg_s = _transport_state_relaxation_center_diag_matrix_kg_s(
+        transport_state,
+        "negative",
+    )
+    scaled_atmosphere_matrix_kg_s = (
+        current_atmosphere_matrix_kg_s
+        + (anion_diag_factor - 1.0) * anion_diag_relaxation_matrix_kg_s
+    )
+    return math.fsum(
+        _transport_state_axis_value_with_component_atmosphere_m2_s(
+            transport_state,
+            temperature_K,
+            axis_index,
+            scaled_atmosphere_matrix_kg_s,
+        )
+        for axis_index in range(3)
+    ) / ISOTROPIC_TRACE_DIVISOR
+
+
+def _required_factor_diffusivity_tolerance_m2_s(
+    first_D_Q_m2_s: float,
+    second_D_Q_m2_s: float,
+    target_D_Q_m2_s: float,
+) -> float:
+    diffusivity_scale_m2_s = max(
+        1.0,
+        abs(first_D_Q_m2_s),
+        abs(second_D_Q_m2_s),
+        abs(target_D_Q_m2_s),
+    )
+    return math.ulp(diffusivity_scale_m2_s) * REQUIRED_FACTOR_BISECTION_STEPS
+
+
+def _assert_unit_interval(value: float, name: str) -> None:
+    if not math.isfinite(value) or value < 0.0 or value > 1.0:
+        raise ValueError(f"{name} must be in [0, 1], got {value}")
+
+
 def _state_nernst_einstein_diffusivity_m2_s(model: KernelDerivedMarkovModel) -> float:
     cation_concentration_mol_m3 = _model_cation_concentration_mol_m3(model)
     return float(
@@ -912,6 +1268,9 @@ def _uncorrelated_jump_diffusivity_m2_s(model: KernelDerivedMarkovModel) -> floa
 def _top_state_contributions(
     model: KernelDerivedMarkovModel,
     temperature_K: float,
+    g_anion_diag_required: float,
+    g_anion_diag_current: float,
+    g_anion_diag_required_status: str,
 ) -> tuple[StateContribution, ...]:
     contributions: list[StateContribution] = []
     for state_index, state in enumerate(model.states):
@@ -936,6 +1295,22 @@ def _top_state_contributions(
             transport_state,
             temperature_K,
             "relaxation",
+        )
+        state_rel_Li_diffusivity_m2_s = (
+            _transport_state_trace_average_for_atmosphere_component_m2_s(
+                model,
+                transport_state,
+                temperature_K,
+                "relaxation_Li_after_ep",
+            )
+        )
+        state_rel_anion_diffusivity_m2_s = (
+            _transport_state_trace_average_for_atmosphere_component_m2_s(
+                model,
+                transport_state,
+                temperature_K,
+                "relaxation_anion_after_ep",
+            )
         )
         state_rel_before_gate_diffusivity_m2_s = (
             _transport_state_trace_average_for_atmosphere_component_m2_s(
@@ -963,6 +1338,14 @@ def _top_state_contributions(
         atmosphere_factor = _state_factor(state_resistance_diffusivity_m2_s, state_binding_diffusivity_m2_s)
         electrophoretic_factor = _state_factor(state_ep_diffusivity_m2_s, state_binding_diffusivity_m2_s)
         relaxation_factor = _state_factor(state_rel_diffusivity_m2_s, state_binding_diffusivity_m2_s)
+        relaxation_Li_factor = _state_factor(
+            state_rel_Li_diffusivity_m2_s,
+            state_ep_diffusivity_m2_s,
+        )
+        relaxation_anion_factor = _state_factor(
+            state_rel_anion_diffusivity_m2_s,
+            state_ep_diffusivity_m2_s,
+        )
         relaxation_before_gate_factor = _state_factor(
             state_rel_before_gate_diffusivity_m2_s,
             state_binding_diffusivity_m2_s,
@@ -976,6 +1359,38 @@ def _top_state_contributions(
             state_rel_diag_diffusivity_m2_s,
         )
         state_factor = _state_factor(state_resistance_diffusivity_m2_s, state_NE_diffusivity_m2_s)
+        required_charge_cloud_radius_A = _required_charge_cloud_radius_A(
+            g_anion_diag_required,
+            model.bulk_ion_atmosphere_state.kappa_inv_m,
+        )
+        hydrodynamic_radius_A = _transport_state_center_radius_A(
+            transport_state,
+            "negative",
+        )
+        anion_shape_factor = _transport_state_center_shape_factor(
+            transport_state,
+            "negative",
+        )
+        charge_cloud_radius_available = _transport_state_charge_cloud_radius_available(
+            transport_state,
+            "negative",
+        )
+        charge_cloud_radius_A = _transport_state_charge_cloud_radius_A(
+            transport_state,
+            "negative",
+        )
+        charge_cloud_source = _transport_state_charge_cloud_source(
+            transport_state,
+            "negative",
+        )
+        charge_cloud_site_count = _transport_state_charge_cloud_site_count(
+            transport_state,
+            "negative",
+        )
+        current_self_form_factor = _transport_state_current_anion_self_form_factor(
+            transport_state,
+            model.bulk_ion_atmosphere_state.kappa_inv_m,
+        )
         constraint_tau_s = _transport_state_constraint_tau_s(transport_state)
         constraint_length_m = _transport_state_constraint_length_m(transport_state)
         constraint_mu = _transport_state_constraint_mu(transport_state)
@@ -994,6 +1409,8 @@ def _top_state_contributions(
                 D_none_alpha_m2_s=state_binding_diffusivity_m2_s,
                 D_ep_alpha_m2_s=state_ep_diffusivity_m2_s,
                 D_rel_alpha_m2_s=state_rel_diffusivity_m2_s,
+                D_rel_Li_alpha_m2_s=state_rel_Li_diffusivity_m2_s,
+                D_rel_anion_alpha_m2_s=state_rel_anion_diffusivity_m2_s,
                 D_rel_diag_alpha_m2_s=state_rel_diag_diffusivity_m2_s,
                 D_rel_full_alpha_m2_s=state_resistance_diffusivity_m2_s,
                 D_full_alpha_m2_s=state_resistance_diffusivity_m2_s,
@@ -1002,6 +1419,8 @@ def _top_state_contributions(
                 H_atmosphere_alpha=atmosphere_factor,
                 H_ep_alpha=electrophoretic_factor,
                 H_rel_alpha=relaxation_factor,
+                H_rel_Li_alpha=relaxation_Li_factor,
+                H_rel_anion_alpha=relaxation_anion_factor,
                 H_rel_diag_alpha=relaxation_diag_factor,
                 H_rel_cross_alpha=relaxation_cross_factor,
                 H_rel_before_gate_alpha=relaxation_before_gate_factor,
@@ -1009,6 +1428,8 @@ def _top_state_contributions(
                 H_full_alpha=atmosphere_factor,
                 drag_ep_alpha=_drag_from_atmosphere_factor(electrophoretic_factor),
                 drag_rel_alpha=_drag_from_atmosphere_factor(relaxation_factor),
+                drag_rel_Li_alpha=_drag_from_atmosphere_factor(relaxation_Li_factor),
+                drag_rel_anion_alpha=_drag_from_atmosphere_factor(relaxation_anion_factor),
                 drag_rel_diag_alpha=_drag_from_atmosphere_factor(relaxation_diag_factor),
                 drag_rel_cross_alpha=_drag_from_atmosphere_factor(relaxation_cross_factor),
                 drag_rel_before_gate_alpha=_drag_from_atmosphere_factor(
@@ -1040,6 +1461,22 @@ def _top_state_contributions(
                     model,
                     transport_state,
                     "relaxation",
+                ),
+                relaxation_Li_resistance_trace_kg_s=float(
+                    np.trace(
+                        _transport_state_relaxation_center_diag_matrix_kg_s(
+                            transport_state,
+                            "positive",
+                        )
+                    )
+                ),
+                relaxation_anion_resistance_trace_kg_s=float(
+                    np.trace(
+                        _transport_state_relaxation_center_diag_matrix_kg_s(
+                            transport_state,
+                            "negative",
+                        )
+                    )
                 ),
                 relaxation_diag_resistance_trace_kg_s=float(
                     np.trace(_transport_state_relaxation_diag_matrix_kg_s(transport_state))
@@ -1074,6 +1511,9 @@ def _top_state_contributions(
                     transport_state.atmosphere_diagnostic_lifetime_gate
                 ),
                 relaxation_dynamic_response=transport_state.relaxation_dynamic_response,
+                anion_diagonal_relaxation_form_factor=(
+                    transport_state.anion_diagonal_relaxation_form_factor
+                ),
                 relaxation_lifetime_gate=transport_state.relaxation_lifetime_gate,
                 raw_atmosphere_form_factor=_transport_state_form_factor_cancellation(
                     transport_state,
@@ -1118,6 +1558,25 @@ def _top_state_contributions(
                     transport_state.external_over_total_ionic_strength
                 ),
                 resolved_charge_center_count=len(transport_state.charged_centers),
+                anion_feature_id=_transport_state_anion_feature_id(transport_state),
+                local_D_Li_m2_s=_transport_state_center_local_diffusivity_m2_s(
+                    transport_state,
+                    "positive",
+                ),
+                local_D_anion_m2_s=_transport_state_center_local_diffusivity_m2_s(
+                    transport_state,
+                    "negative",
+                ),
+                kappa_radius_Li=_transport_state_kappa_radius(
+                    transport_state,
+                    "positive",
+                    model.bulk_ion_atmosphere_state.kappa_inv_m,
+                ),
+                kappa_radius_anion=_transport_state_kappa_radius(
+                    transport_state,
+                    "negative",
+                    model.bulk_ion_atmosphere_state.kappa_inv_m,
+                ),
                 debye_kappa_inv_A=_debye_kappa_inv_A(
                     model.bulk_ion_atmosphere_state.kappa_inv_m,
                 ),
@@ -1141,6 +1600,17 @@ def _top_state_contributions(
                 ),
                 stationary_probability=float(model.stationary_probabilities[state_index]),
                 charge=float(model.state_net_charges[state_index]),
+                g_anion_diag_required=g_anion_diag_required,
+                g_anion_diag_current=g_anion_diag_current,
+                g_anion_diag_required_status=g_anion_diag_required_status,
+                anion_charge_cloud_radius_required_A=required_charge_cloud_radius_A,
+                hydrodynamic_radius_A=hydrodynamic_radius_A,
+                shape_factor=anion_shape_factor,
+                current_self_form_factor=current_self_form_factor,
+                charge_cloud_radius_available=charge_cloud_radius_available,
+                charge_cloud_radius_A=charge_cloud_radius_A,
+                charge_cloud_source=charge_cloud_source,
+                charge_cloud_site_count=charge_cloud_site_count,
             )
         )
     contributions.sort(key=lambda item: abs(item.contribution_m2_s), reverse=True)
@@ -1475,6 +1945,18 @@ def _transport_state_component_atmosphere_matrix_kg_s(
     center_count = len(transport_state.charged_centers)
     if center_count == 0:
         return np.zeros((0, 0), dtype=float)
+    if atmosphere_component == "relaxation_Li_after_ep":
+        return _transport_state_relaxation_center_after_ep_matrix_kg_s(
+            model,
+            transport_state,
+            "positive",
+        )
+    if atmosphere_component == "relaxation_anion_after_ep":
+        return _transport_state_relaxation_center_after_ep_matrix_kg_s(
+            model,
+            transport_state,
+            "negative",
+        )
     if atmosphere_component == "relaxation_diag_after_ep":
         return _transport_state_relaxation_diag_after_ep_matrix_kg_s(
             model,
@@ -1732,6 +2214,211 @@ def _transport_state_relaxation_cross_matrix_kg_s(
     if relaxation_matrix.size == 0:
         return np.zeros((0, 0), dtype=float)
     return relaxation_matrix - np.diag(np.diag(relaxation_matrix))
+
+
+def _transport_state_relaxation_center_diag_matrix_kg_s(
+    transport_state: TransportState,
+    center_charge_class: str,
+) -> np.ndarray:
+    relaxation_matrix = _transport_state_relaxation_after_gate_matrix_kg_s(transport_state)
+    if relaxation_matrix.size == 0:
+        return np.zeros((0, 0), dtype=float)
+    center_diag_matrix = np.zeros_like(relaxation_matrix)
+    for center_index, charged_center in enumerate(transport_state.charged_centers):
+        if _charged_center_matches_charge_class(charged_center, center_charge_class):
+            center_diag_matrix[center_index, center_index] = relaxation_matrix[
+                center_index,
+                center_index,
+            ]
+    return center_diag_matrix
+
+
+def _charged_center_matches_charge_class(
+    charged_center: ChargedCenter,
+    center_charge_class: str,
+) -> bool:
+    if center_charge_class == "positive":
+        return charged_center.charge > 0.0
+    if center_charge_class == "negative":
+        return charged_center.charge < 0.0
+    raise ValueError(f"Unsupported center_charge_class {center_charge_class}")
+
+
+def _transport_state_relaxation_center_after_ep_matrix_kg_s(
+    model: KernelDerivedMarkovModel,
+    transport_state: TransportState,
+    center_charge_class: str,
+) -> np.ndarray:
+    electrophoretic_matrix = _transport_state_component_atmosphere_matrix_kg_s(
+        model,
+        transport_state,
+        "electrophoretic",
+    )
+    return electrophoretic_matrix + _transport_state_relaxation_center_diag_matrix_kg_s(
+        transport_state,
+        center_charge_class,
+    )
+
+
+def _transport_state_center_local_diffusivity_m2_s(
+    transport_state: TransportState,
+    center_charge_class: str,
+) -> float:
+    center_diffusivities = tuple(
+        charged_center.local_diffusion_m2_s
+        for charged_center in transport_state.charged_centers
+        if _charged_center_matches_charge_class(charged_center, center_charge_class)
+    )
+    if not center_diffusivities:
+        return 0.0
+    return math.fsum(center_diffusivities) / len(center_diffusivities)
+
+
+def _transport_state_center_radius_m(
+    transport_state: TransportState,
+    center_charge_class: str,
+) -> float:
+    center_radii = tuple(
+        charged_center.hydrodynamic_radius_m
+        for charged_center in transport_state.charged_centers
+        if _charged_center_matches_charge_class(charged_center, center_charge_class)
+    )
+    if not center_radii:
+        return 0.0
+    return math.fsum(center_radii) / len(center_radii)
+
+
+def _transport_state_center_radius_A(
+    transport_state: TransportState,
+    center_charge_class: str,
+) -> float:
+    return _transport_state_center_radius_m(transport_state, center_charge_class) / ANGSTROM_TO_M
+
+
+def _transport_state_center_shape_factor(
+    transport_state: TransportState,
+    center_charge_class: str,
+) -> float:
+    center_shape_factors = tuple(
+        charged_center.shape_factor
+        for charged_center in transport_state.charged_centers
+        if _charged_center_matches_charge_class(charged_center, center_charge_class)
+    )
+    if not center_shape_factors:
+        return 0.0
+    return math.fsum(center_shape_factors) / len(center_shape_factors)
+
+
+def _transport_state_charge_cloud_radius_available(
+    transport_state: TransportState,
+    center_charge_class: str,
+) -> bool:
+    return any(
+        charged_center.charge_cloud_radius_available
+        for charged_center in transport_state.charged_centers
+        if _charged_center_matches_charge_class(charged_center, center_charge_class)
+    )
+
+
+def _transport_state_charge_cloud_radius_A(
+    transport_state: TransportState,
+    center_charge_class: str,
+) -> float:
+    charge_cloud_radii_A = tuple(
+        charged_center.charge_cloud_radius_A
+        for charged_center in transport_state.charged_centers
+        if (
+            _charged_center_matches_charge_class(charged_center, center_charge_class)
+            and charged_center.charge_cloud_radius_available
+        )
+    )
+    if not charge_cloud_radii_A:
+        return 0.0
+    return math.fsum(charge_cloud_radii_A) / len(charge_cloud_radii_A)
+
+
+def _transport_state_charge_cloud_source(
+    transport_state: TransportState,
+    center_charge_class: str,
+) -> str:
+    charge_cloud_sources = tuple(
+        charged_center.charge_cloud_source
+        for charged_center in transport_state.charged_centers
+        if _charged_center_matches_charge_class(charged_center, center_charge_class)
+    )
+    if not charge_cloud_sources:
+        return "none"
+    return "+".join(sorted(set(charge_cloud_sources)))
+
+
+def _transport_state_charge_cloud_site_count(
+    transport_state: TransportState,
+    center_charge_class: str,
+) -> int:
+    charge_cloud_site_counts = tuple(
+        charged_center.charge_cloud_site_count
+        for charged_center in transport_state.charged_centers
+        if _charged_center_matches_charge_class(charged_center, center_charge_class)
+    )
+    if not charge_cloud_site_counts:
+        return 0
+    return sum(charge_cloud_site_counts)
+
+
+def _transport_state_current_anion_self_form_factor(
+    transport_state: TransportState,
+    kappa_inv_m: float,
+) -> float:
+    hydrodynamic_radius_m = _transport_state_center_radius_m(transport_state, "negative")
+    if hydrodynamic_radius_m == 0.0:
+        return 1.0
+    shape_factor = _transport_state_center_shape_factor(transport_state, "negative")
+    _assert_positive_finite(shape_factor, f"{transport_state.label}.anion_shape_factor")
+    if math.isinf(kappa_inv_m):
+        return 1.0
+    _assert_positive_finite(kappa_inv_m, "kappa_inv_m")
+    form_factor_argument = hydrodynamic_radius_m * shape_factor / kappa_inv_m
+    current_self_form_factor = math.exp(
+        -(
+            form_factor_argument
+            * form_factor_argument
+            / GAUSSIAN_SELF_FORM_FACTOR_SQUARED_DENOMINATOR
+        )
+    )
+    if current_self_form_factor < 0.0 or current_self_form_factor > 1.0:
+        raise ValueError(
+            f"{transport_state.label}.current_self_form_factor must be in [0, 1], "
+            f"got {current_self_form_factor}"
+        )
+    return current_self_form_factor
+
+
+def _transport_state_kappa_radius(
+    transport_state: TransportState,
+    center_charge_class: str,
+    kappa_inv_m: float,
+) -> float:
+    center_radius_m = _transport_state_center_radius_m(transport_state, center_charge_class)
+    if center_radius_m == 0.0:
+        return 0.0
+    if math.isinf(kappa_inv_m):
+        return 0.0
+    _assert_positive_finite(kappa_inv_m, "kappa_inv_m")
+    return center_radius_m / kappa_inv_m
+
+
+def _transport_state_anion_feature_id(transport_state: TransportState) -> str:
+    feature_ids = []
+    for charged_center in transport_state.charged_centers:
+        if charged_center.charge >= 0.0:
+            continue
+        center_label_parts = charged_center.label.split(":")
+        if not center_label_parts:
+            raise ValueError(f"{transport_state.label}.{charged_center.label} has no label parts")
+        feature_ids.append(center_label_parts[0])
+    if not feature_ids:
+        return "none"
+    return "+".join(sorted(set(feature_ids)))
 
 
 def _transport_state_relaxation_diag_after_ep_matrix_kg_s(
@@ -1994,6 +2681,89 @@ def _top_state_resolved_charge_count(
     return top_state_contributions[0].resolved_charge_center_count
 
 
+def _top_state_required_charge_cloud_radius_A(
+    top_state_contributions: Sequence[StateContribution],
+) -> float:
+    if not top_state_contributions:
+        return 0.0
+    return top_state_contributions[0].anion_charge_cloud_radius_required_A
+
+
+def _top_state_hydrodynamic_radius_A(
+    top_state_contributions: Sequence[StateContribution],
+) -> float:
+    if not top_state_contributions:
+        return 0.0
+    return top_state_contributions[0].hydrodynamic_radius_A
+
+
+def _top_state_shape_factor(
+    top_state_contributions: Sequence[StateContribution],
+) -> float:
+    if not top_state_contributions:
+        return 0.0
+    return top_state_contributions[0].shape_factor
+
+
+def _top_state_current_self_form_factor(
+    top_state_contributions: Sequence[StateContribution],
+) -> float:
+    if not top_state_contributions:
+        return 1.0
+    return top_state_contributions[0].current_self_form_factor
+
+
+def _top_state_charge_cloud_radius_available(
+    top_state_contributions: Sequence[StateContribution],
+) -> bool:
+    if not top_state_contributions:
+        return False
+    return top_state_contributions[0].charge_cloud_radius_available
+
+
+def _top_state_charge_cloud_radius_A(
+    top_state_contributions: Sequence[StateContribution],
+) -> float:
+    if not top_state_contributions:
+        return 0.0
+    return top_state_contributions[0].charge_cloud_radius_A
+
+
+def _top_state_charge_cloud_source(
+    top_state_contributions: Sequence[StateContribution],
+) -> str:
+    if not top_state_contributions:
+        return "none"
+    return top_state_contributions[0].charge_cloud_source
+
+
+def _top_state_charge_cloud_site_count(
+    top_state_contributions: Sequence[StateContribution],
+) -> int:
+    if not top_state_contributions:
+        return 0
+    return top_state_contributions[0].charge_cloud_site_count
+
+
+def _required_charge_cloud_radius_A(
+    g_anion_diag_required: float,
+    kappa_inv_m: float,
+) -> float:
+    _assert_unit_interval(g_anion_diag_required, "g_anion_diag_required")
+    if g_anion_diag_required == 1.0:
+        return 0.0
+    if g_anion_diag_required == 0.0:
+        return math.inf
+    if math.isinf(kappa_inv_m):
+        return math.inf
+    _assert_positive_finite(kappa_inv_m, "kappa_inv_m")
+    charge_cloud_radius_m = kappa_inv_m * math.sqrt(
+        -GAUSSIAN_SELF_FORM_FACTOR_SQUARED_DENOMINATOR
+        * math.log(g_anion_diag_required)
+    )
+    return charge_cloud_radius_m / ANGSTROM_TO_M
+
+
 def _salt_family(
     canonical_recipe: RecipeDict,
 ) -> str:
@@ -2161,12 +2931,14 @@ def _family_atmosphere_metrics(
     rows_by_group: defaultdict[tuple[str, str], list[BiasLedgerRow]] = defaultdict(list)
     for ledger_row in ledger_rows:
         top_state_kind = _top_state_kind(ledger_row)
+        top_state_anion_feature_id = _top_state_anion_feature_id(ledger_row)
         eta_relative_bin = _quantile_bin(ledger_row.eta_rel, eta_relative_quantile_cuts)
         debye_length_bin = _quantile_bin(_row_kappa_inv_A(ledger_row), debye_length_quantile_cuts_A)
         _append_family_group(rows_by_group, "salt_family", ledger_row.salt_family, ledger_row)
         _append_family_group(rows_by_group, "solvent_family", ledger_row.solvent_family, ledger_row)
         _append_family_group(rows_by_group, "additive_basis", ledger_row.additive_basis, ledger_row)
         _append_family_group(rows_by_group, "top_state_kind", top_state_kind, ledger_row)
+        _append_family_group(rows_by_group, "anion_feature_id", top_state_anion_feature_id, ledger_row)
         _append_family_group(rows_by_group, "eta_rel_bin", eta_relative_bin, ledger_row)
         _append_family_group(rows_by_group, "kappa_inv_bin", debye_length_bin, ledger_row)
         _append_family_group(
@@ -2199,6 +2971,564 @@ def _family_atmosphere_metrics(
     ]
     metrics.sort(key=lambda metric: (metric.group_name, metric.group_value))
     return tuple(metrics)
+
+
+def _required_anion_diag_factor_metrics(
+    ledger_rows: Sequence[BiasLedgerRow],
+) -> tuple[RequiredAnionDiagFactorMetrics, ...]:
+    rows_by_group: defaultdict[tuple[str, str], list[BiasLedgerRow]] = defaultdict(list)
+    for ledger_row in ledger_rows:
+        top_state_kind = _top_state_kind(ledger_row)
+        top_state_anion_feature_id = _top_state_anion_feature_id(ledger_row)
+        _append_family_group(
+            rows_by_group,
+            "anion_feature_id",
+            top_state_anion_feature_id,
+            ledger_row,
+        )
+        _append_family_group(
+            rows_by_group,
+            "salt_family_x_top_state_kind",
+            f"{ledger_row.salt_family} x {top_state_kind}",
+            ledger_row,
+        )
+        _append_family_group(
+            rows_by_group,
+            "additive_basis_x_top_state_kind",
+            f"{ledger_row.additive_basis} x {top_state_kind}",
+            ledger_row,
+        )
+        _append_family_group(
+            rows_by_group,
+            "solvent_family_x_salt_family",
+            f"{ledger_row.solvent_family} x {ledger_row.salt_family}",
+            ledger_row,
+        )
+    metrics = [
+        _build_required_anion_diag_factor_metrics(group_name, group_value, group_rows)
+        for (group_name, group_value), group_rows in rows_by_group.items()
+    ]
+    metrics.sort(key=lambda metric: (metric.group_name, metric.group_value))
+    return tuple(metrics)
+
+
+def _build_required_anion_diag_factor_metrics(
+    group_name: str,
+    group_value: str,
+    group_rows: Sequence[BiasLedgerRow],
+) -> RequiredAnionDiagFactorMetrics:
+    if not group_rows:
+        raise ValueError(f"{group_name}={group_value} has no rows")
+    status_counter = Counter(ledger_row.g_anion_diag_required_status for ledger_row in group_rows)
+    charge_cloud_source_counter = Counter(ledger_row.charge_cloud_source for ledger_row in group_rows)
+    descriptor_radius_values = tuple(
+        ledger_row.charge_cloud_radius_A
+        for ledger_row in group_rows
+        if ledger_row.charge_cloud_radius_available
+    )
+    return RequiredAnionDiagFactorMetrics(
+        group_name=group_name,
+        group_value=group_value,
+        count=len(group_rows),
+        median_g_required=_median_value(
+            tuple(ledger_row.g_anion_diag_required for ledger_row in group_rows)
+        ),
+        iqr_g_required=_iqr_value(
+            tuple(ledger_row.g_anion_diag_required for ledger_row in group_rows)
+        ),
+        status_counts={
+            status: status_counter[status]
+            for status in ANION_DIAG_REQUIRED_STATUSES
+        },
+        median_charge_cloud_radius_required_A=_median_value(
+            tuple(ledger_row.anion_charge_cloud_radius_required_A for ledger_row in group_rows)
+        ),
+        median_hydrodynamic_radius_A=_median_value(
+            tuple(ledger_row.hydrodynamic_radius_A for ledger_row in group_rows)
+        ),
+        median_shape_factor=_median_value(tuple(ledger_row.shape_factor for ledger_row in group_rows)),
+        median_current_self_form_factor=_median_value(
+            tuple(ledger_row.current_self_form_factor for ledger_row in group_rows)
+        ),
+        charge_cloud_descriptor_covered_count=sum(
+            1 for ledger_row in group_rows if ledger_row.charge_cloud_radius_available
+        ),
+        median_charge_cloud_descriptor_radius_A=(
+            _median_value(descriptor_radius_values)
+            if descriptor_radius_values
+            else 0.0
+        ),
+        charge_cloud_source_counts=dict(sorted(charge_cloud_source_counter.items())),
+        mean_signed_error_mS_cm=float(
+            np.mean(
+                np.asarray(
+                    [ledger_row.sigma_pred_mS_cm - ledger_row.sigma_exp_mS_cm for ledger_row in group_rows],
+                    dtype=float,
+                )
+            )
+        ),
+    )
+
+
+def _base_speciation_inverse_metrics(
+    ledger_rows: Sequence[BiasLedgerRow],
+) -> tuple[BaseSpeciationInverseMetrics, ...]:
+    eta_relative_quantile_cuts = _quantile_cuts(
+        tuple(ledger_row.eta_rel for ledger_row in ledger_rows)
+    )
+    rows_by_group: defaultdict[tuple[str, str], list[BiasLedgerRow]] = defaultdict(list)
+    for ledger_row in ledger_rows:
+        top_state_kind = _top_state_kind(ledger_row)
+        eta_relative_bin = _quantile_bin(ledger_row.eta_rel, eta_relative_quantile_cuts)
+        _append_family_group(
+            rows_by_group,
+            "salt_family_x_solvent_family",
+            f"{ledger_row.salt_family} x {ledger_row.solvent_family}",
+            ledger_row,
+        )
+        _append_family_group(
+            rows_by_group,
+            "salt_family_x_top_state_kind",
+            f"{ledger_row.salt_family} x {top_state_kind}",
+            ledger_row,
+        )
+        _append_family_group(
+            rows_by_group,
+            "salt_family_x_eta_rel_bin",
+            f"{ledger_row.salt_family} x {eta_relative_bin}",
+            ledger_row,
+        )
+    metrics = [
+        _build_base_speciation_inverse_metrics(group_name, group_value, group_rows)
+        for (group_name, group_value), group_rows in rows_by_group.items()
+    ]
+    metrics.sort(key=lambda metric: (metric.group_name, metric.group_value))
+    return tuple(metrics)
+
+
+def _build_base_speciation_inverse_metrics(
+    group_name: str,
+    group_value: str,
+    group_rows: Sequence[BiasLedgerRow],
+) -> BaseSpeciationInverseMetrics:
+    if not group_rows:
+        raise ValueError(f"{group_name}={group_value} has no rows")
+    association_deltaG_values = tuple(
+        ledger_row.association_required_deltaG_kJ_mol for ledger_row in group_rows
+    )
+    base_mobility_deltaG_values = tuple(
+        ledger_row.base_mobility_required_deltaG_kJ_mol for ledger_row in group_rows
+    )
+    return BaseSpeciationInverseMetrics(
+        group_name=group_name,
+        group_value=group_value,
+        count=len(group_rows),
+        median_association_required_deltaG_kJ_mol=_median_value(association_deltaG_values),
+        iqr_association_required_deltaG_kJ_mol=_iqr_value(association_deltaG_values),
+        median_base_mobility_required_deltaG_kJ_mol=_median_value(base_mobility_deltaG_values),
+        iqr_base_mobility_required_deltaG_kJ_mol=_iqr_value(base_mobility_deltaG_values),
+        mean_signed_error_mS_cm=float(
+            np.mean(
+                np.asarray(
+                    [ledger_row.sigma_pred_mS_cm - ledger_row.sigma_exp_mS_cm for ledger_row in group_rows],
+                    dtype=float,
+                )
+            )
+        ),
+    )
+
+
+def _promotion_decision_metrics(
+    required_anion_diag_metrics: Sequence[RequiredAnionDiagFactorMetrics],
+    base_speciation_metrics: Sequence[BaseSpeciationInverseMetrics],
+) -> tuple[PromotionDecisionMetrics, ...]:
+    decisions: list[PromotionDecisionMetrics] = []
+    for required_factor_metrics in required_anion_diag_metrics:
+        decisions.append(_anion_diag_promotion_decision(required_factor_metrics))
+    for inverse_metrics in base_speciation_metrics:
+        decisions.append(_base_speciation_promotion_decision(inverse_metrics))
+    decisions.sort(key=lambda decision: (decision.branch_name, decision.group_name, decision.group_value))
+    return tuple(decisions)
+
+
+def _anion_diag_promotion_decision(
+    required_factor_metrics: RequiredAnionDiagFactorMetrics,
+) -> PromotionDecisionMetrics:
+    matched_count = required_factor_metrics.status_counts[ANION_DIAG_REQUIRED_MATCHED]
+    boundary_count = (
+        required_factor_metrics.status_counts[ANION_DIAG_REQUIRED_STRONGER_RELAXATION]
+        + required_factor_metrics.status_counts[ANION_DIAG_REQUIRED_BELOW_ZERO]
+        + required_factor_metrics.status_counts[ANION_DIAG_REQUIRED_NO_SENSITIVITY]
+    )
+    median_factor_is_plausible = (
+        required_factor_metrics.median_g_required > 0.0
+        and required_factor_metrics.median_g_required < 1.0
+    )
+    factor_distribution_is_narrow = _required_factor_distribution_is_narrow(
+        required_factor_metrics.median_g_required,
+        required_factor_metrics.iqr_g_required,
+    )
+    if required_factor_metrics.count < PROMOTION_MINIMUM_GROUP_COUNT:
+        return PromotionDecisionMetrics(
+            branch_name="anion_diagonal_relaxation",
+            group_name=required_factor_metrics.group_name,
+            group_value=required_factor_metrics.group_value,
+            count=required_factor_metrics.count,
+            decision=PROMOTION_DECISION_INSUFFICIENT_EVIDENCE,
+            candidate="electrostatic_charge_cloud_form_factor",
+            rationale="count_below_user_requested_minimum",
+        )
+    if required_factor_metrics.charge_cloud_descriptor_covered_count < required_factor_metrics.count:
+        return PromotionDecisionMetrics(
+            branch_name="anion_diagonal_relaxation",
+            group_name=required_factor_metrics.group_name,
+            group_value=required_factor_metrics.group_value,
+            count=required_factor_metrics.count,
+            decision=PROMOTION_DECISION_INSUFFICIENT_EVIDENCE,
+            candidate="electrostatic_charge_cloud_form_factor",
+            rationale="missing_charge_cloud_descriptor_coverage",
+        )
+    if matched_count == required_factor_metrics.count and median_factor_is_plausible and factor_distribution_is_narrow:
+        return PromotionDecisionMetrics(
+            branch_name="anion_diagonal_relaxation",
+            group_name=required_factor_metrics.group_name,
+            group_value=required_factor_metrics.group_value,
+            count=required_factor_metrics.count,
+            decision=PROMOTION_DECISION_PROMOTE_CANDIDATE,
+            candidate="electrostatic_charge_cloud_form_factor",
+            rationale="matched_required_factors_cluster_with_descriptor_coverage",
+        )
+    if boundary_count > matched_count:
+        return PromotionDecisionMetrics(
+            branch_name="anion_diagonal_relaxation",
+            group_name=required_factor_metrics.group_name,
+            group_value=required_factor_metrics.group_value,
+            count=required_factor_metrics.count,
+            decision=PROMOTION_DECISION_REJECT,
+            candidate="electrostatic_charge_cloud_form_factor",
+            rationale="boundary_or_impossible_required_factor_statuses_dominate",
+        )
+    return PromotionDecisionMetrics(
+        branch_name="anion_diagonal_relaxation",
+        group_name=required_factor_metrics.group_name,
+        group_value=required_factor_metrics.group_value,
+        count=required_factor_metrics.count,
+        decision=PROMOTION_DECISION_DIAGNOSTIC_ONLY,
+        candidate="electrostatic_charge_cloud_form_factor",
+        rationale="required_factor_group_not_coherent_enough_for_promotion",
+    )
+
+
+def _base_speciation_promotion_decision(
+    inverse_metrics: BaseSpeciationInverseMetrics,
+) -> PromotionDecisionMetrics:
+    association_deltaG_is_coherent = _deltaG_distribution_is_coherent(
+        inverse_metrics.median_association_required_deltaG_kJ_mol,
+        inverse_metrics.iqr_association_required_deltaG_kJ_mol,
+    )
+    base_mobility_deltaG_is_coherent = _deltaG_distribution_is_coherent(
+        inverse_metrics.median_base_mobility_required_deltaG_kJ_mol,
+        inverse_metrics.iqr_base_mobility_required_deltaG_kJ_mol,
+    )
+    if inverse_metrics.count < PROMOTION_MINIMUM_GROUP_COUNT:
+        return PromotionDecisionMetrics(
+            branch_name="base_speciation",
+            group_name=inverse_metrics.group_name,
+            group_value=inverse_metrics.group_value,
+            count=inverse_metrics.count,
+            decision=PROMOTION_DECISION_INSUFFICIENT_EVIDENCE,
+            candidate="no_universal_change",
+            rationale="count_below_user_requested_minimum",
+        )
+    if association_deltaG_is_coherent and not base_mobility_deltaG_is_coherent:
+        return PromotionDecisionMetrics(
+            branch_name="base_speciation",
+            group_name=inverse_metrics.group_name,
+            group_value=inverse_metrics.group_value,
+            count=inverse_metrics.count,
+            decision=PROMOTION_DECISION_PROMOTE_CANDIDATE,
+            candidate="association_PMF_candidate",
+            rationale="association_deltaG_clusters_more_coherently_than_mobility_deltaG",
+        )
+    if base_mobility_deltaG_is_coherent and not association_deltaG_is_coherent:
+        return PromotionDecisionMetrics(
+            branch_name="base_speciation",
+            group_name=inverse_metrics.group_name,
+            group_value=inverse_metrics.group_value,
+            count=inverse_metrics.count,
+            decision=PROMOTION_DECISION_PROMOTE_CANDIDATE,
+            candidate="microviscosity_candidate",
+            rationale="mobility_deltaG_clusters_more_coherently_than_association_deltaG",
+        )
+    return PromotionDecisionMetrics(
+        branch_name="base_speciation",
+        group_name=inverse_metrics.group_name,
+        group_value=inverse_metrics.group_value,
+        count=inverse_metrics.count,
+        decision=PROMOTION_DECISION_DIAGNOSTIC_ONLY,
+        candidate="no_universal_change",
+        rationale="association_and_mobility_inverse_diagnostics_are_mixed",
+    )
+
+
+def _required_factor_distribution_is_narrow(
+    median_g_required: float,
+    iqr_g_required: float,
+) -> bool:
+    _assert_unit_interval(median_g_required, "median_g_required")
+    _assert_nonnegative_finite(iqr_g_required, "iqr_g_required")
+    distance_to_nearest_boundary = min(median_g_required, 1.0 - median_g_required)
+    if distance_to_nearest_boundary == 0.0:
+        return iqr_g_required == 0.0
+    return iqr_g_required <= distance_to_nearest_boundary
+
+
+def _deltaG_distribution_is_coherent(
+    median_deltaG_kJ_mol: float,
+    iqr_deltaG_kJ_mol: float,
+) -> bool:
+    if not math.isfinite(median_deltaG_kJ_mol):
+        raise ValueError(f"median_deltaG_kJ_mol must be finite, got {median_deltaG_kJ_mol}")
+    _assert_nonnegative_finite(iqr_deltaG_kJ_mol, "iqr_deltaG_kJ_mol")
+    if median_deltaG_kJ_mol == 0.0:
+        return iqr_deltaG_kJ_mol == 0.0
+    return iqr_deltaG_kJ_mol <= abs(median_deltaG_kJ_mol)
+
+
+def _predictive_validation_group_metrics(
+    ledger_rows: Sequence[BiasLedgerRow],
+) -> tuple[PredictiveValidationGroupMetrics, ...]:
+    if not ledger_rows:
+        raise ValueError("cannot compute predictive validation metrics with zero evaluated rows")
+    rows_by_group: defaultdict[tuple[str, str], list[BiasLedgerRow]] = defaultdict(list)
+    for ledger_row in ledger_rows:
+        _append_family_group(rows_by_group, "salt_family", ledger_row.salt_family, ledger_row)
+        _append_family_group(rows_by_group, "solvent_family", ledger_row.solvent_family, ledger_row)
+        _append_family_group(rows_by_group, "additive_basis", ledger_row.additive_basis, ledger_row)
+        _append_family_group(rows_by_group, "top_state_kind", _top_state_kind(ledger_row), ledger_row)
+    validation_metrics = [
+        _build_predictive_validation_group_metrics(
+            group_name,
+            group_value,
+            group_rows,
+            ledger_rows,
+        )
+        for (group_name, group_value), group_rows in rows_by_group.items()
+    ]
+    validation_metrics.sort(key=lambda metric: (metric.group_name, metric.group_value))
+    return tuple(validation_metrics)
+
+
+def _build_predictive_validation_group_metrics(
+    group_name: str,
+    group_value: str,
+    group_rows: Sequence[BiasLedgerRow],
+    all_ledger_rows: Sequence[BiasLedgerRow],
+) -> PredictiveValidationGroupMetrics:
+    if not group_rows:
+        raise ValueError(f"{group_name}={group_value} has no validation rows")
+    group_row_ids = {ledger_row.row_id for ledger_row in group_rows}
+    calibration_rows = tuple(
+        ledger_row for ledger_row in all_ledger_rows
+        if ledger_row.row_id not in group_row_ids
+    )
+
+    residuals_mS_cm = np.asarray(
+        [ledger_row.sigma_pred_mS_cm - ledger_row.sigma_exp_mS_cm for ledger_row in group_rows],
+        dtype=float,
+    )
+    empirical_values_mS_cm = tuple(ledger_row.sigma_exp_mS_cm for ledger_row in group_rows)
+    predicted_values_mS_cm = tuple(ledger_row.sigma_pred_mS_cm for ledger_row in group_rows)
+    pearson_available, pearson_r = _pearson_with_availability(
+        empirical_values_mS_cm,
+        predicted_values_mS_cm,
+    )
+    if calibration_rows:
+        conformal_abs_error_80_mS_cm = _calibration_abs_error_quantile(
+            calibration_rows,
+            CONFORMAL_COVERAGE_80,
+        )
+        conformal_abs_error_90_mS_cm = _calibration_abs_error_quantile(
+            calibration_rows,
+            CONFORMAL_COVERAGE_90,
+        )
+    else:
+        conformal_abs_error_80_mS_cm = 0.0
+        conformal_abs_error_90_mS_cm = 0.0
+    mae_mS_cm = float(np.mean(np.abs(residuals_mS_cm)))
+    bias_mS_cm = float(np.mean(residuals_mS_cm))
+    if calibration_rows:
+        decision, rationale = _predictive_validation_decision(
+            count=len(group_rows),
+            mae_mS_cm=mae_mS_cm,
+            bias_mS_cm=bias_mS_cm,
+            pearson_r_available=pearson_available,
+            pearson_r=pearson_r,
+        )
+    else:
+        decision = PREDICTIVE_DECISION_INSUFFICIENT_EVIDENCE
+        rationale = "no_calibration_rows_outside_holdout_group"
+    return PredictiveValidationGroupMetrics(
+        group_name=group_name,
+        group_value=group_value,
+        count=len(group_rows),
+        calibration_count=len(calibration_rows),
+        mae_mS_cm=mae_mS_cm,
+        rmse_mS_cm=float(math.sqrt(float(np.mean(residuals_mS_cm * residuals_mS_cm)))),
+        bias_mS_cm=bias_mS_cm,
+        pearson_r_available=pearson_available,
+        pearson_r=pearson_r,
+        conformal_abs_error_80_mS_cm=conformal_abs_error_80_mS_cm,
+        conformal_coverage_80=_heldout_conformal_coverage(
+            group_rows,
+            conformal_abs_error_80_mS_cm,
+        ),
+        conformal_abs_error_90_mS_cm=conformal_abs_error_90_mS_cm,
+        conformal_coverage_90=_heldout_conformal_coverage(
+            group_rows,
+            conformal_abs_error_90_mS_cm,
+        ),
+        decision=decision,
+        rationale=rationale,
+    )
+
+
+def _active_learning_utility_metrics(
+    ledger_rows: Sequence[BiasLedgerRow],
+) -> ActiveLearningUtilityMetrics:
+    if not ledger_rows:
+        raise ValueError("cannot compute active-learning utility with zero evaluated rows")
+    empirical_values_mS_cm = np.asarray(
+        [ledger_row.sigma_exp_mS_cm for ledger_row in ledger_rows],
+        dtype=float,
+    )
+    hit_threshold_mS_cm = float(np.quantile(empirical_values_mS_cm, UPPER_QUARTILE_FRACTION))
+    true_hit_rows = tuple(
+        ledger_row for ledger_row in ledger_rows
+        if ledger_row.sigma_exp_mS_cm >= hit_threshold_mS_cm
+    )
+    selected_count = len(true_hit_rows)
+    if selected_count <= 0:
+        raise ValueError("active-learning utility requires at least one upper-quartile hit")
+    predicted_selection_rows = tuple(
+        sorted(
+            ledger_rows,
+            key=lambda ledger_row: ledger_row.sigma_pred_mS_cm,
+            reverse=True,
+        )[:selected_count]
+    )
+    selected_hit_count = sum(
+        1 for ledger_row in predicted_selection_rows
+        if ledger_row.sigma_exp_mS_cm >= hit_threshold_mS_cm
+    )
+    selected_hit_rate = selected_hit_count / selected_count
+    random_hit_rate = len(true_hit_rows) / len(ledger_rows)
+    if random_hit_rate <= 0.0:
+        raise ValueError("active-learning utility random hit rate must be positive")
+    enrichment_over_random = selected_hit_rate / random_hit_rate
+    best_measured_mS_cm = float(np.max(empirical_values_mS_cm))
+    best_selected_measured_mS_cm = max(
+        ledger_row.sigma_exp_mS_cm for ledger_row in predicted_selection_rows
+    )
+    regret_mS_cm = best_measured_mS_cm - best_selected_measured_mS_cm
+    _assert_nonnegative_finite(regret_mS_cm, "active_learning.regret_mS_cm")
+    decision, rationale = _active_learning_utility_decision(enrichment_over_random)
+    return ActiveLearningUtilityMetrics(
+        candidate_count=len(ledger_rows),
+        selected_count=selected_count,
+        hit_threshold_mS_cm=hit_threshold_mS_cm,
+        selected_hit_count=selected_hit_count,
+        true_hit_count=len(true_hit_rows),
+        selected_hit_rate=selected_hit_rate,
+        random_hit_rate=random_hit_rate,
+        enrichment_over_random=enrichment_over_random,
+        best_measured_mS_cm=best_measured_mS_cm,
+        best_selected_measured_mS_cm=best_selected_measured_mS_cm,
+        regret_mS_cm=regret_mS_cm,
+        decision=decision,
+        rationale=rationale,
+    )
+
+
+def _active_learning_utility_decision(
+    enrichment_over_random: float,
+) -> tuple[str, str]:
+    _assert_nonnegative_finite(enrichment_over_random, "enrichment_over_random")
+    if enrichment_over_random > PREDICTIVE_TOP_QUARTILE_ENRICHMENT_GATE:
+        return (ACTIVE_UTILITY_DECISION_SUPPORTED, "top_quartile_enrichment_passes_user_gate")
+    return (ACTIVE_UTILITY_DECISION_NOT_PROVEN, "top_quartile_enrichment_below_user_gate")
+
+
+def _predictive_validation_decision(
+    count: int,
+    mae_mS_cm: float,
+    bias_mS_cm: float,
+    pearson_r_available: bool,
+    pearson_r: float,
+) -> tuple[str, str]:
+    if count < PREDICTIVE_VALIDATION_MINIMUM_GROUP_COUNT:
+        return (PREDICTIVE_DECISION_INSUFFICIENT_EVIDENCE, "count_below_validation_minimum")
+    if not pearson_r_available:
+        return (PREDICTIVE_DECISION_INSUFFICIENT_EVIDENCE, "pearson_unavailable_for_holdout_group")
+    absolute_error_gate_passes = (
+        mae_mS_cm < PREDICTIVE_HOLDOUT_MAE_GATE_MILLI_SIEMENS_PER_CM
+        and abs(bias_mS_cm) < PREDICTIVE_HOLDOUT_ABS_BIAS_GATE_MILLI_SIEMENS_PER_CM
+    )
+    ranking_gate_passes = pearson_r > PREDICTIVE_HOLDOUT_PEARSON_GATE
+    if absolute_error_gate_passes and ranking_gate_passes:
+        return (PREDICTIVE_DECISION_ACTIVE_SUPPORTED, "absolute_and_ranking_gates_pass")
+    if ranking_gate_passes:
+        return (PREDICTIVE_DECISION_RANKING_ONLY, "ranking_gate_passes_but_absolute_error_gate_fails")
+    return (PREDICTIVE_DECISION_UNSUPPORTED_HOLDOUT, "predictive_validation_gates_fail")
+
+
+def _calibration_abs_error_quantile(
+    calibration_rows: Sequence[BiasLedgerRow],
+    conformal_coverage_level: float,
+) -> float:
+    _assert_unit_interval(conformal_coverage_level, "conformal_coverage_level")
+    if not calibration_rows:
+        raise ValueError("cannot compute conformal residual quantile without calibration rows")
+    absolute_residuals_mS_cm = np.asarray(
+        [
+            abs(ledger_row.sigma_pred_mS_cm - ledger_row.sigma_exp_mS_cm)
+            for ledger_row in calibration_rows
+        ],
+        dtype=float,
+    )
+    return float(np.quantile(absolute_residuals_mS_cm, conformal_coverage_level))
+
+
+def _heldout_conformal_coverage(
+    group_rows: Sequence[BiasLedgerRow],
+    conformal_abs_error_mS_cm: float,
+) -> float:
+    _assert_nonnegative_finite(conformal_abs_error_mS_cm, "conformal_abs_error_mS_cm")
+    if not group_rows:
+        raise ValueError("cannot compute heldout conformal coverage for empty group")
+    covered_count = sum(
+        1 for ledger_row in group_rows
+        if abs(ledger_row.sigma_pred_mS_cm - ledger_row.sigma_exp_mS_cm)
+        <= conformal_abs_error_mS_cm
+    )
+    return covered_count / len(group_rows)
+
+
+def _pearson_with_availability(
+    empirical_values: Sequence[float],
+    predicted_values: Sequence[float],
+) -> tuple[bool, float]:
+    if len(empirical_values) != len(predicted_values):
+        raise ValueError("Pearson inputs must have equal length")
+    if len(empirical_values) < 2:
+        return (False, 0.0)
+    empirical_array = np.asarray(empirical_values, dtype=float)
+    predicted_array = np.asarray(predicted_values, dtype=float)
+    if not np.all(np.isfinite(empirical_array)) or not np.all(np.isfinite(predicted_array)):
+        raise ValueError("Pearson input contains non-finite value")
+    if float(np.std(empirical_array)) == 0.0 or float(np.std(predicted_array)) == 0.0:
+        return (False, 0.0)
+    return (True, float(np.corrcoef(empirical_array, predicted_array)[0, 1]))
 
 
 def _append_family_group(
@@ -2239,6 +3569,26 @@ def _build_family_atmosphere_metrics(
                 ledger_row.H_rel,
                 ledger_row.H_atmosphere_target,
                 f"row {ledger_row.row_id} H_rel/H_atmosphere_target",
+            )
+        )
+        for ledger_row in group_rows
+    )
+    log_rel_Li_errors = tuple(
+        math.log(
+            _positive_ratio(
+                ledger_row.H_rel_Li,
+                1.0,
+                f"row {ledger_row.row_id} H_rel_Li",
+            )
+        )
+        for ledger_row in group_rows
+    )
+    log_rel_anion_errors = tuple(
+        math.log(
+            _positive_ratio(
+                ledger_row.H_rel_anion,
+                1.0,
+                f"row {ledger_row.row_id} H_rel_anion",
             )
         )
         for ledger_row in group_rows
@@ -2301,6 +3651,8 @@ def _build_family_atmosphere_metrics(
         mean_log_atmosphere_error=mean_log_atmosphere_error,
         mean_log_ep_error=float(np.mean(np.asarray(log_ep_errors, dtype=float))),
         mean_log_rel_error=float(np.mean(np.asarray(log_rel_errors, dtype=float))),
+        mean_log_rel_Li_error=float(np.mean(np.asarray(log_rel_Li_errors, dtype=float))),
+        mean_log_rel_anion_error=float(np.mean(np.asarray(log_rel_anion_errors, dtype=float))),
         mean_log_rel_diag_error=float(np.mean(np.asarray(log_rel_diag_errors, dtype=float))),
         mean_log_rel_cross_error=float(np.mean(np.asarray(log_rel_cross_errors, dtype=float))),
         mean_log_rel_before_gate_error=float(
@@ -2330,6 +3682,8 @@ def _build_family_atmosphere_metrics(
         ),
         mean_H_ep=float(np.mean(np.asarray([ledger_row.H_ep for ledger_row in group_rows]))),
         mean_H_rel=float(np.mean(np.asarray([ledger_row.H_rel for ledger_row in group_rows]))),
+        mean_H_rel_Li=float(np.mean(np.asarray([ledger_row.H_rel_Li for ledger_row in group_rows]))),
+        mean_H_rel_anion=float(np.mean(np.asarray([ledger_row.H_rel_anion for ledger_row in group_rows]))),
         mean_H_rel_diag=float(np.mean(np.asarray([ledger_row.H_rel_diag for ledger_row in group_rows]))),
         mean_H_rel_cross=float(np.mean(np.asarray([ledger_row.H_rel_cross for ledger_row in group_rows]))),
         mean_H_rel_before_gate=float(
@@ -2349,6 +3703,12 @@ def _build_family_atmosphere_metrics(
         ),
         mean_drag_rel_current_over_target=float(
             np.mean(np.asarray([ledger_row.drag_rel_current_over_target for ledger_row in group_rows]))
+        ),
+        mean_drag_rel_Li_current_over_target=float(
+            np.mean(np.asarray([ledger_row.drag_rel_Li_current_over_target for ledger_row in group_rows]))
+        ),
+        mean_drag_rel_anion_current_over_target=float(
+            np.mean(np.asarray([ledger_row.drag_rel_anion_current_over_target for ledger_row in group_rows]))
         ),
         mean_drag_rel_diag_current_over_target=float(
             np.mean(
@@ -2405,6 +3765,24 @@ def _build_family_atmosphere_metrics(
         mean_relaxation_lifetime_gate=float(
             np.mean(np.asarray([ledger_row.mean_relaxation_lifetime_gate for ledger_row in group_rows]))
         ),
+        mean_g_anion_diag_required=float(
+            np.mean(np.asarray([ledger_row.g_anion_diag_required for ledger_row in group_rows]))
+        ),
+        mean_anion_charge_cloud_radius_required_A=float(
+            np.mean(
+                np.asarray(
+                    [ledger_row.anion_charge_cloud_radius_required_A for ledger_row in group_rows],
+                    dtype=float,
+                )
+            )
+        ),
+        mean_hydrodynamic_radius_A=float(
+            np.mean(np.asarray([ledger_row.hydrodynamic_radius_A for ledger_row in group_rows]))
+        ),
+        mean_shape_factor=float(np.mean(np.asarray([ledger_row.shape_factor for ledger_row in group_rows]))),
+        mean_current_self_form_factor=float(
+            np.mean(np.asarray([ledger_row.current_self_form_factor for ledger_row in group_rows]))
+        ),
         mean_eta_rel=float(np.mean(np.asarray(eta_relative_values, dtype=float))),
         mean_kappa_inv_A=float(np.mean(np.asarray(debye_lengths_A, dtype=float))),
         mean_ionic_strength_mol_m3=float(
@@ -2456,6 +3834,12 @@ def _top_state_kind(ledger_row: BiasLedgerRow) -> str:
     return ledger_row.top_state_contributions[0].motif_kind
 
 
+def _top_state_anion_feature_id(ledger_row: BiasLedgerRow) -> str:
+    if not ledger_row.top_state_contributions:
+        return "none"
+    return ledger_row.top_state_contributions[0].anion_feature_id
+
+
 def _dominant_top_state(group_rows: Sequence[BiasLedgerRow]) -> str:
     top_state_counts = Counter(_top_state_kind(ledger_row) for ledger_row in group_rows)
     if not top_state_counts:
@@ -2474,6 +3858,39 @@ def _row_kappa_inv_A(ledger_row: BiasLedgerRow) -> float:
     debye_kappa_inv_A = ledger_row.top_state_contributions[0].debye_kappa_inv_A
     _assert_positive_finite(debye_kappa_inv_A, f"row {ledger_row.row_id}.debye_kappa_inv_A")
     return debye_kappa_inv_A
+
+
+def _median_value(values: Sequence[float]) -> float:
+    if not values:
+        raise ValueError("cannot compute median for an empty sequence")
+    sorted_values = sorted(float(value) for value in values)
+    middle_index = len(sorted_values) // 2
+    if len(sorted_values) % 2 == 1:
+        return sorted_values[middle_index]
+    lower_value = sorted_values[middle_index - 1]
+    upper_value = sorted_values[middle_index]
+    if math.isinf(lower_value) or math.isinf(upper_value):
+        if lower_value == upper_value:
+            return lower_value
+        if lower_value >= 0.0 and math.isinf(upper_value):
+            return math.inf
+        if upper_value <= 0.0 and math.isinf(lower_value):
+            return -math.inf
+        raise ValueError("median input has mixed-sign infinities")
+    return 0.5 * (lower_value + upper_value)
+
+
+def _iqr_value(values: Sequence[float]) -> float:
+    if not values:
+        raise ValueError("cannot compute IQR for an empty sequence")
+    value_array = np.asarray(values, dtype=float)
+    if not np.all(np.isfinite(value_array)):
+        raise ValueError("IQR input contains non-finite value")
+    lower_quantile, upper_quantile = np.quantile(
+        value_array,
+        (LOWER_QUARTILE_FRACTION, UPPER_QUARTILE_FRACTION),
+    )
+    return float(upper_quantile - lower_quantile)
 
 
 def _quantile_cuts(values: Sequence[float]) -> tuple[float, float, float]:

@@ -28,6 +28,12 @@ from conductivity.ion_atmosphere import (
     BulkIonAtmosphereState,
     build_bulk_ion_atmosphere_state,
 )
+from conductivity.finite_mori_conductivity import (
+    MORI_NUMERICAL_TOLERANCE,
+    ProjectedMoriConductivityInput,
+    ProjectedMoriConductivityResult,
+    compute_projected_mori_conductivity,
+)
 from data.species_data import ADDITIVES, SOLVENTS
 from utils.config_cache import load_physics_config
 from utils.strict_validation import require_float, require_mapping
@@ -62,6 +68,15 @@ SUPPORTED_RELAXATION_DYNAMIC_RESPONSES = (
     RELAXATION_DYNAMIC_RESPONSE_OFF,
     RELAXATION_DYNAMIC_RESPONSE_STATE_LIFETIME,
 )
+ANION_DIAGONAL_RELAXATION_FORM_FACTOR_OFF = "off"
+ANION_DIAGONAL_RELAXATION_FORM_FACTOR_RESOLVED_STATE_FINITE_SIZE = "resolved_state_finite_size"
+SUPPORTED_ANION_DIAGONAL_RELAXATION_FORM_FACTORS = (
+    ANION_DIAGONAL_RELAXATION_FORM_FACTOR_OFF,
+    ANION_DIAGONAL_RELAXATION_FORM_FACTOR_RESOLVED_STATE_FINITE_SIZE,
+)
+GAUSSIAN_SELF_FORM_FACTOR_SQUARED_DENOMINATOR = 3.0  # Squared Gaussian charge-cloud form, exp[-(ka)^2/3].
+CHARGE_CLOUD_SOURCE_NOT_APPLICABLE = "not_applicable_non_anion_center"
+CHARGE_CLOUD_SOURCE_WEIGHTED_MISSING = "weighted_anion_missing_partial_charge_geometry"
 PAIR_BASIN_QUADRATURE_POINTS = MASS_BALANCE_MAX_ITERATIONS
 COULOMB_DENOMINATOR_FACTOR = 4.0  # Analytical Coulomb denominator: 4*pi*epsilon.
 EXTERNAL_BATH_CONCENTRATION_TOLERANCE_MOL_M3 = (
@@ -123,6 +138,10 @@ class ChargedCenter:
     shape_factor: float
     local_diffusion_m2_s: float
     relative_position_m: tuple[float, float, float]
+    charge_cloud_radius_available: bool
+    charge_cloud_radius_A: float
+    charge_cloud_source: str
+    charge_cloud_site_count: int
 
 
 @dataclass(frozen=True)
@@ -148,6 +167,7 @@ class TransportState:
     atmosphere_lifetime_gate: float
     atmosphere_diagnostic_lifetime_gate: float
     relaxation_dynamic_response: str
+    anion_diagonal_relaxation_form_factor: str
     relaxation_lifetime_gate: float
     relaxation_resistance_before_gate_kg_s: tuple[tuple[float, ...], ...]
     relaxation_resistance_after_gate_kg_s: tuple[tuple[float, ...], ...]
@@ -167,6 +187,7 @@ class StateAtmosphereResistance:
     applied_lifetime_gate: float
     diagnostic_lifetime_gate: float
     relaxation_dynamic_response: str
+    anion_diagonal_relaxation_form_factor: str
     relaxation_lifetime_gate: float
     relaxation_resistance_before_gate_kg_s: tuple[tuple[float, ...], ...]
     relaxation_resistance_after_gate_kg_s: tuple[tuple[float, ...], ...]
@@ -254,6 +275,7 @@ class KernelDerivedMarkovModel:
     bulk_ion_atmosphere_state: BulkIonAtmosphereState
     atmosphere_bath_basis: str
     relaxation_dynamic_response: str
+    anion_diagonal_relaxation_form_factor: str
     mixture_audit: MixtureKernelAudit
     transition_audit: tuple[TransitionAuditRow, ...]
     capacity_evaluation: str
@@ -317,6 +339,7 @@ class FiniteMarkovConductivityResult:
     detailed_balance_residual_s_inv: float
     capacity_evaluation: str
     generated_model: KernelDerivedMarkovModel | None
+    projected_mori_conductivity: ProjectedMoriConductivityResult
 
 
 def evaluate_finite_markov_conductivity(
@@ -324,9 +347,11 @@ def evaluate_finite_markov_conductivity(
     temperature_K: float,
     atmosphere_bath_basis: str = ATMOSPHERE_BATH_BASIS_TOTAL_FORMAL,
     relaxation_dynamic_response: str = RELAXATION_DYNAMIC_RESPONSE_OFF,
+    anion_diagonal_relaxation_form_factor: str = ANION_DIAGONAL_RELAXATION_FORM_FACTOR_OFF,
 ) -> FiniteMarkovConductivityResult:
     _validate_atmosphere_bath_basis(atmosphere_bath_basis)
     _validate_relaxation_dynamic_response(relaxation_dynamic_response)
+    _validate_anion_diagonal_relaxation_form_factor(anion_diagonal_relaxation_form_factor)
     physics_config = load_physics_config()
     kernel_state = build_transport_kernel_state(recipe, temperature_K, physics_config)
     markov_model = build_kernel_derived_markov_model(
@@ -335,6 +360,7 @@ def evaluate_finite_markov_conductivity(
         physics_config,
         atmosphere_bath_basis,
         relaxation_dynamic_response,
+        anion_diagonal_relaxation_form_factor,
     )
     return compute_finite_markov_conductivity(
         FiniteMarkovInput(
@@ -414,27 +440,40 @@ def compute_finite_markov_conductivity(
         axis_jump_diffusivities.append(jump_axis)
         axis_diffusivities.append(vehicular_axis + jump_axis)
 
+    projected_mori_input = _finite_markov_projected_mori_input(
+        state_concentrations_mol_m3,
+        transport_states,
+        markov_additive_edges,
+        poisson_correctors,
+        finite_input.temperature_K,
+    )
+    projected_mori_result = compute_projected_mori_conductivity(projected_mori_input)
+    _validate_projected_mori_axis_densities(
+        projected_mori_result.quadratic_form_by_axis,
+        tuple(axis_diffusivities),
+    )
+
     cation_concentration_mol_m3 = finite_input.cation_concentration_mol_m3
-    D_Q_m2_s = float(np.mean(np.asarray(axis_diffusivities, dtype=float)) / cation_concentration_mol_m3)
+    mori_axis_transport_densities = np.asarray(
+        projected_mori_result.quadratic_form_by_axis,
+        dtype=float,
+    )
+    D_Q_m2_s = float(np.mean(mori_axis_transport_densities) / cation_concentration_mol_m3)
     vehicular_D_Q_m2_s = float(
         np.mean(np.asarray(axis_vehicular_diffusivities, dtype=float)) / cation_concentration_mol_m3
     )
     jump_D_Q_m2_s = float(
         np.mean(np.asarray(axis_jump_diffusivities, dtype=float)) / cation_concentration_mol_m3
     )
-    sigma_S_m = (
-        F
-        * F
-        / (R * finite_input.temperature_K)
-        * float(np.mean(np.asarray(axis_diffusivities, dtype=float)))
-    )
     return FiniteMarkovConductivityResult(
-        sigma_S_m=float(sigma_S_m),
-        sigma_mS_cm=float(sigma_S_m * S_M_TO_MS_CM),
+        sigma_S_m=projected_mori_result.sigma_S_m,
+        sigma_mS_cm=projected_mori_result.sigma_mS_cm,
         D_Q_m2_s=D_Q_m2_s,
         vehicular_D_Q_m2_s=vehicular_D_Q_m2_s,
         jump_D_Q_m2_s=jump_D_Q_m2_s,
-        axis_D_Q_m2_s=tuple(float(value / cation_concentration_mol_m3) for value in axis_diffusivities),
+        axis_D_Q_m2_s=tuple(
+            float(value / cation_concentration_mol_m3) for value in mori_axis_transport_densities
+        ),
         axis_vehicular_D_Q_m2_s=tuple(
             float(value / cation_concentration_mol_m3) for value in axis_vehicular_diffusivities
         ),
@@ -454,7 +493,134 @@ def compute_finite_markov_conductivity(
         ),
         capacity_evaluation=finite_input.capacity_evaluation,
         generated_model=finite_input.generated_model,
+        projected_mori_conductivity=projected_mori_result,
     )
+
+
+def _finite_markov_projected_mori_input(
+    state_concentrations_mol_m3: np.ndarray,
+    transport_states: tuple[TransportState, ...],
+    markov_additive_edges: tuple[MarkovAdditiveEdge, ...],
+    poisson_correctors_m: np.ndarray,
+    temperature_K: float,
+) -> ProjectedMoriConductivityInput:
+    direct_energy_blocks: list[np.ndarray] = []
+    memory_self_energy_blocks: list[np.ndarray] = []
+    current_coupling_blocks: list[np.ndarray] = []
+
+    for state_index, transport_state in enumerate(transport_states):
+        center_count = len(transport_state.charged_centers)
+        if center_count == 0:
+            continue
+        state_concentration_mol_m3 = float(state_concentrations_mol_m3[state_index])
+        _assert_nonnegative_finite(
+            state_concentration_mol_m3,
+            f"{transport_state.label}.concentration_mol_m3",
+        )
+        direct_resistance_matrix = _transport_state_local_resistance_matrix_kg_s(
+            transport_state,
+            temperature_K,
+        )
+        memory_resistance_matrix = _transport_state_memory_resistance_matrix_kg_s(
+            transport_state,
+            temperature_K,
+        )
+        direct_energy_blocks.append(direct_resistance_matrix / (K_B * temperature_K))
+        memory_self_energy_blocks.append(memory_resistance_matrix / (K_B * temperature_K))
+        charge_vector = np.asarray(
+            [charged_center.charge for charged_center in transport_state.charged_centers],
+            dtype=float,
+        )
+        state_current_coupling = math.sqrt(state_concentration_mol_m3) * charge_vector
+        current_coupling_blocks.append(
+            np.tile(state_current_coupling, (AXIS_COUNT, 1))
+        )
+
+    for edge in markov_additive_edges:
+        edge_rate_s_inv = float(edge.rate_s_inv)
+        source_concentration_mol_m3 = float(state_concentrations_mol_m3[edge.source_index])
+        _assert_nonnegative_finite(source_concentration_mol_m3, f"{edge.label}.source_concentration_mol_m3")
+        _assert_positive_finite(edge_rate_s_inv, f"{edge.label}.rate_s_inv")
+        source_rate_density_mol_m3_s = source_concentration_mol_m3 * edge_rate_s_inv
+        if source_rate_density_mol_m3_s == 0.0:
+            continue
+        direct_energy_blocks.append(np.asarray([[2.0 / source_rate_density_mol_m3_s]], dtype=float))
+        memory_self_energy_blocks.append(np.zeros((1, 1), dtype=float))
+        corrected_displacement_by_axis_m = np.asarray(
+            [
+                edge.displacement_m[axis_index]
+                + poisson_correctors_m[edge.target_index, axis_index]
+                - poisson_correctors_m[edge.source_index, axis_index]
+                for axis_index in range(AXIS_COUNT)
+            ],
+            dtype=float,
+        )
+        current_coupling_blocks.append(corrected_displacement_by_axis_m.reshape(AXIS_COUNT, 1))
+
+    direct_energy_matrix = _block_diagonal_matrix(direct_energy_blocks)
+    memory_self_energy_matrix = _block_diagonal_matrix(memory_self_energy_blocks)
+    current_coupling_matrix = _horizontally_concatenated_current_coupling_matrix(
+        current_coupling_blocks,
+    )
+    return ProjectedMoriConductivityInput(
+        direct_energy_matrix=direct_energy_matrix,
+        memory_self_energy_matrix=memory_self_energy_matrix,
+        current_coupling_matrix=current_coupling_matrix,
+        beta_over_volume=F * F / (R * temperature_K),
+    )
+
+
+def _block_diagonal_matrix(blocks: list[np.ndarray]) -> np.ndarray:
+    if not blocks:
+        return np.zeros((1, 1), dtype=float)
+    total_dimension = sum(block.shape[0] for block in blocks)
+    block_diagonal_matrix = np.zeros((total_dimension, total_dimension), dtype=float)
+    offset = 0
+    for matrix_block in blocks:
+        if matrix_block.ndim != 2:
+            raise ValueError("projected Mori matrix block must be two-dimensional")
+        if matrix_block.shape[0] != matrix_block.shape[1]:
+            raise ValueError(f"projected Mori matrix block must be square, got {matrix_block.shape}")
+        next_offset = offset + matrix_block.shape[0]
+        block_diagonal_matrix[offset:next_offset, offset:next_offset] = matrix_block
+        offset = next_offset
+    return block_diagonal_matrix
+
+
+def _horizontally_concatenated_current_coupling_matrix(blocks: list[np.ndarray]) -> np.ndarray:
+    if not blocks:
+        return np.zeros((AXIS_COUNT, 1), dtype=float)
+    for current_coupling_block in blocks:
+        if current_coupling_block.ndim != 2:
+            raise ValueError("projected Mori current coupling block must be two-dimensional")
+        if current_coupling_block.shape[0] != AXIS_COUNT:
+            raise ValueError(
+                "projected Mori current coupling block axis count mismatch: "
+                f"{current_coupling_block.shape[0]} != {AXIS_COUNT}"
+            )
+    return np.concatenate(blocks, axis=1)
+
+
+def _validate_projected_mori_axis_densities(
+    projected_axis_transport_densities: tuple[float, float, float],
+    direct_axis_transport_densities: tuple[float, float, float],
+) -> None:
+    for axis_index, projected_axis_density in enumerate(projected_axis_transport_densities):
+        direct_axis_density = direct_axis_transport_densities[axis_index]
+        density_scale = max(
+            abs(projected_axis_density),
+            abs(direct_axis_density),
+            np.finfo(float).tiny,
+        )
+        allowed_difference = MORI_NUMERICAL_TOLERANCE * density_scale
+        density_difference = abs(projected_axis_density - direct_axis_density)
+        if density_difference > allowed_difference:
+            raise ValueError(
+                "projected Mori readout does not match finite Markov density "
+                f"for axis {axis_index}: projected={projected_axis_density}, "
+                f"direct={direct_axis_density}, difference={density_difference}, "
+                f"allowed={allowed_difference}"
+            )
 
 
 def solve_poisson_corrector(
@@ -552,11 +718,30 @@ def _transport_state_resistance_matrix_kg_s(
     transport_state: TransportState,
     temperature_K: float,
 ) -> np.ndarray:
+    return (
+        _transport_state_local_resistance_matrix_kg_s(transport_state, temperature_K)
+        + _transport_state_memory_resistance_matrix_kg_s(transport_state, temperature_K)
+    )
+
+
+def _transport_state_local_resistance_matrix_kg_s(
+    transport_state: TransportState,
+    temperature_K: float,
+) -> np.ndarray:
     center_count = len(transport_state.charged_centers)
     resistance_matrix = np.zeros((center_count, center_count), dtype=float)
     for center_index, charged_center in enumerate(transport_state.charged_centers):
         _assert_positive_finite(charged_center.local_diffusion_m2_s, f"{charged_center.label}.local_diffusion_m2_s")
         resistance_matrix[center_index, center_index] = K_B * temperature_K / charged_center.local_diffusion_m2_s
+    return resistance_matrix
+
+
+def _transport_state_memory_resistance_matrix_kg_s(
+    transport_state: TransportState,
+    temperature_K: float,
+) -> np.ndarray:
+    center_count = len(transport_state.charged_centers)
+    resistance_matrix = np.zeros((center_count, center_count), dtype=float)
     for constraint in transport_state.constraints:
         constraint_vector = np.asarray(constraint.vector, dtype=float)
         if constraint_vector.shape != (center_count,):
@@ -567,11 +752,10 @@ def _transport_state_resistance_matrix_kg_s(
             constraint.length_m * constraint.length_m
         )
         resistance_matrix += constraint_strength_kg_s * np.outer(constraint_vector, constraint_vector)
-    atmosphere_resistance_matrix = _transport_state_atmosphere_resistance_matrix_kg_s(
+    resistance_matrix += _transport_state_atmosphere_resistance_matrix_kg_s(
         transport_state,
         center_count,
     )
-    resistance_matrix += atmosphere_resistance_matrix
     return resistance_matrix
 
 
@@ -608,10 +792,12 @@ def build_kernel_derived_markov_model(
     physics_config,
     atmosphere_bath_basis: str = ATMOSPHERE_BATH_BASIS_TOTAL_FORMAL,
     relaxation_dynamic_response: str = RELAXATION_DYNAMIC_RESPONSE_OFF,
+    anion_diagonal_relaxation_form_factor: str = ANION_DIAGONAL_RELAXATION_FORM_FACTOR_OFF,
 ) -> KernelDerivedMarkovModel:
     _assert_positive_finite(temperature_K, "temperature_K")
     _validate_atmosphere_bath_basis(atmosphere_bath_basis)
     _validate_relaxation_dynamic_response(relaxation_dynamic_response)
+    _validate_anion_diagonal_relaxation_form_factor(anion_diagonal_relaxation_form_factor)
 
     total_cation_molarity_M = _total_cation_molarity(kernel_state)
     cation_concentration_mol_m3 = total_cation_molarity_M * MOLARITY_TO_MOL_M3
@@ -674,6 +860,7 @@ def build_kernel_derived_markov_model(
         bulk_ion_atmosphere_state,
         atmosphere_bath_basis,
         relaxation_dynamic_response,
+        anion_diagonal_relaxation_form_factor,
         physics_config,
     )
     transport_states = transport_state_build[0]
@@ -717,6 +904,7 @@ def build_kernel_derived_markov_model(
         bulk_ion_atmosphere_state=bulk_ion_atmosphere_state,
         atmosphere_bath_basis=atmosphere_bath_basis,
         relaxation_dynamic_response=relaxation_dynamic_response,
+        anion_diagonal_relaxation_form_factor=anion_diagonal_relaxation_form_factor,
         mixture_audit=mixture_audit,
         transition_audit=reversible_generator.transition_audit,
         capacity_evaluation="kramers_asymptotic",
@@ -1828,6 +2016,10 @@ def _anion_charged_center_by_feature(
                 "anion_center_diffusivity_by_feature_m2_s",
             ),
             relative_position_m=(0.0, 0.0, 0.0),
+            charge_cloud_radius_available=anion_site.charge_cloud_radius_available,
+            charge_cloud_radius_A=anion_site.charge_cloud_radius_A,
+            charge_cloud_source=anion_site.charge_cloud_source,
+            charge_cloud_site_count=anion_site.charge_cloud_site_count,
         )
     return charged_center_by_feature
 
@@ -1843,10 +2035,12 @@ def _transport_states(
     bulk_ion_atmosphere_state: BulkIonAtmosphereState,
     atmosphere_bath_basis: str,
     relaxation_dynamic_response: str,
+    anion_diagonal_relaxation_form_factor: str,
     physics_config,
 ) -> tuple[tuple[TransportState, ...], tuple[MotifBindingKinetics, ...]]:
     _validate_atmosphere_bath_basis(atmosphere_bath_basis)
     _validate_relaxation_dynamic_response(relaxation_dynamic_response)
+    _validate_anion_diagonal_relaxation_form_factor(anion_diagonal_relaxation_form_factor)
     cation_center_label = kernel_state.site_measure.cation.canonical_feature_id
     weighted_anion_center = ChargedCenter(
         label="weighted_anion",
@@ -1858,6 +2052,10 @@ def _transport_states(
             temperature_K,
         ),
         relative_position_m=(0.0, 0.0, 0.0),
+        charge_cloud_radius_available=False,
+        charge_cloud_radius_A=0.0,
+        charge_cloud_source=CHARGE_CLOUD_SOURCE_WEIGHTED_MISSING,
+        charge_cloud_site_count=0,
     )
     anion_center_by_feature = _anion_charged_center_by_feature(
         kernel_state,
@@ -1882,6 +2080,10 @@ def _transport_states(
                 "state_cation_diffusion_m2_s",
             ),
             relative_position_m=(0.0, 0.0, 0.0),
+            charge_cloud_radius_available=False,
+            charge_cloud_radius_A=0.0,
+            charge_cloud_source=CHARGE_CLOUD_SOURCE_NOT_APPLICABLE,
+            charge_cloud_site_count=0,
         )
         if motif.kind is ChemicalMotifKind.SOLVENT_CAGE:
             charged_centers = (cation_center,)
@@ -1981,6 +2183,8 @@ def _transport_states(
             state_concentration_mol_m3=float(state_concentrations_mol_m3[state_index]),
             atmosphere_bath_basis=atmosphere_bath_basis,
             relaxation_dynamic_response=relaxation_dynamic_response,
+            anion_diagonal_relaxation_form_factor=anion_diagonal_relaxation_form_factor,
+            motif_kind=motif.kind,
             temperature_K=temperature_K,
         )
         transport_states.append(
@@ -2002,6 +2206,9 @@ def _transport_states(
                 ),
                 relaxation_dynamic_response=(
                     state_atmosphere_resistance.relaxation_dynamic_response
+                ),
+                anion_diagonal_relaxation_form_factor=(
+                    state_atmosphere_resistance.anion_diagonal_relaxation_form_factor
                 ),
                 relaxation_lifetime_gate=state_atmosphere_resistance.relaxation_lifetime_gate,
                 relaxation_resistance_before_gate_kg_s=(
@@ -2035,10 +2242,13 @@ def _state_atmosphere_resistance(
     state_concentration_mol_m3: float,
     atmosphere_bath_basis: str,
     relaxation_dynamic_response: str,
+    anion_diagonal_relaxation_form_factor: str,
+    motif_kind: ChemicalMotifKind,
     temperature_K: float,
 ) -> StateAtmosphereResistance:
     _validate_atmosphere_bath_basis(atmosphere_bath_basis)
     _validate_relaxation_dynamic_response(relaxation_dynamic_response)
+    _validate_anion_diagonal_relaxation_form_factor(anion_diagonal_relaxation_form_factor)
     state_bulk_ion_atmosphere_state = _state_bulk_ion_atmosphere_state(
         kernel_state=kernel_state,
         charged_centers=charged_centers,
@@ -2072,6 +2282,7 @@ def _state_atmosphere_resistance(
             applied_lifetime_gate=1.0,
             diagnostic_lifetime_gate=diagnostic_lifetime_gate,
             relaxation_dynamic_response=relaxation_dynamic_response,
+            anion_diagonal_relaxation_form_factor=anion_diagonal_relaxation_form_factor,
             relaxation_lifetime_gate=1.0,
             relaxation_resistance_before_gate_kg_s=(),
             relaxation_resistance_after_gate_kg_s=(),
@@ -2113,12 +2324,19 @@ def _state_atmosphere_resistance(
         ),
         kappa_inv_m=state_bulk_ion_atmosphere_state.kappa_inv_m,
     )
-    relaxation_atmosphere_matrix = state_form_factor_atmosphere_resistance_kg_s(
+    point_relaxation_atmosphere_matrix = state_form_factor_atmosphere_resistance_kg_s(
         charged_centers=charged_centers,
         single_center_atmosphere_resistance_kg_s=tuple(
             relaxation_single_center_resistance_values_kg_s
         ),
         kappa_inv_m=state_bulk_ion_atmosphere_state.kappa_inv_m,
+    )
+    relaxation_atmosphere_matrix = _finite_size_anion_diagonal_relaxation_matrix_kg_s(
+        charged_centers,
+        point_relaxation_atmosphere_matrix,
+        motif_kind,
+        state_bulk_ion_atmosphere_state.kappa_inv_m,
+        anion_diagonal_relaxation_form_factor,
     )
     state_lifetime_s = _state_atmosphere_lifetime_s(constraints)
     relaxation_time_s = _debye_falkenhagen_relaxation_time_s(
@@ -2146,6 +2364,7 @@ def _state_atmosphere_resistance(
         applied_lifetime_gate=applied_lifetime_gate,
         diagnostic_lifetime_gate=diagnostic_lifetime_gate,
         relaxation_dynamic_response=relaxation_dynamic_response,
+        anion_diagonal_relaxation_form_factor=anion_diagonal_relaxation_form_factor,
         relaxation_lifetime_gate=relaxation_lifetime_gate,
         relaxation_resistance_before_gate_kg_s=_matrix_to_tuple(relaxation_atmosphere_matrix),
         relaxation_resistance_after_gate_kg_s=_matrix_to_tuple(relaxation_after_gate_matrix),
@@ -2158,6 +2377,112 @@ def _state_atmosphere_resistance(
 
 def _matrix_to_tuple(matrix: np.ndarray) -> tuple[tuple[float, ...], ...]:
     return tuple(tuple(float(value) for value in row) for row in matrix)
+
+
+def _finite_size_anion_diagonal_relaxation_matrix_kg_s(
+    charged_centers: tuple[ChargedCenter, ...],
+    point_relaxation_atmosphere_matrix_kg_s: np.ndarray,
+    motif_kind: ChemicalMotifKind,
+    kappa_inv_m: float,
+    anion_diagonal_relaxation_form_factor: str,
+) -> np.ndarray:
+    _validate_anion_diagonal_relaxation_form_factor(anion_diagonal_relaxation_form_factor)
+    center_count = len(charged_centers)
+    relaxation_atmosphere_matrix = np.asarray(
+        point_relaxation_atmosphere_matrix_kg_s,
+        dtype=float,
+    )
+    if relaxation_atmosphere_matrix.shape != (center_count, center_count):
+        raise ValueError("point relaxation atmosphere matrix shape must match charged centers")
+    finite_size_matrix = np.array(relaxation_atmosphere_matrix, dtype=float, copy=True)
+    if anion_diagonal_relaxation_form_factor == ANION_DIAGONAL_RELAXATION_FORM_FACTOR_OFF:
+        return finite_size_matrix
+    if not _motif_kind_has_resolved_anion_diagonal_form_factor(motif_kind):
+        return finite_size_matrix
+
+    for center_index, charged_center in enumerate(charged_centers):
+        point_resistance_kg_s = float(finite_size_matrix[center_index, center_index])
+        _assert_nonnegative_finite(
+            point_resistance_kg_s,
+            f"{charged_center.label}.point_relaxation_resistance_kg_s",
+        )
+        if charged_center.charge >= 0.0:
+            continue
+        self_form_factor = _anion_diagonal_relaxation_self_form_factor(
+            charged_center,
+            kappa_inv_m,
+        )
+        finite_size_resistance_kg_s = point_resistance_kg_s * self_form_factor
+        if finite_size_resistance_kg_s > point_resistance_kg_s:
+            raise ValueError(
+                "finite-size anion diagonal relaxation increased point relaxation resistance"
+            )
+        finite_size_matrix[center_index, center_index] = finite_size_resistance_kg_s
+    _validate_form_factor_atmosphere_matrix(finite_size_matrix)
+    return finite_size_matrix
+
+
+def _motif_kind_has_resolved_anion_diagonal_form_factor(motif_kind: ChemicalMotifKind) -> bool:
+    return motif_kind in (
+        ChemicalMotifKind.SSIP,
+        ChemicalMotifKind.ADDITIVE_SSIP,
+        ChemicalMotifKind.CIP,
+        ChemicalMotifKind.AGGREGATE,
+        ChemicalMotifKind.LI2A_PLUS,
+        ChemicalMotifKind.LIA2_MINUS,
+        ChemicalMotifKind.LI2A2_NEUTRAL,
+    )
+
+
+def _anion_diagonal_relaxation_self_form_factor(
+    charged_center: ChargedCenter,
+    kappa_inv_m: float,
+) -> float:
+    if charged_center.charge >= 0.0:
+        raise ValueError(
+            f"{charged_center.label} is not an anion center for diagonal relaxation form factor"
+        )
+    if math.isinf(kappa_inv_m):
+        return 1.0
+    _assert_positive_finite(kappa_inv_m, "kappa_inv_m")
+    _assert_positive_finite(charged_center.hydrodynamic_radius_m, f"{charged_center.label}.hydrodynamic_radius_m")
+    _assert_positive_finite(charged_center.shape_factor, f"{charged_center.label}.shape_factor")
+    effective_hydrodynamic_proxy_radius_m = charged_center.hydrodynamic_radius_m * charged_center.shape_factor
+    form_factor_argument = effective_hydrodynamic_proxy_radius_m / kappa_inv_m
+    self_form_factor = math.exp(
+        -(
+            form_factor_argument
+            * form_factor_argument
+            / GAUSSIAN_SELF_FORM_FACTOR_SQUARED_DENOMINATOR
+        )
+    )
+    if self_form_factor < 0.0 or self_form_factor > 1.0 or not math.isfinite(self_form_factor):
+        raise ValueError(f"anion diagonal relaxation self form factor must be in [0, 1], got {self_form_factor}")
+    return self_form_factor
+
+
+def electrostatic_charge_cloud_self_form_factor_squared(
+    charge_cloud_radius_A: float,
+    kappa_inv_m: float,
+) -> float:
+    _assert_nonnegative_finite(charge_cloud_radius_A, "charge_cloud_radius_A")
+    if charge_cloud_radius_A == 0.0 or math.isinf(kappa_inv_m):
+        return 1.0
+    _assert_positive_finite(kappa_inv_m, "kappa_inv_m")
+    charge_cloud_radius_m = charge_cloud_radius_A * ANGSTROM_TO_M
+    form_factor_argument = charge_cloud_radius_m / kappa_inv_m
+    form_factor_squared = math.exp(
+        -(
+            form_factor_argument
+            * form_factor_argument
+            / GAUSSIAN_SELF_FORM_FACTOR_SQUARED_DENOMINATOR
+        )
+    )
+    if form_factor_squared < 0.0 or form_factor_squared > 1.0 or not math.isfinite(form_factor_squared):
+        raise ValueError(
+            f"charge-cloud self form factor squared must be in [0, 1], got {form_factor_squared}"
+        )
+    return form_factor_squared
 
 
 def _state_atmosphere_lifetime_s(
@@ -2677,6 +3002,10 @@ def _positioned_charged_center(
         shape_factor=charged_center.shape_factor,
         local_diffusion_m2_s=charged_center.local_diffusion_m2_s,
         relative_position_m=relative_position_m,
+        charge_cloud_radius_available=charged_center.charge_cloud_radius_available,
+        charge_cloud_radius_A=charged_center.charge_cloud_radius_A,
+        charge_cloud_source=charged_center.charge_cloud_source,
+        charge_cloud_site_count=charged_center.charge_cloud_site_count,
     )
 
 
@@ -3442,6 +3771,7 @@ def _validate_transport_states(
                 center.local_diffusion_m2_s,
                 f"{transport_state.label}.{center.label}.local_diffusion_m2_s",
             )
+            _validate_charged_center_charge_cloud_descriptor(transport_state.label, center)
         for constraint in transport_state.constraints:
             if len(constraint.labels) == 0:
                 raise ValueError(f"{transport_state.label} constraint labels are empty")
@@ -3524,6 +3854,38 @@ def _validate_transport_state_atmosphere_field(
     atmosphere_eigenvalues = np.linalg.eigvalsh(atmosphere_matrix)
     if float(np.min(atmosphere_eigenvalues)) < -REVERSE_DIFFUSION_TOLERANCE:
         raise ValueError(f"{transport_state.label}.{field_name} must be positive semidefinite")
+
+
+def _validate_charged_center_charge_cloud_descriptor(
+    transport_state_label: str,
+    charged_center: ChargedCenter,
+) -> None:
+    descriptor_context = f"{transport_state_label}.{charged_center.label}.charge_cloud"
+    if charged_center.charge_cloud_source == "":
+        raise ValueError(f"{descriptor_context}_source must not be empty")
+    if charged_center.charge_cloud_site_count < 0:
+        raise ValueError(
+            f"{descriptor_context}_site_count must be nonnegative, got "
+            f"{charged_center.charge_cloud_site_count}"
+        )
+    _assert_nonnegative_finite(
+        charged_center.charge_cloud_radius_A,
+        f"{descriptor_context}_radius_A",
+    )
+    if charged_center.charge_cloud_radius_available:
+        if charged_center.charge_cloud_site_count <= 0:
+            raise ValueError(
+                f"{descriptor_context}_site_count must be positive when radius is available"
+            )
+    else:
+        if charged_center.charge_cloud_radius_A != 0.0:
+            raise ValueError(
+                f"{descriptor_context}_radius_A must be zero when radius is unavailable"
+            )
+        if charged_center.charge_cloud_site_count != 0:
+            raise ValueError(
+                f"{descriptor_context}_site_count must be zero when radius is unavailable"
+            )
 
 
 def _transport_state_charge_diffusivity_trace_average_m2_s(
@@ -3687,6 +4049,17 @@ def _validate_relaxation_dynamic_response(relaxation_dynamic_response: str) -> N
         raise ValueError(
             f"Unsupported relaxation_dynamic_response {relaxation_dynamic_response!r}; "
             f"expected one of {SUPPORTED_RELAXATION_DYNAMIC_RESPONSES}"
+        )
+
+
+def _validate_anion_diagonal_relaxation_form_factor(
+    anion_diagonal_relaxation_form_factor: str,
+) -> None:
+    if anion_diagonal_relaxation_form_factor not in SUPPORTED_ANION_DIAGONAL_RELAXATION_FORM_FACTORS:
+        raise ValueError(
+            "Unsupported anion_diagonal_relaxation_form_factor "
+            f"{anion_diagonal_relaxation_form_factor!r}; expected one of "
+            f"{SUPPORTED_ANION_DIAGONAL_RELAXATION_FORM_FACTORS}"
         )
 
 

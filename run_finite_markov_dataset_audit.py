@@ -3,10 +3,22 @@
 from __future__ import annotations
 
 from constants import T_REF_K
+from conductivity.finite_markov_conductivity import (
+    ANION_DIAGONAL_RELAXATION_FORM_FACTOR_OFF,
+    ANION_DIAGONAL_RELAXATION_FORM_FACTOR_RESOLVED_STATE_FINITE_SIZE,
+    ATMOSPHERE_BATH_BASIS_TOTAL_FORMAL,
+    RELAXATION_DYNAMIC_RESPONSE_OFF,
+    RELAXATION_DYNAMIC_RESPONSE_STATE_LIFETIME,
+)
 from conductivity.finite_markov_dataset_audit import (
+    ActiveLearningUtilityMetrics,
+    BaseSpeciationInverseMetrics,
     BiasLedgerRow,
     DatasetAuditResult,
     FamilyAtmosphereMetrics,
+    PredictiveValidationGroupMetrics,
+    PromotionDecisionMetrics,
+    RequiredAnionDiagFactorMetrics,
     audit_empirical_conductivity_dataset,
 )
 from data.electrolyte_property_db import DATA
@@ -16,19 +28,39 @@ TOP_REPORTED_ROWS = 12  # Explicit constant: compact but enough to expose family
 
 
 def main() -> None:
-    audit = audit_empirical_conductivity_dataset(DATA, T_REF_K, "total_formal", "off")
-    relaxation_response_audit = audit_empirical_conductivity_dataset(
+    audit = audit_empirical_conductivity_dataset(
         DATA,
         T_REF_K,
-        "total_formal",
-        "state_lifetime",
+        ATMOSPHERE_BATH_BASIS_TOTAL_FORMAL,
+        RELAXATION_DYNAMIC_RESPONSE_OFF,
+        ANION_DIAGONAL_RELAXATION_FORM_FACTOR_OFF,
+    )
+    state_lifetime_audit = audit_empirical_conductivity_dataset(
+        DATA,
+        T_REF_K,
+        ATMOSPHERE_BATH_BASIS_TOTAL_FORMAL,
+        RELAXATION_DYNAMIC_RESPONSE_STATE_LIFETIME,
+        ANION_DIAGONAL_RELAXATION_FORM_FACTOR_OFF,
+    )
+    finite_size_anion_audit = audit_empirical_conductivity_dataset(
+        DATA,
+        T_REF_K,
+        ATMOSPHERE_BATH_BASIS_TOTAL_FORMAL,
+        RELAXATION_DYNAMIC_RESPONSE_OFF,
+        ANION_DIAGONAL_RELAXATION_FORM_FACTOR_RESOLVED_STATE_FINITE_SIZE,
     )
 
     print("finite_markov_dataset_audit")
     _print_audit_summary("bath_basis=total_formal relaxation_dynamic_response=off", audit)
     _print_audit_summary(
-        "bath_basis=total_formal relaxation_dynamic_response=state_lifetime",
-        relaxation_response_audit,
+        "bath_basis=total_formal relaxation_dynamic_response=state_lifetime "
+        "anion_diagonal_relaxation_form_factor=off",
+        state_lifetime_audit,
+    )
+    _print_audit_summary(
+        "bath_basis=total_formal relaxation_dynamic_response=off "
+        "anion_diagonal_relaxation_form_factor=resolved_state_finite_size",
+        finite_size_anion_audit,
     )
 
     print("salt_family_metrics")
@@ -45,8 +77,30 @@ def main() -> None:
     for family_metrics in audit.family_atmosphere_metrics:
         _print_family_atmosphere_metrics(family_metrics)
 
-    print("relaxation_dynamic_response_grouped_deltas")
-    _print_grouped_delta_metrics(audit, relaxation_response_audit)
+    print("required_anion_diag_factor_metrics")
+    for required_factor_metrics in audit.required_anion_diag_factor_metrics:
+        _print_required_anion_diag_factor_metrics(required_factor_metrics)
+
+    print("base_speciation_inverse_metrics")
+    for inverse_metrics in audit.base_speciation_inverse_metrics:
+        _print_base_speciation_inverse_metrics(inverse_metrics)
+
+    print("promotion_decision_metrics")
+    for decision_metrics in audit.promotion_decision_metrics:
+        _print_promotion_decision_metrics(decision_metrics)
+
+    print("predictive_validation_group_metrics")
+    for validation_metrics in audit.predictive_validation_group_metrics:
+        _print_predictive_validation_group_metrics(validation_metrics)
+
+    print("active_learning_utility_metrics")
+    _print_active_learning_utility_metrics(audit.active_learning_utility_metrics)
+
+    print("state_lifetime_grouped_deltas")
+    _print_grouped_delta_metrics(audit, state_lifetime_audit)
+
+    print("anion_diagonal_relaxation_form_factor_grouped_deltas")
+    _print_grouped_delta_metrics(audit, finite_size_anion_audit)
 
     print("worst_rows")
     worst_rows = sorted(
@@ -62,11 +116,16 @@ def main() -> None:
         for failure in audit.failures:
             print(f"row_id={failure.row_id} error={failure.error}")
         raise SystemExit("finite Markov dataset audit had failed empirical rows")
-    if relaxation_response_audit.failures:
-        print("relaxation_response_failed_rows_detail")
-        for failure in relaxation_response_audit.failures:
+    if state_lifetime_audit.failures:
+        print("state_lifetime_failed_rows_detail")
+        for failure in state_lifetime_audit.failures:
             print(f"row_id={failure.row_id} error={failure.error}")
-        raise SystemExit("relaxation-response dataset audit had failed empirical rows")
+        raise SystemExit("state-lifetime dataset audit had failed empirical rows")
+    if finite_size_anion_audit.failures:
+        print("finite_size_anion_failed_rows_detail")
+        for failure in finite_size_anion_audit.failures:
+            print(f"row_id={failure.row_id} error={failure.error}")
+        raise SystemExit("finite-size anion dataset audit had failed empirical rows")
 
 
 def _print_audit_summary(label: str, audit: DatasetAuditResult) -> None:
@@ -98,6 +157,8 @@ def _print_family_atmosphere_metrics(family_metrics: FamilyAtmosphereMetrics) ->
         f"mean_log_atmosphere_error={family_metrics.mean_log_atmosphere_error:.6f} "
         f"mean_log_ep_error={family_metrics.mean_log_ep_error:.6f} "
         f"mean_log_rel_error={family_metrics.mean_log_rel_error:.6f} "
+        f"mean_log_rel_Li_error={family_metrics.mean_log_rel_Li_error:.6f} "
+        f"mean_log_rel_anion_error={family_metrics.mean_log_rel_anion_error:.6f} "
         f"mean_log_rel_diag_error={family_metrics.mean_log_rel_diag_error:.6f} "
         f"mean_log_rel_cross_error={family_metrics.mean_log_rel_cross_error:.6f} "
         f"mean_log_rel_before_gate_error={family_metrics.mean_log_rel_before_gate_error:.6f} "
@@ -107,6 +168,8 @@ def _print_family_atmosphere_metrics(family_metrics: FamilyAtmosphereMetrics) ->
         f"H_ratio={family_metrics.mean_H_ratio:.6f} "
         f"H_ep={family_metrics.mean_H_ep:.6f} "
         f"H_rel={family_metrics.mean_H_rel:.6f} "
+        f"H_rel_Li={family_metrics.mean_H_rel_Li:.6f} "
+        f"H_rel_anion={family_metrics.mean_H_rel_anion:.6f} "
         f"H_rel_diag={family_metrics.mean_H_rel_diag:.6f} "
         f"H_rel_cross={family_metrics.mean_H_rel_cross:.6f} "
         f"H_rel_before_gate={family_metrics.mean_H_rel_before_gate:.6f} "
@@ -117,6 +180,10 @@ def _print_family_atmosphere_metrics(family_metrics: FamilyAtmosphereMetrics) ->
         f"r_atm_current_over_target={family_metrics.mean_r_atm_current_over_target:.6f} "
         f"drag_ep_current_over_target={family_metrics.mean_drag_ep_current_over_target:.6f} "
         f"drag_rel_current_over_target={family_metrics.mean_drag_rel_current_over_target:.6f} "
+        f"drag_rel_Li_current_over_target="
+        f"{family_metrics.mean_drag_rel_Li_current_over_target:.6f} "
+        f"drag_rel_anion_current_over_target="
+        f"{family_metrics.mean_drag_rel_anion_current_over_target:.6f} "
         f"drag_rel_diag_current_over_target="
         f"{family_metrics.mean_drag_rel_diag_current_over_target:.6f} "
         f"drag_rel_cross_current_over_target="
@@ -126,11 +193,120 @@ def _print_family_atmosphere_metrics(family_metrics: FamilyAtmosphereMetrics) ->
         f"drag_rel_after_gate_current_over_target="
         f"{family_metrics.mean_drag_rel_after_gate_current_over_target:.6f} "
         f"relaxation_gate={family_metrics.mean_relaxation_lifetime_gate:.6f} "
+        f"g_anion_diag_required={family_metrics.mean_g_anion_diag_required:.6f} "
+        f"anion_charge_cloud_radius_required_A="
+        f"{family_metrics.mean_anion_charge_cloud_radius_required_A:.6f} "
+        f"hydrodynamic_radius_A={family_metrics.mean_hydrodynamic_radius_A:.6f} "
+        f"shape_factor={family_metrics.mean_shape_factor:.6f} "
+        f"current_self_form_factor={family_metrics.mean_current_self_form_factor:.6f} "
         f"eta_rel={family_metrics.mean_eta_rel:.6f} "
         f"kappa_inv_A={family_metrics.mean_kappa_inv_A:.6f} "
         f"ionic_strength_mol_m3={family_metrics.mean_ionic_strength_mol_m3:.6f} "
         f"top_state={family_metrics.dominant_top_state} "
         f"owner={family_metrics.owner}"
+    )
+
+
+def _print_required_anion_diag_factor_metrics(
+    required_factor_metrics: RequiredAnionDiagFactorMetrics,
+) -> None:
+    print(
+        f"group={required_factor_metrics.group_name} "
+        f"value={required_factor_metrics.group_value} "
+        f"count={required_factor_metrics.count} "
+        f"median_g_required={required_factor_metrics.median_g_required:.6f} "
+        f"IQR_g_required={required_factor_metrics.iqr_g_required:.6f} "
+        f"status_counts={_format_int_map(required_factor_metrics.status_counts)} "
+        f"median_charge_cloud_radius_required_A="
+        f"{required_factor_metrics.median_charge_cloud_radius_required_A:.6f} "
+        f"median_hydrodynamic_radius_A="
+        f"{required_factor_metrics.median_hydrodynamic_radius_A:.6f} "
+        f"median_shape_factor={required_factor_metrics.median_shape_factor:.6f} "
+        f"median_current_self_form_factor="
+        f"{required_factor_metrics.median_current_self_form_factor:.6f} "
+        f"charge_cloud_descriptor_covered_count="
+        f"{required_factor_metrics.charge_cloud_descriptor_covered_count} "
+        f"median_charge_cloud_descriptor_radius_A="
+        f"{required_factor_metrics.median_charge_cloud_descriptor_radius_A:.6f} "
+        f"charge_cloud_source_counts={_format_int_map(required_factor_metrics.charge_cloud_source_counts)} "
+        f"mean_signed_error_mS_cm={required_factor_metrics.mean_signed_error_mS_cm:.6f}"
+    )
+
+
+def _print_base_speciation_inverse_metrics(
+    inverse_metrics: BaseSpeciationInverseMetrics,
+) -> None:
+    print(
+        f"group={inverse_metrics.group_name} "
+        f"value={inverse_metrics.group_value} "
+        f"count={inverse_metrics.count} "
+        f"median_DeltaG_K_req_kJ_mol="
+        f"{inverse_metrics.median_association_required_deltaG_kJ_mol:.6f} "
+        f"IQR_DeltaG_K_req_kJ_mol="
+        f"{inverse_metrics.iqr_association_required_deltaG_kJ_mol:.6f} "
+        f"median_DeltaG_D_req_kJ_mol="
+        f"{inverse_metrics.median_base_mobility_required_deltaG_kJ_mol:.6f} "
+        f"IQR_DeltaG_D_req_kJ_mol="
+        f"{inverse_metrics.iqr_base_mobility_required_deltaG_kJ_mol:.6f} "
+        f"mean_signed_error_mS_cm={inverse_metrics.mean_signed_error_mS_cm:.6f}"
+    )
+
+
+def _print_promotion_decision_metrics(
+    decision_metrics: PromotionDecisionMetrics,
+) -> None:
+    print(
+        f"branch={decision_metrics.branch_name} "
+        f"group={decision_metrics.group_name} "
+        f"value={decision_metrics.group_value} "
+        f"count={decision_metrics.count} "
+        f"decision={decision_metrics.decision} "
+        f"candidate={decision_metrics.candidate} "
+        f"rationale={decision_metrics.rationale}"
+    )
+
+
+def _print_predictive_validation_group_metrics(
+    validation_metrics: PredictiveValidationGroupMetrics,
+) -> None:
+    print(
+        f"group={validation_metrics.group_name} "
+        f"value={validation_metrics.group_value} "
+        f"count={validation_metrics.count} "
+        f"calibration_count={validation_metrics.calibration_count} "
+        f"mae={validation_metrics.mae_mS_cm:.6f} "
+        f"rmse={validation_metrics.rmse_mS_cm:.6f} "
+        f"bias={validation_metrics.bias_mS_cm:.6f} "
+        f"pearson_available={validation_metrics.pearson_r_available} "
+        f"pearson_r={validation_metrics.pearson_r:.6f} "
+        f"conformal_abs_error_80="
+        f"{validation_metrics.conformal_abs_error_80_mS_cm:.6f} "
+        f"conformal_coverage_80={validation_metrics.conformal_coverage_80:.6f} "
+        f"conformal_abs_error_90="
+        f"{validation_metrics.conformal_abs_error_90_mS_cm:.6f} "
+        f"conformal_coverage_90={validation_metrics.conformal_coverage_90:.6f} "
+        f"decision={validation_metrics.decision} "
+        f"rationale={validation_metrics.rationale}"
+    )
+
+
+def _print_active_learning_utility_metrics(
+    utility_metrics: ActiveLearningUtilityMetrics,
+) -> None:
+    print(
+        f"candidate_count={utility_metrics.candidate_count} "
+        f"selected_count={utility_metrics.selected_count} "
+        f"hit_threshold_mS_cm={utility_metrics.hit_threshold_mS_cm:.6f} "
+        f"selected_hit_count={utility_metrics.selected_hit_count} "
+        f"true_hit_count={utility_metrics.true_hit_count} "
+        f"selected_hit_rate={utility_metrics.selected_hit_rate:.6f} "
+        f"random_hit_rate={utility_metrics.random_hit_rate:.6f} "
+        f"enrichment_over_random={utility_metrics.enrichment_over_random:.6f} "
+        f"best_measured_mS_cm={utility_metrics.best_measured_mS_cm:.6f} "
+        f"best_selected_measured_mS_cm={utility_metrics.best_selected_measured_mS_cm:.6f} "
+        f"regret_mS_cm={utility_metrics.regret_mS_cm:.6f} "
+        f"decision={utility_metrics.decision} "
+        f"rationale={utility_metrics.rationale}"
     )
 
 
@@ -176,6 +352,18 @@ def _print_grouped_delta_metrics(
                 f"{baseline_metrics.mean_drag_rel_current_over_target:.6f} "
                 f"drag_rel_current_over_target_comparison="
                 f"{comparison_metrics.mean_drag_rel_current_over_target:.6f} "
+                f"delta_drag_rel_Li_current_over_target="
+                f"{comparison_metrics.mean_drag_rel_Li_current_over_target - baseline_metrics.mean_drag_rel_Li_current_over_target:.6f} "
+                f"drag_rel_Li_current_over_target_baseline="
+                f"{baseline_metrics.mean_drag_rel_Li_current_over_target:.6f} "
+                f"drag_rel_Li_current_over_target_comparison="
+                f"{comparison_metrics.mean_drag_rel_Li_current_over_target:.6f} "
+                f"delta_drag_rel_anion_current_over_target="
+                f"{comparison_metrics.mean_drag_rel_anion_current_over_target - baseline_metrics.mean_drag_rel_anion_current_over_target:.6f} "
+                f"drag_rel_anion_current_over_target_baseline="
+                f"{baseline_metrics.mean_drag_rel_anion_current_over_target:.6f} "
+                f"drag_rel_anion_current_over_target_comparison="
+                f"{comparison_metrics.mean_drag_rel_anion_current_over_target:.6f} "
                 f"delta_drag_rel_diag_current_over_target="
                 f"{comparison_metrics.mean_drag_rel_diag_current_over_target - baseline_metrics.mean_drag_rel_diag_current_over_target:.6f} "
                 f"drag_rel_diag_current_over_target_baseline="
@@ -233,6 +421,8 @@ def _print_worst_row(ledger_row: BiasLedgerRow) -> None:
         f"H_atmosphere_target={ledger_row.H_atmosphere_target:.6f} "
         f"H_ep={ledger_row.H_ep:.6f} "
         f"H_rel={ledger_row.H_rel:.6f} "
+        f"H_rel_Li={ledger_row.H_rel_Li:.6f} "
+        f"H_rel_anion={ledger_row.H_rel_anion:.6f} "
         f"H_rel_diag={ledger_row.H_rel_diag:.6f} "
         f"H_rel_cross={ledger_row.H_rel_cross:.6f} "
         f"H_rel_before_gate={ledger_row.H_rel_before_gate:.6f} "
@@ -240,6 +430,8 @@ def _print_worst_row(ledger_row: BiasLedgerRow) -> None:
         f"H_full={ledger_row.H_full:.6f} "
         f"drag_ep={ledger_row.drag_ep:.6f} "
         f"drag_rel={ledger_row.drag_rel:.6f} "
+        f"drag_rel_Li={ledger_row.drag_rel_Li:.6f} "
+        f"drag_rel_anion={ledger_row.drag_rel_anion:.6f} "
         f"drag_rel_diag={ledger_row.drag_rel_diag:.6f} "
         f"drag_rel_cross={ledger_row.drag_rel_cross:.6f} "
         f"drag_rel_before_gate={ledger_row.drag_rel_before_gate:.6f} "
@@ -247,11 +439,15 @@ def _print_worst_row(ledger_row: BiasLedgerRow) -> None:
         f"drag_full={ledger_row.drag_full:.6f} "
         f"drag_ep_current_over_target={ledger_row.drag_ep_current_over_target:.6f} "
         f"drag_rel_current_over_target={ledger_row.drag_rel_current_over_target:.6f} "
+        f"drag_rel_Li_current_over_target={ledger_row.drag_rel_Li_current_over_target:.6f} "
+        f"drag_rel_anion_current_over_target={ledger_row.drag_rel_anion_current_over_target:.6f} "
         f"drag_rel_diag_current_over_target={ledger_row.drag_rel_diag_current_over_target:.6f} "
         f"drag_rel_cross_current_over_target={ledger_row.drag_rel_cross_current_over_target:.6f} "
         f"D_none_state={ledger_row.D_none_state_m2_s:.6e} "
         f"D_ep_state={ledger_row.D_ep_state_m2_s:.6e} "
         f"D_rel_state={ledger_row.D_rel_state_m2_s:.6e} "
+        f"D_rel_Li_state={ledger_row.D_rel_Li_state_m2_s:.6e} "
+        f"D_rel_anion_state={ledger_row.D_rel_anion_state_m2_s:.6e} "
         f"D_rel_diag_state={ledger_row.D_rel_diag_state_m2_s:.6e} "
         f"D_rel_full_state={ledger_row.D_rel_full_state_m2_s:.6e} "
         f"D_full_state={ledger_row.D_full_state_m2_s:.6e} "
@@ -267,7 +463,20 @@ def _print_worst_row(ledger_row: BiasLedgerRow) -> None:
         f"H_atmosphere_external_bath={ledger_row.H_atmosphere_external_bath:.6f} "
         f"H_atmosphere_external_bath_evaluated={ledger_row.H_atmosphere_external_bath_evaluated} "
         f"relaxation_dynamic_response={ledger_row.relaxation_dynamic_response} "
+        f"anion_diagonal_relaxation_form_factor={ledger_row.anion_diagonal_relaxation_form_factor} "
         f"mean_relaxation_lifetime_gate={ledger_row.mean_relaxation_lifetime_gate:.6f} "
+        f"g_anion_diag_required={ledger_row.g_anion_diag_required:.6f} "
+        f"g_anion_diag_current={ledger_row.g_anion_diag_current:.6f} "
+        f"g_anion_diag_required_status={ledger_row.g_anion_diag_required_status} "
+        f"anion_charge_cloud_radius_required_A="
+        f"{ledger_row.anion_charge_cloud_radius_required_A:.6f} "
+        f"hydrodynamic_radius_A={ledger_row.hydrodynamic_radius_A:.6f} "
+        f"top_state_shape_factor={ledger_row.shape_factor:.6f} "
+        f"current_self_form_factor={ledger_row.current_self_form_factor:.6f} "
+        f"charge_cloud_radius_available={ledger_row.charge_cloud_radius_available} "
+        f"charge_cloud_radius_A={ledger_row.charge_cloud_radius_A:.6f} "
+        f"charge_cloud_source={ledger_row.charge_cloud_source} "
+        f"charge_cloud_site_count={ledger_row.charge_cloud_site_count} "
         f"top_state_resolved_charge_count={ledger_row.top_state_resolved_charge_count} "
         f"m_K={ledger_row.association_required_multiplier:.6f} "
         f"DeltaG_K_req_kJ_mol={ledger_row.association_required_deltaG_kJ_mol:.6f} "
@@ -318,6 +527,8 @@ def _print_worst_row(ledger_row: BiasLedgerRow) -> None:
             f"D_none_alpha={state.D_none_alpha_m2_s:.6e} "
             f"D_ep_alpha={state.D_ep_alpha_m2_s:.6e} "
             f"D_rel_alpha={state.D_rel_alpha_m2_s:.6e} "
+            f"D_rel_Li_alpha={state.D_rel_Li_alpha_m2_s:.6e} "
+            f"D_rel_anion_alpha={state.D_rel_anion_alpha_m2_s:.6e} "
             f"D_rel_diag_alpha={state.D_rel_diag_alpha_m2_s:.6e} "
             f"D_rel_full_alpha={state.D_rel_full_alpha_m2_s:.6e} "
             f"D_full_alpha={state.D_full_alpha_m2_s:.6e} "
@@ -326,6 +537,8 @@ def _print_worst_row(ledger_row: BiasLedgerRow) -> None:
             f"H_atmosphere_alpha={state.H_atmosphere_alpha:.6f} "
             f"H_ep_alpha={state.H_ep_alpha:.6f} "
             f"H_rel_alpha={state.H_rel_alpha:.6f} "
+            f"H_rel_Li_alpha={state.H_rel_Li_alpha:.6f} "
+            f"H_rel_anion_alpha={state.H_rel_anion_alpha:.6f} "
             f"H_rel_diag_alpha={state.H_rel_diag_alpha:.6f} "
             f"H_rel_cross_alpha={state.H_rel_cross_alpha:.6f} "
             f"H_rel_before_gate_alpha={state.H_rel_before_gate_alpha:.6f} "
@@ -333,6 +546,8 @@ def _print_worst_row(ledger_row: BiasLedgerRow) -> None:
             f"H_full_alpha={state.H_full_alpha:.6f} "
             f"drag_ep_alpha={state.drag_ep_alpha:.6f} "
             f"drag_rel_alpha={state.drag_rel_alpha:.6f} "
+            f"drag_rel_Li_alpha={state.drag_rel_Li_alpha:.6f} "
+            f"drag_rel_anion_alpha={state.drag_rel_anion_alpha:.6f} "
             f"drag_rel_diag_alpha={state.drag_rel_diag_alpha:.6f} "
             f"drag_rel_cross_alpha={state.drag_rel_cross_alpha:.6f} "
             f"drag_rel_before_gate_alpha={state.drag_rel_before_gate_alpha:.6f} "
@@ -347,6 +562,8 @@ def _print_worst_row(ledger_row: BiasLedgerRow) -> None:
             f"R_atmosphere_trace={state.atmosphere_resistance_trace_kg_s:.6e} "
             f"R_ep_trace={state.electrophoretic_resistance_trace_kg_s:.6e} "
             f"R_rel_trace={state.relaxation_resistance_trace_kg_s:.6e} "
+            f"R_rel_Li_trace={state.relaxation_Li_resistance_trace_kg_s:.6e} "
+            f"R_rel_anion_trace={state.relaxation_anion_resistance_trace_kg_s:.6e} "
             f"R_rel_diag_trace={state.relaxation_diag_resistance_trace_kg_s:.6e} "
             f"R_rel_cross_offdiag_norm={state.relaxation_cross_resistance_offdiag_norm_kg_s:.6e} "
             f"R_rel_before_gate={state.relaxation_resistance_before_gate_trace_kg_s:.6e} "
@@ -358,7 +575,20 @@ def _print_worst_row(ledger_row: BiasLedgerRow) -> None:
             f"atmosphere_lifetime_gate={state.atmosphere_lifetime_gate:.6f} "
             f"atmosphere_diagnostic_lifetime_gate={state.atmosphere_diagnostic_lifetime_gate:.6f} "
             f"relaxation_dynamic_response={state.relaxation_dynamic_response} "
+            f"anion_diagonal_relaxation_form_factor={state.anion_diagonal_relaxation_form_factor} "
             f"relaxation_gate={state.relaxation_lifetime_gate:.6f} "
+            f"g_anion_diag_required={state.g_anion_diag_required:.6f} "
+            f"g_anion_diag_current={state.g_anion_diag_current:.6f} "
+            f"g_anion_diag_required_status={state.g_anion_diag_required_status} "
+            f"anion_charge_cloud_radius_required_A="
+            f"{state.anion_charge_cloud_radius_required_A:.6f} "
+            f"hydrodynamic_radius_A={state.hydrodynamic_radius_A:.6f} "
+            f"anion_shape_factor={state.shape_factor:.6f} "
+            f"current_self_form_factor={state.current_self_form_factor:.6f} "
+            f"charge_cloud_radius_available={state.charge_cloud_radius_available} "
+            f"charge_cloud_radius_A={state.charge_cloud_radius_A:.6f} "
+            f"charge_cloud_source={state.charge_cloud_source} "
+            f"charge_cloud_site_count={state.charge_cloud_site_count} "
             f"raw_form_factor={state.raw_atmosphere_form_factor:.6f} "
             f"effective_form_factor={state.effective_atmosphere_form_factor:.6f} "
             f"R_atmosphere_before_gate={state.atmosphere_resistance_before_lifetime_gate_trace_kg_s:.6e} "
@@ -373,6 +603,11 @@ def _print_worst_row(ledger_row: BiasLedgerRow) -> None:
             f"ionic_strength_external={state.ionic_strength_external_mol_m3:.6f} "
             f"external_over_total_ionic_strength={state.external_over_total_ionic_strength:.6f} "
             f"resolved_charge_center_count={state.resolved_charge_center_count} "
+            f"anion_feature_id={state.anion_feature_id} "
+            f"local_D_Li={state.local_D_Li_m2_s:.6e} "
+            f"local_D_anion={state.local_D_anion_m2_s:.6e} "
+            f"kappa_radius_Li={state.kappa_radius_Li:.6f} "
+            f"kappa_radius_anion={state.kappa_radius_anion:.6f} "
             f"debye_kappa_inv_A={state.debye_kappa_inv_A:.6f} "
             f"separation_over_debye={state.separation_over_debye:.6f} "
             f"mean_center_separation_A={state.mean_charge_center_separation_A:.6f} "
@@ -395,6 +630,12 @@ def _format_float_map(values: dict[str, float]) -> str:
     if not values:
         return "none"
     return ",".join(f"{key}:{values[key]:.6f}" for key in sorted(values))
+
+
+def _format_int_map(values: dict[str, int]) -> str:
+    if not values:
+        return "none"
+    return ",".join(f"{key}:{values[key]}" for key in sorted(values))
 
 
 def _format_float_sequence(values: tuple[float, ...]) -> str:

@@ -50,7 +50,7 @@ class DemoCase:
 
 def main() -> None:
     print(f"finite Markov conductivity demo at T={T_REF_K:.2f} K")
-    print("evaluation path: recipe -> transport kernel -> motif generator -> Poisson readout")
+    print("evaluation path: recipe -> transport kernel -> motif generator -> projected Mori/Poisson readout")
     for demo_case in _demo_cases():
         print()
         print(demo_case.label)

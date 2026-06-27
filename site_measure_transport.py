@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, replace
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from constants import N_A
 from data.species_data import ADDITIVES, CATION_PROPERTIES, SALTS
@@ -14,6 +14,19 @@ from utils.strict_validation import require_float, require_mapping, require_stri
 ANGSTROM3_TO_CM3_PER_MOL = 1.0e-24 * N_A
 CATION_RADIUS_MATCH_TOLERANCE_A = 1.0e-9
 DONOR_GROUP_NAMES = ("S=O", "B-O", "C=O", "N=O", "P=O")
+CHARGE_CLOUD_GEOMETRY_KEY = "anion_charge_cloud_sites"
+CHARGE_CLOUD_PARTIAL_CHARGE_KEY = "partial_charge_e"
+CHARGE_CLOUD_POSITION_KEY = "position_from_com_A"
+CHARGE_CLOUD_SOURCE_MISSING = "missing_partial_charge_geometry"
+CHARGE_CLOUD_SOURCE_PARTIAL_CHARGE_GEOMETRY = "partial_charge_geometry"
+
+
+@dataclass(frozen=True)
+class ChargeCloudDescriptor:
+    radius_available: bool
+    radius_A: float
+    source: str
+    site_count: int
 
 
 @dataclass(frozen=True)
@@ -47,6 +60,10 @@ class AnionSiteFeature:
     coordination_multiplicity: float
     ligand_field_asymmetry: float
     shape_friction_factor: float
+    charge_cloud_radius_available: bool
+    charge_cloud_radius_A: float
+    charge_cloud_source: str
+    charge_cloud_site_count: int
     feature_descriptor: str
 
 
@@ -223,6 +240,7 @@ def _anion_site_feature(
     donor_site_count = donor_site_count_from_feature(source_props, context)
     coordination_multiplicity = coordination_multiplicity_from_feature(source_props, context)
     ligand_asymmetry = ligand_field_asymmetry_from_feature(source_props, context)
+    charge_cloud_descriptor = charge_cloud_descriptor_from_feature(source_props, context)
     return AnionSiteFeature(
         feature_id=feature_id,
         canonical_feature_id=canonical_feature_id,
@@ -242,6 +260,10 @@ def _anion_site_feature(
         coordination_multiplicity=coordination_multiplicity,
         ligand_field_asymmetry=ligand_asymmetry,
         shape_friction_factor=anion_shape_friction_factor_from_feature(source_props, context),
+        charge_cloud_radius_available=charge_cloud_descriptor.radius_available,
+        charge_cloud_radius_A=charge_cloud_descriptor.radius_A,
+        charge_cloud_source=charge_cloud_descriptor.source,
+        charge_cloud_site_count=charge_cloud_descriptor.site_count,
         feature_descriptor=_anion_feature_descriptor(
             source_props,
             donor_site_count,
@@ -249,6 +271,78 @@ def _anion_site_feature(
             ligand_asymmetry,
         ),
     )
+
+
+def charge_cloud_descriptor_from_feature(
+    source_props,
+    context: str,
+) -> ChargeCloudDescriptor:
+    if CHARGE_CLOUD_GEOMETRY_KEY not in source_props:
+        return ChargeCloudDescriptor(
+            radius_available=False,
+            radius_A=0.0,
+            source=CHARGE_CLOUD_SOURCE_MISSING,
+            site_count=0,
+        )
+    raw_sites = source_props[CHARGE_CLOUD_GEOMETRY_KEY]
+    if not isinstance(raw_sites, Sequence) or isinstance(raw_sites, (str, bytes)):
+        raise TypeError(f"{context}.{CHARGE_CLOUD_GEOMETRY_KEY} must be a sequence of charge sites")
+    if len(raw_sites) == 0:
+        raise ValueError(f"{context}.{CHARGE_CLOUD_GEOMETRY_KEY} must not be empty when provided")
+
+    charge_weighted_second_moment_A2 = 0.0
+    absolute_charge_sum = 0.0
+    for site_index, raw_site in enumerate(raw_sites):
+        if not isinstance(raw_site, Mapping):
+            raise TypeError(f"{context}.{CHARGE_CLOUD_GEOMETRY_KEY}[{site_index}] must be a mapping")
+        site_context = f"{context}.{CHARGE_CLOUD_GEOMETRY_KEY}[{site_index}]"
+        partial_charge_e = require_float(raw_site, CHARGE_CLOUD_PARTIAL_CHARGE_KEY, site_context)
+        if not math.isfinite(partial_charge_e):
+            raise ValueError(f"{site_context}.{CHARGE_CLOUD_PARTIAL_CHARGE_KEY} must be finite")
+        position_from_com_A = _charge_cloud_position_from_com_A(raw_site, site_context)
+        absolute_charge = abs(partial_charge_e)
+        absolute_charge_sum += absolute_charge
+        charge_weighted_second_moment_A2 += absolute_charge * math.fsum(
+            component_A * component_A for component_A in position_from_com_A
+        )
+    _assert_positive_float(
+        absolute_charge_sum,
+        f"{context}.{CHARGE_CLOUD_GEOMETRY_KEY} absolute charge sum",
+    )
+    radius_A = math.sqrt(charge_weighted_second_moment_A2 / absolute_charge_sum)
+    _assert_nonnegative_float(radius_A, f"{context}.charge_cloud_radius_A")
+    return ChargeCloudDescriptor(
+        radius_available=True,
+        radius_A=radius_A,
+        source=CHARGE_CLOUD_SOURCE_PARTIAL_CHARGE_GEOMETRY,
+        site_count=len(raw_sites),
+    )
+
+
+def _charge_cloud_position_from_com_A(
+    raw_site,
+    site_context: str,
+) -> tuple[float, float, float]:
+    if CHARGE_CLOUD_POSITION_KEY not in raw_site:
+        raise KeyError(f"{site_context} missing {CHARGE_CLOUD_POSITION_KEY}")
+    raw_position = raw_site[CHARGE_CLOUD_POSITION_KEY]
+    if not isinstance(raw_position, Sequence) or isinstance(raw_position, (str, bytes)):
+        raise TypeError(f"{site_context}.{CHARGE_CLOUD_POSITION_KEY} must be a three-component sequence")
+    if len(raw_position) != 3:
+        raise ValueError(f"{site_context}.{CHARGE_CLOUD_POSITION_KEY} must have three components")
+    position_components: list[float] = []
+    for component_index, raw_component in enumerate(raw_position):
+        if not isinstance(raw_component, (int, float)):
+            raise TypeError(
+                f"{site_context}.{CHARGE_CLOUD_POSITION_KEY}[{component_index}] must be numeric"
+            )
+        component_A = float(raw_component)
+        if not math.isfinite(component_A):
+            raise ValueError(
+                f"{site_context}.{CHARGE_CLOUD_POSITION_KEY}[{component_index}] must be finite"
+            )
+        position_components.append(component_A)
+    return (position_components[0], position_components[1], position_components[2])
 
 
 def _neutral_ligand_site_feature(
