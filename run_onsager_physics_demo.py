@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 
 from constants import T_REF_K
@@ -40,7 +42,7 @@ def main() -> None:
         f"salt_visc_scale={calibration.params.salt_viscosity_scale:.4f}, "
         f"pair_gain={calibration.params.pair_correlation_gain:.4f}, "
         f"steric_gain={calibration.params.steric_anticorrelation_gain:.4f}, "
-        f"salt_mobility={dict(calibration.params.salt_mobility_scales or {})}"
+        f"aggregate_gain={calibration.params.aggregate_correlation_gain:.4f}"
     )
     if rejected:
         for idx, reason in rejected[:5]:
@@ -131,12 +133,12 @@ def print_result(label: str, recipe: dict, params) -> None:
 
 def _mean_free_fraction(result) -> float:
     total = sum(result.composition.ionic_source_molarities_M.values())
-    return sum(
-        result.composition.ionic_source_molarities_M[source]
-        / total
-        * result.speciation.free_fraction_by_source[source]
-        for source in result.composition.ionic_source_molarities_M
+    free_lithium_allocation = math.fsum(
+        concentration_M
+        for motif_label, concentration_M in result.speciation.motif_concentrations_M.items()
+        if motif_label.startswith("free_cation:")
     )
+    return free_lithium_allocation / total
 
 
 def _compact_shell(shell: dict[str, float]) -> str:
