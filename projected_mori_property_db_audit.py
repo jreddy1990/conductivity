@@ -1,4 +1,4 @@
-"""Empirical audit for the property-calibrated latent Mori conductivity readout."""
+"""Empirical audit for the recipe-generated projected Mori conductivity readout."""
 
 from __future__ import annotations
 
@@ -58,7 +58,7 @@ def audit_projected_mori_conductivity_against_property_db(
     relaxation_dynamic_response: str,
     anion_diagonal_relaxation_form_factor: str,
 ) -> ProjectedMoriPropertyDbAuditResult:
-    """Compare recipe-generated latent Mori readout values to empirical labels."""
+    """Compare recipe-generated projected Mori values to empirical labels."""
 
     if not math.isfinite(temperature_K) or temperature_K <= 0.0:
         raise ValueError(f"temperature_K must be positive and finite, got {temperature_K}")

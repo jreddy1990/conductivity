@@ -1,4 +1,4 @@
-"""Run latent Mori conductivity readout directly against empirical labels."""
+"""Run recipe-generated projected Mori conductivity directly against empirical labels."""
 
 from __future__ import annotations
 

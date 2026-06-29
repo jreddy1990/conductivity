@@ -1,9 +1,9 @@
-"""Run the property-calibrated latent Mori surrogate audit."""
+"""Run the property-label Mori regression baseline audit."""
 
 from __future__ import annotations
 
 from constants import T_REF_K
-from conductivity.latent_mori_surrogate import (
+from conductivity.baselines.property_label_mori_regression_baseline import (
     DEFAULT_LATENT_MORI_FOLD_COUNT,
     DEFAULT_LATENT_MORI_RIDGE_PENALTY,
     LatentMoriSurrogateAuditResult,
@@ -23,7 +23,7 @@ def main() -> None:
         DEFAULT_LATENT_MORI_FOLD_COUNT,
     )
 
-    print("latent_mori_surrogate_audit")
+    print("property_label_mori_regression_baseline_audit")
     _print_summary(audit)
     print("worst_cross_validated_rows")
     for row in sorted(
