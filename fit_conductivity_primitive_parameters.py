@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 import math
 import random
-from dataclasses import dataclass
+import itertools
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, Mapping, Protocol, TYPE_CHECKING
 
@@ -114,6 +115,8 @@ _CLUSTER_KIND_LOGK_PARAMETER_BY_KIND = {
     "higher_charged_cluster": "higher_charged_cluster_logK_offset",
 }
 
+PRIMITIVE_PARAMETER_FIT_CONFIG_KEY = "molecular_primitive_parameter_fit"
+
 
 @dataclass(frozen=True)
 class PrimitiveParameterTransform:
@@ -175,8 +178,18 @@ class PrimitiveFitOptions:
 
 
 @dataclass(frozen=True)
+class DescriptorCalibrationTarget:
+    target_id: str
+    source_row_ids: tuple[int, ...]
+    descriptor_driver_values: tuple[tuple[str, float], ...]
+    empirical_sigma_mS_cm: float
+    empirical_sigma_spread_mS_cm: float
+    residual_weight: float
+
+
+@dataclass(frozen=True)
 class PrimitiveFitDatasetEvaluation:
-    empirical_sigmas_mS_cm: tuple[float, ...]
+    descriptor_calibration_targets: tuple[DescriptorCalibrationTarget, ...]
     predicted_sigmas_mS_cm: tuple[float, ...]
     direct_sigmas_mS_cm: tuple[float, ...]
     corrector_sigmas_mS_cm: tuple[float, ...]
@@ -186,7 +199,6 @@ class PrimitiveFitDatasetEvaluation:
     direct_capacity_failure_count: int
     corrector_too_strong_failure_count: int
     corrector_too_weak_failure_count: int
-    empirical_sigma_spreads_mS_cm: tuple[float, ...]
     cluster_activation_penalty: float
     failed_rows: int
     maximum_mass_balance_residual: float
@@ -206,6 +218,764 @@ class ConductivityPrimitiveParameterEvaluator(Protocol):
         primitive_parameters: ConductivityPrimitiveParameterSet,
     ) -> PrimitiveFitDatasetEvaluation:
         ...
+
+
+class MolecularPropertyDbPrimitiveEvaluator:
+    def __init__(
+        self,
+        cases: tuple["MolecularPropertyDbCase", ...],
+        audit_options: "MolecularPropertyDbAuditOptions",
+        fit_options: PrimitiveFitOptions,
+    ) -> None:
+        if not cases:
+            raise ValueError("molecular property-DB evaluator requires cases")
+        self._cases = cases
+        self._audit_options = audit_options
+        self._fit_options = fit_options
+        self._descriptor_calibration_targets = descriptor_calibration_targets_for_cases(
+            cases,
+            fit_options,
+        )
+        self._has_measured_consumed_parameter_fields = False
+        self._consumed_parameter_fields: tuple[str, ...] = tuple()
+
+    def evaluate(
+        self,
+        primitive_parameters: ConductivityPrimitiveParameterSet,
+    ) -> PrimitiveFitDatasetEvaluation:
+        from conductivity.molecular_property_db_audit import (
+            audit_molecular_property_db_cases,
+        )
+
+        audit_result = audit_molecular_property_db_cases(
+            self._cases,
+            primitive_parameters,
+            self._audit_options,
+        )
+        if not self._has_measured_consumed_parameter_fields:
+            self._consumed_parameter_fields = _measured_consumed_parameter_fields(
+                self._cases,
+                primitive_parameters,
+                self._audit_options,
+                audit_result,
+            )
+            self._has_measured_consumed_parameter_fields = True
+        return PrimitiveFitDatasetEvaluation(
+            descriptor_calibration_targets=self._descriptor_calibration_targets,
+            predicted_sigmas_mS_cm=tuple(
+                row.predicted_sigma_mS_cm for row in audit_result.rows
+            ),
+            direct_sigmas_mS_cm=tuple(
+                row.direct_sigma_mS_cm for row in audit_result.rows
+            ),
+            corrector_sigmas_mS_cm=tuple(
+                row.corrector_sigma_mS_cm for row in audit_result.rows
+            ),
+            direct_capacity_gaps_mS_cm=tuple(
+                row.direct_capacity_gap_mS_cm for row in audit_result.rows
+            ),
+            corrector_targets_mS_cm=tuple(
+                row.corrector_target_mS_cm for row in audit_result.rows
+            ),
+            corrector_residuals_mS_cm=tuple(
+                row.corrector_residual_mS_cm for row in audit_result.rows
+            ),
+            direct_capacity_failure_count=sum(
+                1 for row in audit_result.rows if row.direct_capacity_failure
+            ),
+            corrector_too_strong_failure_count=sum(
+                1 for row in audit_result.rows
+                if row.corrector_too_strong_failure
+            ),
+            corrector_too_weak_failure_count=sum(
+                1 for row in audit_result.rows
+                if row.corrector_too_weak_failure
+            ),
+            cluster_activation_penalty=_cluster_activation_penalty(
+                self._cases,
+                primitive_parameters,
+                self._audit_options,
+                self._fit_options,
+                audit_result,
+            ),
+            failed_rows=audit_result.failed_rows,
+            maximum_mass_balance_residual=(
+                audit_result.maximum_mass_balance_residual
+            ),
+            maximum_row_sum_residual=audit_result.maximum_row_sum_residual,
+            maximum_stationary_residual=(
+                audit_result.maximum_stationary_residual
+            ),
+            maximum_detailed_balance_residual=(
+                audit_result.maximum_detailed_balance_residual
+            ),
+            maximum_event_reversal_residual=(
+                audit_result.maximum_event_reversal_residual
+            ),
+            zero_charge_sigma_mS_cm=audit_result.zero_charge_sigma_mS_cm,
+            higher_viscosity_lowers_dilute_conductivity=(
+                audit_result.higher_viscosity_lowers_dilute_conductivity
+            ),
+            higher_packing_lowers_local_mobility=(
+                audit_result.higher_packing_lowers_local_mobility
+            ),
+            consumed_parameter_fields=self._consumed_parameter_fields,
+        )
+
+
+def _cluster_activation_penalty(
+    cases: tuple["MolecularPropertyDbCase", ...],
+    primitive_parameters: ConductivityPrimitiveParameterSet,
+    audit_options: "MolecularPropertyDbAuditOptions",
+    fit_options: PrimitiveFitOptions,
+    audit_result: "MolecularPropertyDbAuditResult",
+) -> float:
+    from conductivity.molecular_property_db_audit import (
+        cluster_sensitivity_diagnostics_for_row,
+    )
+
+    if fit_options.cluster_activation_loss_weight == 0.0:
+        return 0.0
+    case_by_row_id = {molecular_case.row_id: molecular_case for molecular_case in cases}
+    selected_rows = tuple(
+        sorted(
+            audit_result.rows,
+            key=lambda row_result: abs(row_result.residual_mS_cm),
+            reverse=True,
+        )[:fit_options.residual_tail_count]
+    )
+    penalty_terms: list[float] = []
+    residual_threshold_mS_cm = fit_options.cluster_activation_residual_threshold_mS_cm
+    minimum_charged_cluster_fraction = (
+        fit_options.cluster_activation_min_charged_cluster_fraction
+    )
+    minimum_charged_cluster_net_sigma_mS_cm = (
+        fit_options.cluster_activation_min_charged_cluster_net_sigma_mS_cm
+    )
+    for row_result in selected_rows:
+        if abs(row_result.residual_mS_cm) <= residual_threshold_mS_cm:
+            continue
+        if row_result.row_id not in case_by_row_id:
+            raise ValueError(f"missing molecular case for row {row_result.row_id}")
+        if (
+            row_result.charged_cluster_fraction
+            >= minimum_charged_cluster_fraction
+            and abs(row_result.charged_cluster_net_sigma_mS_cm)
+            >= minimum_charged_cluster_net_sigma_mS_cm
+        ):
+            continue
+        sensitivity_diagnostics = cluster_sensitivity_diagnostics_for_row(
+            case_by_row_id[row_result.row_id],
+            primitive_parameters,
+            audit_options,
+            row_result,
+        )
+        charged_cluster_sensitivity_weight = math.fsum(
+            abs(sensitivity_diagnostic.sensitivity_mS_cm_per_logK)
+            for sensitivity_diagnostic in sensitivity_diagnostics
+            if (
+                sensitivity_diagnostic.net_charge_number != 0
+                and sensitivity_diagnostic.direction_needed == "increase_logK"
+            )
+        )
+        if charged_cluster_sensitivity_weight <= 0.0:
+            continue
+        fraction_deficit = max(
+            0.0,
+            (
+                minimum_charged_cluster_fraction
+                - row_result.charged_cluster_fraction
+            )
+            / minimum_charged_cluster_fraction,
+        )
+        sigma_deficit = max(
+            0.0,
+            (
+                minimum_charged_cluster_net_sigma_mS_cm
+                - abs(row_result.charged_cluster_net_sigma_mS_cm)
+            )
+            / minimum_charged_cluster_net_sigma_mS_cm,
+        )
+        penalty_terms.append(
+            charged_cluster_sensitivity_weight
+            * (
+                fraction_deficit * fraction_deficit
+                + sigma_deficit * sigma_deficit
+            )
+        )
+    return float(math.fsum(penalty_terms))
+
+
+def _measured_consumed_parameter_fields(
+    cases: tuple["MolecularPropertyDbCase", ...],
+    primitive_parameters: ConductivityPrimitiveParameterSet,
+    audit_options: "MolecularPropertyDbAuditOptions",
+    baseline_audit_result: "MolecularPropertyDbAuditResult",
+) -> tuple[str, ...]:
+    perturbation_scales = _positive_float_tuple(
+        audit_options.parameter_consumption_perturbation_scales,
+        "parameter_consumption_perturbation_scales",
+    )
+    if all(perturbation_scale == 1.0 for perturbation_scale in perturbation_scales):
+        raise ValueError(
+            "parameter_consumption_perturbation_scales must include a value "
+            "that differs from one"
+        )
+    consumed_parameter_fields: list[str] = []
+    for parameter_name in CONDUCTIVITY_PRIMITIVE_PARAMETER_FIELD_NAMES:
+        if _parameter_is_consumed_by_any_perturbation(
+            cases,
+            primitive_parameters,
+            audit_options,
+            baseline_audit_result,
+            parameter_name,
+            perturbation_scales,
+        ):
+            consumed_parameter_fields.append(parameter_name)
+    return tuple(consumed_parameter_fields)
+
+
+def _parameter_is_consumed_by_any_perturbation(
+    cases: tuple["MolecularPropertyDbCase", ...],
+    primitive_parameters: ConductivityPrimitiveParameterSet,
+    audit_options: "MolecularPropertyDbAuditOptions",
+    baseline_audit_result: "MolecularPropertyDbAuditResult",
+    parameter_name: str,
+    perturbation_scales: tuple[float, ...],
+) -> bool:
+    from conductivity.molecular_property_db_audit import audit_molecular_property_db_cases
+
+    baseline_parameter_value = getattr(primitive_parameters, parameter_name)
+    for perturbation_scale in perturbation_scales:
+        if perturbation_scale == 1.0:
+            continue
+        perturbed_parameter_value = _primitive_parameter_perturbed_value(
+            parameter_name,
+            baseline_parameter_value,
+            perturbation_scale,
+        )
+        perturbed_parameters = replace(
+            primitive_parameters,
+            **{parameter_name: perturbed_parameter_value},
+        )
+        try:
+            perturbed_audit_result = audit_molecular_property_db_cases(
+                cases,
+                perturbed_parameters,
+                audit_options,
+            )
+        except (
+            FloatingPointError,
+            OverflowError,
+            ValueError,
+            np.linalg.LinAlgError,
+        ):
+            return True
+        if _audit_results_differ(
+            baseline_audit_result,
+            perturbed_audit_result,
+        ):
+            return True
+    return False
+
+
+def _primitive_parameter_perturbed_value(
+    parameter_name: str,
+    baseline_parameter_value: float,
+    perturbation_scale: float,
+) -> float:
+    transform_name = CONDUCTIVITY_PRIMITIVE_PARAMETER_TRANSFORM_BY_NAME[
+        parameter_name
+    ]
+    if transform_name == PRIMITIVE_PARAMETER_TRANSFORM_LOG_POSITIVE:
+        return baseline_parameter_value * perturbation_scale
+    if transform_name == PRIMITIVE_PARAMETER_TRANSFORM_IDENTITY_SIGNED:
+        return baseline_parameter_value + math.log(perturbation_scale)
+    raise ValueError(f"unknown primitive parameter transform {transform_name}")
+
+
+def _audit_results_differ(
+    baseline_audit_result: "MolecularPropertyDbAuditResult",
+    perturbed_audit_result: "MolecularPropertyDbAuditResult",
+) -> bool:
+    if len(baseline_audit_result.rows) != len(perturbed_audit_result.rows):
+        return True
+    baseline_values = _audit_comparison_values(baseline_audit_result)
+    perturbed_values = _audit_comparison_values(perturbed_audit_result)
+    tolerance_factor = math.sqrt(np.finfo(float).eps)
+    for baseline_value, perturbed_value in zip(
+        baseline_values,
+        perturbed_values,
+    ):
+        difference_scale = max(
+            1.0,
+            abs(baseline_value),
+            abs(perturbed_value),
+        )
+        tolerance = tolerance_factor * difference_scale
+        if abs(baseline_value - perturbed_value) > tolerance:
+            return True
+    return False
+
+
+def _audit_comparison_values(
+    audit_result: "MolecularPropertyDbAuditResult",
+) -> tuple[float, ...]:
+    values: list[float] = [
+        audit_result.mae_mS_cm,
+        audit_result.rmse_mS_cm,
+        audit_result.bias_mS_cm,
+        audit_result.pearson_r,
+        audit_result.maximum_abs_residual_mS_cm,
+        audit_result.maximum_mass_balance_residual,
+        audit_result.maximum_row_sum_residual,
+        audit_result.maximum_stationary_residual,
+        audit_result.maximum_detailed_balance_residual,
+        audit_result.maximum_event_reversal_residual,
+        audit_result.zero_charge_sigma_mS_cm,
+    ]
+    for row_result in audit_result.rows:
+        values.extend(
+            (
+                row_result.predicted_sigma_mS_cm,
+                row_result.direct_sigma_mS_cm,
+                row_result.corrector_sigma_mS_cm,
+                row_result.direct_capacity_gap_mS_cm,
+                row_result.corrector_target_mS_cm,
+                row_result.corrector_residual_mS_cm,
+                float(row_result.direct_capacity_failure),
+                float(row_result.corrector_too_strong_failure),
+                float(row_result.corrector_too_weak_failure),
+                row_result.charge_weighted_transport_concentration_mol_m3,
+                row_result.charged_cluster_direct_sigma_mS_cm,
+                row_result.charged_cluster_corrector_sigma_mS_cm,
+                row_result.charged_cluster_net_sigma_mS_cm,
+                row_result.mass_balance_residual_mol_m3,
+                row_result.row_sum_residual,
+                row_result.stationary_residual_mol_m3_s,
+                row_result.detailed_balance_residual_mol_m3_s,
+                row_result.event_reversal_residual_mol_m3_s,
+                row_result.free_ion_fraction,
+                row_result.charged_cluster_fraction,
+                row_result.neutral_cluster_fraction,
+                row_result.cluster_transport_mobility_density_mol_m_s,
+                row_result.charged_cluster_transport_mobility_density_mol_m_s,
+                row_result.neutral_cluster_transport_mobility_density_mol_m_s,
+            )
+        )
+        transport_roles = tuple(
+            sorted(row_result.direct_sigma_by_transport_role_mS_cm)
+        )
+        for transport_role in transport_roles:
+            values.extend(
+                (
+                    row_result.direct_sigma_by_transport_role_mS_cm[
+                        transport_role
+                    ],
+                    row_result.corrector_sigma_by_transport_role_mS_cm[
+                        transport_role
+                    ],
+                    row_result.net_sigma_by_transport_role_mS_cm[transport_role],
+                )
+            )
+        for cluster_diagnostic in row_result.cluster_thermodynamic_diagnostics:
+            values.extend(
+                (
+                    cluster_diagnostic.concentration_mol_m3,
+                    cluster_diagnostic.concentration_fraction_of_total_ion,
+                    cluster_diagnostic.standard_free_energy_J_mol,
+                    cluster_diagnostic.standard_free_energy_over_RT,
+                    cluster_diagnostic.log_equilibrium_constant,
+                    cluster_diagnostic.coulomb_J_mol,
+                    cluster_diagnostic.desolvation_J_mol,
+                    cluster_diagnostic.coordination_J_mol,
+                    cluster_diagnostic.steric_J_mol,
+                    cluster_diagnostic.entropy_J_mol,
+                    cluster_diagnostic.activity_correction_J_mol,
+                    cluster_diagnostic.hydrodynamic_radius_A,
+                    cluster_diagnostic.molecular_volume_A3,
+                )
+            )
+    return tuple(_finite_float(value, "audit_comparison_value") for value in values)
+
+
+def default_molecular_primitive_fit_configuration() -> tuple[
+    PrimitiveFitOptions,
+    tuple[PrimitiveParameterTransform, ...],
+]:
+    from conductivity.molecular_property_db_audit import (
+        _load_optimization_config_section,
+        _required_config_bool,
+        _required_config_string,
+        _required_mapping,
+        _required_nonnegative_config_float,
+        _required_nonnegative_config_int,
+        _required_positive_config_float,
+        _required_positive_config_int,
+    )
+
+    fit_config_mapping = _load_optimization_config_section(
+        PRIMITIVE_PARAMETER_FIT_CONFIG_KEY
+    )
+    coordinate_bounds_mapping = _required_mapping(
+        fit_config_mapping,
+        "coordinate_bounds",
+        "molecular_primitive_parameter_fit.coordinate_bounds",
+    )
+    unknown_coordinate_bound_names = tuple(
+        sorted(
+            parameter_name for parameter_name in coordinate_bounds_mapping
+            if parameter_name not in CONDUCTIVITY_PRIMITIVE_PARAMETER_FIELD_NAMES
+        )
+    )
+    if unknown_coordinate_bound_names:
+        raise ValueError(
+            "unknown molecular primitive fit coordinate bounds: "
+            f"{unknown_coordinate_bound_names}"
+        )
+    missing_coordinate_bound_names = tuple(
+        parameter_name
+        for parameter_name in CONDUCTIVITY_PRIMITIVE_PARAMETER_FIELD_NAMES
+        if parameter_name not in coordinate_bounds_mapping
+    )
+    if missing_coordinate_bound_names:
+        raise ValueError(
+            "molecular primitive fit coordinate_bounds missing parameters "
+            f"{missing_coordinate_bound_names}"
+        )
+    fit_options = PrimitiveFitOptions(
+        huber_delta_mS_cm=_required_positive_config_float(
+            fit_config_mapping,
+            "huber_delta_mS_cm",
+        ),
+        empirical_sigma_floor_mS_cm=_required_positive_config_float(
+            fit_config_mapping,
+            "empirical_sigma_floor_mS_cm",
+        ),
+        coordinate_regularization_weight=_required_nonnegative_config_float(
+            fit_config_mapping,
+            "coordinate_regularization_weight",
+        ),
+        residual_tail_loss_weight=_required_nonnegative_config_float(
+            fit_config_mapping,
+            "residual_tail_loss_weight",
+        ),
+        residual_tail_count=_required_positive_config_int(
+            fit_config_mapping,
+            "residual_tail_count",
+        ),
+        cluster_activation_loss_weight=_required_nonnegative_config_float(
+            fit_config_mapping,
+            "cluster_activation_loss_weight",
+        ),
+        cluster_activation_residual_threshold_mS_cm=(
+            _required_positive_config_float(
+                fit_config_mapping,
+                "cluster_activation_residual_threshold_mS_cm",
+            )
+        ),
+        cluster_activation_min_charged_cluster_fraction=(
+            _required_positive_config_float(
+                fit_config_mapping,
+                "cluster_activation_min_charged_cluster_fraction",
+            )
+        ),
+        cluster_activation_min_charged_cluster_net_sigma_mS_cm=(
+            _required_positive_config_float(
+                fit_config_mapping,
+                "cluster_activation_min_charged_cluster_net_sigma_mS_cm",
+            )
+        ),
+        direct_capacity_loss_weight=_required_nonnegative_config_float(
+            fit_config_mapping,
+            "direct_capacity_loss_weight",
+        ),
+        corrector_loss_weight=_required_nonnegative_config_float(
+            fit_config_mapping,
+            "corrector_loss_weight",
+        ),
+        role_direct_scaling_regularization_weight=(
+            _required_nonnegative_config_float(
+                fit_config_mapping,
+                "role_direct_scaling_regularization_weight",
+            )
+        ),
+        role_direct_scaling_lower_bound=_required_positive_config_float(
+            fit_config_mapping,
+            "role_direct_scaling_lower_bound",
+        ),
+        role_direct_scaling_upper_bound=_required_positive_config_float(
+            fit_config_mapping,
+            "role_direct_scaling_upper_bound",
+        ),
+        latin_hypercube_samples_per_parameter=_required_positive_config_float(
+            fit_config_mapping,
+            "latin_hypercube_samples_per_parameter",
+        ),
+        coordinate_search_rounds=_required_nonnegative_config_int(
+            fit_config_mapping,
+            "coordinate_search_rounds",
+        ),
+        initial_coordinate_step=_required_positive_config_float(
+            fit_config_mapping,
+            "initial_coordinate_step",
+        ),
+        coordinate_step_shrinkage=_required_positive_config_float(
+            fit_config_mapping,
+            "coordinate_step_shrinkage",
+        ),
+        minimum_coordinate_step=_required_positive_config_float(
+            fit_config_mapping,
+            "minimum_coordinate_step",
+        ),
+        powell_max_iterations_per_parameter=_required_nonnegative_config_float(
+            fit_config_mapping,
+            "powell_max_iterations_per_parameter",
+        ),
+        powell_max_function_evaluations_per_parameter=_required_nonnegative_config_float(
+            fit_config_mapping,
+            "powell_max_function_evaluations_per_parameter",
+        ),
+        decomposed_block_powell_max_iterations_per_parameter=(
+            _required_nonnegative_config_float(
+                fit_config_mapping,
+                "decomposed_block_powell_max_iterations_per_parameter",
+            )
+        ),
+        decomposed_block_powell_max_function_evaluations_per_parameter=(
+            _required_nonnegative_config_float(
+                fit_config_mapping,
+                "decomposed_block_powell_max_function_evaluations_per_parameter",
+            )
+        ),
+        decomposed_block_cluster_activation_loss_weight=(
+            _required_nonnegative_config_float(
+                fit_config_mapping,
+                "decomposed_block_cluster_activation_loss_weight",
+            )
+        ),
+        powell_xtol_coordinate=_required_positive_config_float(
+            fit_config_mapping,
+            "powell_xtol_coordinate",
+        ),
+        powell_ftol_objective=_required_positive_config_float(
+            fit_config_mapping,
+            "powell_ftol_objective",
+        ),
+        random_seed=_required_nonnegative_config_int(
+            fit_config_mapping,
+            "random_seed",
+        ),
+        maximum_failed_rows=_required_nonnegative_config_int(
+            fit_config_mapping,
+            "maximum_failed_rows",
+        ),
+        maximum_mass_balance_residual=_required_nonnegative_config_float(
+            fit_config_mapping,
+            "maximum_mass_balance_residual",
+        ),
+        maximum_row_sum_residual=_required_nonnegative_config_float(
+            fit_config_mapping,
+            "maximum_row_sum_residual",
+        ),
+        maximum_stationary_residual=_required_nonnegative_config_float(
+            fit_config_mapping,
+            "maximum_stationary_residual",
+        ),
+        maximum_detailed_balance_residual=_required_nonnegative_config_float(
+            fit_config_mapping,
+            "maximum_detailed_balance_residual",
+        ),
+        maximum_event_reversal_residual=_required_nonnegative_config_float(
+            fit_config_mapping,
+            "maximum_event_reversal_residual",
+        ),
+        maximum_zero_charge_sigma_mS_cm=_required_nonnegative_config_float(
+            fit_config_mapping,
+            "maximum_zero_charge_sigma_mS_cm",
+        ),
+        descriptor_matrix_high_correlation_threshold=(
+            _required_positive_config_float(
+                fit_config_mapping,
+                "descriptor_matrix_high_correlation_threshold",
+            )
+        ),
+        descriptor_matrix_condition_number_warn_threshold=(
+            _required_positive_config_float(
+                fit_config_mapping,
+                "descriptor_matrix_condition_number_warn_threshold",
+            )
+        ),
+        descriptor_matrix_reported_correlation_pair_count=(
+            _required_nonnegative_config_int(
+                fit_config_mapping,
+                "descriptor_matrix_reported_correlation_pair_count",
+            )
+        ),
+        prediction_sensitivity_coordinate_step=_required_positive_config_float(
+            fit_config_mapping,
+            "prediction_sensitivity_coordinate_step",
+        ),
+        prediction_sensitivity_min_column_norm_mS_cm_per_coordinate=(
+            _required_positive_config_float(
+                fit_config_mapping,
+                "prediction_sensitivity_min_column_norm_mS_cm_per_coordinate",
+            )
+        ),
+        prediction_sensitivity_relative_singular_value_threshold=(
+            _required_positive_config_float(
+                fit_config_mapping,
+                "prediction_sensitivity_relative_singular_value_threshold",
+            )
+        ),
+        prediction_sensitivity_high_correlation_threshold=(
+            _required_positive_config_float(
+                fit_config_mapping,
+                "prediction_sensitivity_high_correlation_threshold",
+            )
+        ),
+        prediction_sensitivity_reported_correlation_pair_count=(
+            _required_nonnegative_config_int(
+                fit_config_mapping,
+                "prediction_sensitivity_reported_correlation_pair_count",
+            )
+        ),
+        candidate_output_path=_required_config_string(
+            fit_config_mapping,
+            "candidate_output_path",
+        ),
+        promotion_maximum_mae_mS_cm=_required_positive_config_float(
+            fit_config_mapping,
+            "promotion_maximum_mae_mS_cm",
+        ),
+        promotion_maximum_abs_bias_mS_cm=_required_nonnegative_config_float(
+            fit_config_mapping,
+            "promotion_maximum_abs_bias_mS_cm",
+        ),
+        promotion_maximum_worst_abs_residual_mS_cm=(
+            _required_nonnegative_config_float(
+                fit_config_mapping,
+                "promotion_maximum_worst_abs_residual_mS_cm",
+            )
+        ),
+        promotion_require_mae_improvement=_required_config_bool(
+            fit_config_mapping,
+            "promotion_require_mae_improvement",
+        ),
+    )
+    coordinate_bounds: list[PrimitiveParameterTransform] = []
+    for parameter_name in CONDUCTIVITY_PRIMITIVE_PARAMETER_FIELD_NAMES:
+        coordinate_bounds.append(
+            _primitive_fit_coordinate_bound_from_config(
+                coordinate_bounds_mapping,
+                parameter_name,
+            )
+        )
+    return fit_options, tuple(coordinate_bounds)
+
+
+def validate_molecular_property_db_audit_result(
+    audit_result: "MolecularPropertyDbAuditResult",
+    fit_options: PrimitiveFitOptions,
+) -> None:
+    if audit_result.evaluated_rows != audit_result.labeled_rows:
+        raise ValueError(
+            "molecular property-DB audit did not evaluate every labeled row: "
+            f"{audit_result.evaluated_rows}/{audit_result.labeled_rows}"
+        )
+    if audit_result.failed_rows > fit_options.maximum_failed_rows:
+        raise ValueError(
+            "molecular property-DB audit failed row count "
+            f"{audit_result.failed_rows} exceeds {fit_options.maximum_failed_rows}"
+        )
+    _threshold_or_raise(
+        audit_result.maximum_mass_balance_residual,
+        fit_options.maximum_mass_balance_residual,
+        "maximum_mass_balance_residual",
+    )
+    _threshold_or_raise(
+        audit_result.maximum_row_sum_residual,
+        fit_options.maximum_row_sum_residual,
+        "maximum_row_sum_residual",
+    )
+    _threshold_or_raise(
+        audit_result.maximum_stationary_residual,
+        fit_options.maximum_stationary_residual,
+        "maximum_stationary_residual",
+    )
+    _threshold_or_raise(
+        audit_result.maximum_detailed_balance_residual,
+        fit_options.maximum_detailed_balance_residual,
+        "maximum_detailed_balance_residual",
+    )
+    _threshold_or_raise(
+        audit_result.maximum_event_reversal_residual,
+        fit_options.maximum_event_reversal_residual,
+        "maximum_event_reversal_residual",
+    )
+    _threshold_or_raise(
+        abs(audit_result.zero_charge_sigma_mS_cm),
+        fit_options.maximum_zero_charge_sigma_mS_cm,
+        "zero_charge_sigma_mS_cm",
+    )
+    if not audit_result.higher_viscosity_lowers_dilute_conductivity:
+        raise ValueError("higher-viscosity molecular invariant failed")
+    if not audit_result.higher_packing_lowers_local_mobility:
+        raise ValueError("higher-packing molecular invariant failed")
+
+
+def _primitive_fit_coordinate_bound_from_config(
+    coordinate_bounds_mapping: dict,
+    parameter_name: str,
+) -> PrimitiveParameterTransform:
+    if parameter_name not in coordinate_bounds_mapping:
+        raise ValueError(f"missing coordinate bound for {parameter_name}")
+    bound_values = coordinate_bounds_mapping[parameter_name]
+    if not isinstance(bound_values, list):
+        raise TypeError(f"coordinate bound for {parameter_name} must be a list")
+    expected_bound_count = 2
+    if len(bound_values) != expected_bound_count:
+        raise ValueError(
+            f"coordinate bound for {parameter_name} must contain two values"
+        )
+    lower_value = _primitive_bound_endpoint_from_config(
+        parameter_name,
+        bound_values[0],
+        "lower_bound",
+    )
+    upper_value = _primitive_bound_endpoint_from_config(
+        parameter_name,
+        bound_values[1],
+        "upper_bound",
+    )
+    if lower_value >= upper_value:
+        raise ValueError(
+            f"coordinate bound for {parameter_name} lower must be below upper"
+        )
+    return PrimitiveParameterTransform(
+        name=parameter_name,
+        transform=CONDUCTIVITY_PRIMITIVE_PARAMETER_TRANSFORM_BY_NAME[
+            parameter_name
+        ],
+        lower=lower_value,
+        upper=upper_value,
+    )
+
+
+def _primitive_bound_endpoint_from_config(
+    parameter_name: str,
+    endpoint_value: float,
+    endpoint_name: str,
+) -> float:
+    context = f"{parameter_name}.{endpoint_name}"
+    transform_name = CONDUCTIVITY_PRIMITIVE_PARAMETER_TRANSFORM_BY_NAME[
+        parameter_name
+    ]
+    if transform_name == PRIMITIVE_PARAMETER_TRANSFORM_LOG_POSITIVE:
+        return math.log(_positive_float(endpoint_value, context))
+    if transform_name == PRIMITIVE_PARAMETER_TRANSFORM_IDENTITY_SIGNED:
+        return _finite_float(endpoint_value, context)
+    raise ValueError(f"unknown primitive parameter transform {transform_name}")
 
 
 @dataclass(frozen=True)
@@ -444,9 +1214,16 @@ def evaluate_primitive_parameter_candidate(
             options,
             type(evaluation_error).__name__,
         )
-    empirical_sigmas = _validated_sigma_tuple(
-        evaluation.empirical_sigmas_mS_cm,
-        "empirical_sigmas_mS_cm",
+    descriptor_calibration_targets = _validated_descriptor_calibration_targets(
+        evaluation.descriptor_calibration_targets,
+    )
+    empirical_sigmas = tuple(
+        descriptor_target.empirical_sigma_mS_cm
+        for descriptor_target in descriptor_calibration_targets
+    )
+    residual_weights = tuple(
+        descriptor_target.residual_weight
+        for descriptor_target in descriptor_calibration_targets
     )
     predicted_sigmas = _validated_sigma_tuple(
         evaluation.predicted_sigmas_mS_cm,
@@ -495,16 +1272,6 @@ def evaluate_primitive_parameter_candidate(
     _nonnegative_int(
         evaluation.corrector_too_weak_failure_count,
         "corrector_too_weak_failure_count",
-    )
-    empirical_sigma_spreads = _validated_sigma_spread_tuple(
-        evaluation.empirical_sigma_spreads_mS_cm,
-        "empirical_sigma_spreads_mS_cm",
-    )
-    if len(empirical_sigmas) != len(empirical_sigma_spreads):
-        raise ValueError("empirical sigma spread tuple length must match sigma tuple length")
-    residual_weights = _empirical_spread_residual_weights(
-        empirical_sigma_spreads,
-        options.empirical_sigma_floor_mS_cm,
     )
     residuals = tuple(
         predicted_sigma_mS_cm - empirical_sigma_mS_cm
@@ -749,7 +1516,6 @@ def fit_speciation_from_cluster_sensitivities(
     regularization_reference_parameters: ConductivityPrimitiveParameterSet,
 ) -> SpeciationSensitivityFitResult:
     from conductivity.molecular_property_db_audit import (
-        MolecularPropertyDbPrimitiveEvaluator,
         cluster_sensitivity_diagnostics_for_row,
     )
 
@@ -1714,6 +2480,96 @@ def _validated_sigma_spread_tuple(
     )
 
 
+def _validated_descriptor_calibration_targets(
+    descriptor_calibration_targets: tuple[DescriptorCalibrationTarget, ...],
+) -> tuple[DescriptorCalibrationTarget, ...]:
+    if not descriptor_calibration_targets:
+        raise ValueError("descriptor_calibration_targets must be nonempty")
+    first_driver_values = _validated_descriptor_driver_values(
+        descriptor_calibration_targets[0].descriptor_driver_values,
+        descriptor_calibration_targets[0].target_id,
+    )
+    reference_driver_names = tuple(
+        driver_name for driver_name, driver_value in first_driver_values
+    )
+    seen_target_ids: set[str] = set()
+    validated_targets: list[DescriptorCalibrationTarget] = []
+    for target_index, descriptor_target in enumerate(descriptor_calibration_targets):
+        target_id = _nonempty_string(descriptor_target.target_id, "target_id")
+        if target_id in seen_target_ids:
+            raise ValueError(f"duplicate descriptor calibration target {target_id}")
+        seen_target_ids.add(target_id)
+        source_row_ids = tuple(
+            _nonnegative_int(source_row_id, "source_row_id")
+            for source_row_id in descriptor_target.source_row_ids
+        )
+        if not source_row_ids:
+            raise ValueError(f"descriptor target {target_id} has no source rows")
+        descriptor_driver_values = (
+            first_driver_values
+            if target_index == 0
+            else _validated_descriptor_driver_values(
+                descriptor_target.descriptor_driver_values,
+                target_id,
+            )
+        )
+        driver_names = tuple(
+            driver_name for driver_name, driver_value in descriptor_driver_values
+        )
+        if driver_names != reference_driver_names:
+            raise ValueError(
+                "descriptor calibration targets must share identical driver columns"
+            )
+        validated_targets.append(
+            DescriptorCalibrationTarget(
+                target_id=target_id,
+                source_row_ids=source_row_ids,
+                descriptor_driver_values=descriptor_driver_values,
+                empirical_sigma_mS_cm=_nonnegative_float(
+                    descriptor_target.empirical_sigma_mS_cm,
+                    f"{target_id}.empirical_sigma_mS_cm",
+                ),
+                empirical_sigma_spread_mS_cm=_nonnegative_float(
+                    descriptor_target.empirical_sigma_spread_mS_cm,
+                    f"{target_id}.empirical_sigma_spread_mS_cm",
+                ),
+                residual_weight=_positive_float(
+                    descriptor_target.residual_weight,
+                    f"{target_id}.residual_weight",
+                ),
+            )
+        )
+    return tuple(validated_targets)
+
+
+def _validated_descriptor_driver_values(
+    descriptor_driver_values: tuple[tuple[str, float], ...],
+    target_id: str,
+) -> tuple[tuple[str, float], ...]:
+    target_id_text = _nonempty_string(target_id, "target_id")
+    if not descriptor_driver_values:
+        raise ValueError(f"descriptor target {target_id_text} has no driver values")
+    seen_driver_names: set[str] = set()
+    validated_values: list[tuple[str, float]] = []
+    for driver_name, driver_value in descriptor_driver_values:
+        driver_name_text = _nonempty_string(driver_name, "descriptor_driver_name")
+        if driver_name_text in seen_driver_names:
+            raise ValueError(
+                f"descriptor target {target_id_text} duplicate driver {driver_name_text}"
+            )
+        seen_driver_names.add(driver_name_text)
+        validated_values.append(
+            (
+                driver_name_text,
+                _finite_float(
+                    driver_value,
+                    f"{target_id_text}.{driver_name_text}",
+                ),
+            )
+        )
+    return tuple(validated_values)
+
+
 def _best_accepted_candidate(
     candidate_results: list[PrimitiveFitCandidateResult],
 ) -> PrimitiveFitCandidateResult:
@@ -1833,10 +2689,79 @@ def primitive_driver_matrix_diagnostics(
     if not cases:
         raise ValueError("primitive driver matrix diagnostics require cases")
     _validate_fit_options(options)
-    feature_rows = tuple(
-        _primitive_driver_feature_row(molecular_case)
+    descriptor_targets = descriptor_calibration_targets_for_cases(cases, options)
+    return primitive_driver_matrix_diagnostics_for_targets(
+        descriptor_targets,
+        options,
+    )
+
+
+def descriptor_calibration_targets_for_cases(
+    cases: tuple["MolecularPropertyDbCase", ...],
+    options: PrimitiveFitOptions,
+) -> tuple[DescriptorCalibrationTarget, ...]:
+    if not cases:
+        raise ValueError("descriptor calibration targets require cases")
+    _validate_fit_options(options)
+    empirical_sigma_spreads = tuple(
+        _nonnegative_float(
+            molecular_case.empirical_sigma_spread_mS_cm,
+            "empirical_sigma_spread_mS_cm",
+        )
         for molecular_case in cases
     )
+    residual_weights = _empirical_spread_residual_weights(
+        empirical_sigma_spreads,
+        options.empirical_sigma_floor_mS_cm,
+    )
+    descriptor_targets = tuple(
+        DescriptorCalibrationTarget(
+            target_id=f"formulation_group:{molecular_case.row_id}",
+            source_row_ids=tuple(
+                _nonnegative_int(source_row_id, "source_row_id")
+                for source_row_id in molecular_case.source_row_ids
+            ),
+            descriptor_driver_values=_primitive_driver_feature_row(molecular_case),
+            empirical_sigma_mS_cm=_nonnegative_float(
+                molecular_case.empirical_sigma_mS_cm,
+                "empirical_sigma_mS_cm",
+            ),
+            empirical_sigma_spread_mS_cm=empirical_sigma_spread_mS_cm,
+            residual_weight=residual_weight,
+        )
+        for molecular_case, empirical_sigma_spread_mS_cm, residual_weight in zip(
+            cases,
+            empirical_sigma_spreads,
+            residual_weights,
+        )
+    )
+    return _validated_descriptor_calibration_targets(descriptor_targets)
+
+
+def primitive_driver_matrix_diagnostics_for_targets(
+    descriptor_calibration_targets: tuple[DescriptorCalibrationTarget, ...],
+    options: PrimitiveFitOptions,
+) -> PrimitiveDriverMatrixDiagnostics:
+    descriptor_targets = _validated_descriptor_calibration_targets(
+        descriptor_calibration_targets,
+    )
+    feature_rows = tuple(
+        descriptor_target.descriptor_driver_values
+        for descriptor_target in descriptor_targets
+    )
+    return primitive_driver_matrix_diagnostics_from_feature_rows(
+        feature_rows,
+        options,
+    )
+
+
+def primitive_driver_matrix_diagnostics_from_feature_rows(
+    feature_rows: tuple[tuple[tuple[str, float], ...], ...],
+    options: PrimitiveFitOptions,
+) -> PrimitiveDriverMatrixDiagnostics:
+    if not feature_rows:
+        raise ValueError("primitive driver matrix diagnostics require feature rows")
+    _validate_fit_options(options)
     feature_names = tuple(
         feature_name for feature_name, feature_value in feature_rows[0]
     )
@@ -1946,17 +2871,20 @@ def primitive_prediction_sensitivity_diagnostics(
         baseline_evaluation.predicted_sigmas_mS_cm,
         "baseline_predicted_sigmas_mS_cm",
     )
-    empirical_sigma_spreads = _validated_sigma_spread_tuple(
-        baseline_evaluation.empirical_sigma_spreads_mS_cm,
-        "baseline_empirical_sigma_spreads_mS_cm",
+    baseline_descriptor_targets = _validated_descriptor_calibration_targets(
+        baseline_evaluation.descriptor_calibration_targets,
+    )
+    empirical_sigma_spreads = tuple(
+        descriptor_target.empirical_sigma_spread_mS_cm
+        for descriptor_target in baseline_descriptor_targets
     )
     if len(baseline_predicted_sigmas) != len(empirical_sigma_spreads):
         raise ValueError(
             "baseline predicted sigma and empirical spread counts must match"
         )
-    residual_weights = _empirical_spread_residual_weights(
-        empirical_sigma_spreads,
-        options.empirical_sigma_floor_mS_cm,
+    residual_weights = tuple(
+        descriptor_target.residual_weight
+        for descriptor_target in baseline_descriptor_targets
     )
     current_coordinate_values = (
         conductivity_primitive_parameter_coordinate_values_for_names(
@@ -2960,6 +3888,12 @@ def _positive_float(value: float, context: str) -> float:
     return parsed_value
 
 
+def _positive_float_tuple(values: tuple[float, ...], context: str) -> tuple[float, ...]:
+    if not values:
+        raise ValueError(f"{context} must be nonempty")
+    return tuple(_positive_float(value, context) for value in values)
+
+
 def _nonnegative_float(value: float, context: str) -> float:
     parsed_value = _finite_float(value, context)
     if parsed_value < 0.0:
@@ -3046,19 +3980,856 @@ def _print_prediction_sensitivity_diagnostics(
         )
 
 
-def main() -> None:
+DIRECT_CAPACITY_BLOCK_PARAMETER_NAMES = (
+    "coulomb_scale",
+    "desolvation_scale",
+    "coordination_scale",
+    "steric_free_energy_scale",
+    "cluster_entropy_penalty_scale",
+    "association_crowding_stabilization_scale",
+    "association_crowding_ionic_strength_exponent",
+    "association_crowding_charge_density_exponent",
+    "activity_debye_scale",
+    "activity_size_scale",
+    "activity_hard_sphere_scale",
+    "cluster_activity_scale",
+    "pair_logK_offset",
+    "solvent_separated_pair_logK_offset",
+    "contact_pair_logK_offset",
+    "positive_charged_triplet_logK_offset",
+    "negative_charged_triplet_logK_offset",
+    "neutral_cluster_logK_offset",
+    "higher_charged_cluster_logK_offset",
+    "cluster_order_logK_slope",
+    "cluster_charge_magnitude_logK_slope",
+    "cluster_hydrodynamic_radius_scale",
+    "hydrodynamic_radius_scale_positive_ion",
+    "hydrodynamic_radius_scale_negative_ion",
+    "hydrodynamic_radius_scale_cluster",
+    "shape_friction_exponent",
+    "free_volume_exponent",
+    "dielectric_mobility_exponent",
+    "solvation_mobility_exponent",
+    "additive_shape_solvation_mobility_exponent",
+    "positive_ion_charge_density_mobility_exponent",
+    "negative_ion_charge_density_mobility_exponent",
+    "positive_ion_counteranion_charge_cloud_mobility_exponent",
+    "negative_ion_charge_cloud_mobility_exponent",
+    "negative_ion_intrinsic_dielectric_drag_mobility_exponent",
+    "negative_ion_shape_delocalization_mobility_exponent",
+    "positive_ion_anion_disorder_mobility_exponent",
+    "negative_ion_anion_disorder_mobility_exponent",
+    "local_obstruction_strength",
+    "local_obstruction_free_volume_exponent",
+    "local_obstruction_ionic_strength_exponent",
+    "local_obstruction_additive_solvation_exponent",
+    "local_obstruction_size_exponent",
+    "local_obstruction_charge_density_exponent",
+    "local_obstruction_solvation_exponent",
+)
+
+CORRECTOR_BLOCK_PARAMETER_NAMES = (
+    "atmosphere_ep_scale",
+    "atmosphere_rel_scale",
+    "charge_cloud_radius_scale",
+    "cross_relaxation_scale",
+    "jump_length_scale",
+    "atmosphere_capture_scale",
+    "atmosphere_exit_scale",
+    "association_conversion_rate_scale",
+    "orientation_relaxation_rate_scale",
+)
+
+CLUSTER_SINK_BLOCK_PARAMETER_NAMES = (
+    "coulomb_scale",
+    "desolvation_scale",
+    "coordination_scale",
+    "cluster_entropy_penalty_scale",
+    "association_crowding_stabilization_scale",
+    "association_crowding_ionic_strength_exponent",
+    "association_crowding_charge_density_exponent",
+    "activity_debye_scale",
+    "activity_size_scale",
+    "activity_hard_sphere_scale",
+    "cluster_activity_scale",
+    "cluster_hydrodynamic_radius_scale",
+) + CLUSTER_SENSITIVITY_PARAMETER_NAMES
+
+
+@dataclass(frozen=True)
+class DecomposedFitBlockResult:
+    block_name: str
+    selected_row_count: int
+    active_parameter_count: int
+    sensitivity_rank: int
+    accepted: bool
+    accepted_parameters: ConductivityPrimitiveParameterSet
+    fit_result: PrimitiveParameterFitResult
+    audit_result: "MolecularPropertyDbAuditResult"
+
+
+@dataclass(frozen=True)
+class TransportRoleDirectScalingAudit:
+    selected_row_count: int
+    transport_roles: tuple[str, ...]
+    scale_factors: tuple[float, ...]
+    objective_value: float
+    target_direct_sigmas_mS_cm: tuple[float, ...]
+    fitted_direct_sigmas_mS_cm: tuple[float, ...]
+
+
+@dataclass(frozen=True)
+class DecomposedFitResult:
+    direct_capacity_result: DecomposedFitBlockResult
+    corrector_result: DecomposedFitBlockResult
+    cluster_sink_result: DecomposedFitBlockResult
+    final_result: DecomposedFitBlockResult
+    baseline_audit_result: "MolecularPropertyDbAuditResult"
+    candidate_audit_result: "MolecularPropertyDbAuditResult"
+    baseline_role_scaling_audit: TransportRoleDirectScalingAudit
+    candidate_role_scaling_audit: TransportRoleDirectScalingAudit
+    promotion_rejection_reasons: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class DecomposedFitContext:
+    cases: tuple["MolecularPropertyDbCase", ...]
+    audit_options: "MolecularPropertyDbAuditOptions"
+    fit_options: PrimitiveFitOptions
+    coordinate_bounds: tuple[PrimitiveParameterTransform, ...]
+    full_evaluator: ConductivityPrimitiveParameterEvaluator
+    regularization_reference_parameters: ConductivityPrimitiveParameterSet
+
+
+class RowFilteredPrimitiveEvaluator:
+    def __init__(
+        self,
+        base_evaluator: ConductivityPrimitiveParameterEvaluator,
+        selected_row_indices: tuple[int, ...],
+    ) -> None:
+        if not selected_row_indices:
+            raise ValueError("row-filtered evaluator requires selected rows")
+        self._base_evaluator = base_evaluator
+        self._selected_row_indices = selected_row_indices
+
+    def evaluate(
+        self,
+        primitive_parameters: ConductivityPrimitiveParameterSet,
+    ) -> PrimitiveFitDatasetEvaluation:
+        full_evaluation = self._base_evaluator.evaluate(primitive_parameters)
+        selected_direct_capacity_gaps = _select_tuple_values(
+            full_evaluation.direct_capacity_gaps_mS_cm,
+            self._selected_row_indices,
+        )
+        selected_corrector_residuals = _select_tuple_values(
+            full_evaluation.corrector_residuals_mS_cm,
+            self._selected_row_indices,
+        )
+        return PrimitiveFitDatasetEvaluation(
+            descriptor_calibration_targets=_select_descriptor_calibration_targets(
+                full_evaluation.descriptor_calibration_targets,
+                self._selected_row_indices,
+            ),
+            predicted_sigmas_mS_cm=_select_tuple_values(
+                full_evaluation.predicted_sigmas_mS_cm,
+                self._selected_row_indices,
+            ),
+            direct_sigmas_mS_cm=_select_tuple_values(
+                full_evaluation.direct_sigmas_mS_cm,
+                self._selected_row_indices,
+            ),
+            corrector_sigmas_mS_cm=_select_tuple_values(
+                full_evaluation.corrector_sigmas_mS_cm,
+                self._selected_row_indices,
+            ),
+            direct_capacity_gaps_mS_cm=selected_direct_capacity_gaps,
+            corrector_targets_mS_cm=_select_tuple_values(
+                full_evaluation.corrector_targets_mS_cm,
+                self._selected_row_indices,
+            ),
+            corrector_residuals_mS_cm=selected_corrector_residuals,
+            direct_capacity_failure_count=sum(
+                direct_capacity_gap_mS_cm > 0.0
+                for direct_capacity_gap_mS_cm in selected_direct_capacity_gaps
+            ),
+            corrector_too_strong_failure_count=sum(
+                direct_capacity_gap_mS_cm <= 0.0 and corrector_residual_mS_cm > 0.0
+                for direct_capacity_gap_mS_cm, corrector_residual_mS_cm in zip(
+                    selected_direct_capacity_gaps,
+                    selected_corrector_residuals,
+                )
+            ),
+            corrector_too_weak_failure_count=sum(
+                direct_capacity_gap_mS_cm <= 0.0 and corrector_residual_mS_cm < 0.0
+                for direct_capacity_gap_mS_cm, corrector_residual_mS_cm in zip(
+                    selected_direct_capacity_gaps,
+                    selected_corrector_residuals,
+                )
+            ),
+            cluster_activation_penalty=full_evaluation.cluster_activation_penalty,
+            failed_rows=full_evaluation.failed_rows,
+            maximum_mass_balance_residual=(
+                full_evaluation.maximum_mass_balance_residual
+            ),
+            maximum_row_sum_residual=full_evaluation.maximum_row_sum_residual,
+            maximum_stationary_residual=(
+                full_evaluation.maximum_stationary_residual
+            ),
+            maximum_detailed_balance_residual=(
+                full_evaluation.maximum_detailed_balance_residual
+            ),
+            maximum_event_reversal_residual=(
+                full_evaluation.maximum_event_reversal_residual
+            ),
+            zero_charge_sigma_mS_cm=full_evaluation.zero_charge_sigma_mS_cm,
+            higher_viscosity_lowers_dilute_conductivity=(
+                full_evaluation.higher_viscosity_lowers_dilute_conductivity
+            ),
+            higher_packing_lowers_local_mobility=(
+                full_evaluation.higher_packing_lowers_local_mobility
+            ),
+            consumed_parameter_fields=full_evaluation.consumed_parameter_fields,
+        )
+
+
+def _select_descriptor_calibration_targets(
+    descriptor_targets: tuple[DescriptorCalibrationTarget, ...],
+    selected_row_indices: tuple[int, ...],
+) -> tuple[DescriptorCalibrationTarget, ...]:
+    validated_targets = _validated_descriptor_calibration_targets(descriptor_targets)
+    if not selected_row_indices:
+        raise ValueError("selected_row_indices must be nonempty")
+    return tuple(validated_targets[row_index] for row_index in selected_row_indices)
+
+
+def _select_tuple_values(
+    values: tuple[float, ...],
+    selected_row_indices: tuple[int, ...],
+) -> tuple[float, ...]:
+    if not values:
+        raise ValueError("cannot select from an empty tuple")
+    return tuple(values[row_index] for row_index in selected_row_indices)
+
+
+def _coordinate_bounds_for_parameter_names(
+    coordinate_bounds: tuple[PrimitiveParameterTransform, ...],
+    parameter_names: tuple[str, ...],
+) -> tuple[PrimitiveParameterTransform, ...]:
+    requested_parameter_names = set(parameter_names)
+    selected_coordinate_bounds = tuple(
+        coordinate_bound
+        for coordinate_bound in coordinate_bounds
+        if coordinate_bound.name in requested_parameter_names
+    )
+    if not selected_coordinate_bounds:
+        raise ValueError("selected coordinate bounds must contain at least one parameter")
+    return selected_coordinate_bounds
+
+
+def _coordinate_bounds_for_identifiable_parameters(
+    coordinate_bounds: tuple[PrimitiveParameterTransform, ...],
+    sensitivity_diagnostics: PrimitivePredictionSensitivityDiagnostics,
+) -> tuple[PrimitiveParameterTransform, ...]:
+    identifiable_parameter_names = set(
+        sensitivity_diagnostics.identifiable_parameter_names
+    )
+    selected_coordinate_bounds = tuple(
+        coordinate_bound
+        for coordinate_bound in coordinate_bounds
+        if coordinate_bound.name in identifiable_parameter_names
+    )
+    if not selected_coordinate_bounds:
+        raise ValueError("identifiability analysis selected no active parameters")
+    return selected_coordinate_bounds
+
+
+def _unique_parameter_names(
+    parameter_names: tuple[str, ...],
+) -> tuple[str, ...]:
+    ordered_parameter_names: list[str] = []
+    seen_parameter_names: set[str] = set()
+    for parameter_name in parameter_names:
+        if parameter_name in seen_parameter_names:
+            continue
+        ordered_parameter_names.append(parameter_name)
+        seen_parameter_names.add(parameter_name)
+    return tuple(ordered_parameter_names)
+
+
+def fit_decomposed_conductivity_primitives() -> DecomposedFitResult:
     from data.electrolyte_property_db import DATA
     from data.species_data import ADDITIVES, CATION_PROPERTIES, SALTS, SOLVENTS
     from conductivity.molecular_property_db_audit import (
-        MolecularPropertyDbPrimitiveEvaluator,
         MolecularPropertyDbRegistrySource,
         REFERENCE_CONDUCTIVITY_PRIMITIVE_PARAMETERS,
         audit_molecular_property_db_cases,
         build_molecular_property_db_case_selection,
         configured_conductivity_primitive_parameters,
-        default_molecular_primitive_fit_configuration,
         default_molecular_property_db_audit_options,
-        validate_molecular_property_db_audit_result,
+    )
+
+    audit_options = default_molecular_property_db_audit_options()
+    fit_options, coordinate_bounds = default_molecular_primitive_fit_configuration()
+    block_fit_options = replace(
+        fit_options,
+        cluster_activation_loss_weight=(
+            fit_options.decomposed_block_cluster_activation_loss_weight
+        ),
+        powell_max_iterations_per_parameter=(
+            fit_options.decomposed_block_powell_max_iterations_per_parameter
+        ),
+        powell_max_function_evaluations_per_parameter=(
+            fit_options.decomposed_block_powell_max_function_evaluations_per_parameter
+        ),
+    )
+    registry_source = MolecularPropertyDbRegistrySource(
+        solvent_registry=SOLVENTS,
+        salt_registry=SALTS,
+        additive_registry=ADDITIVES,
+        cation_registry=CATION_PROPERTIES,
+    )
+    case_selection = build_molecular_property_db_case_selection(
+        tuple(DATA),
+        registry_source,
+        audit_options,
+    )
+    block_evaluator = MolecularPropertyDbPrimitiveEvaluator(
+        case_selection.cases,
+        audit_options,
+        block_fit_options,
+    )
+    full_evaluator = MolecularPropertyDbPrimitiveEvaluator(
+        case_selection.cases,
+        audit_options,
+        fit_options,
+    )
+    decomposed_context = DecomposedFitContext(
+        cases=case_selection.cases,
+        audit_options=audit_options,
+        fit_options=block_fit_options,
+        coordinate_bounds=coordinate_bounds,
+        full_evaluator=block_evaluator,
+        regularization_reference_parameters=REFERENCE_CONDUCTIVITY_PRIMITIVE_PARAMETERS,
+    )
+    final_decomposed_context = DecomposedFitContext(
+        cases=case_selection.cases,
+        audit_options=audit_options,
+        fit_options=fit_options,
+        coordinate_bounds=coordinate_bounds,
+        full_evaluator=full_evaluator,
+        regularization_reference_parameters=REFERENCE_CONDUCTIVITY_PRIMITIVE_PARAMETERS,
+    )
+    current_parameters = configured_conductivity_primitive_parameters()
+    baseline_audit_result = audit_molecular_property_db_cases(
+        case_selection.cases,
+        current_parameters,
+        audit_options,
+    )
+    validate_molecular_property_db_audit_result(baseline_audit_result, fit_options)
+
+    direct_capacity_result = _run_decomposed_block(
+        "direct_capacity",
+        current_parameters,
+        baseline_audit_result,
+        DIRECT_CAPACITY_BLOCK_PARAMETER_NAMES,
+        tuple(
+            row_index
+            for row_index, row_result in enumerate(baseline_audit_result.rows)
+            if row_result.direct_capacity_failure
+        ),
+        decomposed_context,
+    )
+    current_parameters = direct_capacity_result.accepted_parameters
+
+    corrector_start_audit_result = direct_capacity_result.audit_result
+    corrector_result = _run_decomposed_block(
+        "corrector",
+        current_parameters,
+        corrector_start_audit_result,
+        CORRECTOR_BLOCK_PARAMETER_NAMES,
+        tuple(
+            row_index
+            for row_index, row_result in enumerate(corrector_start_audit_result.rows)
+            if (
+                not row_result.direct_capacity_failure
+                and (
+                    row_result.corrector_too_strong_failure
+                    or row_result.corrector_too_weak_failure
+                )
+            )
+        ),
+        decomposed_context,
+    )
+    current_parameters = corrector_result.accepted_parameters
+
+    cluster_start_audit_result = corrector_result.audit_result
+    cluster_sink_result = _run_decomposed_block(
+        "cluster_sink",
+        current_parameters,
+        cluster_start_audit_result,
+        CLUSTER_SINK_BLOCK_PARAMETER_NAMES,
+        _cluster_sink_row_indices(cluster_start_audit_result, fit_options),
+        decomposed_context,
+    )
+    current_parameters = cluster_sink_result.accepted_parameters
+
+    final_start_audit_result = cluster_sink_result.audit_result
+    final_result = _run_decomposed_block(
+        "final_joint",
+        current_parameters,
+        final_start_audit_result,
+        SPECIATION_FIT_PARAMETER_NAMES + MOBILITY_EVENT_FIT_PARAMETER_NAMES,
+        tuple(range(len(final_start_audit_result.rows))),
+        final_decomposed_context,
+    )
+
+    write_primitive_parameter_candidate_config(
+        fit_options.candidate_output_path,
+        final_result.accepted_parameters,
+        case_selection.source_labeled_rows,
+    )
+    loaded_candidate_parameters = (
+        load_primitive_parameters_from_candidate_config_artifact(
+            fit_options.candidate_output_path
+        )
+    )
+    candidate_audit_result = audit_molecular_property_db_cases(
+        case_selection.cases,
+        loaded_candidate_parameters,
+        audit_options,
+    )
+    validate_molecular_property_db_audit_result(candidate_audit_result, fit_options)
+    baseline_role_scaling_audit = _transport_role_direct_scaling_audit(
+        baseline_audit_result,
+        fit_options,
+    )
+    candidate_role_scaling_audit = _transport_role_direct_scaling_audit(
+        candidate_audit_result,
+        fit_options,
+    )
+    baseline_metrics = PrimitivePromotionMetrics(
+        mae_mS_cm=baseline_audit_result.mae_mS_cm,
+        bias_mS_cm=baseline_audit_result.bias_mS_cm,
+        pearson_r=baseline_audit_result.pearson_r,
+        worst_abs_residual_mS_cm=baseline_audit_result.maximum_abs_residual_mS_cm,
+        failed_rows=baseline_audit_result.failed_rows,
+        maximum_mass_balance_residual=(
+            baseline_audit_result.maximum_mass_balance_residual
+        ),
+        maximum_row_sum_residual=baseline_audit_result.maximum_row_sum_residual,
+        maximum_stationary_residual=baseline_audit_result.maximum_stationary_residual,
+        maximum_detailed_balance_residual=(
+            baseline_audit_result.maximum_detailed_balance_residual
+        ),
+        maximum_event_reversal_residual=(
+            baseline_audit_result.maximum_event_reversal_residual
+        ),
+        zero_charge_sigma_mS_cm=baseline_audit_result.zero_charge_sigma_mS_cm,
+        higher_viscosity_lowers_dilute_conductivity=(
+            baseline_audit_result.higher_viscosity_lowers_dilute_conductivity
+        ),
+        higher_packing_lowers_local_mobility=(
+            baseline_audit_result.higher_packing_lowers_local_mobility
+        ),
+    )
+    candidate_metrics = PrimitivePromotionMetrics(
+        mae_mS_cm=candidate_audit_result.mae_mS_cm,
+        bias_mS_cm=candidate_audit_result.bias_mS_cm,
+        pearson_r=candidate_audit_result.pearson_r,
+        worst_abs_residual_mS_cm=candidate_audit_result.maximum_abs_residual_mS_cm,
+        failed_rows=candidate_audit_result.failed_rows,
+        maximum_mass_balance_residual=(
+            candidate_audit_result.maximum_mass_balance_residual
+        ),
+        maximum_row_sum_residual=candidate_audit_result.maximum_row_sum_residual,
+        maximum_stationary_residual=candidate_audit_result.maximum_stationary_residual,
+        maximum_detailed_balance_residual=(
+            candidate_audit_result.maximum_detailed_balance_residual
+        ),
+        maximum_event_reversal_residual=(
+            candidate_audit_result.maximum_event_reversal_residual
+        ),
+        zero_charge_sigma_mS_cm=candidate_audit_result.zero_charge_sigma_mS_cm,
+        higher_viscosity_lowers_dilute_conductivity=(
+            candidate_audit_result.higher_viscosity_lowers_dilute_conductivity
+        ),
+        higher_packing_lowers_local_mobility=(
+            candidate_audit_result.higher_packing_lowers_local_mobility
+        ),
+    )
+    promotion_rejection_reasons = primitive_parameter_promotion_rejection_reasons(
+        baseline_metrics,
+        candidate_metrics,
+        fit_options,
+    )
+    write_primitive_parameter_candidate_artifact(
+        fit_options.candidate_output_path,
+        loaded_candidate_parameters,
+        baseline_metrics,
+        candidate_metrics,
+        case_selection.source_labeled_rows,
+        promotion_rejection_reasons,
+    )
+    return DecomposedFitResult(
+        direct_capacity_result=direct_capacity_result,
+        corrector_result=corrector_result,
+        cluster_sink_result=cluster_sink_result,
+        final_result=final_result,
+        baseline_audit_result=baseline_audit_result,
+        candidate_audit_result=candidate_audit_result,
+        baseline_role_scaling_audit=baseline_role_scaling_audit,
+        candidate_role_scaling_audit=candidate_role_scaling_audit,
+        promotion_rejection_reasons=promotion_rejection_reasons,
+    )
+
+
+def _run_decomposed_block(
+    block_name: str,
+    initial_parameters: ConductivityPrimitiveParameterSet,
+    starting_audit_result: "MolecularPropertyDbAuditResult",
+    block_parameter_names: tuple[str, ...],
+    selected_row_indices: tuple[int, ...],
+    decomposed_context: DecomposedFitContext,
+) -> DecomposedFitBlockResult:
+    from conductivity.molecular_property_db_audit import (
+        audit_molecular_property_db_cases,
+    )
+
+    validate_conductivity_primitive_parameters(initial_parameters)
+    if not selected_row_indices:
+        raise ValueError(f"{block_name} block selected no calibration rows")
+    base_block_coordinate_bounds = _coordinate_bounds_for_parameter_names(
+        decomposed_context.coordinate_bounds,
+        _unique_parameter_names(block_parameter_names),
+    )
+    block_evaluator = RowFilteredPrimitiveEvaluator(
+        decomposed_context.full_evaluator,
+        selected_row_indices,
+    )
+    sensitivity_diagnostics = primitive_prediction_sensitivity_diagnostics(
+        initial_parameters,
+        base_block_coordinate_bounds,
+        block_evaluator,
+        decomposed_context.fit_options,
+    )
+    active_coordinate_bounds = _coordinate_bounds_for_identifiable_parameters(
+        base_block_coordinate_bounds,
+        sensitivity_diagnostics,
+    )
+    fit_result = fit_conductivity_primitive_parameters(
+        initial_parameters,
+        decomposed_context.regularization_reference_parameters,
+        active_coordinate_bounds,
+        block_evaluator,
+        decomposed_context.fit_options,
+    )
+    candidate_audit_result = audit_molecular_property_db_cases(
+        decomposed_context.cases,
+        fit_result.best_candidate.primitive_parameters,
+        decomposed_context.audit_options,
+    )
+    validate_molecular_property_db_audit_result(
+        candidate_audit_result,
+        decomposed_context.fit_options,
+    )
+    accepted = _block_candidate_preserves_full_audit(
+        starting_audit_result,
+        candidate_audit_result,
+    )
+    accepted_parameters = (
+        fit_result.best_candidate.primitive_parameters
+        if accepted
+        else initial_parameters
+    )
+    audit_result = candidate_audit_result if accepted else starting_audit_result
+    return DecomposedFitBlockResult(
+        block_name=block_name,
+        selected_row_count=len(selected_row_indices),
+        active_parameter_count=len(active_coordinate_bounds),
+        sensitivity_rank=sensitivity_diagnostics.rank,
+        accepted=accepted,
+        accepted_parameters=accepted_parameters,
+        fit_result=fit_result,
+        audit_result=audit_result,
+    )
+
+
+def _block_candidate_preserves_full_audit(
+    starting_audit_result: "MolecularPropertyDbAuditResult",
+    candidate_audit_result: "MolecularPropertyDbAuditResult",
+) -> bool:
+    return (
+        candidate_audit_result.mae_mS_cm <= starting_audit_result.mae_mS_cm
+        and candidate_audit_result.maximum_abs_residual_mS_cm
+        <= starting_audit_result.maximum_abs_residual_mS_cm
+    )
+
+
+def _cluster_sink_row_indices(
+    audit_result: "MolecularPropertyDbAuditResult",
+    fit_options: PrimitiveFitOptions,
+) -> tuple[int, ...]:
+    sorted_index_and_row = tuple(
+        sorted(
+            enumerate(audit_result.rows),
+            key=lambda index_and_row: abs(index_and_row[1].residual_mS_cm),
+            reverse=True,
+        )
+    )
+    tail_index_and_row = sorted_index_and_row[: fit_options.residual_tail_count]
+    return tuple(
+        row_index
+        for row_index, row_result in tail_index_and_row
+        if (
+            row_result.neutral_cluster_fraction > 0.0
+            or row_result.charged_cluster_fraction > 0.0
+            or row_result.charged_cluster_net_sigma_mS_cm != 0.0
+        )
+    )
+
+
+def _transport_role_direct_scaling_audit(
+    audit_result: "MolecularPropertyDbAuditResult",
+    fit_options: PrimitiveFitOptions,
+) -> TransportRoleDirectScalingAudit:
+    if not audit_result.rows:
+        raise ValueError("role scaling audit requires audit rows")
+    transport_roles = tuple(
+        audit_result.rows[0].direct_sigma_by_transport_role_mS_cm.keys()
+    )
+    if not transport_roles:
+        raise ValueError("role scaling audit requires transport-role fields")
+    tail_rows = tuple(
+        row_result
+        for row_result in sorted(
+            audit_result.rows,
+            key=lambda row_result: abs(row_result.residual_mS_cm),
+            reverse=True,
+        )[: fit_options.residual_tail_count]
+        if row_result.direct_capacity_failure
+    )
+    if not tail_rows:
+        return TransportRoleDirectScalingAudit(
+            selected_row_count=0,
+            transport_roles=transport_roles,
+            scale_factors=tuple(1.0 for transport_role in transport_roles),
+            objective_value=0.0,
+            target_direct_sigmas_mS_cm=tuple(),
+            fitted_direct_sigmas_mS_cm=tuple(),
+        )
+    role_direct_matrix = np.asarray(
+        tuple(
+            tuple(
+                row_result.direct_sigma_by_transport_role_mS_cm[transport_role]
+                for transport_role in transport_roles
+            )
+            for row_result in tail_rows
+        ),
+        dtype=float,
+    )
+    target_direct_vector = np.asarray(
+        tuple(row_result.empirical_sigma_mS_cm for row_result in tail_rows),
+        dtype=float,
+    )
+    scale_factors = _solve_bounded_role_direct_scaling(
+        role_direct_matrix,
+        target_direct_vector,
+        fit_options.role_direct_scaling_regularization_weight,
+        fit_options.role_direct_scaling_lower_bound,
+        fit_options.role_direct_scaling_upper_bound,
+    )
+    fitted_direct_vector = role_direct_matrix @ np.asarray(scale_factors, dtype=float)
+    objective_value = _role_direct_scaling_objective(
+        role_direct_matrix,
+        target_direct_vector,
+        np.asarray(scale_factors, dtype=float),
+        fit_options.role_direct_scaling_regularization_weight,
+    )
+    return TransportRoleDirectScalingAudit(
+        selected_row_count=len(tail_rows),
+        transport_roles=transport_roles,
+        scale_factors=scale_factors,
+        objective_value=objective_value,
+        target_direct_sigmas_mS_cm=tuple(float(value) for value in target_direct_vector),
+        fitted_direct_sigmas_mS_cm=tuple(float(value) for value in fitted_direct_vector),
+    )
+
+
+def _solve_bounded_role_direct_scaling(
+    role_direct_matrix: np.ndarray,
+    target_direct_vector: np.ndarray,
+    regularization_weight: float,
+    lower_bound: float,
+    upper_bound: float,
+) -> tuple[float, ...]:
+    if role_direct_matrix.ndim != 2:
+        raise ValueError("role_direct_matrix must be two-dimensional")
+    row_count, role_count = role_direct_matrix.shape
+    if row_count == 0 or role_count == 0:
+        raise ValueError("role_direct_matrix must be nonempty")
+    if target_direct_vector.shape != (row_count,):
+        raise ValueError("target_direct_vector shape must match role rows")
+    if not np.all(np.isfinite(role_direct_matrix)):
+        raise ValueError("role_direct_matrix values must be finite")
+    if not np.all(np.isfinite(target_direct_vector)):
+        raise ValueError("target_direct_vector values must be finite")
+    if lower_bound >= upper_bound:
+        raise ValueError("lower_bound must be below upper_bound")
+    best_scale_vector = np.ones(role_count, dtype=float)
+    best_objective_value = np.inf
+    found_feasible_scale_vector = False
+    active_set_status_values = (0, 1, 2)
+    for active_set_statuses in itertools.product(
+        active_set_status_values,
+        repeat=role_count,
+    ):
+        candidate_scale_vector = np.ones(role_count, dtype=float)
+        free_role_indices: list[int] = []
+        for role_index, active_set_status in enumerate(active_set_statuses):
+            if active_set_status == 0:
+                free_role_indices.append(role_index)
+            elif active_set_status == 1:
+                candidate_scale_vector[role_index] = lower_bound
+            else:
+                candidate_scale_vector[role_index] = upper_bound
+        if free_role_indices:
+            fixed_role_indices = tuple(
+                role_index
+                for role_index in range(role_count)
+                if role_index not in free_role_indices
+            )
+            fixed_direct_vector = np.zeros(row_count, dtype=float)
+            if fixed_role_indices:
+                fixed_direct_vector = (
+                    role_direct_matrix[:, fixed_role_indices]
+                    @ candidate_scale_vector[list(fixed_role_indices)]
+                )
+            free_role_matrix = role_direct_matrix[:, free_role_indices]
+            adjusted_target_vector = target_direct_vector - fixed_direct_vector
+            free_system_matrix = (
+                free_role_matrix.T @ free_role_matrix
+                + regularization_weight * np.eye(len(free_role_indices))
+            )
+            free_target_vector = (
+                free_role_matrix.T @ adjusted_target_vector
+                + regularization_weight * np.ones(len(free_role_indices))
+            )
+            free_scale_vector = np.linalg.solve(
+                free_system_matrix,
+                free_target_vector,
+            )
+            if np.any(free_scale_vector < lower_bound):
+                continue
+            if np.any(free_scale_vector > upper_bound):
+                continue
+            candidate_scale_vector[free_role_indices] = free_scale_vector
+        objective_value = _role_direct_scaling_objective(
+            role_direct_matrix,
+            target_direct_vector,
+            candidate_scale_vector,
+            regularization_weight,
+        )
+        if objective_value < best_objective_value:
+            best_objective_value = objective_value
+            best_scale_vector = candidate_scale_vector
+            found_feasible_scale_vector = True
+    if not found_feasible_scale_vector:
+        raise ValueError("bounded role direct-scaling solve found no feasible point")
+    return tuple(float(value) for value in best_scale_vector)
+
+
+def _role_direct_scaling_objective(
+    role_direct_matrix: np.ndarray,
+    target_direct_vector: np.ndarray,
+    scale_vector: np.ndarray,
+    regularization_weight: float,
+) -> float:
+    residual_vector = role_direct_matrix @ scale_vector - target_direct_vector
+    regularization_vector = scale_vector - np.ones(scale_vector.shape[0], dtype=float)
+    return float(
+        residual_vector @ residual_vector
+        + regularization_weight * (regularization_vector @ regularization_vector)
+    )
+
+
+def print_decomposed_fit_result(result: DecomposedFitResult) -> None:
+    candidate_audit_result = result.candidate_audit_result
+    print("decomposed_molecular_primitive_parameter_fit")
+    print(f"baseline_mae_mS_cm={result.baseline_audit_result.mae_mS_cm:.6f}")
+    print(f"verified_candidate_mae_mS_cm={candidate_audit_result.mae_mS_cm:.6f}")
+    print(f"verified_candidate_bias_mS_cm={candidate_audit_result.bias_mS_cm:.6f}")
+    print(f"verified_candidate_pearson_r={candidate_audit_result.pearson_r:.6f}")
+    print(
+        "verified_candidate_worst_abs_residual_mS_cm="
+        f"{candidate_audit_result.maximum_abs_residual_mS_cm:.6f}"
+    )
+    print(f"verified_candidate_failed_rows={candidate_audit_result.failed_rows}")
+    print(
+        "verified_candidate_event_reversal_residual="
+        f"{candidate_audit_result.maximum_event_reversal_residual:.6e}"
+    )
+    print(
+        "verified_candidate_direct_capacity_failures="
+        f"{sum(row.direct_capacity_failure for row in candidate_audit_result.rows)}"
+    )
+    print(
+        "verified_candidate_corrector_too_strong_failures="
+        f"{sum(row.corrector_too_strong_failure for row in candidate_audit_result.rows)}"
+    )
+    print(
+        "verified_candidate_corrector_too_weak_failures="
+        f"{sum(row.corrector_too_weak_failure for row in candidate_audit_result.rows)}"
+    )
+    _print_transport_role_direct_scaling_audit(
+        "baseline",
+        result.baseline_role_scaling_audit,
+    )
+    _print_transport_role_direct_scaling_audit(
+        "verified_candidate",
+        result.candidate_role_scaling_audit,
+    )
+    print(
+        "promotion_status="
+        f"{'accepted' if not result.promotion_rejection_reasons else 'rejected'}"
+    )
+    print(
+        "promotion_rejection_reasons="
+        f"{','.join(result.promotion_rejection_reasons)}"
+    )
+
+
+def _print_transport_role_direct_scaling_audit(
+    report_prefix: str,
+    role_scaling_audit: TransportRoleDirectScalingAudit,
+) -> None:
+    print(
+        f"{report_prefix}_role_direct_scaling_selected_row_count="
+        f"{role_scaling_audit.selected_row_count}"
+    )
+    print(
+        f"{report_prefix}_role_direct_scaling_objective="
+        f"{role_scaling_audit.objective_value:.6f}"
+    )
+    for transport_role, scale_factor in zip(
+        role_scaling_audit.transport_roles,
+        role_scaling_audit.scale_factors,
+    ):
+        print(
+            f"{report_prefix}_role_direct_scaling_factor_{transport_role}="
+            f"{scale_factor:.6f}"
+        )
+
+
+def main() -> None:
+    from data.electrolyte_property_db import DATA
+    from data.species_data import ADDITIVES, CATION_PROPERTIES, SALTS, SOLVENTS
+    from conductivity.molecular_property_db_audit import (
+        MolecularPropertyDbRegistrySource,
+        REFERENCE_CONDUCTIVITY_PRIMITIVE_PARAMETERS,
+        audit_molecular_property_db_cases,
+        build_molecular_property_db_case_selection,
+        configured_conductivity_primitive_parameters,
+        default_molecular_property_db_audit_options,
     )
 
     audit_options = default_molecular_property_db_audit_options()
