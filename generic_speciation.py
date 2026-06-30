@@ -74,6 +74,7 @@ class ClusterStateTemplate:
     steric_J_mol: float
     entropy_J_mol: float
     standard_state_correction_J_mol: float
+    activity_reference_J_mol: float
     geometry: tuple[ClusterChargedCenter, ...]
     orientation_count: int
     hydrodynamic_radius_A: float
@@ -89,6 +90,7 @@ class _ClusterFreeEnergyTerms:
     steric_J_mol: float
     entropy_J_mol: float
     standard_state_correction_J_mol: float
+    activity_reference_J_mol: float
 
 
 @dataclass(frozen=True)
@@ -386,6 +388,7 @@ def _stoichiometric_cluster_template(
         standard_state_correction_J_mol=(
             free_energy_terms.standard_state_correction_J_mol
         ),
+        activity_reference_J_mol=free_energy_terms.activity_reference_J_mol,
         geometry=geometry,
         orientation_count=1,
         hydrodynamic_radius_A=_cluster_hydrodynamic_radius_A(
@@ -520,6 +523,12 @@ def _cluster_standard_free_energy_terms(
             primitive_parameters,
         )
     )
+    activity_reference_J_mol = _cluster_activity_reference_J_mol(
+        components,
+        stoichiometric_counts,
+        solvent_environment,
+        primitive_parameters,
+    )
     standard_free_energy_J_mol = (
         coulomb_J_mol
         + desolvation_J_mol
@@ -536,6 +545,7 @@ def _cluster_standard_free_energy_terms(
         steric_J_mol=float(steric_J_mol),
         entropy_J_mol=float(entropy_J_mol),
         standard_state_correction_J_mol=float(standard_state_correction_J_mol),
+        activity_reference_J_mol=float(activity_reference_J_mol),
     )
 
 
@@ -560,6 +570,53 @@ def _cluster_topology_standard_state_correction_J_mol(
     return float(
         -R * solvent_environment.temperature_K * log_equilibrium_offset
     )
+
+
+def _cluster_activity_reference_J_mol(
+    components: tuple[IonComponent, ...],
+    stoichiometric_counts: tuple[int, ...],
+    solvent_environment: MolecularSolventEnvironment,
+    primitive_parameters: ConductivityPrimitiveParameterSet,
+) -> float:
+    reference_ionic_strength_ratio = (
+        ACTIVITY_IONIC_STRENGTH_REFERENCE_MOL_M3
+        / STANDARD_STATE_CONCENTRATION_MOL_M3
+    )
+    component_activity_log_sum = 0.0
+    for component, stoichiometric_count in zip(components, stoichiometric_counts):
+        if stoichiometric_count <= 0:
+            continue
+        component_activity_log_sum += (
+            stoichiometric_count
+            * _species_activity_ln_gamma(
+                charge_number=component.charge_number,
+                activity_size_radius_A=component.descriptor.cavity_radius_A,
+                molecular_volume_A3=component.descriptor.molecular_volume_A3,
+                ionic_strength_ratio=reference_ionic_strength_ratio,
+                solvent_environment=solvent_environment,
+                primitive_parameters=primitive_parameters,
+            )
+        )
+    cluster_activity_log_gamma = _species_activity_ln_gamma(
+        charge_number=_cluster_net_charge_number(components, stoichiometric_counts),
+        activity_size_radius_A=_cluster_hydrodynamic_radius_A(
+            components,
+            stoichiometric_counts,
+            primitive_parameters,
+        ),
+        molecular_volume_A3=_cluster_molecular_volume_A3(
+            components,
+            stoichiometric_counts,
+        ),
+        ionic_strength_ratio=reference_ionic_strength_ratio,
+        solvent_environment=solvent_environment,
+        primitive_parameters=primitive_parameters,
+    )
+    activity_log_factor = (
+        component_activity_log_sum
+        - primitive_parameters.cluster_activity_scale * cluster_activity_log_gamma
+    )
+    return float(-R * solvent_environment.temperature_K * activity_log_factor)
 
 
 def _cluster_kind_logK_offset(

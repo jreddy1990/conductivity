@@ -35,7 +35,7 @@ FITTED_CANDIDATE_CONFIG_NAME = "fitted_candidate"
 def main() -> None:
     runner_arguments = _parse_runner_arguments()
     options = default_molecular_property_db_audit_options()
-    fit_options, _log_bounds = default_molecular_primitive_fit_configuration()
+    fit_options, _coordinate_bounds = default_molecular_primitive_fit_configuration()
     registry_source = MolecularPropertyDbRegistrySource(
         solvent_registry=SOLVENTS,
         salt_registry=SALTS,
@@ -126,6 +126,12 @@ def main() -> None:
             "empirical_target={empirical:.6f} empirical_spread={spread:.6f} "
             "predicted={predicted:.6f} "
             "residual={residual:.6f} direct={direct:.6f} corrector={corrector:.6f} "
+            "direct_capacity_gap={direct_gap:.6f} "
+            "corrector_target={corrector_target:.6f} "
+            "corrector_residual={corrector_residual:.6f} "
+            "direct_capacity_failure={direct_capacity_failure} "
+            "corrector_too_strong_failure={corrector_too_strong_failure} "
+            "corrector_too_weak_failure={corrector_too_weak_failure} "
             "free_ion_fraction={free_fraction:.6f} "
             "charged_cluster_fraction={charged_fraction:.6f} "
             "neutral_cluster_fraction={neutral_fraction:.6f} "
@@ -141,6 +147,16 @@ def main() -> None:
                 residual=row_result.residual_mS_cm,
                 direct=row_result.direct_sigma_mS_cm,
                 corrector=row_result.corrector_sigma_mS_cm,
+                direct_gap=row_result.direct_capacity_gap_mS_cm,
+                corrector_target=row_result.corrector_target_mS_cm,
+                corrector_residual=row_result.corrector_residual_mS_cm,
+                direct_capacity_failure=row_result.direct_capacity_failure,
+                corrector_too_strong_failure=(
+                    row_result.corrector_too_strong_failure
+                ),
+                corrector_too_weak_failure=(
+                    row_result.corrector_too_weak_failure
+                ),
                 free_fraction=row_result.free_ion_fraction,
                 charged_fraction=row_result.charged_cluster_fraction,
                 neutral_fraction=row_result.neutral_cluster_fraction,

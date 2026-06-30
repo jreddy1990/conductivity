@@ -17,14 +17,20 @@ from conductivity.finite_markov_additive_green_kubo import (
 )
 from conductivity.generic_speciation import (
     ANGSTROM_TO_M,
+    CONTACT_PAIR_CLUSTER_KIND,
     CUBIC_ANGSTROM_TO_CUBIC_M,
     ClusterEnumerationOptions,
     ClusterStateTemplate,
     GenericSpeciationResult,
+    HIGHER_CHARGED_CLUSTER_KIND,
     IonComponent,
     MASS_BALANCE_TOLERANCE_FACTOR,
     MolecularSolventEnvironment,
+    NEGATIVE_CHARGED_TRIPLET_CLUSTER_KIND,
+    NEUTRAL_CLUSTER_KIND,
+    POSITIVE_CHARGED_TRIPLET_CLUSTER_KIND,
     STANDARD_STATE_CONCENTRATION_MOL_M3,
+    SOLVENT_SEPARATED_PAIR_CLUSTER_KIND,
     build_cluster_state_templates,
     solve_generic_mass_balance,
 )
@@ -62,6 +68,13 @@ MINIMUM_CLUSTER_ION_COUNT = 2  # Molecular production must include cation-anion 
 GAUSSIAN_CHARGE_CLOUD_FORM_FACTOR_DENOMINATOR = 6.0  # Gaussian F_q(kappa,a_q)=exp(-(kappa*a_q)^2/6).
 ISOTROPIC_SHAPE_FACTOR = 1.0  # Dimensionless reference: lambda_s=1 is isotropic.
 TRANSPORT_STATE_CONCENTRATION_RESOLUTION_FACTOR = np.finfo(float).eps  # Markov-basis floor for zero-measure clusters.
+TRANSPORT_ROLE_FREE_ION_CENTER = "free_ion_center"
+TRANSPORT_ROLE_CONTACT_PAIR_CENTER = "contact_pair_center"
+TRANSPORT_ROLE_SOLVENT_SEPARATED_PAIR_CENTER = "solvent_separated_pair_center"
+TRANSPORT_ROLE_CHARGED_TRIPLET_CENTER = "charged_triplet_center"
+TRANSPORT_ROLE_CLUSTER_COM_CENTER = "cluster_com_center"
+TRANSPORT_ROLE_INTERNAL_POLARIZATION_CENTER = "internal_polarization_center"
+TRANSPORT_ROLE_NEUTRAL_CENTER = "neutral_center"
 
 
 @dataclass(frozen=True)
@@ -89,21 +102,24 @@ class MolecularMoriOptions:
     free_volume_exponent: float
     translation_jump_length_multiplier: float
     primitive_parameters: ConductivityPrimitiveParameterSet
-    cluster_standard_free_energy_shift_over_RT_by_label: Mapping[str, float]
 
 
 @dataclass(frozen=True)
-class MolecularTransportState:
+class MolecularTransportCenter:
     label: str
+    parent_cluster_label: str
+    parent_cluster_kind: str
     concentration_mol_m3: float
-    net_charge_number: int
+    center_species_name: str
+    center_charge_number: int
+    center_index: int
     hydrodynamic_radius_A: float
     charge_cloud_radius_A: float
     molecular_volume_A3: float
     diffusion_m2_s: float
     local_obstruction_factor: float
     local_obstruction_diffusion_scale: float
-    state_kind: str
+    transport_role: str
 
 
 @dataclass(frozen=True)
@@ -143,6 +159,15 @@ class _ChargeDensityReferenceEntry:
 
 
 @dataclass(frozen=True)
+class _TransportCenterConstructionContext:
+    component_descriptor_by_name: Mapping[str, MolecularSpeciesDescriptor]
+    mixture_descriptor_state: _MolecularMixtureDescriptorState
+    charge_density_reference_A_inv3: float
+    solvent_environment: MolecularSolventEnvironment
+    options: MolecularMoriOptions
+
+
+@dataclass(frozen=True)
 class MolecularAtmosphereMemoryPrimitive:
     state_label: str
     D_local_m2_s: float
@@ -161,7 +186,7 @@ class MolecularAtmosphereMemoryPrimitive:
 
 @dataclass(frozen=True)
 class _AtmosphereTransportStateResult:
-    transport_states: tuple[MolecularTransportState, ...]
+    transport_states: tuple[MolecularTransportCenter, ...]
     diagnostics: MolecularIonAtmosphereDiagnostics
 
 
@@ -175,9 +200,17 @@ class _MarkovProcessConstruction:
 
 @dataclass(frozen=True)
 class _MobileTransportStateIndex:
-    transport_state: MolecularTransportState
+    transport_state: MolecularTransportCenter
     mobile_state_index: int
     mobile_concentration_mol_m3: float
+
+
+@dataclass(frozen=True)
+class _SolventSeparatedPairModeRateBudget:
+    relative_rate_s_inv: float
+    co_motion_rate_s_inv: float
+    positive_residual_rate_s_inv: float
+    negative_residual_rate_s_inv: float
 
 
 @dataclass(frozen=True)
@@ -189,7 +222,7 @@ class MolecularMoriConductivityResult:
     solvent_environment: MolecularSolventEnvironment
     speciation: GenericSpeciationResult
     cluster_states: tuple[ClusterStateTemplate, ...]
-    transport_states: tuple[MolecularTransportState, ...]
+    transport_states: tuple[MolecularTransportCenter, ...]
     markov_state_labels: tuple[str, ...]
     markov_state_concentrations_mol_m3: tuple[float, ...]
     events: tuple[MarkovAdditiveEvent, ...]
@@ -204,6 +237,38 @@ def compute_molecular_electrolyte_conductivity(
     species_inputs: Mapping[str, MolecularSpeciesInput],
     descriptor_backend: MolecularDescriptorBackend,
     options: MolecularMoriOptions,
+) -> MolecularMoriConductivityResult:
+    return _compute_molecular_electrolyte_conductivity(
+        recipe,
+        species_inputs,
+        descriptor_backend,
+        options,
+        {},
+    )
+
+
+def compute_molecular_electrolyte_conductivity_with_diagnostic_cluster_shifts(
+    recipe: MolecularElectrolyteRecipe,
+    species_inputs: Mapping[str, MolecularSpeciesInput],
+    descriptor_backend: MolecularDescriptorBackend,
+    options: MolecularMoriOptions,
+    diagnostic_cluster_standard_free_energy_shift_over_RT_by_label: Mapping[str, float],
+) -> MolecularMoriConductivityResult:
+    return _compute_molecular_electrolyte_conductivity(
+        recipe,
+        species_inputs,
+        descriptor_backend,
+        options,
+        diagnostic_cluster_standard_free_energy_shift_over_RT_by_label,
+    )
+
+
+def _compute_molecular_electrolyte_conductivity(
+    recipe: MolecularElectrolyteRecipe,
+    species_inputs: Mapping[str, MolecularSpeciesInput],
+    descriptor_backend: MolecularDescriptorBackend,
+    options: MolecularMoriOptions,
+    diagnostic_cluster_standard_free_energy_shift_over_RT_by_label: Mapping[str, float],
 ) -> MolecularMoriConductivityResult:
     _validate_recipe(recipe)
     _validate_options(options)
@@ -229,7 +294,7 @@ def compute_molecular_electrolyte_conductivity(
     )
     cluster_templates = _apply_cluster_standard_free_energy_shifts(
         cluster_templates,
-        options.cluster_standard_free_energy_shift_over_RT_by_label,
+        diagnostic_cluster_standard_free_energy_shift_over_RT_by_label,
         solvent_environment.temperature_K,
     )
     speciation = solve_generic_mass_balance(
@@ -404,10 +469,10 @@ def _validate_ionic_charge_balance(
 
 def _apply_cluster_standard_free_energy_shifts(
     cluster_templates: tuple[ClusterStateTemplate, ...],
-    cluster_standard_free_energy_shift_over_RT_by_label: Mapping[str, float],
+    diagnostic_cluster_standard_free_energy_shift_over_RT_by_label: Mapping[str, float],
     temperature_K: float,
 ) -> tuple[ClusterStateTemplate, ...]:
-    if not cluster_standard_free_energy_shift_over_RT_by_label:
+    if not diagnostic_cluster_standard_free_energy_shift_over_RT_by_label:
         return cluster_templates
     known_cluster_labels = {
         cluster_template.label for cluster_template in cluster_templates
@@ -415,7 +480,7 @@ def _apply_cluster_standard_free_energy_shifts(
     unknown_cluster_labels = tuple(
         sorted(
             cluster_label
-            for cluster_label in cluster_standard_free_energy_shift_over_RT_by_label
+            for cluster_label in diagnostic_cluster_standard_free_energy_shift_over_RT_by_label
             if cluster_label not in known_cluster_labels
         )
     )
@@ -426,11 +491,16 @@ def _apply_cluster_standard_free_energy_shifts(
         )
     shifted_templates: list[ClusterStateTemplate] = []
     for cluster_template in cluster_templates:
+        if cluster_template.label in diagnostic_cluster_standard_free_energy_shift_over_RT_by_label:
+            raw_shift_over_RT = (
+                diagnostic_cluster_standard_free_energy_shift_over_RT_by_label[
+                    cluster_template.label
+                ]
+            )
+        else:
+            raw_shift_over_RT = 0.0
         shift_over_RT = _finite_float(
-            cluster_standard_free_energy_shift_over_RT_by_label.get(
-                cluster_template.label,
-                0.0,
-            ),
+            raw_shift_over_RT,
             f"{cluster_template.label}.standard_free_energy_shift_over_RT",
         )
         if shift_over_RT == 0.0:
@@ -448,6 +518,9 @@ def _apply_cluster_standard_free_energy_shifts(
                     cluster_template.standard_state_correction_J_mol
                     + shift_J_mol
                 ),
+                activity_reference_J_mol=(
+                    cluster_template.activity_reference_J_mol
+                ),
             )
         )
     return tuple(shifted_templates)
@@ -459,8 +532,8 @@ def _molecular_transport_states(
     speciation: GenericSpeciationResult,
     solvent_environment: MolecularSolventEnvironment,
     options: MolecularMoriOptions,
-) -> tuple[MolecularTransportState, ...]:
-    states: list[MolecularTransportState] = []
+) -> tuple[MolecularTransportCenter, ...]:
+    states: list[MolecularTransportCenter] = []
     component_descriptor_by_name = {
         component.species_name: component.descriptor
         for component in speciation.components
@@ -476,6 +549,13 @@ def _molecular_transport_states(
         component_descriptor_by_name,
         options,
     )
+    transport_context = _TransportCenterConstructionContext(
+        component_descriptor_by_name=component_descriptor_by_name,
+        mixture_descriptor_state=mixture_descriptor_state,
+        charge_density_reference_A_inv3=charge_density_reference_A_inv3,
+        solvent_environment=solvent_environment,
+        options=options,
+    )
     concentration_resolution_mol_m3 = (
         _transport_state_concentration_resolution_mol_m3(speciation)
     )
@@ -487,18 +567,19 @@ def _molecular_transport_states(
         states.append(
             _transport_state_from_descriptor(
                 label=f"free:{component.species_name}",
+                parent_cluster_label=f"free:{component.species_name}",
+                parent_cluster_kind=TRANSPORT_ROLE_FREE_ION_CENTER,
                 concentration_mol_m3=concentration_mol_m3,
-                net_charge_number=component.charge_number,
+                center_species_name=component.species_name,
+                center_charge_number=component.charge_number,
+                center_index=0,
                 descriptor=descriptor,
                 hydrodynamic_radius_scale=_free_ion_hydrodynamic_radius_scale(
                     component,
                     options,
                 ),
-                mixture_descriptor_state=mixture_descriptor_state,
-                charge_density_reference_A_inv3=charge_density_reference_A_inv3,
-                solvent_environment=solvent_environment,
-                options=options,
-                state_kind="free_ion",
+                transport_context=transport_context,
+                transport_role=TRANSPORT_ROLE_FREE_ION_CENTER,
             )
         )
     for cluster_template in speciation.cluster_templates:
@@ -507,78 +588,198 @@ def _molecular_transport_states(
         ]
         if concentration_mol_m3 <= concentration_resolution_mol_m3:
             continue
-        shape_factor = _cluster_shape_factor(
-            cluster_template,
-            component_descriptor_by_name,
-        )
-        charge_cloud_radius_A = _cluster_charge_cloud_radius_A(
-            cluster_template,
-            component_descriptor_by_name,
-            options,
-        )
-        transport_hydrodynamic_radius_A = (
-            options.primitive_parameters.hydrodynamic_radius_scale_cluster
-            * cluster_template.hydrodynamic_radius_A
-        )
-        base_diffusion_m2_s = _diffusion_m2_s(
-            hydrodynamic_radius_A=transport_hydrodynamic_radius_A,
-            shape_factor=shape_factor,
-            intrinsic_dielectric_constant=_cluster_intrinsic_dielectric_constant(
+        states.extend(
+            _cluster_transport_centers(
                 cluster_template,
-                component_descriptor_by_name,
-            ),
-            net_charge_number=cluster_template.net_charge_number,
-            charge_cloud_radius_A=charge_cloud_radius_A,
-            charge_density_reference_A_inv3=charge_density_reference_A_inv3,
-            mixture_descriptor_state=mixture_descriptor_state,
-            solvent_environment=solvent_environment,
-            options=options,
-        )
-        local_obstruction_factor = _local_obstruction_factor(
-            label=cluster_template.label,
-            net_charge_number=cluster_template.net_charge_number,
-            hydrodynamic_radius_A=transport_hydrodynamic_radius_A,
-            charge_cloud_radius_A=charge_cloud_radius_A,
-            mixture_descriptor_state=mixture_descriptor_state,
-            options=options,
-            charge_density_reference_A_inv3=charge_density_reference_A_inv3,
-        )
-        local_obstruction_diffusion_scale = _local_obstruction_diffusion_scale(
-            local_obstruction_factor,
-            cluster_template.label,
-        )
-        states.append(
-            MolecularTransportState(
-                label=cluster_template.label,
-                concentration_mol_m3=_positive_float(
-                    concentration_mol_m3,
-                    f"{cluster_template.label}.concentration_mol_m3",
-                ),
-                net_charge_number=cluster_template.net_charge_number,
-                hydrodynamic_radius_A=transport_hydrodynamic_radius_A,
-                charge_cloud_radius_A=charge_cloud_radius_A,
-                molecular_volume_A3=cluster_template.molecular_volume_A3,
-                diffusion_m2_s=(
-                    base_diffusion_m2_s * local_obstruction_diffusion_scale
-                ),
-                local_obstruction_factor=local_obstruction_factor,
-                local_obstruction_diffusion_scale=local_obstruction_diffusion_scale,
-                state_kind="cluster",
+                concentration_mol_m3,
+                transport_context,
             )
         )
     states.extend(
         _neutral_transport_states(
             recipe,
             descriptors,
-            mixture_descriptor_state,
-            charge_density_reference_A_inv3,
-            solvent_environment,
-            options,
+            transport_context,
         )
     )
     if not states:
         raise ValueError("molecular transport state construction produced no states")
     return tuple(states)
+
+
+def _cluster_transport_centers(
+    cluster_template: ClusterStateTemplate,
+    concentration_mol_m3: float,
+    transport_context: _TransportCenterConstructionContext,
+) -> tuple[MolecularTransportCenter, ...]:
+    if cluster_template.cluster_kind == SOLVENT_SEPARATED_PAIR_CLUSTER_KIND:
+        return _cluster_internal_transport_centers(
+            cluster_template,
+            concentration_mol_m3,
+            transport_context,
+            TRANSPORT_ROLE_SOLVENT_SEPARATED_PAIR_CENTER,
+        )
+    if cluster_template.cluster_kind in (
+        POSITIVE_CHARGED_TRIPLET_CLUSTER_KIND,
+        NEGATIVE_CHARGED_TRIPLET_CLUSTER_KIND,
+    ):
+        return (
+            _cluster_com_transport_center(
+                cluster_template,
+                concentration_mol_m3,
+                transport_context,
+                TRANSPORT_ROLE_CLUSTER_COM_CENTER,
+            ),
+            *_cluster_internal_transport_centers(
+                cluster_template,
+                concentration_mol_m3,
+                transport_context,
+                TRANSPORT_ROLE_CHARGED_TRIPLET_CENTER,
+            ),
+        )
+    if cluster_template.cluster_kind == HIGHER_CHARGED_CLUSTER_KIND:
+        return (
+            _cluster_com_transport_center(
+                cluster_template,
+                concentration_mol_m3,
+                transport_context,
+                TRANSPORT_ROLE_CLUSTER_COM_CENTER,
+            ),
+            *_cluster_internal_transport_centers(
+                cluster_template,
+                concentration_mol_m3,
+                transport_context,
+                TRANSPORT_ROLE_INTERNAL_POLARIZATION_CENTER,
+            ),
+        )
+    if cluster_template.cluster_kind in (
+        CONTACT_PAIR_CLUSTER_KIND,
+        NEUTRAL_CLUSTER_KIND,
+    ):
+        return (
+            _cluster_com_transport_center(
+                cluster_template,
+                concentration_mol_m3,
+                transport_context,
+                TRANSPORT_ROLE_CONTACT_PAIR_CENTER
+                if cluster_template.cluster_kind == CONTACT_PAIR_CLUSTER_KIND
+                else TRANSPORT_ROLE_CLUSTER_COM_CENTER,
+            ),
+        )
+    raise ValueError(f"unknown cluster kind {cluster_template.cluster_kind}")
+
+
+def _cluster_internal_transport_centers(
+    cluster_template: ClusterStateTemplate,
+    concentration_mol_m3: float,
+    transport_context: _TransportCenterConstructionContext,
+    transport_role: str,
+) -> tuple[MolecularTransportCenter, ...]:
+    centers: list[MolecularTransportCenter] = []
+    for center_index, charged_center in enumerate(cluster_template.geometry):
+        descriptor = transport_context.component_descriptor_by_name[
+            charged_center.species_name
+        ]
+        centers.append(
+            _transport_state_from_descriptor(
+                label=(
+                    f"{cluster_template.label}:center{center_index}:"
+                    f"{charged_center.species_name}"
+                ),
+                parent_cluster_label=cluster_template.label,
+                parent_cluster_kind=cluster_template.cluster_kind,
+                concentration_mol_m3=concentration_mol_m3,
+                center_species_name=charged_center.species_name,
+                center_charge_number=charged_center.charge_number,
+                center_index=center_index,
+                descriptor=descriptor,
+                hydrodynamic_radius_scale=_hydrodynamic_radius_scale_for_charge(
+                    charged_center.charge_number,
+                    transport_context.options,
+                )
+                * transport_context.options.primitive_parameters.hydrodynamic_radius_scale_cluster,
+                transport_context=transport_context,
+                transport_role=transport_role,
+            )
+        )
+    return tuple(centers)
+
+
+def _cluster_com_transport_center(
+    cluster_template: ClusterStateTemplate,
+    concentration_mol_m3: float,
+    transport_context: _TransportCenterConstructionContext,
+    transport_role: str,
+) -> MolecularTransportCenter:
+    charge_cloud_radius_A = _cluster_charge_cloud_radius_A(
+        cluster_template,
+        transport_context.component_descriptor_by_name,
+        transport_context.options,
+    )
+    hydrodynamic_radius_A = (
+        transport_context.options.primitive_parameters.hydrodynamic_radius_scale_cluster
+        * cluster_template.hydrodynamic_radius_A
+    )
+    base_diffusion_m2_s = _diffusion_m2_s(
+        hydrodynamic_radius_A=hydrodynamic_radius_A,
+        shape_factor=_cluster_shape_factor(
+            cluster_template,
+            transport_context.component_descriptor_by_name,
+        ),
+        intrinsic_dielectric_constant=_cluster_intrinsic_dielectric_constant(
+            cluster_template,
+            transport_context.component_descriptor_by_name,
+        ),
+        net_charge_number=cluster_template.net_charge_number,
+        charge_cloud_radius_A=charge_cloud_radius_A,
+        charge_density_reference_A_inv3=transport_context.charge_density_reference_A_inv3,
+        mixture_descriptor_state=transport_context.mixture_descriptor_state,
+        solvent_environment=transport_context.solvent_environment,
+        options=transport_context.options,
+    )
+    local_obstruction_factor = _local_obstruction_factor(
+        label=cluster_template.label,
+        net_charge_number=cluster_template.net_charge_number,
+        hydrodynamic_radius_A=hydrodynamic_radius_A,
+        charge_cloud_radius_A=charge_cloud_radius_A,
+        mixture_descriptor_state=transport_context.mixture_descriptor_state,
+        options=transport_context.options,
+        charge_density_reference_A_inv3=transport_context.charge_density_reference_A_inv3,
+    )
+    local_obstruction_diffusion_scale = _local_obstruction_diffusion_scale(
+        local_obstruction_factor,
+        cluster_template.label,
+    )
+    return MolecularTransportCenter(
+        label=f"{cluster_template.label}:com",
+        parent_cluster_label=cluster_template.label,
+        parent_cluster_kind=cluster_template.cluster_kind,
+        concentration_mol_m3=_positive_float(
+            concentration_mol_m3,
+            f"{cluster_template.label}.concentration_mol_m3",
+        ),
+        center_species_name=cluster_template.label,
+        center_charge_number=cluster_template.net_charge_number,
+        center_index=0,
+        hydrodynamic_radius_A=hydrodynamic_radius_A,
+        charge_cloud_radius_A=charge_cloud_radius_A,
+        molecular_volume_A3=cluster_template.molecular_volume_A3,
+        diffusion_m2_s=base_diffusion_m2_s * local_obstruction_diffusion_scale,
+        local_obstruction_factor=local_obstruction_factor,
+        local_obstruction_diffusion_scale=local_obstruction_diffusion_scale,
+        transport_role=transport_role,
+    )
+
+
+def _hydrodynamic_radius_scale_for_charge(
+    center_charge_number: int,
+    options: MolecularMoriOptions,
+) -> float:
+    if center_charge_number > 0:
+        return options.primitive_parameters.hydrodynamic_radius_scale_positive_ion
+    if center_charge_number < 0:
+        return options.primitive_parameters.hydrodynamic_radius_scale_negative_ion
+    raise ValueError("transport center charge must be nonzero")
 
 
 def _transport_state_concentration_resolution_mol_m3(
@@ -599,13 +800,13 @@ def _transport_state_concentration_resolution_mol_m3(
 
 
 def _apply_ion_atmosphere_to_transport_states(
-    transport_states: tuple[MolecularTransportState, ...],
+    transport_states: tuple[MolecularTransportCenter, ...],
     solvent_environment: MolecularSolventEnvironment,
     options: MolecularMoriOptions,
 ) -> _AtmosphereTransportStateResult:
     charged_states = tuple(
         state for state in transport_states
-        if state.net_charge_number != 0
+        if state.center_charge_number != 0
     )
     if not charged_states:
         return _AtmosphereTransportStateResult(
@@ -627,7 +828,7 @@ def _apply_ion_atmosphere_to_transport_states(
         state.label: state.concentration_mol_m3 for state in charged_states
     }
     carrier_charges = {
-        state.label: state.net_charge_number for state in charged_states
+        state.label: state.center_charge_number for state in charged_states
     }
     local_diffusivity_m2_s_by_carrier = {
         state.label: state.diffusion_m2_s for state in charged_states
@@ -747,7 +948,7 @@ def _atmosphere_friction_ratio(
 
 
 def _charge_cloud_form_factor(
-    transport_state: MolecularTransportState,
+    transport_state: MolecularTransportCenter,
     inverse_screening_length_m_inv: float,
 ) -> float:
     charge_cloud_radius_m = (
@@ -771,7 +972,7 @@ def _charge_cloud_form_factor(
 
 
 def _countercharge_relaxation_diffusivity_by_state(
-    charged_states: tuple[MolecularTransportState, ...],
+    charged_states: tuple[MolecularTransportCenter, ...],
     local_diffusivity_m2_s_by_carrier: Mapping[str, float],
 ) -> Mapping[str, float]:
     relaxation_diffusivity_by_state: dict[str, float] = {}
@@ -779,11 +980,15 @@ def _countercharge_relaxation_diffusivity_by_state(
         countercharge_weighted_diffusivity = 0.0
         countercharge_weight = 0.0
         for target_state in charged_states:
-            if source_state.net_charge_number * target_state.net_charge_number >= 0:
+            if (
+                source_state.center_charge_number
+                * target_state.center_charge_number
+                >= 0
+            ):
                 continue
             target_weight = (
                 target_state.concentration_mol_m3
-                * abs(target_state.net_charge_number)
+                * abs(target_state.center_charge_number)
             )
             countercharge_weight += target_weight
             countercharge_weighted_diffusivity += (
@@ -811,59 +1016,71 @@ def _countercharge_relaxation_diffusivity_by_state(
 
 def _transport_state_from_descriptor(
     label: str,
+    parent_cluster_label: str,
+    parent_cluster_kind: str,
     concentration_mol_m3: float,
-    net_charge_number: int,
+    center_species_name: str,
+    center_charge_number: int,
+    center_index: int,
     descriptor: MolecularSpeciesDescriptor,
     hydrodynamic_radius_scale: float,
-    mixture_descriptor_state: _MolecularMixtureDescriptorState,
-    charge_density_reference_A_inv3: float,
-    solvent_environment: MolecularSolventEnvironment,
-    options: MolecularMoriOptions,
-    state_kind: str,
-) -> MolecularTransportState:
+    transport_context: _TransportCenterConstructionContext,
+    transport_role: str,
+) -> MolecularTransportCenter:
     hydrodynamic_radius_A = (
         _positive_float(hydrodynamic_radius_scale, f"{label}.hydrodynamic_radius_scale")
         * descriptor.hydrodynamic_radius_A
     )
-    charge_cloud_radius_A = _scaled_charge_cloud_radius_A(descriptor, options)
+    charge_cloud_radius_A = _scaled_charge_cloud_radius_A(
+        descriptor,
+        transport_context.options,
+    )
     base_diffusion_m2_s = _diffusion_m2_s(
         hydrodynamic_radius_A=hydrodynamic_radius_A,
         shape_factor=descriptor.ligand_field_asymmetry,
         intrinsic_dielectric_constant=descriptor.epsilon_r_pure,
-        net_charge_number=net_charge_number,
+        net_charge_number=center_charge_number,
         charge_cloud_radius_A=charge_cloud_radius_A,
-        charge_density_reference_A_inv3=charge_density_reference_A_inv3,
-        mixture_descriptor_state=mixture_descriptor_state,
-        solvent_environment=solvent_environment,
-        options=options,
+        charge_density_reference_A_inv3=(
+            transport_context.charge_density_reference_A_inv3
+        ),
+        mixture_descriptor_state=transport_context.mixture_descriptor_state,
+        solvent_environment=transport_context.solvent_environment,
+        options=transport_context.options,
     )
     local_obstruction_factor = _local_obstruction_factor(
         label=label,
-        net_charge_number=net_charge_number,
+        net_charge_number=center_charge_number,
         hydrodynamic_radius_A=hydrodynamic_radius_A,
         charge_cloud_radius_A=charge_cloud_radius_A,
-        mixture_descriptor_state=mixture_descriptor_state,
-        options=options,
-        charge_density_reference_A_inv3=charge_density_reference_A_inv3,
+        mixture_descriptor_state=transport_context.mixture_descriptor_state,
+        options=transport_context.options,
+        charge_density_reference_A_inv3=(
+            transport_context.charge_density_reference_A_inv3
+        ),
     )
     local_obstruction_diffusion_scale = _local_obstruction_diffusion_scale(
         local_obstruction_factor,
         label,
     )
-    return MolecularTransportState(
+    return MolecularTransportCenter(
         label=label,
+        parent_cluster_label=parent_cluster_label,
+        parent_cluster_kind=parent_cluster_kind,
         concentration_mol_m3=_positive_float(
             concentration_mol_m3,
             f"{label}.concentration_mol_m3",
         ),
-        net_charge_number=net_charge_number,
+        center_species_name=center_species_name,
+        center_charge_number=center_charge_number,
+        center_index=center_index,
         hydrodynamic_radius_A=hydrodynamic_radius_A,
         charge_cloud_radius_A=charge_cloud_radius_A,
         molecular_volume_A3=descriptor.molecular_volume_A3,
         diffusion_m2_s=base_diffusion_m2_s * local_obstruction_diffusion_scale,
         local_obstruction_factor=local_obstruction_factor,
         local_obstruction_diffusion_scale=local_obstruction_diffusion_scale,
-        state_kind=state_kind,
+        transport_role=transport_role,
     )
 
 
@@ -881,12 +1098,9 @@ def _free_ion_hydrodynamic_radius_scale(
 def _neutral_transport_states(
     recipe: MolecularElectrolyteRecipe,
     descriptors: Mapping[str, MolecularSpeciesDescriptor],
-    mixture_descriptor_state: _MolecularMixtureDescriptorState,
-    charge_density_reference_A_inv3: float,
-    solvent_environment: MolecularSolventEnvironment,
-    options: MolecularMoriOptions,
-) -> tuple[MolecularTransportState, ...]:
-    states: list[MolecularTransportState] = []
+    transport_context: _TransportCenterConstructionContext,
+) -> tuple[MolecularTransportCenter, ...]:
+    states: list[MolecularTransportCenter] = []
     for species_name, volume_fraction in recipe.solvents.items():
         descriptor = descriptors[species_name]
         if descriptor.role != ROLE_SOLVENT:
@@ -898,15 +1112,16 @@ def _neutral_transport_states(
         states.append(
             _transport_state_from_descriptor(
                 label=f"neutral:{species_name}",
+                parent_cluster_label=f"neutral:{species_name}",
+                parent_cluster_kind=TRANSPORT_ROLE_NEUTRAL_CENTER,
                 concentration_mol_m3=concentration_mol_m3,
-                net_charge_number=0,
+                center_species_name=species_name,
+                center_charge_number=0,
+                center_index=0,
                 descriptor=descriptor,
                 hydrodynamic_radius_scale=1.0,
-                mixture_descriptor_state=mixture_descriptor_state,
-                charge_density_reference_A_inv3=charge_density_reference_A_inv3,
-                solvent_environment=solvent_environment,
-                options=options,
-                state_kind="neutral",
+                transport_context=transport_context,
+                transport_role=TRANSPORT_ROLE_NEUTRAL_CENTER,
             )
         )
     for species_name, weight_fraction in recipe.additives.items():
@@ -922,28 +1137,29 @@ def _neutral_transport_states(
         states.append(
             _transport_state_from_descriptor(
                 label=f"neutral:{species_name}",
+                parent_cluster_label=f"neutral:{species_name}",
+                parent_cluster_kind=TRANSPORT_ROLE_NEUTRAL_CENTER,
                 concentration_mol_m3=concentration_mol_m3,
-                net_charge_number=0,
+                center_species_name=species_name,
+                center_charge_number=0,
+                center_index=0,
                 descriptor=descriptor,
                 hydrodynamic_radius_scale=1.0,
-                mixture_descriptor_state=mixture_descriptor_state,
-                charge_density_reference_A_inv3=charge_density_reference_A_inv3,
-                solvent_environment=solvent_environment,
-                options=options,
-                state_kind="neutral",
+                transport_context=transport_context,
+                transport_role=TRANSPORT_ROLE_NEUTRAL_CENTER,
             )
         )
     return tuple(states)
 
 
 def _markov_process_from_transport_states(
-    transport_states: tuple[MolecularTransportState, ...],
+    transport_states: tuple[MolecularTransportCenter, ...],
     options: MolecularMoriOptions,
     atmosphere_diagnostics: MolecularIonAtmosphereDiagnostics,
 ) -> _MarkovProcessConstruction:
     charged_states = tuple(
         transport_state for transport_state in transport_states
-        if transport_state.net_charge_number != 0
+        if transport_state.center_charge_number != 0
     )
     if not charged_states:
         return _neutral_markov_process_from_transport_states(
@@ -956,6 +1172,21 @@ def _markov_process_from_transport_states(
     memory_primitives: list[MolecularAtmosphereMemoryPrimitive] = []
     mobile_state_indices: list[_MobileTransportStateIndex] = []
     for transport_state in charged_states:
+        if (
+            transport_state.transport_role
+            == TRANSPORT_ROLE_SOLVENT_SEPARATED_PAIR_CENTER
+        ):
+            mobile_state_index = len(state_labels)
+            state_labels.append(f"{transport_state.label}:mobile")
+            state_concentrations.append(transport_state.concentration_mol_m3)
+            mobile_state_indices.append(
+                _MobileTransportStateIndex(
+                    transport_state=transport_state,
+                    mobile_state_index=mobile_state_index,
+                    mobile_concentration_mol_m3=transport_state.concentration_mol_m3,
+                )
+            )
+            continue
         if _state_has_zero_atmosphere_coupling(
             transport_state,
             atmosphere_diagnostics,
@@ -1061,6 +1292,11 @@ def _markov_process_from_transport_states(
         tuple(mobile_state_indices),
         options,
     )
+    _append_solvent_separated_pair_center_events(
+        events,
+        tuple(mobile_state_indices),
+        options,
+    )
     return _MarkovProcessConstruction(
         state_labels=tuple(state_labels),
         state_concentrations_mol_m3=np.asarray(state_concentrations, dtype=float),
@@ -1070,7 +1306,7 @@ def _markov_process_from_transport_states(
 
 
 def _state_has_zero_atmosphere_coupling(
-    transport_state: MolecularTransportState,
+    transport_state: MolecularTransportCenter,
     atmosphere_diagnostics: MolecularIonAtmosphereDiagnostics,
 ) -> bool:
     state_label = transport_state.label
@@ -1088,7 +1324,7 @@ def _state_has_zero_atmosphere_coupling(
 def _append_ordinary_mobile_translation_events(
     events: list[MarkovAdditiveEvent],
     mobile_state_index: int,
-    transport_state: MolecularTransportState,
+    transport_state: MolecularTransportCenter,
     jump_length_m: float,
     rate_s_inv: float,
 ) -> None:
@@ -1125,17 +1361,295 @@ def _append_association_conversion_events(
     for source_index, source_state_index in enumerate(mobile_state_indices):
         for target_state_index in mobile_state_indices[source_index + 1:]:
             if (
-                source_state_index.transport_state.net_charge_number
-                != target_state_index.transport_state.net_charge_number
+                source_state_index.transport_state.center_charge_number
+                != target_state_index.transport_state.center_charge_number
             ):
                 continue
-            if source_state_index.transport_state.net_charge_number == 0:
+            if source_state_index.transport_state.center_charge_number == 0:
                 continue
             _append_reversible_association_conversion_pair(
                 events,
                 source_state_index,
                 target_state_index,
                 options,
+            )
+
+
+def _append_solvent_separated_pair_center_events(
+    events: list[MarkovAdditiveEvent],
+    mobile_state_indices: tuple[_MobileTransportStateIndex, ...],
+    options: MolecularMoriOptions,
+) -> None:
+    ssip_mobile_indices_by_parent: dict[str, list[_MobileTransportStateIndex]] = {}
+    for mobile_state_index in mobile_state_indices:
+        transport_state = mobile_state_index.transport_state
+        if (
+            transport_state.transport_role
+            != TRANSPORT_ROLE_SOLVENT_SEPARATED_PAIR_CENTER
+        ):
+            continue
+        if transport_state.parent_cluster_kind != SOLVENT_SEPARATED_PAIR_CLUSTER_KIND:
+            raise ValueError(
+                f"{transport_state.label} SSIP center has parent kind "
+                f"{transport_state.parent_cluster_kind}"
+            )
+        ssip_mobile_indices_by_parent.setdefault(
+            transport_state.parent_cluster_label,
+            [],
+        ).append(mobile_state_index)
+    for parent_cluster_label, ssip_mobile_indices in ssip_mobile_indices_by_parent.items():
+        positive_centers = tuple(
+            mobile_state_index
+            for mobile_state_index in ssip_mobile_indices
+            if mobile_state_index.transport_state.center_charge_number > 0
+        )
+        negative_centers = tuple(
+            mobile_state_index
+            for mobile_state_index in ssip_mobile_indices
+            if mobile_state_index.transport_state.center_charge_number < 0
+        )
+        if not positive_centers or not negative_centers:
+            raise ValueError(
+                f"{parent_cluster_label} solvent-separated pair must contain "
+                "opposite charged centers"
+            )
+        for positive_center in positive_centers:
+            for negative_center in negative_centers:
+                mode_rate_budget = _solvent_separated_pair_mode_rate_budget(
+                    positive_center.transport_state,
+                    negative_center.transport_state,
+                    options,
+                )
+                _append_solvent_separated_pair_relative_translation_events(
+                    events,
+                    positive_center,
+                    negative_center,
+                    mode_rate_budget.relative_rate_s_inv,
+                    options,
+                )
+                _append_solvent_separated_pair_com_translation_events(
+                    events,
+                    positive_center,
+                    negative_center,
+                    mode_rate_budget.co_motion_rate_s_inv,
+                    options,
+                )
+                _append_solvent_separated_pair_residual_center_events(
+                    events,
+                    positive_center,
+                    mode_rate_budget.positive_residual_rate_s_inv,
+                    options,
+                )
+                _append_solvent_separated_pair_residual_center_events(
+                    events,
+                    negative_center,
+                    mode_rate_budget.negative_residual_rate_s_inv,
+                    options,
+                )
+
+
+def _solvent_separated_pair_mode_rate_budget(
+    positive_transport_center: MolecularTransportCenter,
+    negative_transport_center: MolecularTransportCenter,
+    options: MolecularMoriOptions,
+) -> _SolventSeparatedPairModeRateBudget:
+    positive_center_rate_budget_s_inv = _center_translation_rate_budget_s_inv(
+        positive_transport_center,
+        options,
+    )
+    negative_center_rate_budget_s_inv = _center_translation_rate_budget_s_inv(
+        negative_transport_center,
+        options,
+    )
+    paired_center_rate_budget_s_inv = min(
+        positive_center_rate_budget_s_inv,
+        negative_center_rate_budget_s_inv,
+    )
+    absolute_net_charge_number = abs(
+        positive_transport_center.center_charge_number
+        + negative_transport_center.center_charge_number
+    )
+    absolute_center_charge_sum = (
+        abs(positive_transport_center.center_charge_number)
+        + abs(negative_transport_center.center_charge_number)
+    )
+    charge_sum_scale = _positive_float(
+        absolute_center_charge_sum,
+        "solvent_separated_pair.absolute_center_charge_sum",
+    )
+    co_motion_fraction = absolute_net_charge_number / charge_sum_scale
+    relative_fraction = 1.0 - co_motion_fraction
+    if relative_fraction < 0.0:
+        raise ValueError("solvent-separated-pair relative fraction is negative")
+    return _SolventSeparatedPairModeRateBudget(
+        relative_rate_s_inv=paired_center_rate_budget_s_inv * relative_fraction,
+        co_motion_rate_s_inv=paired_center_rate_budget_s_inv * co_motion_fraction,
+        positive_residual_rate_s_inv=(
+            positive_center_rate_budget_s_inv - paired_center_rate_budget_s_inv
+        ),
+        negative_residual_rate_s_inv=(
+            negative_center_rate_budget_s_inv - paired_center_rate_budget_s_inv
+        ),
+    )
+
+
+def _center_translation_rate_budget_s_inv(
+    transport_center: MolecularTransportCenter,
+    options: MolecularMoriOptions,
+) -> float:
+    jump_length_m = _jump_length_m(transport_center, options)
+    return _positive_float(
+        transport_center.diffusion_m2_s,
+        f"{transport_center.label}.diffusion_m2_s",
+    ) / (jump_length_m * jump_length_m)
+
+
+def _append_solvent_separated_pair_relative_translation_events(
+    events: list[MarkovAdditiveEvent],
+    positive_center_index: _MobileTransportStateIndex,
+    negative_center_index: _MobileTransportStateIndex,
+    relative_rate_s_inv: float,
+    options: MolecularMoriOptions,
+) -> None:
+    positive_transport_center = positive_center_index.transport_state
+    negative_transport_center = negative_center_index.transport_state
+    positive_jump_length_m = _jump_length_m(positive_transport_center, options)
+    negative_jump_length_m = _jump_length_m(negative_transport_center, options)
+    if relative_rate_s_inv == 0.0:
+        return
+    relative_charge_step_m = (
+        positive_transport_center.center_charge_number * positive_jump_length_m
+        - negative_transport_center.center_charge_number * negative_jump_length_m
+    )
+    _append_solvent_separated_pair_axis_events(
+        events,
+        positive_center_index.mobile_state_index,
+        positive_transport_center,
+        negative_transport_center,
+        relative_charge_step_m,
+        relative_rate_s_inv,
+        "solvent_separated_pair_relative_translation",
+    )
+
+
+def _append_solvent_separated_pair_com_translation_events(
+    events: list[MarkovAdditiveEvent],
+    positive_center_index: _MobileTransportStateIndex,
+    negative_center_index: _MobileTransportStateIndex,
+    co_motion_rate_s_inv: float,
+    options: MolecularMoriOptions,
+) -> None:
+    positive_transport_center = positive_center_index.transport_state
+    negative_transport_center = negative_center_index.transport_state
+    positive_jump_length_m = _jump_length_m(positive_transport_center, options)
+    negative_jump_length_m = _jump_length_m(negative_transport_center, options)
+    if co_motion_rate_s_inv == 0.0:
+        return
+    co_motion_length_m = math.sqrt(positive_jump_length_m * negative_jump_length_m)
+    co_motion_charge_step_m = (
+        (
+            positive_transport_center.center_charge_number
+            + negative_transport_center.center_charge_number
+        )
+        * co_motion_length_m
+    )
+    _append_solvent_separated_pair_axis_events(
+        events,
+        positive_center_index.mobile_state_index,
+        positive_transport_center,
+        negative_transport_center,
+        co_motion_charge_step_m,
+        co_motion_rate_s_inv,
+        "solvent_separated_pair_com_translation",
+    )
+
+
+def _append_solvent_separated_pair_residual_center_events(
+    events: list[MarkovAdditiveEvent],
+    center_index: _MobileTransportStateIndex,
+    residual_rate_s_inv: float,
+    options: MolecularMoriOptions,
+) -> None:
+    if residual_rate_s_inv < 0.0:
+        raise ValueError(
+            f"{center_index.transport_state.label}.residual_rate_s_inv is negative"
+        )
+    if residual_rate_s_inv == 0.0:
+        return
+    _append_solvent_separated_pair_center_axis_events(
+        events,
+        center_index.mobile_state_index,
+        center_index.transport_state,
+        _jump_length_m(center_index.transport_state, options),
+        residual_rate_s_inv,
+        "solvent_separated_pair_residual_center_translation",
+    )
+
+
+def _append_solvent_separated_pair_axis_events(
+    events: list[MarkovAdditiveEvent],
+    source_mobile_state_index: int,
+    positive_transport_center: MolecularTransportCenter,
+    negative_transport_center: MolecularTransportCenter,
+    charge_step_m: float,
+    rate_s_inv: float,
+    family_label: str,
+) -> None:
+    _positive_float(rate_s_inv, f"{family_label}.rate_s_inv")
+    for axis_index, axis_vector in enumerate(CARTESIAN_DIRECTIONS):
+        for direction_sign in TRANSLATION_EVENT_SIGNS:
+            sign_label = "plus" if direction_sign > 0.0 else "minus"
+            displacement_m = tuple(
+                float(direction_sign * charge_step_m * axis_component)
+                for axis_component in axis_vector
+            )
+            events.append(
+                MarkovAdditiveEvent(
+                    from_state_index=source_mobile_state_index,
+                    to_state_index=source_mobile_state_index,
+                    rate_s_inv=rate_s_inv,
+                    charge_displacement_m=displacement_m,
+                    label=(
+                        f"{family_label}:"
+                        f"{positive_transport_center.label}:"
+                        f"{negative_transport_center.label}:"
+                        f"axis{axis_index}:{sign_label}"
+                    ),
+                    family_label=family_label,
+                )
+            )
+
+
+def _append_solvent_separated_pair_center_axis_events(
+    events: list[MarkovAdditiveEvent],
+    source_mobile_state_index: int,
+    transport_center: MolecularTransportCenter,
+    jump_length_m: float,
+    rate_s_inv: float,
+    family_label: str,
+) -> None:
+    _positive_float(rate_s_inv, f"{family_label}.rate_s_inv")
+    for axis_index, axis_vector in enumerate(CARTESIAN_DIRECTIONS):
+        for direction_sign in TRANSLATION_EVENT_SIGNS:
+            sign_label = "plus" if direction_sign > 0.0 else "minus"
+            displacement_m = _charge_displacement_m(
+                transport_center,
+                jump_length_m,
+                axis_vector,
+                direction_sign,
+            )
+            events.append(
+                MarkovAdditiveEvent(
+                    from_state_index=source_mobile_state_index,
+                    to_state_index=source_mobile_state_index,
+                    rate_s_inv=rate_s_inv,
+                    charge_displacement_m=displacement_m,
+                    label=(
+                        f"{family_label}:"
+                        f"{transport_center.label}:axis{axis_index}:{sign_label}"
+                    ),
+                    family_label=family_label,
+                )
             )
 
 
@@ -1218,7 +1732,7 @@ def _append_reversible_association_conversion_pair(
 
 
 def _charge_displacement_m(
-    transport_state: MolecularTransportState,
+    transport_state: MolecularTransportCenter,
     jump_length_m: float,
     axis_vector: tuple[float, float, float],
     direction_sign: float,
@@ -1226,7 +1740,7 @@ def _charge_displacement_m(
     return tuple(
         float(
             direction_sign
-            * transport_state.net_charge_number
+            * transport_state.center_charge_number
             * jump_length_m
             * axis_component
         )
@@ -1235,7 +1749,7 @@ def _charge_displacement_m(
 
 
 def _atmosphere_memory_primitive(
-    transport_state: MolecularTransportState,
+    transport_state: MolecularTransportCenter,
     options: MolecularMoriOptions,
     atmosphere_diagnostics: MolecularIonAtmosphereDiagnostics,
 ) -> MolecularAtmosphereMemoryPrimitive:
@@ -1345,7 +1859,7 @@ def _atmosphere_memory_exit_rate_s_inv(
 
 
 def _neutral_markov_process_from_transport_states(
-    transport_states: tuple[MolecularTransportState, ...],
+    transport_states: tuple[MolecularTransportCenter, ...],
     options: MolecularMoriOptions,
 ) -> _MarkovProcessConstruction:
     state_labels = tuple(state.label for state in transport_states)
@@ -1376,7 +1890,7 @@ def _neutral_markov_process_from_transport_states(
 
 
 def _jump_length_m(
-    transport_state: MolecularTransportState,
+    transport_state: MolecularTransportCenter,
     options: MolecularMoriOptions,
 ) -> float:
     jump_length_m = (
@@ -2478,15 +2992,6 @@ def _validate_options(options: MolecularMoriOptions) -> None:
         options.translation_jump_length_multiplier,
         "translation_jump_length_multiplier",
     )
-    for cluster_label, shift_over_RT in (
-        options.cluster_standard_free_energy_shift_over_RT_by_label.items()
-    ):
-        if not cluster_label:
-            raise ValueError("cluster standard-free-energy shift label must be nonempty")
-        _finite_float(
-            shift_over_RT,
-            f"{cluster_label}.standard_free_energy_shift_over_RT",
-        )
 
 
 def _positive_float(value: float, context: str) -> float:

@@ -12,7 +12,7 @@ import numpy as np
 
 from constants import F, N_A, PA_PER_ATM, R, S_M_TO_MS_CM, T_REF_K
 from conductivity.fit_conductivity_primitive_parameters import (
-    PrimitiveFitLogBound,
+    PrimitiveParameterTransform,
     PrimitiveFitOptions,
     PrimitiveFitDatasetEvaluation,
 )
@@ -33,11 +33,20 @@ from conductivity.molecular_electrolyte_mori_generator import (
     MolecularMixtureProperties,
     MolecularMoriConductivityResult,
     MolecularMoriOptions,
-    compute_molecular_electrolyte_conductivity,
+    TRANSPORT_ROLE_CHARGED_TRIPLET_CENTER,
+    TRANSPORT_ROLE_CLUSTER_COM_CENTER,
+    TRANSPORT_ROLE_CONTACT_PAIR_CENTER,
+    TRANSPORT_ROLE_FREE_ION_CENTER,
+    TRANSPORT_ROLE_INTERNAL_POLARIZATION_CENTER,
+    TRANSPORT_ROLE_SOLVENT_SEPARATED_PAIR_CENTER,
+    compute_molecular_electrolyte_conductivity_with_diagnostic_cluster_shifts,
 )
 from conductivity.molecular_primitive_parameters import (
     CONDUCTIVITY_PRIMITIVE_PARAMETER_FIELD_NAMES,
+    CONDUCTIVITY_PRIMITIVE_PARAMETER_TRANSFORM_BY_NAME,
     ConductivityPrimitiveParameterSet,
+    PRIMITIVE_PARAMETER_TRANSFORM_IDENTITY_SIGNED,
+    PRIMITIVE_PARAMETER_TRANSFORM_LOG_POSITIVE,
     conductivity_primitive_parameters_from_mapping,
     validate_conductivity_primitive_parameters,
 )
@@ -55,6 +64,14 @@ GRAMS_PER_LITER_PER_G_ML = 1000.0  # Unit conversion: g/mL to g/L.
 SPHERE_VOLUME_FACTOR = 4.0 / 3.0  # Sphere volume coefficient: 4*pi*r^3/3.
 SPHERE_AREA_FACTOR = 4.0  # Sphere area coefficient: 4*pi*r^2.
 POLARIZABILITY_CLAUSIUS_MOSSOTTI_FACTOR = 3.0 / (4.0 * math.pi)
+TRANSPORT_ROLE_DIRECT_CORRECTOR_ATTRIBUTION_LABELS = (
+    TRANSPORT_ROLE_FREE_ION_CENTER,
+    TRANSPORT_ROLE_SOLVENT_SEPARATED_PAIR_CENTER,
+    TRANSPORT_ROLE_CHARGED_TRIPLET_CENTER,
+    TRANSPORT_ROLE_CLUSTER_COM_CENTER,
+    TRANSPORT_ROLE_INTERNAL_POLARIZATION_CENTER,
+    TRANSPORT_ROLE_CONTACT_PAIR_CENTER,
+)
 
 
 @dataclass(frozen=True)
@@ -151,6 +168,16 @@ class MolecularPropertyDbRowResult:
     failure_reason: str
     direct_sigma_mS_cm: float
     corrector_sigma_mS_cm: float
+    direct_capacity_gap_mS_cm: float
+    corrector_target_mS_cm: float
+    corrector_residual_mS_cm: float
+    direct_capacity_failure: bool
+    corrector_too_strong_failure: bool
+    corrector_too_weak_failure: bool
+    direct_sigma_by_transport_role_mS_cm: Mapping[str, float]
+    corrector_sigma_by_transport_role_mS_cm: Mapping[str, float]
+    net_sigma_by_transport_role_mS_cm: Mapping[str, float]
+    charge_weighted_transport_concentration_mol_m3: float
     mass_balance_residual_mol_m3: float
     row_sum_residual: float
     stationary_residual_mol_m3_s: float
@@ -188,6 +215,7 @@ class MolecularClusterThermodynamicDiagnostic:
     coordination_J_mol: float
     steric_J_mol: float
     entropy_J_mol: float
+    activity_reference_J_mol: float
     activity_correction_J_mol: float
     hydrodynamic_radius_A: float
     molecular_volume_A3: float
@@ -205,6 +233,16 @@ class MolecularClusterSensitivityDiagnostic:
     sigma_higher_deltaG_mS_cm: float
     sensitivity_mS_cm_per_logK: float
     direction_needed: str
+
+
+@dataclass(frozen=True)
+class ConductivityDecompositionDiagnostic:
+    direct_capacity_gap_mS_cm: float
+    corrector_target_mS_cm: float
+    corrector_residual_mS_cm: float
+    direct_capacity_failure: bool
+    corrector_too_strong_failure: bool
+    corrector_too_weak_failure: bool
 
 
 @dataclass(frozen=True)
@@ -233,11 +271,13 @@ class MolecularPropertyDbPrimitiveEvaluator:
         self,
         cases: tuple[MolecularPropertyDbCase, ...],
         options: MolecularPropertyDbAuditOptions,
+        fit_options: PrimitiveFitOptions,
     ) -> None:
         if not cases:
             raise ValueError("molecular property-DB evaluator requires cases")
         self._cases = cases
         self._options = options
+        self._fit_options = fit_options
         self._has_measured_consumed_parameter_fields = False
         self._consumed_parameter_fields: tuple[str, ...] = tuple()
 
@@ -265,6 +305,42 @@ class MolecularPropertyDbPrimitiveEvaluator:
             predicted_sigmas_mS_cm=tuple(
                 row.predicted_sigma_mS_cm for row in audit_result.rows
             ),
+            direct_sigmas_mS_cm=tuple(
+                row.direct_sigma_mS_cm for row in audit_result.rows
+            ),
+            corrector_sigmas_mS_cm=tuple(
+                row.corrector_sigma_mS_cm for row in audit_result.rows
+            ),
+            direct_capacity_gaps_mS_cm=tuple(
+                row.direct_capacity_gap_mS_cm for row in audit_result.rows
+            ),
+            corrector_targets_mS_cm=tuple(
+                row.corrector_target_mS_cm for row in audit_result.rows
+            ),
+            corrector_residuals_mS_cm=tuple(
+                row.corrector_residual_mS_cm for row in audit_result.rows
+            ),
+            direct_capacity_failure_count=sum(
+                1 for row in audit_result.rows if row.direct_capacity_failure
+            ),
+            corrector_too_strong_failure_count=sum(
+                1 for row in audit_result.rows
+                if row.corrector_too_strong_failure
+            ),
+            corrector_too_weak_failure_count=sum(
+                1 for row in audit_result.rows
+                if row.corrector_too_weak_failure
+            ),
+            empirical_sigma_spreads_mS_cm=tuple(
+                row.empirical_sigma_spread_mS_cm for row in audit_result.rows
+            ),
+            cluster_activation_penalty=_cluster_activation_penalty(
+                self._cases,
+                primitive_parameters,
+                self._options,
+                self._fit_options,
+                audit_result,
+            ),
             failed_rows=audit_result.failed_rows,
             maximum_mass_balance_residual=(
                 audit_result.maximum_mass_balance_residual
@@ -290,7 +366,86 @@ class MolecularPropertyDbPrimitiveEvaluator:
         )
 
 
-REFERENCE_LOGK_OFFSET_PARAMETER_VALUE = 1.0e-6
+def _cluster_activation_penalty(
+    cases: tuple[MolecularPropertyDbCase, ...],
+    primitive_parameters: ConductivityPrimitiveParameterSet,
+    options: MolecularPropertyDbAuditOptions,
+    fit_options: PrimitiveFitOptions,
+    audit_result: MolecularPropertyDbAuditResult,
+) -> float:
+    if fit_options.cluster_activation_loss_weight == 0.0:
+        return 0.0
+    case_by_row_id = {molecular_case.row_id: molecular_case for molecular_case in cases}
+    selected_rows = tuple(
+        sorted(
+            audit_result.rows,
+            key=lambda row_result: abs(row_result.residual_mS_cm),
+            reverse=True,
+        )[:fit_options.residual_tail_count]
+    )
+    penalty_terms: list[float] = []
+    residual_threshold_mS_cm = fit_options.cluster_activation_residual_threshold_mS_cm
+    minimum_charged_cluster_fraction = (
+        fit_options.cluster_activation_min_charged_cluster_fraction
+    )
+    minimum_charged_cluster_net_sigma_mS_cm = (
+        fit_options.cluster_activation_min_charged_cluster_net_sigma_mS_cm
+    )
+    for row_result in selected_rows:
+        if abs(row_result.residual_mS_cm) <= residual_threshold_mS_cm:
+            continue
+        if row_result.row_id not in case_by_row_id:
+            raise ValueError(f"missing molecular case for row {row_result.row_id}")
+        if (
+            row_result.charged_cluster_fraction
+            >= minimum_charged_cluster_fraction
+            and abs(row_result.charged_cluster_net_sigma_mS_cm)
+            >= minimum_charged_cluster_net_sigma_mS_cm
+        ):
+            continue
+        sensitivity_diagnostics = cluster_sensitivity_diagnostics_for_row(
+            case_by_row_id[row_result.row_id],
+            primitive_parameters,
+            options,
+            row_result,
+        )
+        charged_cluster_sensitivity_weight = math.fsum(
+            abs(sensitivity_diagnostic.sensitivity_mS_cm_per_logK)
+            for sensitivity_diagnostic in sensitivity_diagnostics
+            if (
+                sensitivity_diagnostic.net_charge_number != 0
+                and sensitivity_diagnostic.direction_needed == "increase_logK"
+            )
+        )
+        if charged_cluster_sensitivity_weight <= 0.0:
+            continue
+        fraction_deficit = max(
+            0.0,
+            (
+                minimum_charged_cluster_fraction
+                - row_result.charged_cluster_fraction
+            )
+            / minimum_charged_cluster_fraction,
+        )
+        sigma_deficit = max(
+            0.0,
+            (
+                minimum_charged_cluster_net_sigma_mS_cm
+                - abs(row_result.charged_cluster_net_sigma_mS_cm)
+            )
+            / minimum_charged_cluster_net_sigma_mS_cm,
+        )
+        penalty_terms.append(
+            charged_cluster_sensitivity_weight
+            * (
+                fraction_deficit * fraction_deficit
+                + sigma_deficit * sigma_deficit
+            )
+        )
+    return float(math.fsum(penalty_terms))
+
+
+REFERENCE_LOGK_OFFSET_PARAMETER_VALUE = 0.0
 LOGK_OFFSET_PARAMETER_NAMES = frozenset(
     (
         "pair_logK_offset",
@@ -412,7 +567,7 @@ def configured_conductivity_primitive_parameters() -> ConductivityPrimitiveParam
     _validate_primitive_parameter_config_keys(config_mapping)
     primitive_parameters = conductivity_primitive_parameters_from_mapping(
         {
-            field_name: _required_positive_config_float(
+            field_name: _required_primitive_parameter_config_float(
                 config_mapping,
                 field_name,
             )
@@ -441,42 +596,49 @@ def _validate_primitive_parameter_config_keys(config_mapping: dict) -> None:
 
 def default_molecular_primitive_fit_configuration() -> tuple[
     PrimitiveFitOptions,
-    tuple[PrimitiveFitLogBound, ...],
+    tuple[PrimitiveParameterTransform, ...],
 ]:
     fit_config_mapping = _load_optimization_config_section(
         PRIMITIVE_PARAMETER_FIT_CONFIG_KEY
     )
-    log_bounds_mapping = _required_mapping(
+    coordinate_bounds_mapping = _required_mapping(
         fit_config_mapping,
-        "log_bounds",
-        "molecular_primitive_parameter_fit.log_bounds",
+        "coordinate_bounds",
+        "molecular_primitive_parameter_fit.coordinate_bounds",
     )
-    unknown_log_bound_names = tuple(
+    unknown_coordinate_bound_names = tuple(
         sorted(
-            parameter_name for parameter_name in log_bounds_mapping
+            parameter_name for parameter_name in coordinate_bounds_mapping
             if parameter_name not in CONDUCTIVITY_PRIMITIVE_PARAMETER_FIELD_NAMES
         )
     )
-    if unknown_log_bound_names:
-        raise ValueError(f"unknown molecular primitive fit log bounds: {unknown_log_bound_names}")
-    missing_log_bound_names = tuple(
+    if unknown_coordinate_bound_names:
+        raise ValueError(
+            "unknown molecular primitive fit coordinate bounds: "
+            f"{unknown_coordinate_bound_names}"
+        )
+    missing_coordinate_bound_names = tuple(
         parameter_name
         for parameter_name in CONDUCTIVITY_PRIMITIVE_PARAMETER_FIELD_NAMES
-        if parameter_name not in log_bounds_mapping
+        if parameter_name not in coordinate_bounds_mapping
     )
-    if missing_log_bound_names:
+    if missing_coordinate_bound_names:
         raise ValueError(
-            "molecular primitive fit log_bounds missing parameters "
-            f"{missing_log_bound_names}"
+            "molecular primitive fit coordinate_bounds missing parameters "
+            f"{missing_coordinate_bound_names}"
         )
     fit_options = PrimitiveFitOptions(
         huber_delta_mS_cm=_required_positive_config_float(
             fit_config_mapping,
             "huber_delta_mS_cm",
         ),
-        log_regularization_weight=_required_nonnegative_config_float(
+        empirical_sigma_floor_mS_cm=_required_positive_config_float(
             fit_config_mapping,
-            "log_regularization_weight",
+            "empirical_sigma_floor_mS_cm",
+        ),
+        coordinate_regularization_weight=_required_nonnegative_config_float(
+            fit_config_mapping,
+            "coordinate_regularization_weight",
         ),
         residual_tail_loss_weight=_required_nonnegative_config_float(
             fit_config_mapping,
@@ -486,37 +648,99 @@ def default_molecular_primitive_fit_configuration() -> tuple[
             fit_config_mapping,
             "residual_tail_count",
         ),
-        latin_hypercube_sample_count=_required_positive_config_int(
+        cluster_activation_loss_weight=_required_nonnegative_config_float(
             fit_config_mapping,
-            "latin_hypercube_sample_count",
+            "cluster_activation_loss_weight",
+        ),
+        cluster_activation_residual_threshold_mS_cm=(
+            _required_positive_config_float(
+                fit_config_mapping,
+                "cluster_activation_residual_threshold_mS_cm",
+            )
+        ),
+        cluster_activation_min_charged_cluster_fraction=(
+            _required_positive_config_float(
+                fit_config_mapping,
+                "cluster_activation_min_charged_cluster_fraction",
+            )
+        ),
+        cluster_activation_min_charged_cluster_net_sigma_mS_cm=(
+            _required_positive_config_float(
+                fit_config_mapping,
+                "cluster_activation_min_charged_cluster_net_sigma_mS_cm",
+            )
+        ),
+        direct_capacity_loss_weight=_required_nonnegative_config_float(
+            fit_config_mapping,
+            "direct_capacity_loss_weight",
+        ),
+        corrector_loss_weight=_required_nonnegative_config_float(
+            fit_config_mapping,
+            "corrector_loss_weight",
+        ),
+        role_direct_scaling_regularization_weight=(
+            _required_nonnegative_config_float(
+                fit_config_mapping,
+                "role_direct_scaling_regularization_weight",
+            )
+        ),
+        role_direct_scaling_lower_bound=_required_positive_config_float(
+            fit_config_mapping,
+            "role_direct_scaling_lower_bound",
+        ),
+        role_direct_scaling_upper_bound=_required_positive_config_float(
+            fit_config_mapping,
+            "role_direct_scaling_upper_bound",
+        ),
+        latin_hypercube_samples_per_parameter=_required_positive_config_float(
+            fit_config_mapping,
+            "latin_hypercube_samples_per_parameter",
         ),
         coordinate_search_rounds=_required_nonnegative_config_int(
             fit_config_mapping,
             "coordinate_search_rounds",
         ),
-        initial_coordinate_step_log=_required_positive_config_float(
+        initial_coordinate_step=_required_positive_config_float(
             fit_config_mapping,
-            "initial_coordinate_step_log",
+            "initial_coordinate_step",
         ),
         coordinate_step_shrinkage=_required_positive_config_float(
             fit_config_mapping,
             "coordinate_step_shrinkage",
         ),
-        minimum_coordinate_step_log=_required_positive_config_float(
+        minimum_coordinate_step=_required_positive_config_float(
             fit_config_mapping,
-            "minimum_coordinate_step_log",
+            "minimum_coordinate_step",
         ),
-        powell_max_iterations=_required_nonnegative_config_int(
+        powell_max_iterations_per_parameter=_required_nonnegative_config_float(
             fit_config_mapping,
-            "powell_max_iterations",
+            "powell_max_iterations_per_parameter",
         ),
-        powell_max_function_evaluations=_required_nonnegative_config_int(
+        powell_max_function_evaluations_per_parameter=_required_nonnegative_config_float(
             fit_config_mapping,
-            "powell_max_function_evaluations",
+            "powell_max_function_evaluations_per_parameter",
         ),
-        powell_xtol_log=_required_positive_config_float(
+        decomposed_block_powell_max_iterations_per_parameter=(
+            _required_nonnegative_config_float(
+                fit_config_mapping,
+                "decomposed_block_powell_max_iterations_per_parameter",
+            )
+        ),
+        decomposed_block_powell_max_function_evaluations_per_parameter=(
+            _required_nonnegative_config_float(
+                fit_config_mapping,
+                "decomposed_block_powell_max_function_evaluations_per_parameter",
+            )
+        ),
+        decomposed_block_cluster_activation_loss_weight=(
+            _required_nonnegative_config_float(
+                fit_config_mapping,
+                "decomposed_block_cluster_activation_loss_weight",
+            )
+        ),
+        powell_xtol_coordinate=_required_positive_config_float(
             fit_config_mapping,
-            "powell_xtol_log",
+            "powell_xtol_coordinate",
         ),
         powell_ftol_objective=_required_positive_config_float(
             fit_config_mapping,
@@ -554,6 +778,52 @@ def default_molecular_primitive_fit_configuration() -> tuple[
             fit_config_mapping,
             "maximum_zero_charge_sigma_mS_cm",
         ),
+        descriptor_matrix_high_correlation_threshold=(
+            _required_positive_config_float(
+                fit_config_mapping,
+                "descriptor_matrix_high_correlation_threshold",
+            )
+        ),
+        descriptor_matrix_condition_number_warn_threshold=(
+            _required_positive_config_float(
+                fit_config_mapping,
+                "descriptor_matrix_condition_number_warn_threshold",
+            )
+        ),
+        descriptor_matrix_reported_correlation_pair_count=(
+            _required_nonnegative_config_int(
+                fit_config_mapping,
+                "descriptor_matrix_reported_correlation_pair_count",
+            )
+        ),
+        prediction_sensitivity_coordinate_step=_required_positive_config_float(
+            fit_config_mapping,
+            "prediction_sensitivity_coordinate_step",
+        ),
+        prediction_sensitivity_min_column_norm_mS_cm_per_coordinate=(
+            _required_positive_config_float(
+                fit_config_mapping,
+                "prediction_sensitivity_min_column_norm_mS_cm_per_coordinate",
+            )
+        ),
+        prediction_sensitivity_relative_singular_value_threshold=(
+            _required_positive_config_float(
+                fit_config_mapping,
+                "prediction_sensitivity_relative_singular_value_threshold",
+            )
+        ),
+        prediction_sensitivity_high_correlation_threshold=(
+            _required_positive_config_float(
+                fit_config_mapping,
+                "prediction_sensitivity_high_correlation_threshold",
+            )
+        ),
+        prediction_sensitivity_reported_correlation_pair_count=(
+            _required_nonnegative_config_int(
+                fit_config_mapping,
+                "prediction_sensitivity_reported_correlation_pair_count",
+            )
+        ),
         candidate_output_path=_required_config_string(
             fit_config_mapping,
             "candidate_output_path",
@@ -577,15 +847,15 @@ def default_molecular_primitive_fit_configuration() -> tuple[
             "promotion_require_mae_improvement",
         ),
     )
-    log_bounds: list[PrimitiveFitLogBound] = []
+    coordinate_bounds: list[PrimitiveParameterTransform] = []
     for parameter_name in CONDUCTIVITY_PRIMITIVE_PARAMETER_FIELD_NAMES:
-        log_bounds.append(
-            _primitive_fit_log_bound_from_config(
-                log_bounds_mapping,
+        coordinate_bounds.append(
+            _primitive_fit_coordinate_bound_from_config(
+                coordinate_bounds_mapping,
                 parameter_name,
             )
         )
-    return fit_options, tuple(log_bounds)
+    return fit_options, tuple(coordinate_bounds)
 
 
 def build_molecular_property_db_case_selection(
@@ -1008,11 +1278,24 @@ def _evaluate_molecular_property_db_case(
     )
     validation = molecular_result.markov_additive_result.validation
     predicted_sigma_mS_cm = molecular_result.sigma_mS_cm
+    direct_sigma_mS_cm = molecular_result.markov_additive_result.direct_sigma_mS_cm
+    corrector_sigma_mS_cm = (
+        molecular_result.markov_additive_result.corrector_sigma_mS_cm
+    )
+    decomposition_diagnostic = conductivity_decomposition_diagnostic(
+        direct_sigma_mS_cm,
+        corrector_sigma_mS_cm,
+        predicted_sigma_mS_cm,
+        molecular_case.empirical_sigma_mS_cm,
+    )
     cluster_fraction_rollup = _cluster_fraction_rollup(molecular_result)
     cluster_mobility_rollup = _cluster_transport_mobility_rollup(
         molecular_result,
     )
     charged_cluster_sigma_rollup = _charged_cluster_event_sigma_rollup(
+        molecular_result,
+    )
+    transport_role_sigma_rollup = _transport_role_event_sigma_rollup(
         molecular_result,
     )
     return MolecularPropertyDbRowResult(
@@ -1026,9 +1309,33 @@ def _evaluate_molecular_property_db_case(
         residual_mS_cm=predicted_sigma_mS_cm - molecular_case.empirical_sigma_mS_cm,
         failed=False,
         failure_reason="",
-        direct_sigma_mS_cm=molecular_result.markov_additive_result.direct_sigma_mS_cm,
-        corrector_sigma_mS_cm=(
-            molecular_result.markov_additive_result.corrector_sigma_mS_cm
+        direct_sigma_mS_cm=direct_sigma_mS_cm,
+        corrector_sigma_mS_cm=corrector_sigma_mS_cm,
+        direct_capacity_gap_mS_cm=(
+            decomposition_diagnostic.direct_capacity_gap_mS_cm
+        ),
+        corrector_target_mS_cm=decomposition_diagnostic.corrector_target_mS_cm,
+        corrector_residual_mS_cm=(
+            decomposition_diagnostic.corrector_residual_mS_cm
+        ),
+        direct_capacity_failure=decomposition_diagnostic.direct_capacity_failure,
+        corrector_too_strong_failure=(
+            decomposition_diagnostic.corrector_too_strong_failure
+        ),
+        corrector_too_weak_failure=(
+            decomposition_diagnostic.corrector_too_weak_failure
+        ),
+        direct_sigma_by_transport_role_mS_cm=(
+            transport_role_sigma_rollup["direct_sigma_by_transport_role_mS_cm"]
+        ),
+        corrector_sigma_by_transport_role_mS_cm=(
+            transport_role_sigma_rollup["corrector_sigma_by_transport_role_mS_cm"]
+        ),
+        net_sigma_by_transport_role_mS_cm=(
+            transport_role_sigma_rollup["net_sigma_by_transport_role_mS_cm"]
+        ),
+        charge_weighted_transport_concentration_mol_m3=(
+            _charge_weighted_transport_concentration_mol_m3(molecular_result)
         ),
         mass_balance_residual_mol_m3=molecular_result.mass_balance_residual_mol_m3,
         row_sum_residual=validation.row_sum_residual,
@@ -1095,7 +1402,7 @@ def _compute_case_result_with_cluster_shifts(
     molecular_case: MolecularPropertyDbCase,
     primitive_parameters: ConductivityPrimitiveParameterSet,
     options: MolecularPropertyDbAuditOptions,
-    cluster_standard_free_energy_shift_over_RT_by_label: Mapping[str, float],
+    diagnostic_cluster_standard_free_energy_shift_over_RT_by_label: Mapping[str, float],
 ) -> MolecularMoriConductivityResult:
     molecular_options = MolecularMoriOptions(
         max_cluster_ion_count=options.max_cluster_ion_count,
@@ -1105,15 +1412,91 @@ def _compute_case_result_with_cluster_shifts(
             options.translation_jump_length_multiplier
         ),
         primitive_parameters=primitive_parameters,
-        cluster_standard_free_energy_shift_over_RT_by_label=dict(
-            cluster_standard_free_energy_shift_over_RT_by_label
-        ),
     )
-    return compute_molecular_electrolyte_conductivity(
+    return compute_molecular_electrolyte_conductivity_with_diagnostic_cluster_shifts(
         molecular_case.recipe,
         molecular_case.species_inputs,
         ProvidedPropertyDescriptorBackend(),
         molecular_options,
+        diagnostic_cluster_standard_free_energy_shift_over_RT_by_label,
+    )
+
+
+def conductivity_decomposition_diagnostic(
+    direct_sigma_mS_cm: float,
+    corrector_sigma_mS_cm: float,
+    predicted_sigma_mS_cm: float,
+    empirical_sigma_mS_cm: float,
+) -> ConductivityDecompositionDiagnostic:
+    direct_sigma_value = _nonnegative_float(
+        direct_sigma_mS_cm,
+        "direct_sigma_mS_cm",
+    )
+    corrector_sigma_value = _nonnegative_float(
+        corrector_sigma_mS_cm,
+        "corrector_sigma_mS_cm",
+    )
+    predicted_sigma_value = _finite_float(
+        predicted_sigma_mS_cm,
+        "predicted_sigma_mS_cm",
+    )
+    empirical_sigma_value = _nonnegative_float(
+        empirical_sigma_mS_cm,
+        "empirical_sigma_mS_cm",
+    )
+    if direct_sigma_value == 0.0:
+        if empirical_sigma_value == 0.0 and predicted_sigma_value == 0.0:
+            return ConductivityDecompositionDiagnostic(
+                direct_capacity_gap_mS_cm=0.0,
+                corrector_target_mS_cm=0.0,
+                corrector_residual_mS_cm=0.0,
+                direct_capacity_failure=False,
+                corrector_too_strong_failure=False,
+                corrector_too_weak_failure=False,
+            )
+        raise ValueError(
+            "positive conductivity row has zero direct Markov-additive capacity"
+        )
+    direct_capacity_gap_mS_cm = empirical_sigma_value - direct_sigma_value
+    corrector_target_mS_cm = max(0.0, direct_sigma_value - empirical_sigma_value)
+    corrector_residual_mS_cm = corrector_sigma_value - corrector_target_mS_cm
+    direct_capacity_failure = direct_capacity_gap_mS_cm > 0.0
+    corrector_too_strong_failure = (
+        not direct_capacity_failure and corrector_residual_mS_cm > 0.0
+    )
+    corrector_too_weak_failure = (
+        not direct_capacity_failure and corrector_residual_mS_cm < 0.0
+    )
+    return ConductivityDecompositionDiagnostic(
+        direct_capacity_gap_mS_cm=_finite_float(
+            direct_capacity_gap_mS_cm,
+            "direct_capacity_gap_mS_cm",
+        ),
+        corrector_target_mS_cm=_nonnegative_float(
+            corrector_target_mS_cm,
+            "corrector_target_mS_cm",
+        ),
+        corrector_residual_mS_cm=_finite_float(
+            corrector_residual_mS_cm,
+            "corrector_residual_mS_cm",
+        ),
+        direct_capacity_failure=direct_capacity_failure,
+        corrector_too_strong_failure=corrector_too_strong_failure,
+        corrector_too_weak_failure=corrector_too_weak_failure,
+    )
+
+
+def measured_molecular_property_db_consumed_parameter_fields(
+    cases: tuple[MolecularPropertyDbCase, ...],
+    primitive_parameters: ConductivityPrimitiveParameterSet,
+    options: MolecularPropertyDbAuditOptions,
+    baseline_audit_result: MolecularPropertyDbAuditResult,
+) -> tuple[str, ...]:
+    return _measured_consumed_parameter_fields(
+        cases,
+        primitive_parameters,
+        options,
+        baseline_audit_result,
     )
 
 
@@ -1249,7 +1632,7 @@ def _cluster_transport_mobility_rollup(
     charged_cluster_transport_mobility_density_mol_m_s = 0.0
     neutral_cluster_transport_mobility_density_mol_m_s = 0.0
     for transport_state in molecular_result.transport_states:
-        if transport_state.state_kind != "cluster":
+        if not _transport_state_is_cluster_center(transport_state.transport_role):
             continue
         mobility_density_mol_m_s = (
             transport_state.concentration_mol_m3
@@ -1258,7 +1641,7 @@ def _cluster_transport_mobility_rollup(
         cluster_transport_mobility_density_mol_m_s += (
             mobility_density_mol_m_s
         )
-        if transport_state.net_charge_number == 0:
+        if transport_state.center_charge_number == 0:
             neutral_cluster_transport_mobility_density_mol_m_s += (
                 mobility_density_mol_m_s
             )
@@ -1285,14 +1668,69 @@ def _charged_cluster_event_sigma_rollup(
     charged_cluster_labels = tuple(
         transport_state.label
         for transport_state in molecular_result.transport_states
-        if transport_state.state_kind == "cluster"
-        and transport_state.net_charge_number != 0
+        if _transport_state_is_cluster_center(transport_state.transport_role)
+        and transport_state.center_charge_number != 0
     )
-    if not charged_cluster_labels:
+    sigma_rollup = _event_sigma_rollup_for_transport_labels(
+        molecular_result,
+        charged_cluster_labels,
+    )
+    return {
+        "charged_cluster_direct_sigma_mS_cm": (
+            sigma_rollup["direct_sigma_mS_cm"]
+        ),
+        "charged_cluster_corrector_sigma_mS_cm": (
+            sigma_rollup["corrector_sigma_mS_cm"]
+        ),
+        "charged_cluster_net_sigma_mS_cm": sigma_rollup["net_sigma_mS_cm"],
+    }
+
+
+def _transport_role_event_sigma_rollup(
+    molecular_result: MolecularMoriConductivityResult,
+) -> Mapping[str, Mapping[str, float]]:
+    direct_sigma_by_transport_role_mS_cm: dict[str, float] = {}
+    corrector_sigma_by_transport_role_mS_cm: dict[str, float] = {}
+    net_sigma_by_transport_role_mS_cm: dict[str, float] = {}
+    for transport_role in TRANSPORT_ROLE_DIRECT_CORRECTOR_ATTRIBUTION_LABELS:
+        transport_state_labels = tuple(
+            transport_state.label
+            for transport_state in molecular_result.transport_states
+            if transport_state.transport_role == transport_role
+        )
+        sigma_rollup = _event_sigma_rollup_for_transport_labels(
+            molecular_result,
+            transport_state_labels,
+        )
+        direct_sigma_by_transport_role_mS_cm[transport_role] = sigma_rollup[
+            "direct_sigma_mS_cm"
+        ]
+        corrector_sigma_by_transport_role_mS_cm[transport_role] = sigma_rollup[
+            "corrector_sigma_mS_cm"
+        ]
+        net_sigma_by_transport_role_mS_cm[transport_role] = sigma_rollup[
+            "net_sigma_mS_cm"
+        ]
+    return {
+        "direct_sigma_by_transport_role_mS_cm": (
+            direct_sigma_by_transport_role_mS_cm
+        ),
+        "corrector_sigma_by_transport_role_mS_cm": (
+            corrector_sigma_by_transport_role_mS_cm
+        ),
+        "net_sigma_by_transport_role_mS_cm": net_sigma_by_transport_role_mS_cm,
+    }
+
+
+def _event_sigma_rollup_for_transport_labels(
+    molecular_result: MolecularMoriConductivityResult,
+    transport_state_labels: tuple[str, ...],
+) -> Mapping[str, float]:
+    if not transport_state_labels:
         return {
-            "charged_cluster_direct_sigma_mS_cm": 0.0,
-            "charged_cluster_corrector_sigma_mS_cm": 0.0,
-            "charged_cluster_net_sigma_mS_cm": 0.0,
+            "direct_sigma_mS_cm": 0.0,
+            "corrector_sigma_mS_cm": 0.0,
+            "net_sigma_mS_cm": 0.0,
         }
     state_concentrations = np.asarray(
         molecular_result.markov_state_concentrations_mol_m3,
@@ -1311,7 +1749,7 @@ def _charged_cluster_event_sigma_rollup(
     for event in molecular_result.events:
         if not _event_label_matches_transport_labels(
             event.label,
-            charged_cluster_labels,
+            transport_state_labels,
         ):
             continue
         if event.from_state_index < 0 or event.from_state_index >= state_count:
@@ -1344,11 +1782,9 @@ def _charged_cluster_event_sigma_rollup(
         temperature_K=molecular_result.solvent_environment.temperature_K,
     )
     return {
-        "charged_cluster_direct_sigma_mS_cm": direct_sigma_mS_cm,
-        "charged_cluster_corrector_sigma_mS_cm": corrector_sigma_mS_cm,
-        "charged_cluster_net_sigma_mS_cm": (
-            direct_sigma_mS_cm - corrector_sigma_mS_cm
-        ),
+        "direct_sigma_mS_cm": direct_sigma_mS_cm,
+        "corrector_sigma_mS_cm": corrector_sigma_mS_cm,
+        "net_sigma_mS_cm": direct_sigma_mS_cm - corrector_sigma_mS_cm,
     }
 
 
@@ -1364,13 +1800,40 @@ def _event_label_matches_transport_labels(
         back_prefix = (
             f"atmosphere_memory_back_relaxation:{transport_state_label}:"
         )
+        ssip_relative_prefix = (
+            "solvent_separated_pair_relative_translation:"
+            f"{transport_state_label}:"
+        )
+        ssip_com_prefix = (
+            "solvent_separated_pair_com_translation:"
+            f"{transport_state_label}:"
+        )
+        ssip_residual_prefix = (
+            "solvent_separated_pair_residual_center_translation:"
+            f"{transport_state_label}:"
+        )
         if (
             event_label.startswith(ordinary_prefix)
             or event_label.startswith(capture_prefix)
             or event_label.startswith(back_prefix)
+            or event_label.startswith(ssip_relative_prefix)
+            or event_label.startswith(ssip_com_prefix)
+            or event_label.startswith(ssip_residual_prefix)
         ):
             return True
     return False
+
+
+def _transport_state_is_cluster_center(
+    transport_role: str,
+) -> bool:
+    return transport_role in (
+        TRANSPORT_ROLE_CHARGED_TRIPLET_CENTER,
+        TRANSPORT_ROLE_CLUSTER_COM_CENTER,
+        TRANSPORT_ROLE_CONTACT_PAIR_CENTER,
+        TRANSPORT_ROLE_INTERNAL_POLARIZATION_CENTER,
+        TRANSPORT_ROLE_SOLVENT_SEPARATED_PAIR_CENTER,
+    )
 
 
 def _axis_density_sigma_mS_cm(
@@ -1504,6 +1967,9 @@ def _cluster_thermodynamic_diagnostics(
                 coordination_J_mol=cluster_template.coordination_J_mol,
                 steric_J_mol=cluster_template.steric_J_mol,
                 entropy_J_mol=cluster_template.entropy_J_mol,
+                activity_reference_J_mol=(
+                    cluster_template.activity_reference_J_mol
+                ),
                 activity_correction_J_mol=activity_correction_J_mol,
                 hydrodynamic_radius_A=cluster_template.hydrodynamic_radius_A,
                 molecular_volume_A3=cluster_template.molecular_volume_A3,
@@ -1522,6 +1988,21 @@ def _total_analytical_ion_concentration_mol_m3(
             for component in molecular_result.speciation.components
         ),
         "total_analytical_ion_concentration_mol_m3",
+    )
+
+
+def _charge_weighted_transport_concentration_mol_m3(
+    molecular_result: MolecularMoriConductivityResult,
+) -> float:
+    charge_weighted_concentration_mol_m3 = math.fsum(
+        transport_state.concentration_mol_m3
+        * transport_state.center_charge_number
+        * transport_state.center_charge_number
+        for transport_state in molecular_result.transport_states
+    )
+    return _nonnegative_float(
+        charge_weighted_concentration_mol_m3,
+        "charge_weighted_transport_concentration_mol_m3",
     )
 
 
@@ -1566,11 +2047,14 @@ def _parameter_is_consumed_by_any_perturbation(
     for perturbation_scale in perturbation_scales:
         if perturbation_scale == 1.0:
             continue
+        perturbed_parameter_value = _primitive_parameter_perturbed_value(
+            parameter_name,
+            baseline_parameter_value,
+            perturbation_scale,
+        )
         perturbed_parameters = replace(
             primitive_parameters,
-            **{
-                parameter_name: baseline_parameter_value * perturbation_scale
-            },
+            **{parameter_name: perturbed_parameter_value},
         )
         try:
             perturbed_audit_result = audit_molecular_property_db_cases(
@@ -1591,6 +2075,21 @@ def _parameter_is_consumed_by_any_perturbation(
         ):
             return True
     return False
+
+
+def _primitive_parameter_perturbed_value(
+    parameter_name: str,
+    baseline_parameter_value: float,
+    perturbation_scale: float,
+) -> float:
+    transform_name = CONDUCTIVITY_PRIMITIVE_PARAMETER_TRANSFORM_BY_NAME[
+        parameter_name
+    ]
+    if transform_name == PRIMITIVE_PARAMETER_TRANSFORM_LOG_POSITIVE:
+        return baseline_parameter_value * perturbation_scale
+    if transform_name == PRIMITIVE_PARAMETER_TRANSFORM_IDENTITY_SIGNED:
+        return baseline_parameter_value + math.log(perturbation_scale)
+    raise ValueError(f"unknown primitive parameter transform {transform_name}")
 
 
 def _audit_results_differ(
@@ -1639,6 +2138,13 @@ def _audit_comparison_values(
                 row_result.predicted_sigma_mS_cm,
                 row_result.direct_sigma_mS_cm,
                 row_result.corrector_sigma_mS_cm,
+                row_result.direct_capacity_gap_mS_cm,
+                row_result.corrector_target_mS_cm,
+                row_result.corrector_residual_mS_cm,
+                float(row_result.direct_capacity_failure),
+                float(row_result.corrector_too_strong_failure),
+                float(row_result.corrector_too_weak_failure),
+                row_result.charge_weighted_transport_concentration_mol_m3,
                 row_result.charged_cluster_direct_sigma_mS_cm,
                 row_result.charged_cluster_corrector_sigma_mS_cm,
                 row_result.charged_cluster_net_sigma_mS_cm,
@@ -1655,6 +2161,18 @@ def _audit_comparison_values(
                 row_result.neutral_cluster_transport_mobility_density_mol_m_s,
             )
         )
+        for transport_role in TRANSPORT_ROLE_DIRECT_CORRECTOR_ATTRIBUTION_LABELS:
+            values.extend(
+                (
+                    row_result.direct_sigma_by_transport_role_mS_cm[
+                        transport_role
+                    ],
+                    row_result.corrector_sigma_by_transport_role_mS_cm[
+                        transport_role
+                    ],
+                    row_result.net_sigma_by_transport_role_mS_cm[transport_role],
+                )
+            )
         for cluster_diagnostic in row_result.cluster_thermodynamic_diagnostics:
             values.extend(
                 (
@@ -3055,6 +3573,15 @@ def _required_nonnegative_config_float(
     return _nonnegative_float(mapping[key], key)
 
 
+def _required_finite_config_float(
+    mapping: dict,
+    key: str,
+) -> float:
+    if key not in mapping:
+        raise ValueError(f"missing physics config {key}")
+    return _finite_float(mapping[key], key)
+
+
 def _required_positive_config_int(
     mapping: dict,
     key: str,
@@ -3103,27 +3630,70 @@ def _required_config_string(
     return value
 
 
-def _primitive_fit_log_bound_from_config(
-    log_bounds_mapping: dict,
+def _primitive_fit_coordinate_bound_from_config(
+    coordinate_bounds_mapping: dict,
     parameter_name: str,
-) -> PrimitiveFitLogBound:
-    if parameter_name not in log_bounds_mapping:
-        raise ValueError(f"missing log bound for {parameter_name}")
-    bound_values = log_bounds_mapping[parameter_name]
+) -> PrimitiveParameterTransform:
+    if parameter_name not in coordinate_bounds_mapping:
+        raise ValueError(f"missing coordinate bound for {parameter_name}")
+    bound_values = coordinate_bounds_mapping[parameter_name]
     if not isinstance(bound_values, list):
-        raise TypeError(f"log bound for {parameter_name} must be a list")
+        raise TypeError(f"coordinate bound for {parameter_name} must be a list")
     expected_bound_count = 2
     if len(bound_values) != expected_bound_count:
-        raise ValueError(f"log bound for {parameter_name} must contain two values")
-    lower_value = _positive_float(bound_values[0], f"{parameter_name}.lower_bound")
-    upper_value = _positive_float(bound_values[1], f"{parameter_name}.upper_bound")
-    if lower_value >= upper_value:
-        raise ValueError(f"log bound for {parameter_name} lower must be below upper")
-    return PrimitiveFitLogBound(
-        parameter_name=parameter_name,
-        lower_log_value=math.log(lower_value),
-        upper_log_value=math.log(upper_value),
+        raise ValueError(
+            f"coordinate bound for {parameter_name} must contain two values"
+        )
+    lower_value = _primitive_bound_endpoint_from_config(
+        parameter_name,
+        bound_values[0],
+        "lower_bound",
     )
+    upper_value = _primitive_bound_endpoint_from_config(
+        parameter_name,
+        bound_values[1],
+        "upper_bound",
+    )
+    if lower_value >= upper_value:
+        raise ValueError(
+            f"coordinate bound for {parameter_name} lower must be below upper"
+        )
+    return PrimitiveParameterTransform(
+        name=parameter_name,
+        transform=CONDUCTIVITY_PRIMITIVE_PARAMETER_TRANSFORM_BY_NAME[
+            parameter_name
+        ],
+        lower=lower_value,
+        upper=upper_value,
+    )
+
+
+def _primitive_bound_endpoint_from_config(
+    parameter_name: str,
+    endpoint_value: float,
+    endpoint_name: str,
+) -> float:
+    context = f"{parameter_name}.{endpoint_name}"
+    transform_name = CONDUCTIVITY_PRIMITIVE_PARAMETER_TRANSFORM_BY_NAME[
+        parameter_name
+    ]
+    if transform_name == PRIMITIVE_PARAMETER_TRANSFORM_LOG_POSITIVE:
+        return math.log(_positive_float(endpoint_value, context))
+    if transform_name == PRIMITIVE_PARAMETER_TRANSFORM_IDENTITY_SIGNED:
+        return _finite_float(endpoint_value, context)
+    raise ValueError(f"unknown primitive parameter transform {transform_name}")
+
+
+def _required_primitive_parameter_config_float(
+    mapping: dict,
+    key: str,
+) -> float:
+    transform_name = CONDUCTIVITY_PRIMITIVE_PARAMETER_TRANSFORM_BY_NAME[key]
+    if transform_name == PRIMITIVE_PARAMETER_TRANSFORM_LOG_POSITIVE:
+        return _required_positive_config_float(mapping, key)
+    if transform_name == PRIMITIVE_PARAMETER_TRANSFORM_IDENTITY_SIGNED:
+        return _required_finite_config_float(mapping, key)
+    raise ValueError(f"unknown primitive parameter transform {transform_name}")
 
 
 def _finite_float(value: float, context: str) -> float:
