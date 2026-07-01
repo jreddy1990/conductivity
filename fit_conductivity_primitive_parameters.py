@@ -6,7 +6,8 @@ import json
 import math
 import random
 import itertools
-from dataclasses import dataclass, replace
+import hashlib
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Literal, Mapping, Protocol, TYPE_CHECKING
 
@@ -30,9 +31,21 @@ from conductivity.molecular_primitive_parameters import (
 
 if TYPE_CHECKING:
     from conductivity.molecular_property_db_audit import (
+        MolecularClusterThermodynamicDiagnostic,
         MolecularPropertyDbAuditOptions,
         MolecularPropertyDbAuditResult,
         MolecularPropertyDbCase,
+        MolecularPropertyDbRowResult,
+    )
+    from conductivity.molecular_descriptors import MolecularSpeciesInput
+    from conductivity.analytical_conductivity_model import (
+        AnalyticalConductivityModelResult,
+        MolecularElectrolyteRecipe,
+    )
+    from conductivity.trajectory_primitive_targets import (
+        TrajectoryBlockPrimitiveTarget,
+        TrajectoryDisplacementMomentTarget,
+        TrajectoryPrimitiveTargetArtifact,
     )
 
 SPECIATION_FIT_PARAMETER_NAMES = (
@@ -116,6 +129,18 @@ _CLUSTER_KIND_LOGK_PARAMETER_BY_KIND = {
 }
 
 PRIMITIVE_PARAMETER_FIT_CONFIG_KEY = "molecular_primitive_parameter_fit"
+TRAJECTORY_PRIMITIVE_CALIBRATION_ARTIFACT_TYPE = (
+    "trajectory_primitive_calibration_target"
+)
+PRIMITIVE_FIT_PROGRESS_ARTIFACT_TYPE = (
+    "molecular_conductivity_primitive_fit_progress"
+)
+TRAJECTORY_TARGET_LABEL_SEPARATOR = ":"
+TRAJECTORY_TOPOLOGY_LOGK_PARAMETER_BY_ROLE = {
+    "contact_pair_center": "contact_pair_logK_offset",
+    "solvent_separated_pair_center": "solvent_separated_pair_logK_offset",
+    "internal_polarization_center": "higher_charged_cluster_logK_offset",
+}
 
 
 @dataclass(frozen=True)
@@ -139,6 +164,10 @@ class PrimitiveFitOptions:
     cluster_activation_min_charged_cluster_net_sigma_mS_cm: float
     direct_capacity_loss_weight: float
     corrector_loss_weight: float
+    trajectory_concentration_loss_weight: float
+    trajectory_transition_rate_loss_weight: float
+    trajectory_displacement_moment_loss_weight: float
+    trajectory_sigma_loss_weight: float
     role_direct_scaling_regularization_weight: float
     role_direct_scaling_lower_bound: float
     role_direct_scaling_upper_bound: float
@@ -165,12 +194,14 @@ class PrimitiveFitOptions:
     descriptor_matrix_high_correlation_threshold: float
     descriptor_matrix_condition_number_warn_threshold: float
     descriptor_matrix_reported_correlation_pair_count: int
+    trajectory_primitive_target_paths: tuple[str, ...]
     prediction_sensitivity_coordinate_step: float
     prediction_sensitivity_min_column_norm_mS_cm_per_coordinate: float
     prediction_sensitivity_relative_singular_value_threshold: float
     prediction_sensitivity_high_correlation_threshold: float
     prediction_sensitivity_reported_correlation_pair_count: int
     candidate_output_path: str
+    progress_output_path: str
     promotion_maximum_mae_mS_cm: float
     promotion_maximum_abs_bias_mS_cm: float
     promotion_maximum_worst_abs_residual_mS_cm: float
@@ -188,8 +219,38 @@ class DescriptorCalibrationTarget:
 
 
 @dataclass(frozen=True)
+class TrajectoryPrimitiveCalibrationTarget:
+    system_id: str
+    recipe: "MolecularElectrolyteRecipe"
+    species_inputs: Mapping[str, "MolecularSpeciesInput"]
+    primitive_target_artifact: "TrajectoryPrimitiveTargetArtifact"
+
+
+@dataclass(frozen=True)
+class TrajectoryPrimitiveLossBreakdown:
+    concentration_loss: float
+    transition_rate_loss: float
+    displacement_moment_loss: float
+    sigma_loss_mS_cm: float
+
+
+@dataclass(frozen=True)
+class TrajectoryConcentrationTargetCoverage:
+    system_id: str
+    positive_target_count: int
+    reachable_target_count: int
+    unreachable_target_labels: tuple[str, ...]
+    under_floor_target_labels: tuple[str, ...]
+    predicted_target_rows: tuple[tuple[str, float, float, bool], ...]
+
+
+@dataclass(frozen=True)
 class PrimitiveFitDatasetEvaluation:
     descriptor_calibration_targets: tuple[DescriptorCalibrationTarget, ...]
+    trajectory_primitive_calibration_targets: tuple[
+        TrajectoryPrimitiveCalibrationTarget,
+        ...,
+    ]
     predicted_sigmas_mS_cm: tuple[float, ...]
     direct_sigmas_mS_cm: tuple[float, ...]
     corrector_sigmas_mS_cm: tuple[float, ...]
@@ -199,6 +260,10 @@ class PrimitiveFitDatasetEvaluation:
     direct_capacity_failure_count: int
     corrector_too_strong_failure_count: int
     corrector_too_weak_failure_count: int
+    trajectory_concentration_loss: float
+    trajectory_transition_rate_loss: float
+    trajectory_displacement_moment_loss: float
+    trajectory_sigma_loss_mS_cm: float
     cluster_activation_penalty: float
     failed_rows: int
     maximum_mass_balance_residual: float
@@ -226,12 +291,19 @@ class MolecularPropertyDbPrimitiveEvaluator:
         cases: tuple["MolecularPropertyDbCase", ...],
         audit_options: "MolecularPropertyDbAuditOptions",
         fit_options: PrimitiveFitOptions,
+        trajectory_primitive_calibration_targets: tuple[
+            TrajectoryPrimitiveCalibrationTarget,
+            ...,
+        ],
     ) -> None:
         if not cases:
             raise ValueError("molecular property-DB evaluator requires cases")
         self._cases = cases
         self._audit_options = audit_options
         self._fit_options = fit_options
+        self._trajectory_primitive_calibration_targets = (
+            trajectory_primitive_calibration_targets
+        )
         self._descriptor_calibration_targets = descriptor_calibration_targets_for_cases(
             cases,
             fit_options,
@@ -260,8 +332,17 @@ class MolecularPropertyDbPrimitiveEvaluator:
                 audit_result,
             )
             self._has_measured_consumed_parameter_fields = True
+        trajectory_losses = _trajectory_primitive_loss_breakdown(
+            self._trajectory_primitive_calibration_targets,
+            primitive_parameters,
+            self._audit_options,
+            self._fit_options,
+        )
         return PrimitiveFitDatasetEvaluation(
             descriptor_calibration_targets=self._descriptor_calibration_targets,
+            trajectory_primitive_calibration_targets=(
+                self._trajectory_primitive_calibration_targets
+            ),
             predicted_sigmas_mS_cm=tuple(
                 row.predicted_sigma_mS_cm for row in audit_result.rows
             ),
@@ -291,6 +372,12 @@ class MolecularPropertyDbPrimitiveEvaluator:
                 1 for row in audit_result.rows
                 if row.corrector_too_weak_failure
             ),
+            trajectory_concentration_loss=trajectory_losses.concentration_loss,
+            trajectory_transition_rate_loss=trajectory_losses.transition_rate_loss,
+            trajectory_displacement_moment_loss=(
+                trajectory_losses.displacement_moment_loss
+            ),
+            trajectory_sigma_loss_mS_cm=trajectory_losses.sigma_loss_mS_cm,
             cluster_activation_penalty=_cluster_activation_penalty(
                 self._cases,
                 primitive_parameters,
@@ -340,7 +427,7 @@ def _cluster_activation_penalty(
     selected_rows = tuple(
         sorted(
             audit_result.rows,
-            key=lambda row_result: abs(row_result.residual_mS_cm),
+            key=_absolute_residual_sort_key,
             reverse=True,
         )[:fit_options.residual_tail_count]
     )
@@ -404,6 +491,744 @@ def _cluster_activation_penalty(
             )
         )
     return float(math.fsum(penalty_terms))
+
+
+def _trajectory_primitive_loss_breakdown(
+    trajectory_targets: tuple[TrajectoryPrimitiveCalibrationTarget, ...],
+    primitive_parameters: ConductivityPrimitiveParameterSet,
+    audit_options: "MolecularPropertyDbAuditOptions",
+    fit_options: PrimitiveFitOptions,
+) -> TrajectoryPrimitiveLossBreakdown:
+    if not trajectory_targets:
+        return TrajectoryPrimitiveLossBreakdown(
+            concentration_loss=0.0,
+            transition_rate_loss=0.0,
+            displacement_moment_loss=0.0,
+            sigma_loss_mS_cm=0.0,
+        )
+    concentration_losses: list[float] = []
+    transition_rate_losses: list[float] = []
+    displacement_moment_losses: list[float] = []
+    sigma_losses_mS_cm: list[float] = []
+    for trajectory_target in trajectory_targets:
+        target_artifact = trajectory_target.primitive_target_artifact
+        analytical_result = _trajectory_target_analytical_result(
+            trajectory_target,
+            primitive_parameters,
+            audit_options,
+        )
+        concentration_losses.append(
+            _log_mapping_loss(
+                _transport_center_concentration_targets(analytical_result),
+                target_artifact.state_concentrations_mol_m3,
+                f"{trajectory_target.system_id}.state_concentrations_mol_m3",
+            )
+        )
+        if target_artifact.transition_rate_targets_validated:
+            transition_rate_losses.append(
+                _log_mapping_loss(
+                    _transition_rate_targets_from_analytical_result(
+                        analytical_result
+                    ),
+                    target_artifact.transition_rates_s_inv,
+                    f"{trajectory_target.system_id}.transition_rates_s_inv",
+                )
+            )
+        if target_artifact.displacement_moment_targets_validated:
+            displacement_moment_losses.append(
+                _log_mapping_loss(
+                    _displacement_moment_targets_from_analytical_result(
+                        analytical_result,
+                    ),
+                    _mean_squared_displacement_targets(
+                        target_artifact.displacement_moments_by_family,
+                    ),
+                    f"{trajectory_target.system_id}.displacement_moments_by_family",
+                )
+            )
+        if target_artifact.markov_additive_sigma_validated:
+            sigma_losses_mS_cm.append(
+                _smooth_l1_loss_mS_cm(
+                    analytical_result.sigma_mS_cm
+                    - target_artifact.markov_additive_sigma_mS_cm,
+                    fit_options.huber_delta_mS_cm,
+                )
+            )
+    return TrajectoryPrimitiveLossBreakdown(
+        concentration_loss=_mean_loss(concentration_losses, "trajectory_c_loss"),
+        transition_rate_loss=_mean_loss(transition_rate_losses, "trajectory_Q_loss"),
+        displacement_moment_loss=_mean_loss(
+            displacement_moment_losses,
+            "trajectory_d_loss",
+        ),
+        sigma_loss_mS_cm=_mean_loss(sigma_losses_mS_cm, "trajectory_sigma_loss"),
+    )
+
+
+def _trajectory_target_analytical_result(
+    trajectory_target: TrajectoryPrimitiveCalibrationTarget,
+    primitive_parameters: ConductivityPrimitiveParameterSet,
+    audit_options: "MolecularPropertyDbAuditOptions",
+) -> "AnalyticalConductivityModelResult":
+    from conductivity.analytical_conductivity_model import (
+        AnalyticalConductivityModelInput,
+        MolecularMoriOptions,
+        compute_analytical_conductivity_model,
+    )
+    from conductivity.molecular_descriptors import ProvidedPropertyDescriptorBackend
+
+    molecular_options = MolecularMoriOptions(
+        max_cluster_ion_count=audit_options.max_cluster_ion_count,
+        max_packing_fraction=audit_options.max_packing_fraction,
+        free_volume_exponent=audit_options.free_volume_exponent,
+        translation_jump_length_multiplier=(
+            audit_options.translation_jump_length_multiplier
+        ),
+        primitive_parameters=primitive_parameters,
+    )
+    return compute_analytical_conductivity_model(
+        AnalyticalConductivityModelInput(
+            recipe=trajectory_target.recipe,
+            species_inputs=trajectory_target.species_inputs,
+            descriptor_backend=ProvidedPropertyDescriptorBackend(),
+            options=molecular_options,
+        )
+    )
+
+
+def _transport_center_concentration_targets(
+    analytical_result: "AnalyticalConductivityModelResult",
+) -> Mapping[str, float]:
+    concentration_by_target_label: dict[str, float] = {}
+    cluster_template_by_label = {
+        cluster_template.label: cluster_template
+        for cluster_template in analytical_result.cluster_states
+    }
+    descriptor_species_names = set(analytical_result.descriptors)
+    for transport_state in analytical_result.transport_states:
+        if transport_state.center_species_name in descriptor_species_names:
+            _add_concentration_target(
+                concentration_by_target_label,
+                _transport_center_target_label(
+                    transport_state.transport_role,
+                    transport_state.center_species_name,
+                ),
+                transport_state.concentration_mol_m3,
+            )
+            continue
+        if transport_state.parent_cluster_label not in cluster_template_by_label:
+            continue
+        cluster_template = cluster_template_by_label[
+            transport_state.parent_cluster_label
+        ]
+        for species_name, stoichiometric_count in cluster_template.stoichiometry.items():
+            _add_concentration_target(
+                concentration_by_target_label,
+                _transport_center_target_label(
+                    transport_state.transport_role,
+                    species_name,
+                ),
+                transport_state.concentration_mol_m3
+                * _positive_int(
+                    stoichiometric_count,
+                    f"{cluster_template.label}.{species_name}.stoichiometric_count",
+                ),
+            )
+    return concentration_by_target_label
+
+
+def _add_concentration_target(
+    concentration_by_target_label: dict[str, float],
+    target_label: str,
+    concentration_mol_m3: float,
+) -> None:
+    parsed_concentration_mol_m3 = _nonnegative_float(
+        concentration_mol_m3,
+        f"{target_label}.concentration_mol_m3",
+    )
+    if target_label not in concentration_by_target_label:
+        concentration_by_target_label[target_label] = 0.0
+    concentration_by_target_label[target_label] += parsed_concentration_mol_m3
+
+
+def _transport_center_target_label(
+    transport_role: str,
+    center_species_name: str,
+) -> str:
+    role_name = _nonempty_string(transport_role, "transport_role")
+    species_name = _nonempty_string(center_species_name, "center_species_name")
+    return f"{role_name}:{species_name}"
+
+
+def _transition_rate_targets_from_analytical_result(
+    analytical_result: "AnalyticalConductivityModelResult",
+) -> Mapping[str, float]:
+    target_label_by_state_index = _target_label_by_markov_state_index(
+        analytical_result,
+    )
+    transition_rates_s_inv: dict[str, float] = {}
+    for event in analytical_result.events:
+        if event.from_state_index == event.to_state_index:
+            continue
+        if event.from_state_index not in target_label_by_state_index:
+            continue
+        if event.to_state_index not in target_label_by_state_index:
+            continue
+        from_target_label = target_label_by_state_index[event.from_state_index]
+        to_target_label = target_label_by_state_index[event.to_state_index]
+        if from_target_label == to_target_label:
+            continue
+        transition_label = _transition_label(from_target_label, to_target_label)
+        if transition_label not in transition_rates_s_inv:
+            transition_rates_s_inv[transition_label] = 0.0
+        transition_rates_s_inv[transition_label] += event.rate_s_inv
+    return transition_rates_s_inv
+
+
+def _displacement_moment_targets_from_analytical_result(
+    analytical_result: "AnalyticalConductivityModelResult",
+) -> Mapping[str, float]:
+    target_label_by_state_index = _target_label_by_markov_state_index(
+        analytical_result,
+    )
+    weighted_displacement_m2_by_transition: dict[str, float] = {}
+    rate_by_transition: dict[str, float] = {}
+    for event in analytical_result.events:
+        if event.from_state_index not in target_label_by_state_index:
+            continue
+        if event.to_state_index not in target_label_by_state_index:
+            continue
+        from_target_label = target_label_by_state_index[event.from_state_index]
+        to_target_label = target_label_by_state_index[event.to_state_index]
+        transition_label = _transition_label(from_target_label, to_target_label)
+        displacement_m2 = math.fsum(
+            component_m * component_m
+            for component_m in event.charge_displacement_m
+        )
+        if transition_label not in weighted_displacement_m2_by_transition:
+            weighted_displacement_m2_by_transition[transition_label] = 0.0
+            rate_by_transition[transition_label] = 0.0
+        weighted_displacement_m2_by_transition[transition_label] += (
+            event.rate_s_inv * displacement_m2
+        )
+        rate_by_transition[transition_label] += event.rate_s_inv
+    displacement_moments_m2: dict[str, float] = {}
+    for transition_label, weighted_displacement_m2 in (
+        weighted_displacement_m2_by_transition.items()
+    ):
+        transition_rate_s_inv = _positive_float(
+            rate_by_transition[transition_label],
+            f"{transition_label}.transition_rate_s_inv",
+        )
+        displacement_moments_m2[transition_label] = (
+            weighted_displacement_m2 / transition_rate_s_inv
+        )
+    return displacement_moments_m2
+
+
+def _target_label_by_markov_state_index(
+    analytical_result: "AnalyticalConductivityModelResult",
+) -> Mapping[int, str]:
+    target_label_by_transport_mobile_label = {
+        f"{transport_state.label}:mobile": _transport_center_target_label(
+            transport_state.transport_role,
+            transport_state.center_species_name,
+        )
+        for transport_state in analytical_result.transport_states
+    }
+    target_label_by_state_index: dict[int, str] = {}
+    for state_index, markov_state_label in enumerate(
+        analytical_result.markov_state_labels,
+    ):
+        if markov_state_label in target_label_by_transport_mobile_label:
+            target_label_by_state_index[state_index] = (
+                target_label_by_transport_mobile_label[markov_state_label]
+            )
+    return target_label_by_state_index
+
+
+def _transition_label(
+    from_target_label: str,
+    to_target_label: str,
+) -> str:
+    return (
+        f"{_nonempty_string(from_target_label, 'from_target_label')}"
+        f"->{_nonempty_string(to_target_label, 'to_target_label')}"
+    )
+
+
+def _mean_squared_displacement_targets(
+    displacement_moments_by_family: Mapping[
+        str,
+        "TrajectoryDisplacementMomentTarget",
+    ],
+) -> Mapping[str, float]:
+    displacement_targets_m2: dict[str, float] = {}
+    for transition_label, moment_target in displacement_moments_by_family.items():
+        displacement_targets_m2[
+            _nonempty_string(transition_label, "transition_label")
+        ] = _nonnegative_float(
+            moment_target.mean_squared_displacement_m2,
+            f"{transition_label}.mean_squared_displacement_m2",
+        )
+    return displacement_targets_m2
+
+
+def trajectory_concentration_target_coverage(
+    trajectory_targets: tuple[TrajectoryPrimitiveCalibrationTarget, ...],
+    primitive_parameters: ConductivityPrimitiveParameterSet,
+    audit_options: "MolecularPropertyDbAuditOptions",
+) -> tuple[TrajectoryConcentrationTargetCoverage, ...]:
+    coverages: list[TrajectoryConcentrationTargetCoverage] = []
+    for trajectory_target in trajectory_targets:
+        target_artifact = trajectory_target.primitive_target_artifact
+        analytical_result = _trajectory_target_analytical_result(
+            trajectory_target,
+            primitive_parameters,
+            audit_options,
+        )
+        predicted_concentrations = _transport_center_concentration_targets(
+            analytical_result,
+        )
+        reachable_labels = _reachable_transport_center_target_labels(
+            analytical_result,
+        )
+        concentration_floor_mol_m3 = _trajectory_concentration_floor_mol_m3(
+            analytical_result,
+        )
+        positive_target_rows: list[tuple[str, float, float, bool]] = []
+        unreachable_labels: list[str] = []
+        under_floor_labels: list[str] = []
+        for target_label, target_concentration_mol_m3 in sorted(
+            target_artifact.state_concentrations_mol_m3.items()
+        ):
+            parsed_target_concentration_mol_m3 = _nonnegative_float(
+                target_concentration_mol_m3,
+                (
+                    f"{trajectory_target.system_id}.{target_label}"
+                    ".target_concentration_mol_m3"
+                ),
+            )
+            if parsed_target_concentration_mol_m3 <= 0.0:
+                continue
+            reachable = target_label in reachable_labels
+            predicted_concentration_mol_m3 = _predicted_mapping_value_or_zero(
+                predicted_concentrations,
+                target_label,
+                f"{trajectory_target.system_id}.state_concentrations_mol_m3",
+            )
+            positive_target_rows.append(
+                (
+                    target_label,
+                    parsed_target_concentration_mol_m3,
+                    predicted_concentration_mol_m3,
+                    reachable,
+                )
+            )
+            if not reachable:
+                unreachable_labels.append(target_label)
+                continue
+            if predicted_concentration_mol_m3 <= concentration_floor_mol_m3:
+                under_floor_labels.append(target_label)
+        coverages.append(
+            TrajectoryConcentrationTargetCoverage(
+                system_id=trajectory_target.system_id,
+                positive_target_count=len(positive_target_rows),
+                reachable_target_count=sum(
+                    1 for target_row in positive_target_rows if target_row[3]
+                ),
+                unreachable_target_labels=tuple(unreachable_labels),
+                under_floor_target_labels=tuple(under_floor_labels),
+                predicted_target_rows=tuple(positive_target_rows),
+            )
+        )
+    return tuple(coverages)
+
+
+def validate_trajectory_concentration_target_coverage(
+    trajectory_targets: tuple[TrajectoryPrimitiveCalibrationTarget, ...],
+    primitive_parameters: ConductivityPrimitiveParameterSet,
+    audit_options: "MolecularPropertyDbAuditOptions",
+) -> tuple[TrajectoryConcentrationTargetCoverage, ...]:
+    coverages = trajectory_concentration_target_coverage(
+        trajectory_targets,
+        primitive_parameters,
+        audit_options,
+    )
+    unreachable_pairs: list[str] = []
+    for coverage in coverages:
+        unreachable_pairs.extend(
+            f"{coverage.system_id}:{target_label}"
+            for target_label in coverage.unreachable_target_labels
+        )
+    if unreachable_pairs:
+        raise ValueError(
+            "trajectory concentration targets are outside analytical target "
+            f"namespace: {tuple(unreachable_pairs)}"
+        )
+    return coverages
+
+
+def print_trajectory_concentration_target_coverage(
+    report_prefix: str,
+    coverages: tuple[TrajectoryConcentrationTargetCoverage, ...],
+) -> None:
+    prefix = _nonempty_string(report_prefix, "trajectory_coverage_report_prefix")
+    for coverage in coverages:
+        system_id = _nonempty_string(coverage.system_id, "coverage.system_id")
+        print(
+            f"{prefix}_trajectory_target_coverage_system={system_id} "
+            f"positive_targets={coverage.positive_target_count} "
+            f"reachable_targets={coverage.reachable_target_count} "
+            f"unreachable_targets={len(coverage.unreachable_target_labels)} "
+            f"under_floor_targets={len(coverage.under_floor_target_labels)}"
+        )
+        if coverage.unreachable_target_labels:
+            print(
+                f"{prefix}_trajectory_target_unreachable_labels_system={system_id} "
+                f"labels={','.join(coverage.unreachable_target_labels)}"
+            )
+        if coverage.under_floor_target_labels:
+            print(
+                f"{prefix}_trajectory_target_under_floor_labels_system={system_id} "
+                f"labels={','.join(coverage.under_floor_target_labels)}"
+            )
+        for (
+            target_label,
+            target_concentration_mol_m3,
+            predicted_concentration_mol_m3,
+            reachable,
+        ) in coverage.predicted_target_rows:
+            print(
+                f"{prefix}_trajectory_target_row system={system_id} "
+                f"label={target_label} "
+                f"target_mol_m3={target_concentration_mol_m3:.6e} "
+                f"predicted_mol_m3={predicted_concentration_mol_m3:.6e} "
+                f"reachable={reachable}"
+            )
+
+
+def initialize_topology_logk_offsets_from_trajectory_concentrations(
+    primitive_parameters: ConductivityPrimitiveParameterSet,
+    trajectory_targets: tuple[TrajectoryPrimitiveCalibrationTarget, ...],
+    audit_options: "MolecularPropertyDbAuditOptions",
+    coordinate_bounds: tuple[PrimitiveParameterTransform, ...],
+) -> ConductivityPrimitiveParameterSet:
+    if not trajectory_targets:
+        return primitive_parameters
+    validate_conductivity_primitive_parameters(primitive_parameters)
+    coordinate_bound_by_name = {
+        coordinate_bound.name: coordinate_bound
+        for coordinate_bound in _ordered_coordinate_bounds(coordinate_bounds)
+    }
+    updated_parameter_mapping = conductivity_primitive_parameters_to_mapping(
+        primitive_parameters,
+    )
+    numerator_by_parameter_name: dict[str, float] = {}
+    denominator_by_parameter_name: dict[str, float] = {}
+    for trajectory_target in trajectory_targets:
+        analytical_result = _trajectory_target_analytical_result(
+            trajectory_target,
+            primitive_parameters,
+            audit_options,
+        )
+        predicted_concentrations = _transport_center_concentration_targets(
+            analytical_result,
+        )
+        reachable_labels = _reachable_transport_center_target_labels(
+            analytical_result,
+        )
+        concentration_floor_mol_m3 = _trajectory_concentration_floor_mol_m3(
+            analytical_result,
+        )
+        for target_label, target_concentration_mol_m3 in (
+            trajectory_target.primitive_target_artifact.state_concentrations_mol_m3.items()
+        ):
+            parsed_target_concentration_mol_m3 = _nonnegative_float(
+                target_concentration_mol_m3,
+                (
+                    f"{trajectory_target.system_id}.{target_label}"
+                    ".target_concentration_mol_m3"
+                ),
+            )
+            if parsed_target_concentration_mol_m3 <= 0.0:
+                continue
+            if target_label not in reachable_labels:
+                continue
+            target_role, _target_species_name = _trajectory_target_label_parts(
+                target_label,
+            )
+            if target_role not in TRAJECTORY_TOPOLOGY_LOGK_PARAMETER_BY_ROLE:
+                continue
+            parameter_name = TRAJECTORY_TOPOLOGY_LOGK_PARAMETER_BY_ROLE[target_role]
+            predicted_concentration_mol_m3 = max(
+                concentration_floor_mol_m3,
+                _predicted_mapping_value_or_zero(
+                    predicted_concentrations,
+                    target_label,
+                    f"{trajectory_target.system_id}.state_concentrations_mol_m3",
+                ),
+            )
+            log_concentration_ratio = (
+                math.log(parsed_target_concentration_mol_m3)
+                - math.log(predicted_concentration_mol_m3)
+            )
+            target_weight = max(
+                parsed_target_concentration_mol_m3,
+                concentration_floor_mol_m3,
+            )
+            if parameter_name not in numerator_by_parameter_name:
+                numerator_by_parameter_name[parameter_name] = 0.0
+                denominator_by_parameter_name[parameter_name] = 0.0
+            numerator_by_parameter_name[parameter_name] += (
+                target_weight * log_concentration_ratio
+            )
+            denominator_by_parameter_name[parameter_name] += target_weight
+    if not numerator_by_parameter_name:
+        return primitive_parameters
+    for parameter_name, numerator_value in numerator_by_parameter_name.items():
+        if parameter_name not in coordinate_bound_by_name:
+            raise ValueError(f"missing coordinate bound for {parameter_name}")
+        denominator_value = _positive_float(
+            denominator_by_parameter_name[parameter_name],
+            f"{parameter_name}.trajectory_initialization_weight",
+        )
+        current_coordinate = _finite_float(
+            updated_parameter_mapping[parameter_name],
+            f"{parameter_name}.current_coordinate",
+        )
+        proposed_coordinate = current_coordinate + numerator_value / denominator_value
+        coordinate_bound = coordinate_bound_by_name[parameter_name]
+        updated_parameter_mapping[parameter_name] = min(
+            coordinate_bound.upper,
+            max(coordinate_bound.lower, proposed_coordinate),
+        )
+    initialized_parameters = conductivity_primitive_parameters_from_mapping(
+        updated_parameter_mapping,
+    )
+    validate_conductivity_primitive_parameters(initialized_parameters)
+    return initialized_parameters
+
+
+def _trajectory_target_label_parts(target_label: str) -> tuple[str, str]:
+    label = _nonempty_string(target_label, "trajectory_target_label")
+    separator_count = label.count(TRAJECTORY_TARGET_LABEL_SEPARATOR)
+    if separator_count != 1:
+        raise ValueError(
+            "trajectory target label must be formatted as "
+            f"transport_role{TRAJECTORY_TARGET_LABEL_SEPARATOR}species_name"
+        )
+    role_name, species_name = label.split(TRAJECTORY_TARGET_LABEL_SEPARATOR)
+    return (
+        _nonempty_string(role_name, "trajectory_target_role"),
+        _nonempty_string(species_name, "trajectory_target_species_name"),
+    )
+
+
+def _reachable_transport_center_target_labels(
+    analytical_result: "AnalyticalConductivityModelResult",
+) -> frozenset[str]:
+    from conductivity.analytical_conductivity_model import (
+        CONTACT_PAIR_CLUSTER_KIND,
+        HIGHER_CHARGED_CLUSTER_KIND,
+        NEGATIVE_CHARGED_TRIPLET_CLUSTER_KIND,
+        NEUTRAL_CLUSTER_KIND,
+        POSITIVE_CHARGED_TRIPLET_CLUSTER_KIND,
+        SOLVENT_SEPARATED_PAIR_CLUSTER_KIND,
+        TRANSPORT_ROLE_CHARGED_TRIPLET_CENTER,
+        TRANSPORT_ROLE_CLUSTER_COM_CENTER,
+        TRANSPORT_ROLE_CONTACT_PAIR_CENTER,
+        TRANSPORT_ROLE_FREE_ION_CENTER,
+        TRANSPORT_ROLE_INTERNAL_POLARIZATION_CENTER,
+        TRANSPORT_ROLE_SOLVENT_SEPARATED_PAIR_CENTER,
+    )
+
+    reachable_labels: set[str] = set(
+        _transport_center_concentration_targets(analytical_result)
+    )
+    for species_name, descriptor in analytical_result.descriptors.items():
+        if descriptor.charge_number != 0:
+            reachable_labels.add(
+                _transport_center_target_label(
+                    TRANSPORT_ROLE_FREE_ION_CENTER,
+                    species_name,
+                )
+            )
+    transport_roles_by_cluster_kind = {
+        CONTACT_PAIR_CLUSTER_KIND: (TRANSPORT_ROLE_CONTACT_PAIR_CENTER,),
+        SOLVENT_SEPARATED_PAIR_CLUSTER_KIND: (
+            TRANSPORT_ROLE_SOLVENT_SEPARATED_PAIR_CENTER,
+        ),
+        POSITIVE_CHARGED_TRIPLET_CLUSTER_KIND: (
+            TRANSPORT_ROLE_CHARGED_TRIPLET_CENTER,
+            TRANSPORT_ROLE_CLUSTER_COM_CENTER,
+        ),
+        NEGATIVE_CHARGED_TRIPLET_CLUSTER_KIND: (
+            TRANSPORT_ROLE_CHARGED_TRIPLET_CENTER,
+            TRANSPORT_ROLE_CLUSTER_COM_CENTER,
+        ),
+        HIGHER_CHARGED_CLUSTER_KIND: (
+            TRANSPORT_ROLE_INTERNAL_POLARIZATION_CENTER,
+            TRANSPORT_ROLE_CLUSTER_COM_CENTER,
+        ),
+        NEUTRAL_CLUSTER_KIND: (TRANSPORT_ROLE_CLUSTER_COM_CENTER,),
+    }
+    for cluster_template in analytical_result.cluster_states:
+        cluster_kind = _nonempty_string(
+            cluster_template.cluster_kind,
+            f"{cluster_template.label}.cluster_kind",
+        )
+        if cluster_kind not in transport_roles_by_cluster_kind:
+            raise ValueError(f"unknown analytical cluster kind {cluster_kind}")
+        for transport_role in transport_roles_by_cluster_kind[cluster_kind]:
+            _add_reachable_stoichiometric_labels(
+                reachable_labels,
+                transport_role,
+                cluster_template.stoichiometry,
+            )
+    return frozenset(reachable_labels)
+
+
+def _add_reachable_stoichiometric_labels(
+    reachable_labels: set[str],
+    transport_role: str,
+    stoichiometry: Mapping[str, int],
+) -> None:
+    for species_name, stoichiometric_count in stoichiometry.items():
+        _positive_int(
+            stoichiometric_count,
+            f"{transport_role}:{species_name}.stoichiometric_count",
+        )
+        reachable_labels.add(
+            _transport_center_target_label(transport_role, species_name)
+        )
+
+
+def _trajectory_concentration_floor_mol_m3(
+    analytical_result: "AnalyticalConductivityModelResult",
+) -> float:
+    from conductivity.analytical_conductivity_model import (
+        STANDARD_STATE_CONCENTRATION_MOL_M3,
+        TRANSPORT_STATE_CONCENTRATION_RESOLUTION_FACTOR,
+    )
+
+    analytical_ion_concentration_mol_m3 = math.fsum(
+        _positive_float(
+            component.analytical_concentration_M,
+            f"{component.species_name}.analytical_concentration_M",
+        )
+        * STANDARD_STATE_CONCENTRATION_MOL_M3
+        for component in analytical_result.speciation.components
+    )
+    return TRANSPORT_STATE_CONCENTRATION_RESOLUTION_FACTOR * max(
+        1.0,
+        analytical_ion_concentration_mol_m3,
+    )
+
+
+def print_trajectory_topology_initialization_changes(
+    baseline_parameters: ConductivityPrimitiveParameterSet,
+    initialized_parameters: ConductivityPrimitiveParameterSet,
+) -> None:
+    baseline_mapping = conductivity_primitive_parameters_to_mapping(
+        baseline_parameters,
+    )
+    initialized_mapping = conductivity_primitive_parameters_to_mapping(
+        initialized_parameters,
+    )
+    reported_parameter_names = tuple(
+        dict.fromkeys(TRAJECTORY_TOPOLOGY_LOGK_PARAMETER_BY_ROLE.values())
+    )
+    for parameter_name in reported_parameter_names:
+        if parameter_name not in baseline_mapping:
+            raise ValueError(f"missing baseline primitive parameter {parameter_name}")
+        if parameter_name not in initialized_mapping:
+            raise ValueError(f"missing initialized primitive parameter {parameter_name}")
+        baseline_value = _finite_float(
+            baseline_mapping[parameter_name],
+            f"{parameter_name}.baseline",
+        )
+        initialized_value = _finite_float(
+            initialized_mapping[parameter_name],
+            f"{parameter_name}.initialized",
+        )
+        print(
+            "trajectory_topology_initialization "
+            f"parameter={parameter_name} "
+            f"baseline={baseline_value:.6f} "
+            f"initialized={initialized_value:.6f}"
+        )
+
+
+def _log_mapping_loss(
+    predicted_values_by_label: Mapping[str, float],
+    target_values_by_label: Mapping[str, float],
+    context: str,
+) -> float:
+    if not target_values_by_label:
+        return 0.0
+    positive_reference_values = tuple(
+        _positive_float(target_value, f"{context}.{target_label}")
+        for target_label, target_value in target_values_by_label.items()
+        if target_value > 0.0
+    )
+    if not positive_reference_values:
+        return 0.0
+    log_epsilon = min(positive_reference_values) * math.sqrt(np.finfo(float).eps)
+    residuals: list[float] = []
+    for target_label, target_value in target_values_by_label.items():
+        parsed_target_value = _nonnegative_float(
+            target_value,
+            f"{context}.{target_label}",
+        )
+        predicted_value = _predicted_mapping_value_or_zero(
+            predicted_values_by_label,
+            target_label,
+            context,
+        )
+        residuals.append(
+            math.log(predicted_value + log_epsilon)
+            - math.log(parsed_target_value + log_epsilon)
+        )
+    return _mean_squared_dimensionless_loss(residuals, context)
+
+
+def _predicted_mapping_value_or_zero(
+    predicted_values_by_label: Mapping[str, float],
+    target_label: str,
+    context: str,
+) -> float:
+    label = _nonempty_string(target_label, "target_label")
+    if label not in predicted_values_by_label:
+        return 0.0
+    return _nonnegative_float(predicted_values_by_label[label], f"{context}.{label}")
+
+
+def _mean_squared_dimensionless_loss(
+    residuals: list[float],
+    context: str,
+) -> float:
+    if not residuals:
+        return 0.0
+    return float(
+        math.fsum(
+            _finite_float(residual, context) * _finite_float(residual, context)
+            for residual in residuals
+        )
+        / len(residuals)
+    )
+
+
+def _mean_loss(
+    losses: list[float],
+    context: str,
+) -> float:
+    if not losses:
+        return 0.0
+    return float(
+        math.fsum(_nonnegative_float(loss, context) for loss in losses)
+        / len(losses)
+    )
 
 
 def _measured_consumed_parameter_fields(
@@ -694,6 +1519,24 @@ def default_molecular_primitive_fit_configuration() -> tuple[
             fit_config_mapping,
             "corrector_loss_weight",
         ),
+        trajectory_concentration_loss_weight=_required_nonnegative_config_float(
+            fit_config_mapping,
+            "trajectory_concentration_loss_weight",
+        ),
+        trajectory_transition_rate_loss_weight=_required_nonnegative_config_float(
+            fit_config_mapping,
+            "trajectory_transition_rate_loss_weight",
+        ),
+        trajectory_displacement_moment_loss_weight=(
+            _required_nonnegative_config_float(
+                fit_config_mapping,
+                "trajectory_displacement_moment_loss_weight",
+            )
+        ),
+        trajectory_sigma_loss_weight=_required_nonnegative_config_float(
+            fit_config_mapping,
+            "trajectory_sigma_loss_weight",
+        ),
         role_direct_scaling_regularization_weight=(
             _required_nonnegative_config_float(
                 fit_config_mapping,
@@ -812,6 +1655,10 @@ def default_molecular_primitive_fit_configuration() -> tuple[
                 "descriptor_matrix_reported_correlation_pair_count",
             )
         ),
+        trajectory_primitive_target_paths=_required_string_tuple_allow_empty(
+            fit_config_mapping,
+            "trajectory_primitive_target_paths",
+        ),
         prediction_sensitivity_coordinate_step=_required_positive_config_float(
             fit_config_mapping,
             "prediction_sensitivity_coordinate_step",
@@ -843,6 +1690,10 @@ def default_molecular_primitive_fit_configuration() -> tuple[
         candidate_output_path=_required_config_string(
             fit_config_mapping,
             "candidate_output_path",
+        ),
+        progress_output_path=_required_config_string(
+            fit_config_mapping,
+            "progress_output_path",
         ),
         promotion_maximum_mae_mS_cm=_required_positive_config_float(
             fit_config_mapping,
@@ -962,6 +1813,35 @@ def _primitive_fit_coordinate_bound_from_config(
     )
 
 
+def _required_string_tuple_allow_empty(
+    mapping: dict,
+    key: str,
+) -> tuple[str, ...]:
+    if key not in mapping:
+        raise ValueError(f"molecular_primitive_parameter_fit.{key} missing")
+    raw_values = mapping[key]
+    if not isinstance(raw_values, list):
+        raise TypeError(f"molecular_primitive_parameter_fit.{key} must be a list")
+    parsed_values: list[str] = []
+    for value_index, raw_value in enumerate(raw_values):
+        value_context = f"molecular_primitive_parameter_fit.{key}[{value_index}]"
+        if not isinstance(raw_value, str) or raw_value == "":
+            raise ValueError(f"{value_context} must be a nonempty string")
+        parsed_values.append(raw_value)
+    duplicate_values = tuple(
+        sorted(
+            value
+            for value in set(parsed_values)
+            if parsed_values.count(value) > 1
+        )
+    )
+    if duplicate_values:
+        raise ValueError(
+            f"molecular_primitive_parameter_fit.{key} duplicates {duplicate_values}"
+        )
+    return tuple(parsed_values)
+
+
 def _primitive_bound_endpoint_from_config(
     parameter_name: str,
     endpoint_value: float,
@@ -987,6 +1867,10 @@ class PrimitiveFitCandidateResult:
     tail_huber_loss_mS_cm: float
     direct_capacity_loss_mS_cm: float
     corrector_loss_mS_cm: float
+    trajectory_concentration_loss: float
+    trajectory_transition_rate_loss: float
+    trajectory_displacement_moment_loss: float
+    trajectory_sigma_loss_mS_cm: float
     coordinate_regularization_loss: float
     cluster_activation_loss: float
     mae_mS_cm: float
@@ -1041,7 +1925,7 @@ class PrimitivePredictionSensitivityDiagnostics:
 @dataclass(frozen=True)
 class PrimitivePredictionSensitivityTrial:
     valid: bool
-    predicted_sigmas_mS_cm: tuple[float, ...]
+    sensitivity_values: tuple[float, ...]
 
 
 @dataclass(frozen=True)
@@ -1059,6 +1943,222 @@ class PrimitivePromotionMetrics:
     zero_charge_sigma_mS_cm: float
     higher_viscosity_lowers_dilute_conductivity: bool
     higher_packing_lowers_local_mobility: bool
+
+
+@dataclass(frozen=True)
+class PrimitiveFitProgressPayload:
+    active_coordinate_bounds: tuple[PrimitiveParameterTransform, ...]
+    regularization_reference_parameters: ConductivityPrimitiveParameterSet
+    latin_hypercube_sample_count: int
+    coordinate_step_value: float
+    improved_this_round: bool
+    powell_cached_candidate_count: int
+    promotion_candidate_is_available: bool
+    promotion_candidate: PrimitiveFitCandidateResult
+
+
+def _write_fit_progress_status(
+    options: PrimitiveFitOptions,
+    stage: str,
+    stage_detail: str,
+    candidate_results: list[PrimitiveFitCandidateResult],
+    current_best: PrimitiveFitCandidateResult,
+    progress_payload: PrimitiveFitProgressPayload,
+) -> None:
+    progress_path = Path(_nonempty_string(
+        options.progress_output_path,
+        "progress_output_path",
+    ))
+    progress_path.parent.mkdir(parents=True, exist_ok=True)
+    status_mapping = {
+        "artifact_type": PRIMITIVE_FIT_PROGRESS_ARTIFACT_TYPE,
+        "stage": _nonempty_string(stage, "fit_progress.stage"),
+        "stage_detail": _nonempty_string(stage_detail, "fit_progress.stage_detail"),
+        "candidate_count": len(candidate_results),
+        "accepted_candidate_count": sum(
+            1 for candidate_result in candidate_results
+            if not candidate_result.rejected
+        ),
+        "current_best": _candidate_progress_mapping(
+            current_best,
+            progress_payload,
+            options,
+        ),
+        "progress_values": _fit_progress_values_mapping(progress_payload, options),
+    }
+    temporary_progress_path = progress_path.with_name(progress_path.name + ".tmp")
+    temporary_progress_path.write_text(
+        json.dumps(status_mapping, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    temporary_progress_path.replace(progress_path)
+
+
+def _fit_progress_values_mapping(
+    progress_payload: PrimitiveFitProgressPayload,
+    options: PrimitiveFitOptions,
+):
+    promotion_candidate = (
+        _candidate_progress_mapping(
+            progress_payload.promotion_candidate,
+            progress_payload,
+            options,
+        )
+        if progress_payload.promotion_candidate_is_available
+        else None
+    )
+    active_parameter_names = _ordered_bound_parameter_names(
+        progress_payload.active_coordinate_bounds,
+    )
+    return {
+        "active_parameter_count": len(active_parameter_names),
+        "active_parameter_names": active_parameter_names,
+        "coordinate_bounds_digest": _coordinate_bounds_digest(
+            progress_payload.active_coordinate_bounds,
+        ),
+        "fit_options_digest": _fit_options_digest(options),
+        "regularization_reference_digest": (
+            _primitive_parameters_digest(
+                progress_payload.regularization_reference_parameters,
+            )
+        ),
+        "latin_hypercube_sample_count": (
+            progress_payload.latin_hypercube_sample_count
+        ),
+        "coordinate_step_value": progress_payload.coordinate_step_value,
+        "improved_this_round": progress_payload.improved_this_round,
+        "powell_cached_candidate_count": (
+            progress_payload.powell_cached_candidate_count
+        ),
+        "promotion_candidate": promotion_candidate,
+    }
+
+
+def _progress_json_float(
+    progress_value: float,
+    context: str,
+):
+    parsed_value = float(progress_value)
+    if math.isfinite(parsed_value):
+        return parsed_value
+    if math.isinf(parsed_value):
+        return "inf" if parsed_value > 0.0 else "-inf"
+    return "nan"
+
+
+def _json_digest(mapping, context: str):
+    _nonempty_string(context, "json_digest_context")
+    digest_payload = json.dumps(mapping, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(digest_payload.encode("utf-8")).hexdigest()
+
+
+def _coordinate_bounds_digest(
+    coordinate_bounds: tuple[PrimitiveParameterTransform, ...],
+) -> str:
+    ordered_bounds = _ordered_coordinate_bounds(coordinate_bounds)
+    coordinate_bound_mappings = tuple(
+        asdict(coordinate_bound) for coordinate_bound in ordered_bounds
+    )
+    return _json_digest(
+        {"coordinate_bounds": coordinate_bound_mappings},
+        "coordinate_bounds_digest",
+    )
+
+
+def _fit_options_digest(options: PrimitiveFitOptions) -> str:
+    _validate_fit_options(options)
+    return _json_digest({"fit_options": asdict(options)}, "fit_options_digest")
+
+
+def _primitive_parameters_digest(
+    primitive_parameters: ConductivityPrimitiveParameterSet,
+) -> str:
+    validate_conductivity_primitive_parameters(primitive_parameters)
+    primitive_parameter_mapping = conductivity_primitive_parameters_to_mapping(
+        primitive_parameters,
+    )
+    return _json_digest(
+        {"primitive_parameters": primitive_parameter_mapping},
+        "primitive_parameters_digest",
+    )
+
+
+def _candidate_progress_mapping(
+    candidate_result: PrimitiveFitCandidateResult,
+    progress_payload: PrimitiveFitProgressPayload,
+    options: PrimitiveFitOptions,
+):
+    active_parameter_names = _ordered_bound_parameter_names(
+        progress_payload.active_coordinate_bounds,
+    )
+    return {
+        "objective_value": _progress_json_float(
+            candidate_result.objective_value,
+            "candidate.objective_value",
+        ),
+        "mae_mS_cm": _progress_json_float(
+            candidate_result.mae_mS_cm,
+            "candidate.mae_mS_cm",
+        ),
+        "bias_mS_cm": _progress_json_float(
+            candidate_result.bias_mS_cm,
+            "candidate.bias_mS_cm",
+        ),
+        "pearson_r": _progress_json_float(
+            candidate_result.pearson_r,
+            "candidate.pearson_r",
+        ),
+        "worst_abs_residual_mS_cm": _progress_json_float(
+            candidate_result.worst_abs_residual_mS_cm,
+            "candidate.worst_abs_residual_mS_cm",
+        ),
+        "trajectory_concentration_loss": _progress_json_float(
+            candidate_result.trajectory_concentration_loss,
+            "candidate.trajectory_concentration_loss",
+        ),
+        "trajectory_transition_rate_loss": _progress_json_float(
+            candidate_result.trajectory_transition_rate_loss,
+            "candidate.trajectory_transition_rate_loss",
+        ),
+        "trajectory_displacement_moment_loss": _progress_json_float(
+            candidate_result.trajectory_displacement_moment_loss,
+            "candidate.trajectory_displacement_moment_loss",
+        ),
+        "trajectory_sigma_loss_mS_cm": _progress_json_float(
+            candidate_result.trajectory_sigma_loss_mS_cm,
+            "candidate.trajectory_sigma_loss_mS_cm",
+        ),
+        "failed_rows": candidate_result.failed_rows,
+        "rejected": candidate_result.rejected,
+        "rejection_reasons": tuple(candidate_result.rejection_reasons),
+        "primitive_parameters": conductivity_primitive_parameters_to_mapping(
+            candidate_result.primitive_parameters,
+        ),
+        "coordinate_values": tuple(candidate_result.coordinate_values),
+        "coordinate_parameter_names": active_parameter_names,
+        "coordinate_bounds_digest": _coordinate_bounds_digest(
+            progress_payload.active_coordinate_bounds,
+        ),
+        "fit_options_digest": _fit_options_digest(options),
+        "regularization_reference_digest": (
+            _primitive_parameters_digest(
+                progress_payload.regularization_reference_parameters,
+            )
+        ),
+    }
+
+
+def _updated_current_best_candidate(
+    candidate_result: PrimitiveFitCandidateResult,
+    current_best: PrimitiveFitCandidateResult,
+) -> PrimitiveFitCandidateResult:
+    if candidate_result.rejected:
+        return current_best
+    if current_best.rejected:
+        return candidate_result
+    if _candidate_is_better(candidate_result, current_best):
+        return candidate_result
+    return current_best
 
 
 def fit_conductivity_primitive_parameters(
@@ -1088,15 +2188,32 @@ def fit_conductivity_primitive_parameters(
     )
 
     candidate_results: list[PrimitiveFitCandidateResult] = []
-    candidate_results.append(
-        evaluate_primitive_parameter_candidate(
-            initial_coordinate_values,
-            initial_parameters,
-            regularization_reference_coordinate_values,
-            ordered_bounds,
-            evaluator,
-            options,
-        )
+    initial_candidate = evaluate_primitive_parameter_candidate(
+        initial_coordinate_values,
+        initial_parameters,
+        regularization_reference_coordinate_values,
+        ordered_bounds,
+        evaluator,
+        options,
+    )
+    candidate_results.append(initial_candidate)
+    current_best_for_progress = initial_candidate
+    _write_fit_progress_status(
+        options,
+        "initial_candidate",
+        "initial configured primitive parameter evaluation",
+        candidate_results,
+        current_best_for_progress,
+        PrimitiveFitProgressPayload(
+            active_coordinate_bounds=ordered_bounds,
+            regularization_reference_parameters=regularization_reference_parameters,
+            latin_hypercube_sample_count=0,
+            coordinate_step_value=0.0,
+            improved_this_round=False,
+            powell_cached_candidate_count=0,
+            promotion_candidate_is_available=False,
+            promotion_candidate=current_best_for_progress,
+        ),
     )
     random_number_generator = random.Random(options.random_seed)
     latin_hypercube_sample_count = _fit_budget_count_from_parameter_count(
@@ -1104,23 +2221,62 @@ def fit_conductivity_primitive_parameters(
         options.latin_hypercube_samples_per_parameter,
         "latin_hypercube_samples_per_parameter",
     )
-    for sample_coordinate_values in _latin_hypercube_coordinate_values(
-        ordered_bounds,
-        latin_hypercube_sample_count,
-        random_number_generator,
+    for sample_index, sample_coordinate_values in enumerate(
+        _latin_hypercube_coordinate_values(
+            ordered_bounds,
+            latin_hypercube_sample_count,
+            random_number_generator,
+        )
     ):
-        candidate_results.append(
-            evaluate_primitive_parameter_candidate(
-                sample_coordinate_values,
-                initial_parameters,
-                regularization_reference_coordinate_values,
-                ordered_bounds,
-                evaluator,
-                options,
-            )
+        sample_candidate = evaluate_primitive_parameter_candidate(
+            sample_coordinate_values,
+            initial_parameters,
+            regularization_reference_coordinate_values,
+            ordered_bounds,
+            evaluator,
+            options,
+        )
+        candidate_results.append(sample_candidate)
+        current_best_for_progress = _updated_current_best_candidate(
+            sample_candidate,
+            current_best_for_progress,
+        )
+        _write_fit_progress_status(
+            options,
+            "latin_hypercube",
+            f"sample {sample_index + 1} of {latin_hypercube_sample_count}",
+            candidate_results,
+            current_best_for_progress,
+            PrimitiveFitProgressPayload(
+                active_coordinate_bounds=ordered_bounds,
+                regularization_reference_parameters=regularization_reference_parameters,
+                latin_hypercube_sample_count=latin_hypercube_sample_count,
+                coordinate_step_value=0.0,
+                improved_this_round=False,
+                powell_cached_candidate_count=0,
+                promotion_candidate_is_available=False,
+                promotion_candidate=current_best_for_progress,
+            ),
         )
 
     current_best = _best_accepted_candidate(candidate_results)
+    _write_fit_progress_status(
+        options,
+        "latin_hypercube_complete",
+        "latin hypercube candidate generation complete",
+        candidate_results,
+        current_best,
+        PrimitiveFitProgressPayload(
+            active_coordinate_bounds=ordered_bounds,
+            regularization_reference_parameters=regularization_reference_parameters,
+            latin_hypercube_sample_count=latin_hypercube_sample_count,
+            coordinate_step_value=0.0,
+            improved_this_round=False,
+            powell_cached_candidate_count=0,
+            promotion_candidate_is_available=False,
+            promotion_candidate=current_best,
+        ),
+    )
     coordinate_step_value = options.initial_coordinate_step
     for search_round_index in range(options.coordinate_search_rounds):
         if coordinate_step_value < options.minimum_coordinate_step:
@@ -1146,15 +2302,74 @@ def fit_conductivity_primitive_parameters(
                 if _candidate_is_better(trial_result, current_best):
                     current_best = trial_result
                     improved_this_round = True
+                _write_fit_progress_status(
+                    options,
+                    "coordinate_search",
+                    (
+                        f"round {search_round_index + 1} of "
+                        f"{options.coordinate_search_rounds}, "
+                        f"parameter {parameter_index + 1} of {len(ordered_bounds)}, "
+                        f"step_sign {step_sign:.0f}"
+                    ),
+                    candidate_results,
+                    current_best,
+                    PrimitiveFitProgressPayload(
+                        active_coordinate_bounds=ordered_bounds,
+                        regularization_reference_parameters=(
+                            regularization_reference_parameters
+                        ),
+                        latin_hypercube_sample_count=latin_hypercube_sample_count,
+                        coordinate_step_value=coordinate_step_value,
+                        improved_this_round=improved_this_round,
+                        powell_cached_candidate_count=0,
+                        promotion_candidate_is_available=False,
+                        promotion_candidate=current_best,
+                    ),
+                )
         if not improved_this_round:
             coordinate_step_value *= options.coordinate_step_shrinkage
+        _write_fit_progress_status(
+            options,
+            "coordinate_search_round_complete",
+            f"round {search_round_index + 1} of {options.coordinate_search_rounds}",
+            candidate_results,
+            current_best,
+            PrimitiveFitProgressPayload(
+                active_coordinate_bounds=ordered_bounds,
+                regularization_reference_parameters=regularization_reference_parameters,
+                latin_hypercube_sample_count=latin_hypercube_sample_count,
+                coordinate_step_value=coordinate_step_value,
+                improved_this_round=improved_this_round,
+                powell_cached_candidate_count=0,
+                promotion_candidate_is_available=False,
+                promotion_candidate=current_best,
+            ),
+        )
         if search_round_index == options.coordinate_search_rounds - 1:
             break
 
+    _write_fit_progress_status(
+        options,
+        "powell_local_polish_start",
+        "starting Powell local polish",
+        candidate_results,
+        current_best,
+        PrimitiveFitProgressPayload(
+            active_coordinate_bounds=ordered_bounds,
+            regularization_reference_parameters=regularization_reference_parameters,
+            latin_hypercube_sample_count=latin_hypercube_sample_count,
+            coordinate_step_value=coordinate_step_value,
+            improved_this_round=False,
+            powell_cached_candidate_count=0,
+            promotion_candidate_is_available=False,
+            promotion_candidate=current_best,
+        ),
+    )
     current_best = _run_powell_local_polish(
         current_best,
         candidate_results,
         initial_parameters,
+        regularization_reference_parameters,
         regularization_reference_coordinate_values,
         ordered_bounds,
         evaluator,
@@ -1169,6 +2384,23 @@ def fit_conductivity_primitive_parameters(
         candidate_results,
         candidate_results[0],
         options,
+    )
+    _write_fit_progress_status(
+        options,
+        "fit_complete",
+        "primitive fit candidate search complete",
+        candidate_results,
+        current_best,
+        PrimitiveFitProgressPayload(
+            active_coordinate_bounds=ordered_bounds,
+            regularization_reference_parameters=regularization_reference_parameters,
+            latin_hypercube_sample_count=latin_hypercube_sample_count,
+            coordinate_step_value=coordinate_step_value,
+            improved_this_round=False,
+            powell_cached_candidate_count=0,
+            promotion_candidate_is_available=True,
+            promotion_candidate=promotion_candidate,
+        ),
     )
     return PrimitiveParameterFitResult(
         best_candidate=current_best,
@@ -1316,6 +2548,22 @@ def evaluate_primitive_parameter_candidate(
         residual_weights,
         options.huber_delta_mS_cm,
     )
+    trajectory_concentration_loss = _nonnegative_float(
+        evaluation.trajectory_concentration_loss,
+        "trajectory_concentration_loss",
+    )
+    trajectory_transition_rate_loss = _nonnegative_float(
+        evaluation.trajectory_transition_rate_loss,
+        "trajectory_transition_rate_loss",
+    )
+    trajectory_displacement_moment_loss = _nonnegative_float(
+        evaluation.trajectory_displacement_moment_loss,
+        "trajectory_displacement_moment_loss",
+    )
+    trajectory_sigma_loss_mS_cm = _nonnegative_float(
+        evaluation.trajectory_sigma_loss_mS_cm,
+        "trajectory_sigma_loss_mS_cm",
+    )
     coordinate_regularization_loss = _coordinate_regularization_loss(
         bounded_coordinate_values,
         regularization_reference_coordinate_values,
@@ -1334,6 +2582,19 @@ def evaluate_primitive_parameter_candidate(
             + options.residual_tail_loss_weight * tail_huber_loss_mS_cm
             + options.direct_capacity_loss_weight * direct_capacity_loss_mS_cm
             + options.corrector_loss_weight * corrector_loss_mS_cm
+            + (
+                options.trajectory_concentration_loss_weight
+                * trajectory_concentration_loss
+            )
+            + (
+                options.trajectory_transition_rate_loss_weight
+                * trajectory_transition_rate_loss
+            )
+            + (
+                options.trajectory_displacement_moment_loss_weight
+                * trajectory_displacement_moment_loss
+            )
+            + options.trajectory_sigma_loss_weight * trajectory_sigma_loss_mS_cm
             + coordinate_regularization_loss
             + cluster_activation_loss
         )
@@ -1346,6 +2607,10 @@ def evaluate_primitive_parameter_candidate(
         tail_huber_loss_mS_cm=tail_huber_loss_mS_cm,
         direct_capacity_loss_mS_cm=direct_capacity_loss_mS_cm,
         corrector_loss_mS_cm=corrector_loss_mS_cm,
+        trajectory_concentration_loss=trajectory_concentration_loss,
+        trajectory_transition_rate_loss=trajectory_transition_rate_loss,
+        trajectory_displacement_moment_loss=trajectory_displacement_moment_loss,
+        trajectory_sigma_loss_mS_cm=trajectory_sigma_loss_mS_cm,
         coordinate_regularization_loss=coordinate_regularization_loss,
         cluster_activation_loss=cluster_activation_loss,
         mae_mS_cm=mae_mS_cm,
@@ -1378,6 +2643,10 @@ def _failed_candidate_result(
         tail_huber_loss_mS_cm=math.inf,
         direct_capacity_loss_mS_cm=math.inf,
         corrector_loss_mS_cm=math.inf,
+        trajectory_concentration_loss=math.inf,
+        trajectory_transition_rate_loss=math.inf,
+        trajectory_displacement_moment_loss=math.inf,
+        trajectory_sigma_loss_mS_cm=math.inf,
         coordinate_regularization_loss=coordinate_regularization_loss,
         cluster_activation_loss=math.inf,
         mae_mS_cm=math.inf,
@@ -1394,11 +2663,13 @@ def _run_powell_local_polish(
     current_best: PrimitiveFitCandidateResult,
     candidate_results: list[PrimitiveFitCandidateResult],
     initial_parameters: ConductivityPrimitiveParameterSet,
+    regularization_reference_parameters: ConductivityPrimitiveParameterSet,
     regularization_reference_coordinate_values: tuple[float, ...],
     ordered_bounds: tuple[PrimitiveParameterTransform, ...],
     evaluator: ConductivityPrimitiveParameterEvaluator,
     options: PrimitiveFitOptions,
 ) -> PrimitiveFitCandidateResult:
+    validate_conductivity_primitive_parameters(regularization_reference_parameters)
     if (
         options.powell_max_iterations_per_parameter == 0.0
         or options.powell_max_function_evaluations_per_parameter == 0.0
@@ -1418,8 +2689,8 @@ def _run_powell_local_polish(
     )
 
     evaluation_cache: dict[tuple[float, ...], PrimitiveFitCandidateResult] = {}
-
     def _objective_for_coordinate_values(coordinate_value_array: np.ndarray) -> float:
+        nonlocal current_best
         coordinate_values = tuple(
             float(coordinate_value) for coordinate_value in coordinate_value_array
         )
@@ -1435,6 +2706,27 @@ def _run_powell_local_polish(
             )
             evaluation_cache[bounded_coordinate_values] = candidate_result
             candidate_results.append(candidate_result)
+            current_best = _updated_current_best_candidate(
+                candidate_result,
+                current_best,
+            )
+            _write_fit_progress_status(
+                options,
+                "powell_local_polish",
+                f"objective evaluation {len(evaluation_cache)}",
+                candidate_results,
+                current_best,
+                PrimitiveFitProgressPayload(
+                    active_coordinate_bounds=ordered_bounds,
+                    regularization_reference_parameters=regularization_reference_parameters,
+                    latin_hypercube_sample_count=0,
+                    coordinate_step_value=0.0,
+                    improved_this_round=False,
+                    powell_cached_candidate_count=len(evaluation_cache),
+                    promotion_candidate_is_available=False,
+                    promotion_candidate=current_best,
+                ),
+            )
         return evaluation_cache[bounded_coordinate_values].objective_value
 
     lower_coordinate_values = np.asarray(
@@ -1514,6 +2806,10 @@ def fit_speciation_from_cluster_sensitivities(
     fit_options: PrimitiveFitOptions,
     speciation_coordinate_bounds: tuple[PrimitiveParameterTransform, ...],
     regularization_reference_parameters: ConductivityPrimitiveParameterSet,
+    trajectory_primitive_calibration_targets: tuple[
+        TrajectoryPrimitiveCalibrationTarget,
+        ...,
+    ],
 ) -> SpeciationSensitivityFitResult:
     from conductivity.molecular_property_db_audit import (
         cluster_sensitivity_diagnostics_for_row,
@@ -1527,6 +2823,7 @@ def fit_speciation_from_cluster_sensitivities(
         cases,
         audit_options,
         fit_options,
+        trajectory_primitive_calibration_targets,
     )
     sensitivity_coordinate_bounds = tuple(
         coordinate_bound
@@ -1569,7 +2866,7 @@ def fit_speciation_from_cluster_sensitivities(
     selected_rows = tuple(
         sorted(
             baseline_audit_result.rows,
-            key=lambda row_result: abs(row_result.residual_mS_cm),
+            key=_absolute_residual_sort_key,
             reverse=True,
         )[:fit_options.residual_tail_count]
     )
@@ -1923,6 +3220,22 @@ def _validate_fit_options(options: PrimitiveFitOptions) -> None:
         "corrector_loss_weight",
     )
     _nonnegative_float(
+        options.trajectory_concentration_loss_weight,
+        "trajectory_concentration_loss_weight",
+    )
+    _nonnegative_float(
+        options.trajectory_transition_rate_loss_weight,
+        "trajectory_transition_rate_loss_weight",
+    )
+    _nonnegative_float(
+        options.trajectory_displacement_moment_loss_weight,
+        "trajectory_displacement_moment_loss_weight",
+    )
+    _nonnegative_float(
+        options.trajectory_sigma_loss_weight,
+        "trajectory_sigma_loss_weight",
+    )
+    _nonnegative_float(
         options.role_direct_scaling_regularization_weight,
         "role_direct_scaling_regularization_weight",
     )
@@ -2010,6 +3323,9 @@ def _validate_fit_options(options: PrimitiveFitOptions) -> None:
         options.descriptor_matrix_reported_correlation_pair_count,
         "descriptor_matrix_reported_correlation_pair_count",
     )
+    for target_path in options.trajectory_primitive_target_paths:
+        _nonempty_string(target_path, "trajectory_primitive_target_path")
+    _nonempty_string(options.progress_output_path, "progress_output_path")
     _positive_float(
         options.prediction_sensitivity_coordinate_step,
         "prediction_sensitivity_coordinate_step",
@@ -2231,6 +3547,19 @@ def _append_threshold_reason(
     maximum_allowed = _nonnegative_float(maximum_allowed_value, f"{reason}.maximum")
     if observed > maximum_allowed:
         reasons.append(reason)
+
+
+def _absolute_residual_sort_key(
+    row_result: "MolecularPropertyDbRowResult",
+) -> float:
+    return abs(_finite_float(row_result.residual_mS_cm, "residual_mS_cm"))
+
+
+def _indexed_absolute_residual_sort_key(
+    index_and_row_result: tuple[int, "MolecularPropertyDbRowResult"],
+) -> float:
+    row_result = index_and_row_result[1]
+    return _absolute_residual_sort_key(row_result)
 
 
 def _smooth_l1_loss_mS_cm(
@@ -2588,7 +3917,7 @@ def _best_accepted_candidate(
         )
     return min(
         accepted_candidates,
-        key=lambda candidate_result: candidate_result.objective_value,
+        key=_candidate_objective_sort_key,
     )
 
 
@@ -2599,6 +3928,12 @@ def _candidate_is_better(
     if trial_result.rejected:
         return False
     return trial_result.objective_value < current_best.objective_value
+
+
+def _candidate_objective_sort_key(
+    candidate_result: PrimitiveFitCandidateResult,
+) -> float:
+    return candidate_result.objective_value
 
 
 def select_primitive_parameter_promotion_candidate(
@@ -2615,14 +3950,34 @@ def select_primitive_parameter_promotion_candidate(
     )
     if not accepted_candidates:
         raise ValueError("promotion candidate selection requires accepted candidates")
-    return min(
+    return _minimum_promotion_candidate(
         accepted_candidates,
-        key=lambda candidate_result: _promotion_candidate_sort_key(
+        baseline_candidate,
+        options,
+    )
+
+
+def _minimum_promotion_candidate(
+    accepted_candidates: tuple[PrimitiveFitCandidateResult, ...],
+    baseline_candidate: PrimitiveFitCandidateResult,
+    options: PrimitiveFitOptions,
+) -> PrimitiveFitCandidateResult:
+    best_candidate = accepted_candidates[0]
+    best_sort_key = _promotion_candidate_sort_key(
+        best_candidate,
+        baseline_candidate,
+        options,
+    )
+    for candidate_result in accepted_candidates[1:]:
+        candidate_sort_key = _promotion_candidate_sort_key(
             candidate_result,
             baseline_candidate,
             options,
-        ),
-    )
+        )
+        if candidate_sort_key < best_sort_key:
+            best_candidate = candidate_result
+            best_sort_key = candidate_sort_key
+    return best_candidate
 
 
 def _promotion_candidate_sort_key(
@@ -2867,25 +4222,21 @@ def primitive_prediction_sensitivity_diagnostics(
         options,
         "baseline_prediction_sensitivity",
     )
-    baseline_predicted_sigmas = _validated_sigma_tuple(
-        baseline_evaluation.predicted_sigmas_mS_cm,
-        "baseline_predicted_sigmas_mS_cm",
-    )
     baseline_descriptor_targets = _validated_descriptor_calibration_targets(
         baseline_evaluation.descriptor_calibration_targets,
     )
-    empirical_sigma_spreads = tuple(
-        descriptor_target.empirical_sigma_spread_mS_cm
-        for descriptor_target in baseline_descriptor_targets
+    baseline_sensitivity_values = _prediction_sensitivity_values(
+        baseline_evaluation,
+        options,
+        "baseline_prediction_sensitivity",
     )
-    if len(baseline_predicted_sigmas) != len(empirical_sigma_spreads):
-        raise ValueError(
-            "baseline predicted sigma and empirical spread counts must match"
-        )
-    residual_weights = tuple(
-        descriptor_target.residual_weight
-        for descriptor_target in baseline_descriptor_targets
+    sensitivity_weights = _prediction_sensitivity_weights(
+        baseline_descriptor_targets,
+        options,
+        "baseline_prediction_sensitivity",
     )
+    if len(baseline_sensitivity_values) != len(sensitivity_weights):
+        raise ValueError("baseline sensitivity value and weight counts must match")
     current_coordinate_values = (
         conductivity_primitive_parameter_coordinate_values_for_names(
             primitive_parameters,
@@ -2908,7 +4259,7 @@ def primitive_prediction_sensitivity_diagnostics(
         )
         if minus_coordinate_value == plus_coordinate_value:
             sensitivity_columns.append(
-                tuple(0.0 for baseline_sigma in baseline_predicted_sigmas)
+                tuple(0.0 for _value in baseline_sensitivity_values)
             )
             continue
         minus_trial = _prediction_sensitivity_trial(
@@ -2933,12 +4284,12 @@ def primitive_prediction_sensitivity_diagnostics(
             invalid_trial_parameter_names.append(coordinate_bound.name)
         _validate_prediction_sensitivity_trial_shape(
             minus_trial,
-            baseline_predicted_sigmas,
+            baseline_sensitivity_values,
             "minus_prediction_sensitivity",
         )
         _validate_prediction_sensitivity_trial_shape(
             plus_trial,
-            baseline_predicted_sigmas,
+            baseline_sensitivity_values,
             "plus_prediction_sensitivity",
         )
         if minus_trial.valid and plus_trial.valid:
@@ -2949,10 +4300,10 @@ def primitive_prediction_sensitivity_diagnostics(
             )
             sensitivity_columns.append(
                 tuple(
-                    (plus_sigma_mS_cm - minus_sigma_mS_cm) / coordinate_delta
-                    for minus_sigma_mS_cm, plus_sigma_mS_cm in zip(
-                        minus_trial.predicted_sigmas_mS_cm,
-                        plus_trial.predicted_sigmas_mS_cm,
+                    (plus_value - minus_value) / coordinate_delta
+                    for minus_value, plus_value in zip(
+                        minus_trial.sensitivity_values,
+                        plus_trial.sensitivity_values,
                     )
                 )
             )
@@ -2967,10 +4318,10 @@ def primitive_prediction_sensitivity_diagnostics(
             )
             sensitivity_columns.append(
                 tuple(
-                    (plus_sigma_mS_cm - baseline_sigma_mS_cm) / coordinate_delta
-                    for baseline_sigma_mS_cm, plus_sigma_mS_cm in zip(
-                        baseline_predicted_sigmas,
-                        plus_trial.predicted_sigmas_mS_cm,
+                    (plus_value - baseline_value) / coordinate_delta
+                    for baseline_value, plus_value in zip(
+                        baseline_sensitivity_values,
+                        plus_trial.sensitivity_values,
                     )
                 )
             )
@@ -2985,22 +4336,22 @@ def primitive_prediction_sensitivity_diagnostics(
             )
             sensitivity_columns.append(
                 tuple(
-                    (baseline_sigma_mS_cm - minus_sigma_mS_cm) / coordinate_delta
-                    for baseline_sigma_mS_cm, minus_sigma_mS_cm in zip(
-                        baseline_predicted_sigmas,
-                        minus_trial.predicted_sigmas_mS_cm,
+                    (baseline_value - minus_value) / coordinate_delta
+                    for baseline_value, minus_value in zip(
+                        baseline_sensitivity_values,
+                        minus_trial.sensitivity_values,
                     )
                 )
             )
             continue
         sensitivity_columns.append(
-            tuple(0.0 for baseline_sigma in baseline_predicted_sigmas)
+            tuple(0.0 for _value in baseline_sensitivity_values)
         )
     sensitivity_matrix = np.asarray(sensitivity_columns, dtype=float).T
     if not np.all(np.isfinite(sensitivity_matrix)):
         raise ValueError("prediction sensitivity matrix must be finite")
     weighted_sensitivity_matrix = (
-        np.sqrt(np.asarray(residual_weights, dtype=float))[:, None]
+        np.sqrt(np.asarray(sensitivity_weights, dtype=float))[:, None]
         * sensitivity_matrix
     )
     return _primitive_prediction_sensitivity_diagnostics_from_matrix(
@@ -3065,9 +4416,10 @@ def _prediction_sensitivity_trial(
             options,
             "trial_prediction_sensitivity",
         )
-        predicted_sigmas_mS_cm = _validated_sigma_tuple(
-            trial_evaluation.predicted_sigmas_mS_cm,
-            "trial_predicted_sigmas_mS_cm",
+        sensitivity_values = _prediction_sensitivity_values(
+            trial_evaluation,
+            options,
+            "trial_prediction_sensitivity",
         )
     except (
         FloatingPointError,
@@ -3077,23 +4429,97 @@ def _prediction_sensitivity_trial(
     ):
         return PrimitivePredictionSensitivityTrial(
             valid=False,
-            predicted_sigmas_mS_cm=tuple(),
+            sensitivity_values=tuple(),
         )
     return PrimitivePredictionSensitivityTrial(
         valid=True,
-        predicted_sigmas_mS_cm=predicted_sigmas_mS_cm,
+        sensitivity_values=sensitivity_values,
     )
 
 
 def _validate_prediction_sensitivity_trial_shape(
     trial: PrimitivePredictionSensitivityTrial,
-    baseline_predicted_sigmas_mS_cm: tuple[float, ...],
+    baseline_sensitivity_values: tuple[float, ...],
     context: str,
 ) -> None:
     if not trial.valid:
         return
-    if len(trial.predicted_sigmas_mS_cm) != len(baseline_predicted_sigmas_mS_cm):
-        raise ValueError(f"{context} prediction count must match baseline")
+    if len(trial.sensitivity_values) != len(baseline_sensitivity_values):
+        raise ValueError(f"{context} sensitivity value count must match baseline")
+
+
+def _prediction_sensitivity_values(
+    evaluation: PrimitiveFitDatasetEvaluation,
+    options: PrimitiveFitOptions,
+    context: str,
+) -> tuple[float, ...]:
+    _validate_fit_options(options)
+    context_text = _nonempty_string(context, "prediction_sensitivity_context")
+    sensitivity_values: list[float] = list(
+        _validated_sigma_tuple(
+            evaluation.predicted_sigmas_mS_cm,
+            f"{context_text}.predicted_sigmas_mS_cm",
+        )
+    )
+    if options.trajectory_concentration_loss_weight > 0.0:
+        sensitivity_values.append(
+            _nonnegative_float(
+                evaluation.trajectory_concentration_loss,
+                f"{context_text}.trajectory_concentration_loss",
+            )
+        )
+    if options.trajectory_transition_rate_loss_weight > 0.0:
+        sensitivity_values.append(
+            _nonnegative_float(
+                evaluation.trajectory_transition_rate_loss,
+                f"{context_text}.trajectory_transition_rate_loss",
+            )
+        )
+    if options.trajectory_displacement_moment_loss_weight > 0.0:
+        sensitivity_values.append(
+            _nonnegative_float(
+                evaluation.trajectory_displacement_moment_loss,
+                f"{context_text}.trajectory_displacement_moment_loss",
+            )
+        )
+    if options.trajectory_sigma_loss_weight > 0.0:
+        sensitivity_values.append(
+            _nonnegative_float(
+                evaluation.trajectory_sigma_loss_mS_cm,
+                f"{context_text}.trajectory_sigma_loss_mS_cm",
+            )
+        )
+    return tuple(sensitivity_values)
+
+
+def _prediction_sensitivity_weights(
+    descriptor_targets: tuple[DescriptorCalibrationTarget, ...],
+    options: PrimitiveFitOptions,
+    context: str,
+) -> tuple[float, ...]:
+    _validate_fit_options(options)
+    context_text = _nonempty_string(context, "prediction_sensitivity_context")
+    sensitivity_weights: list[float] = [
+        _positive_float(
+            descriptor_target.residual_weight,
+            f"{context_text}.descriptor_residual_weight",
+        )
+        for descriptor_target in descriptor_targets
+    ]
+    if options.trajectory_concentration_loss_weight > 0.0:
+        sensitivity_weights.append(options.trajectory_concentration_loss_weight)
+    if options.trajectory_transition_rate_loss_weight > 0.0:
+        sensitivity_weights.append(options.trajectory_transition_rate_loss_weight)
+    if options.trajectory_displacement_moment_loss_weight > 0.0:
+        sensitivity_weights.append(
+            options.trajectory_displacement_moment_loss_weight
+        )
+    if options.trajectory_sigma_loss_weight > 0.0:
+        sensitivity_weights.append(options.trajectory_sigma_loss_weight)
+    return tuple(
+        _positive_float(sensitivity_weight, f"{context_text}.sensitivity_weight")
+        for sensitivity_weight in sensitivity_weights
+    )
 
 
 def _validate_prediction_sensitivity_evaluation(
@@ -3788,6 +5214,813 @@ def load_primitive_parameters_from_promoted_candidate_artifact(
     return _primitive_parameters_from_artifact_mapping(artifact_value)
 
 
+def write_default_calibration_error_decomposition_report(
+    report_path: str,
+) -> None:
+    from data.electrolyte_property_db import DATA
+    from data.species_data import ADDITIVES, CATION_PROPERTIES, SALTS, SOLVENTS
+    from conductivity.molecular_property_db_audit import (
+        MolecularPropertyDbRegistrySource,
+        build_molecular_property_db_case_selection,
+        configured_conductivity_primitive_parameters,
+        default_molecular_property_db_audit_options,
+    )
+
+    output_path = Path(_nonempty_string(report_path, "report_path"))
+    audit_options = default_molecular_property_db_audit_options()
+    fit_options, coordinate_bounds = default_molecular_primitive_fit_configuration()
+    trajectory_targets = load_trajectory_primitive_calibration_targets(
+        fit_options.trajectory_primitive_target_paths,
+    )
+    registry_source = MolecularPropertyDbRegistrySource(
+        solvent_registry=SOLVENTS,
+        salt_registry=SALTS,
+        additive_registry=ADDITIVES,
+        cation_registry=CATION_PROPERTIES,
+    )
+    case_selection = build_molecular_property_db_case_selection(
+        tuple(DATA),
+        registry_source,
+        audit_options,
+    )
+    configured_parameters = configured_conductivity_primitive_parameters()
+    topology_initialized_parameters = (
+        initialize_topology_logk_offsets_from_trajectory_concentrations(
+            configured_parameters,
+            trajectory_targets,
+            audit_options,
+            coordinate_bounds,
+        )
+    )
+    snapshot_parameter_sets = [
+        ("configured_baseline", configured_parameters),
+        ("topology_initialized", topology_initialized_parameters),
+    ]
+    candidate_path = Path(fit_options.candidate_output_path)
+    if candidate_path.exists():
+        snapshot_parameter_sets.append(
+            (
+                "completed_candidate",
+                load_primitive_parameters_from_candidate_artifact(
+                    fit_options.candidate_output_path,
+                ),
+            )
+        )
+    report_mapping = calibration_error_decomposition_report_mapping(
+        tuple(snapshot_parameter_sets),
+        case_selection.cases,
+        audit_options,
+        fit_options,
+        trajectory_targets,
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps(report_mapping, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def write_default_topology_reachability_sweep_report(
+    report_path: str,
+    contact_pair_logk_offsets: tuple[float, ...],
+    solvent_separated_pair_logk_offsets: tuple[float, ...],
+    higher_charged_cluster_logk_offsets: tuple[float, ...],
+) -> None:
+    from data.electrolyte_property_db import DATA
+    from data.species_data import ADDITIVES, CATION_PROPERTIES, SALTS, SOLVENTS
+    from conductivity.molecular_property_db_audit import (
+        MolecularPropertyDbRegistrySource,
+        build_molecular_property_db_case_selection,
+        configured_conductivity_primitive_parameters,
+        default_molecular_property_db_audit_options,
+    )
+
+    output_path = Path(_nonempty_string(report_path, "report_path"))
+    audit_options = default_molecular_property_db_audit_options()
+    fit_options, _coordinate_bounds = default_molecular_primitive_fit_configuration()
+    trajectory_targets = load_trajectory_primitive_calibration_targets(
+        fit_options.trajectory_primitive_target_paths,
+    )
+    registry_source = MolecularPropertyDbRegistrySource(
+        solvent_registry=SOLVENTS,
+        salt_registry=SALTS,
+        additive_registry=ADDITIVES,
+        cation_registry=CATION_PROPERTIES,
+    )
+    case_selection = build_molecular_property_db_case_selection(
+        tuple(DATA),
+        registry_source,
+        audit_options,
+    )
+    report_mapping = topology_reachability_sweep_report_mapping(
+        configured_conductivity_primitive_parameters(),
+        case_selection.cases,
+        audit_options,
+        fit_options,
+        trajectory_targets,
+        contact_pair_logk_offsets,
+        solvent_separated_pair_logk_offsets,
+        higher_charged_cluster_logk_offsets,
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps(report_mapping, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def topology_reachability_sweep_report_mapping(
+    base_parameters: ConductivityPrimitiveParameterSet,
+    cases: tuple["MolecularPropertyDbCase", ...],
+    audit_options: "MolecularPropertyDbAuditOptions",
+    fit_options: PrimitiveFitOptions,
+    trajectory_targets: tuple[TrajectoryPrimitiveCalibrationTarget, ...],
+    contact_pair_logk_offsets: tuple[float, ...],
+    solvent_separated_pair_logk_offsets: tuple[float, ...],
+    higher_charged_cluster_logk_offsets: tuple[float, ...],
+) -> dict:
+    contact_offsets = _nonnegative_float_tuple(
+        contact_pair_logk_offsets,
+        "contact_pair_logk_offsets",
+    )
+    ssip_offsets = _nonnegative_float_tuple(
+        solvent_separated_pair_logk_offsets,
+        "solvent_separated_pair_logk_offsets",
+    )
+    higher_offsets = _nonnegative_float_tuple(
+        higher_charged_cluster_logk_offsets,
+        "higher_charged_cluster_logk_offsets",
+    )
+    sweep_entries = []
+    for contact_pair_logk_offset in contact_offsets:
+        for ssip_logk_offset in ssip_offsets:
+            for higher_charged_cluster_logk_offset in higher_offsets:
+                sweep_parameters = _sweep_parameters_with_topology_offsets(
+                    base_parameters,
+                    contact_pair_logk_offset,
+                    ssip_logk_offset,
+                    higher_charged_cluster_logk_offset,
+                )
+                sweep_entries.append(
+                    _topology_reachability_sweep_entry_mapping(
+                        sweep_parameters,
+                        cases,
+                        audit_options,
+                        fit_options,
+                        trajectory_targets,
+                        contact_pair_logk_offset,
+                        ssip_logk_offset,
+                        higher_charged_cluster_logk_offset,
+                    )
+                )
+    return {
+        "artifact_type": "molecular_conductivity_topology_reachability_sweep",
+        "contact_pair_logk_offsets": contact_offsets,
+        "solvent_separated_pair_logk_offsets": ssip_offsets,
+        "higher_charged_cluster_logk_offsets": higher_offsets,
+        "sweep_entry_count": len(sweep_entries),
+        "sweep_entries": tuple(sweep_entries),
+    }
+
+
+def _sweep_parameters_with_topology_offsets(
+    base_parameters: ConductivityPrimitiveParameterSet,
+    contact_pair_logk_offset: float,
+    solvent_separated_pair_logk_offset: float,
+    higher_charged_cluster_logk_offset: float,
+) -> ConductivityPrimitiveParameterSet:
+    validate_conductivity_primitive_parameters(base_parameters)
+    parameter_mapping = conductivity_primitive_parameters_to_mapping(base_parameters)
+    parameter_mapping["contact_pair_logK_offset"] = _nonnegative_float(
+        contact_pair_logk_offset,
+        "contact_pair_logk_offset",
+    )
+    parameter_mapping["solvent_separated_pair_logK_offset"] = _nonnegative_float(
+        solvent_separated_pair_logk_offset,
+        "solvent_separated_pair_logk_offset",
+    )
+    parameter_mapping["higher_charged_cluster_logK_offset"] = _nonnegative_float(
+        higher_charged_cluster_logk_offset,
+        "higher_charged_cluster_logk_offset",
+    )
+    sweep_parameters = conductivity_primitive_parameters_from_mapping(
+        parameter_mapping,
+    )
+    validate_conductivity_primitive_parameters(sweep_parameters)
+    return sweep_parameters
+
+
+def _topology_reachability_sweep_entry_mapping(
+    primitive_parameters: ConductivityPrimitiveParameterSet,
+    cases: tuple["MolecularPropertyDbCase", ...],
+    audit_options: "MolecularPropertyDbAuditOptions",
+    fit_options: PrimitiveFitOptions,
+    trajectory_targets: tuple[TrajectoryPrimitiveCalibrationTarget, ...],
+    contact_pair_logk_offset: float,
+    solvent_separated_pair_logk_offset: float,
+    higher_charged_cluster_logk_offset: float,
+) -> dict:
+    from conductivity.molecular_property_db_audit import (
+        audit_molecular_property_db_cases,
+    )
+
+    audit_result = audit_molecular_property_db_cases(
+        cases,
+        primitive_parameters,
+        audit_options,
+    )
+    trajectory_losses = _trajectory_primitive_loss_breakdown(
+        trajectory_targets,
+        primitive_parameters,
+        audit_options,
+        fit_options,
+    )
+    coverages = trajectory_concentration_target_coverage(
+        trajectory_targets,
+        primitive_parameters,
+        audit_options,
+    )
+    trajectory_system_mappings = tuple(
+        _topology_sweep_trajectory_system_mapping(
+            trajectory_target,
+            primitive_parameters,
+            audit_options,
+        )
+        for trajectory_target in trajectory_targets
+    )
+    return {
+        "sweep_parameters": {
+            "contact_pair_logK_offset": contact_pair_logk_offset,
+            "solvent_separated_pair_logK_offset": solvent_separated_pair_logk_offset,
+            "higher_charged_cluster_logK_offset": higher_charged_cluster_logk_offset,
+        },
+        "property_metrics": {
+            "mae_mS_cm": audit_result.mae_mS_cm,
+            "bias_mS_cm": audit_result.bias_mS_cm,
+            "pearson_r": audit_result.pearson_r,
+            "worst_abs_residual_mS_cm": audit_result.maximum_abs_residual_mS_cm,
+            "direct_sigma_mS_cm_mean": _mean_row_value(
+                tuple(row.direct_sigma_mS_cm for row in audit_result.rows),
+                "direct_sigma_mS_cm",
+            ),
+            "corrector_sigma_mS_cm_mean": _mean_row_value(
+                tuple(row.corrector_sigma_mS_cm for row in audit_result.rows),
+                "corrector_sigma_mS_cm",
+            ),
+        },
+        "trajectory_losses": {
+            "concentration_loss": trajectory_losses.concentration_loss,
+            "transition_rate_loss": trajectory_losses.transition_rate_loss,
+            "displacement_moment_loss": trajectory_losses.displacement_moment_loss,
+            "sigma_loss_mS_cm": trajectory_losses.sigma_loss_mS_cm,
+        },
+        "direct_corrector_failure_counts": {
+            "direct_capacity_failure_count": sum(
+                1 for row in audit_result.rows if row.direct_capacity_failure
+            ),
+            "corrector_too_strong_failure_count": sum(
+                1 for row in audit_result.rows if row.corrector_too_strong_failure
+            ),
+            "corrector_too_weak_failure_count": sum(
+                1 for row in audit_result.rows if row.corrector_too_weak_failure
+            ),
+        },
+        "trajectory_coverage": tuple(
+            _trajectory_coverage_mapping(coverage) for coverage in coverages
+        ),
+        "trajectory_systems": trajectory_system_mappings,
+    }
+
+
+def _mean_row_value(values: tuple[float, ...], context: str) -> float:
+    if not values:
+        raise ValueError(f"{context} must contain at least one value")
+    return float(
+        math.fsum(_finite_float(value, context) for value in values)
+        / len(values)
+    )
+
+
+def _topology_sweep_trajectory_system_mapping(
+    trajectory_target: TrajectoryPrimitiveCalibrationTarget,
+    primitive_parameters: ConductivityPrimitiveParameterSet,
+    audit_options: "MolecularPropertyDbAuditOptions",
+) -> dict:
+    analytical_result = _trajectory_target_analytical_result(
+        trajectory_target,
+        primitive_parameters,
+        audit_options,
+    )
+    return {
+        "system_id": trajectory_target.system_id,
+        "sigma_mS_cm": analytical_result.sigma_mS_cm,
+        "direct_sigma_mS_cm": (
+            analytical_result.markov_additive_result.direct_sigma_mS_cm
+        ),
+        "corrector_sigma_mS_cm": (
+            analytical_result.markov_additive_result.corrector_sigma_mS_cm
+        ),
+        "free_ion_fraction": _trajectory_free_ion_fraction(analytical_result),
+        "charged_cluster_fraction": _trajectory_cluster_fraction_by_charge(
+            analytical_result,
+            "charged_cluster_fraction",
+            True,
+        ),
+        "neutral_cluster_fraction": _trajectory_cluster_fraction_by_charge(
+            analytical_result,
+            "neutral_cluster_fraction",
+            False,
+        ),
+        "top_clusters_by_concentration": tuple(
+            _cluster_thermodynamic_mapping(cluster_mapping)
+            for cluster_mapping in tuple(
+                sorted(
+                    _trajectory_cluster_thermodynamic_diagnostics(
+                        trajectory_target,
+                        analytical_result,
+                        primitive_parameters,
+                    ),
+                    key=_cluster_concentration_sort_key,
+                    reverse=True,
+                )
+            )[: audit_options.max_cluster_ion_count]
+        ),
+        "top_clusters_by_favorable_free_energy": tuple(
+            _cluster_thermodynamic_mapping(cluster_mapping)
+            for cluster_mapping in tuple(
+                sorted(
+                    _trajectory_cluster_thermodynamic_diagnostics(
+                        trajectory_target,
+                        analytical_result,
+                        primitive_parameters,
+                    ),
+                    key=_cluster_free_energy_sort_key,
+                )
+            )[: audit_options.max_cluster_ion_count]
+        ),
+    }
+
+
+def _trajectory_free_ion_fraction(
+    analytical_result: "AnalyticalConductivityModelResult",
+) -> float:
+    total_ion_concentration_mol_m3 = _trajectory_total_ion_concentration_mol_m3(
+        analytical_result,
+    )
+    free_ion_concentration_mol_m3 = math.fsum(
+        analytical_result.speciation.free_component_concentrations_mol_m3[
+            component.species_name
+        ]
+        for component in analytical_result.speciation.components
+    )
+    return free_ion_concentration_mol_m3 / total_ion_concentration_mol_m3
+
+
+def _trajectory_cluster_fraction_by_charge(
+    analytical_result: "AnalyticalConductivityModelResult",
+    context: str,
+    charged: bool,
+) -> float:
+    total_ion_concentration_mol_m3 = _trajectory_total_ion_concentration_mol_m3(
+        analytical_result,
+    )
+    selected_concentration_mol_m3 = 0.0
+    for cluster_template in analytical_result.speciation.cluster_templates:
+        if (cluster_template.net_charge_number != 0) != charged:
+            continue
+        cluster_concentration_mol_m3 = (
+            analytical_result.speciation.cluster_concentrations_mol_m3[
+                cluster_template.label
+            ]
+        )
+        selected_concentration_mol_m3 += (
+            math.fsum(cluster_template.stoichiometry.values())
+            * cluster_concentration_mol_m3
+        )
+    return _nonnegative_float(
+        selected_concentration_mol_m3 / total_ion_concentration_mol_m3,
+        context,
+    )
+
+
+def _trajectory_total_ion_concentration_mol_m3(
+    analytical_result: "AnalyticalConductivityModelResult",
+) -> float:
+    from conductivity.analytical_conductivity_model import (
+        STANDARD_STATE_CONCENTRATION_MOL_M3,
+    )
+
+    return _positive_float(
+        math.fsum(
+            component.analytical_concentration_M
+            * STANDARD_STATE_CONCENTRATION_MOL_M3
+            for component in analytical_result.speciation.components
+        ),
+        "trajectory_total_ion_concentration_mol_m3",
+    )
+
+
+def _trajectory_cluster_thermodynamic_diagnostics(
+    trajectory_target: TrajectoryPrimitiveCalibrationTarget,
+    analytical_result: "AnalyticalConductivityModelResult",
+    primitive_parameters: ConductivityPrimitiveParameterSet,
+) -> tuple["MolecularClusterThermodynamicDiagnostic", ...]:
+    from constants import R
+    from conductivity.analytical_conductivity_model import (
+        cluster_activity_correction_J_mol,
+    )
+    from conductivity.molecular_property_db_audit import (
+        MolecularClusterThermodynamicDiagnostic,
+    )
+
+    total_ion_concentration_mol_m3 = _trajectory_total_ion_concentration_mol_m3(
+        analytical_result,
+    )
+    diagnostics: list[MolecularClusterThermodynamicDiagnostic] = []
+    for cluster_template in analytical_result.speciation.cluster_templates:
+        cluster_concentration_mol_m3 = (
+            analytical_result.speciation.cluster_concentrations_mol_m3[
+                cluster_template.label
+            ]
+        )
+        cluster_ion_count = math.fsum(cluster_template.stoichiometry.values())
+        standard_free_energy_over_RT = (
+            cluster_template.standard_free_energy_J_mol
+            / (R * trajectory_target.recipe.temperature_K)
+        )
+        diagnostics.append(
+            MolecularClusterThermodynamicDiagnostic(
+                row_id=0,
+                cluster_label=cluster_template.label,
+                cluster_kind=cluster_template.cluster_kind,
+                stoichiometry=dict(cluster_template.stoichiometry),
+                net_charge_number=cluster_template.net_charge_number,
+                concentration_mol_m3=cluster_concentration_mol_m3,
+                concentration_fraction_of_total_ion=(
+                    cluster_concentration_mol_m3
+                    * cluster_ion_count
+                    / total_ion_concentration_mol_m3
+                ),
+                standard_free_energy_J_mol=(
+                    cluster_template.standard_free_energy_J_mol
+                ),
+                standard_free_energy_over_RT=standard_free_energy_over_RT,
+                log_equilibrium_constant=-standard_free_energy_over_RT,
+                coulomb_J_mol=cluster_template.coulomb_J_mol,
+                desolvation_J_mol=cluster_template.desolvation_J_mol,
+                coordination_J_mol=cluster_template.coordination_J_mol,
+                steric_J_mol=cluster_template.steric_J_mol,
+                entropy_J_mol=cluster_template.entropy_J_mol,
+                activity_reference_J_mol=(
+                    cluster_template.activity_reference_J_mol
+                ),
+                activity_correction_J_mol=cluster_activity_correction_J_mol(
+                    analytical_result.speciation.components,
+                    cluster_template,
+                    analytical_result.speciation.free_component_concentrations_mol_m3,
+                    analytical_result.solvent_environment,
+                    primitive_parameters,
+                ),
+                hydrodynamic_radius_A=cluster_template.hydrodynamic_radius_A,
+                molecular_volume_A3=cluster_template.molecular_volume_A3,
+            )
+        )
+    return tuple(diagnostics)
+
+
+def load_progress_checkpoint_primitive_parameters(
+    progress_path: str,
+    coordinate_bounds: tuple[PrimitiveParameterTransform, ...],
+    options: PrimitiveFitOptions,
+    regularization_reference_parameters: ConductivityPrimitiveParameterSet,
+) -> ConductivityPrimitiveParameterSet:
+    progress_path_text = _nonempty_string(progress_path, "progress_path")
+    checkpoint_mapping = json.loads(
+        Path(progress_path_text).read_text(encoding="utf-8")
+    )
+    if not isinstance(checkpoint_mapping, dict):
+        raise TypeError("fit progress checkpoint must contain a JSON object")
+    _required_checkpoint_value(
+        checkpoint_mapping,
+        "artifact_type",
+        "fit progress checkpoint",
+    )
+    if checkpoint_mapping["artifact_type"] != PRIMITIVE_FIT_PROGRESS_ARTIFACT_TYPE:
+        raise ValueError(
+            "fit progress checkpoint artifact_type must be "
+            f"{PRIMITIVE_FIT_PROGRESS_ARTIFACT_TYPE}"
+        )
+    current_best_mapping = _required_checkpoint_mapping(
+        checkpoint_mapping,
+        "current_best",
+        "fit progress checkpoint",
+    )
+    _validate_checkpoint_digest(
+        current_best_mapping,
+        "coordinate_bounds_digest",
+        _coordinate_bounds_digest(coordinate_bounds),
+    )
+    _validate_checkpoint_digest(
+        current_best_mapping,
+        "fit_options_digest",
+        _fit_options_digest(options),
+    )
+    _validate_checkpoint_digest(
+        current_best_mapping,
+        "regularization_reference_digest",
+        _primitive_parameters_digest(regularization_reference_parameters),
+    )
+    primitive_parameter_mapping = _required_checkpoint_mapping(
+        current_best_mapping,
+        "primitive_parameters",
+        "fit progress current_best",
+    )
+    primitive_parameters = conductivity_primitive_parameters_from_mapping(
+        primitive_parameter_mapping,
+    )
+    validate_conductivity_primitive_parameters(primitive_parameters)
+    return primitive_parameters
+
+
+def _required_checkpoint_mapping(
+    mapping: dict,
+    key: str,
+    context: str,
+) -> dict:
+    value = _required_checkpoint_value(mapping, key, context)
+    if not isinstance(value, dict):
+        raise TypeError(f"{context}.{key} must be an object")
+    return value
+
+
+def _required_checkpoint_value(
+    mapping: dict,
+    key: str,
+    context: str,
+):
+    _nonempty_string(key, "checkpoint_key")
+    _nonempty_string(context, "checkpoint_context")
+    if key not in mapping:
+        raise ValueError(f"{context} missing {key}")
+    return mapping[key]
+
+
+def _validate_checkpoint_digest(
+    mapping: dict,
+    key: str,
+    expected_digest: str,
+) -> None:
+    observed_digest_value = _required_checkpoint_value(
+        mapping,
+        key,
+        "fit progress current_best",
+    )
+    if not isinstance(observed_digest_value, str):
+        raise TypeError(f"fit progress current_best.{key} must be a string")
+    expected_digest_text = _nonempty_string(expected_digest, f"{key}.expected")
+    if observed_digest_value != expected_digest_text:
+        raise ValueError(
+            f"fit progress current_best.{key} does not match current run"
+        )
+
+
+def calibration_error_decomposition_report_mapping(
+    snapshot_parameter_sets: tuple[
+        tuple[str, ConductivityPrimitiveParameterSet],
+        ...,
+    ],
+    cases: tuple["MolecularPropertyDbCase", ...],
+    audit_options: "MolecularPropertyDbAuditOptions",
+    fit_options: PrimitiveFitOptions,
+    trajectory_targets: tuple[TrajectoryPrimitiveCalibrationTarget, ...],
+) -> dict:
+    if not snapshot_parameter_sets:
+        raise ValueError("calibration decomposition report requires snapshots")
+    snapshots = []
+    for snapshot_name, primitive_parameters in snapshot_parameter_sets:
+        snapshots.append(
+            _calibration_snapshot_decomposition_mapping(
+                snapshot_name,
+                primitive_parameters,
+                cases,
+                audit_options,
+                fit_options,
+                trajectory_targets,
+            )
+        )
+    return {
+        "artifact_type": "molecular_conductivity_calibration_error_decomposition",
+        "snapshot_count": len(snapshots),
+        "snapshots": snapshots,
+    }
+
+
+def _calibration_snapshot_decomposition_mapping(
+    snapshot_name: str,
+    primitive_parameters: ConductivityPrimitiveParameterSet,
+    cases: tuple["MolecularPropertyDbCase", ...],
+    audit_options: "MolecularPropertyDbAuditOptions",
+    fit_options: PrimitiveFitOptions,
+    trajectory_targets: tuple[TrajectoryPrimitiveCalibrationTarget, ...],
+) -> dict:
+    from conductivity.molecular_property_db_audit import (
+        audit_molecular_property_db_cases,
+    )
+
+    snapshot_name_text = _nonempty_string(snapshot_name, "snapshot_name")
+    validate_conductivity_primitive_parameters(primitive_parameters)
+    audit_result = audit_molecular_property_db_cases(
+        cases,
+        primitive_parameters,
+        audit_options,
+    )
+    trajectory_losses = _trajectory_primitive_loss_breakdown(
+        trajectory_targets,
+        primitive_parameters,
+        audit_options,
+        fit_options,
+    )
+    coverages = trajectory_concentration_target_coverage(
+        trajectory_targets,
+        primitive_parameters,
+        audit_options,
+    )
+    return {
+        "snapshot_name": snapshot_name_text,
+        "primitive_parameters_digest": _primitive_parameters_digest(
+            primitive_parameters,
+        ),
+        "property_metrics": {
+            "mae_mS_cm": audit_result.mae_mS_cm,
+            "bias_mS_cm": audit_result.bias_mS_cm,
+            "pearson_r": audit_result.pearson_r,
+            "worst_abs_residual_mS_cm": audit_result.maximum_abs_residual_mS_cm,
+            "failed_rows": audit_result.failed_rows,
+        },
+        "trajectory_losses": {
+            "concentration_loss": trajectory_losses.concentration_loss,
+            "transition_rate_loss": trajectory_losses.transition_rate_loss,
+            "displacement_moment_loss": trajectory_losses.displacement_moment_loss,
+            "sigma_loss_mS_cm": trajectory_losses.sigma_loss_mS_cm,
+        },
+        "trajectory_coverage": tuple(
+            _trajectory_coverage_mapping(coverage) for coverage in coverages
+        ),
+        "direct_corrector_failure_counts": {
+            "direct_capacity_failure_count": sum(
+                1 for row in audit_result.rows if row.direct_capacity_failure
+            ),
+            "corrector_too_strong_failure_count": sum(
+                1 for row in audit_result.rows if row.corrector_too_strong_failure
+            ),
+            "corrector_too_weak_failure_count": sum(
+                1 for row in audit_result.rows if row.corrector_too_weak_failure
+            ),
+        },
+        "worst_rows": tuple(
+            _calibration_worst_row_mapping(row_result, fit_options)
+            for row_result in tuple(
+                sorted(
+                    audit_result.rows,
+                    key=_absolute_residual_sort_key,
+                    reverse=True,
+                )
+            )[: fit_options.residual_tail_count]
+        ),
+    }
+
+
+def _trajectory_coverage_mapping(
+    coverage: TrajectoryConcentrationTargetCoverage,
+) -> dict:
+    return {
+        "system_id": coverage.system_id,
+        "positive_target_count": coverage.positive_target_count,
+        "reachable_target_count": coverage.reachable_target_count,
+        "unreachable_target_labels": coverage.unreachable_target_labels,
+        "under_floor_target_labels": coverage.under_floor_target_labels,
+        "target_rows": tuple(
+            {
+                "target_label": target_label,
+                "target_concentration_mol_m3": target_concentration_mol_m3,
+                "predicted_concentration_mol_m3": predicted_concentration_mol_m3,
+                "reachable": reachable,
+            }
+            for (
+                target_label,
+                target_concentration_mol_m3,
+                predicted_concentration_mol_m3,
+                reachable,
+            ) in coverage.predicted_target_rows
+        ),
+    }
+
+
+def _calibration_worst_row_mapping(
+    row_result: "MolecularPropertyDbRowResult",
+    fit_options: PrimitiveFitOptions,
+) -> dict:
+    return {
+        "row_id": row_result.row_id,
+        "source_row_ids": row_result.source_row_ids,
+        "empirical_sigma_mS_cm": row_result.empirical_sigma_mS_cm,
+        "predicted_sigma_mS_cm": row_result.predicted_sigma_mS_cm,
+        "residual_mS_cm": row_result.residual_mS_cm,
+        "direct_sigma_mS_cm": row_result.direct_sigma_mS_cm,
+        "corrector_sigma_mS_cm": row_result.corrector_sigma_mS_cm,
+        "direct_capacity_gap_mS_cm": row_result.direct_capacity_gap_mS_cm,
+        "corrector_target_mS_cm": row_result.corrector_target_mS_cm,
+        "corrector_residual_mS_cm": row_result.corrector_residual_mS_cm,
+        "direct_capacity_failure": row_result.direct_capacity_failure,
+        "corrector_too_strong_failure": row_result.corrector_too_strong_failure,
+        "corrector_too_weak_failure": row_result.corrector_too_weak_failure,
+        "free_ion_fraction": row_result.free_ion_fraction,
+        "charged_cluster_fraction": row_result.charged_cluster_fraction,
+        "neutral_cluster_fraction": row_result.neutral_cluster_fraction,
+        "charge_weighted_transport_concentration_mol_m3": (
+            row_result.charge_weighted_transport_concentration_mol_m3
+        ),
+        "charged_cluster_direct_sigma_mS_cm": (
+            row_result.charged_cluster_direct_sigma_mS_cm
+        ),
+        "charged_cluster_corrector_sigma_mS_cm": (
+            row_result.charged_cluster_corrector_sigma_mS_cm
+        ),
+        "charged_cluster_net_sigma_mS_cm": (
+            row_result.charged_cluster_net_sigma_mS_cm
+        ),
+        "direct_sigma_by_transport_role_mS_cm": dict(
+            row_result.direct_sigma_by_transport_role_mS_cm
+        ),
+        "corrector_sigma_by_transport_role_mS_cm": dict(
+            row_result.corrector_sigma_by_transport_role_mS_cm
+        ),
+        "net_sigma_by_transport_role_mS_cm": dict(
+            row_result.net_sigma_by_transport_role_mS_cm
+        ),
+        "top_clusters_by_concentration": tuple(
+            _cluster_thermodynamic_mapping(cluster_diagnostic)
+            for cluster_diagnostic in tuple(
+                sorted(
+                    row_result.cluster_thermodynamic_diagnostics,
+                    key=_cluster_concentration_sort_key,
+                    reverse=True,
+                )
+            )[: fit_options.residual_tail_count]
+        ),
+        "top_clusters_by_favorable_free_energy": tuple(
+            _cluster_thermodynamic_mapping(cluster_diagnostic)
+            for cluster_diagnostic in tuple(
+                sorted(
+                    row_result.cluster_thermodynamic_diagnostics,
+                    key=_cluster_free_energy_sort_key,
+                )
+            )[: fit_options.residual_tail_count]
+        ),
+    }
+
+
+def _cluster_concentration_sort_key(
+    cluster_diagnostic: "MolecularClusterThermodynamicDiagnostic",
+) -> float:
+    return cluster_diagnostic.concentration_mol_m3
+
+
+def _cluster_free_energy_sort_key(
+    cluster_diagnostic: "MolecularClusterThermodynamicDiagnostic",
+) -> float:
+    return cluster_diagnostic.standard_free_energy_over_RT
+
+
+def _cluster_thermodynamic_mapping(
+    cluster_diagnostic: "MolecularClusterThermodynamicDiagnostic",
+) -> dict:
+    return {
+        "cluster_label": cluster_diagnostic.cluster_label,
+        "cluster_kind": cluster_diagnostic.cluster_kind,
+        "stoichiometry": dict(cluster_diagnostic.stoichiometry),
+        "net_charge_number": cluster_diagnostic.net_charge_number,
+        "concentration_mol_m3": cluster_diagnostic.concentration_mol_m3,
+        "concentration_fraction_of_total_ion": (
+            cluster_diagnostic.concentration_fraction_of_total_ion
+        ),
+        "standard_free_energy_over_RT": (
+            cluster_diagnostic.standard_free_energy_over_RT
+        ),
+        "log_equilibrium_constant": cluster_diagnostic.log_equilibrium_constant,
+        "coulomb_J_mol": cluster_diagnostic.coulomb_J_mol,
+        "desolvation_J_mol": cluster_diagnostic.desolvation_J_mol,
+        "coordination_J_mol": cluster_diagnostic.coordination_J_mol,
+        "steric_J_mol": cluster_diagnostic.steric_J_mol,
+        "entropy_J_mol": cluster_diagnostic.entropy_J_mol,
+        "activity_correction_J_mol": (
+            cluster_diagnostic.activity_correction_J_mol
+        ),
+        "hydrodynamic_radius_A": cluster_diagnostic.hydrodynamic_radius_A,
+        "molecular_volume_A3": cluster_diagnostic.molecular_volume_A3,
+    }
+
+
 def _primitive_candidate_artifact_mapping(
     artifact_path: str,
     expected_artifact_type: str,
@@ -3810,6 +6043,582 @@ def _primitive_candidate_artifact_mapping(
             f"{expected_type_text}, found {artifact_type}"
         )
     return artifact_value
+
+
+def load_trajectory_primitive_calibration_targets(
+    target_paths: tuple[str, ...],
+) -> tuple[TrajectoryPrimitiveCalibrationTarget, ...]:
+    return tuple(
+        _trajectory_primitive_calibration_target_from_path(target_path)
+        for target_path in target_paths
+    )
+
+
+def _trajectory_primitive_calibration_target_from_path(
+    target_path: str,
+) -> TrajectoryPrimitiveCalibrationTarget:
+    artifact_path = _nonempty_string(target_path, "trajectory_primitive_target_path")
+    artifact_text = Path(artifact_path).read_text(encoding="utf-8")
+    artifact_mapping = _json_mapping(json.loads(artifact_text), artifact_path)
+    artifact_type = _required_json_string(
+        artifact_mapping,
+        "artifact_type",
+        artifact_path,
+    )
+    if artifact_type != TRAJECTORY_PRIMITIVE_CALIBRATION_ARTIFACT_TYPE:
+        raise ValueError(
+            "trajectory primitive artifact_type must be "
+            f"{TRAJECTORY_PRIMITIVE_CALIBRATION_ARTIFACT_TYPE}, found {artifact_type}"
+        )
+    system_id = _required_json_string(artifact_mapping, "system_id", artifact_path)
+    return TrajectoryPrimitiveCalibrationTarget(
+        system_id=system_id,
+        recipe=_molecular_recipe_from_json_mapping(
+            _required_json_mapping(artifact_mapping, "recipe", artifact_path),
+            f"{artifact_path}.recipe",
+        ),
+        species_inputs=_molecular_species_inputs_from_json_mapping(
+            _required_json_mapping(artifact_mapping, "species_inputs", artifact_path),
+            f"{artifact_path}.species_inputs",
+        ),
+        primitive_target_artifact=_trajectory_primitive_target_artifact_from_mapping(
+            system_id,
+            _required_json_mapping(
+                artifact_mapping,
+                "primitive_targets",
+                artifact_path,
+            ),
+            f"{artifact_path}.primitive_targets",
+        ),
+    )
+
+
+def _json_mapping(
+    value,
+    context: str,
+) -> dict:
+    if not isinstance(value, dict):
+        raise TypeError(f"{context} must be a JSON object")
+    return value
+
+
+def _required_json_mapping(
+    mapping: dict,
+    key: str,
+    context: str,
+) -> dict:
+    if key not in mapping:
+        raise ValueError(f"{context} missing {key}")
+    return _json_mapping(mapping[key], f"{context}.{key}")
+
+
+def _required_json_list(
+    mapping: dict,
+    key: str,
+    context: str,
+) -> list:
+    if key not in mapping:
+        raise ValueError(f"{context} missing {key}")
+    value = mapping[key]
+    if not isinstance(value, list):
+        raise TypeError(f"{context}.{key} must be a list")
+    return value
+
+
+def _required_json_string(
+    mapping: dict,
+    key: str,
+    context: str,
+) -> str:
+    if key not in mapping:
+        raise ValueError(f"{context} missing {key}")
+    value = mapping[key]
+    if not isinstance(value, str) or value == "":
+        raise ValueError(f"{context}.{key} must be a nonempty string")
+    return value
+
+
+def _required_json_text(
+    mapping: dict,
+    key: str,
+    context: str,
+) -> str:
+    if key not in mapping:
+        raise ValueError(f"{context} missing {key}")
+    value = mapping[key]
+    if not isinstance(value, str):
+        raise TypeError(f"{context}.{key} must be a string")
+    return value
+
+
+def _required_json_bool(
+    mapping: dict,
+    key: str,
+    context: str,
+) -> bool:
+    if key not in mapping:
+        raise ValueError(f"{context} missing {key}")
+    value = mapping[key]
+    if not isinstance(value, bool):
+        raise TypeError(f"{context}.{key} must be a boolean")
+    return value
+
+
+def _required_json_int(
+    mapping: dict,
+    key: str,
+    context: str,
+) -> int:
+    if key not in mapping:
+        raise ValueError(f"{context} missing {key}")
+    value = mapping[key]
+    if not isinstance(value, int):
+        raise TypeError(f"{context}.{key} must be an integer")
+    return value
+
+
+def _required_json_float(
+    mapping: dict,
+    key: str,
+    context: str,
+) -> float:
+    if key not in mapping:
+        raise ValueError(f"{context} missing {key}")
+    value = mapping[key]
+    if not isinstance(value, (int, float)):
+        raise TypeError(f"{context}.{key} must be numeric")
+    return _finite_float(float(value), f"{context}.{key}")
+
+
+def _required_json_positive_float(
+    mapping: dict,
+    key: str,
+    context: str,
+) -> float:
+    return _positive_float(
+        _required_json_float(mapping, key, context),
+        f"{context}.{key}",
+    )
+
+
+def _required_json_nonnegative_float(
+    mapping: dict,
+    key: str,
+    context: str,
+) -> float:
+    return _nonnegative_float(
+        _required_json_float(mapping, key, context),
+        f"{context}.{key}",
+    )
+
+
+def _required_json_positive_int(
+    mapping: dict,
+    key: str,
+    context: str,
+) -> int:
+    return _positive_int(
+        _required_json_int(mapping, key, context),
+        f"{context}.{key}",
+    )
+
+
+def _required_json_nonnegative_int(
+    mapping: dict,
+    key: str,
+    context: str,
+) -> int:
+    return _nonnegative_int(
+        _required_json_int(mapping, key, context),
+        f"{context}.{key}",
+    )
+
+
+def _molecular_recipe_from_json_mapping(
+    recipe_mapping: dict,
+    context: str,
+) -> "MolecularElectrolyteRecipe":
+    from conductivity.analytical_conductivity_model import (
+        MolecularElectrolyteRecipe,
+        MolecularMixtureProperties,
+    )
+
+    mixture_mapping = _required_json_mapping(
+        recipe_mapping,
+        "mixture_properties",
+        context,
+    )
+    return MolecularElectrolyteRecipe(
+        cations=_required_float_mapping(recipe_mapping, "cations", context),
+        anions=_required_float_mapping(recipe_mapping, "anions", context),
+        solvents=_required_float_mapping(recipe_mapping, "solvents", context),
+        additives=_required_float_mapping(recipe_mapping, "additives", context),
+        temperature_K=_required_json_positive_float(
+            recipe_mapping,
+            "temperature_K",
+            context,
+        ),
+        pressure_Pa=_required_json_positive_float(
+            recipe_mapping,
+            "pressure_Pa",
+            context,
+        ),
+        mixture_properties=MolecularMixtureProperties(
+            density_g_ml=_required_json_positive_float(
+                mixture_mapping,
+                "density_g_ml",
+                f"{context}.mixture_properties",
+            ),
+            viscosity_cP=_required_json_positive_float(
+                mixture_mapping,
+                "viscosity_cP",
+                f"{context}.mixture_properties",
+            ),
+            dielectric_constant=_required_json_positive_float(
+                mixture_mapping,
+                "dielectric_constant",
+                f"{context}.mixture_properties",
+            ),
+        ),
+    )
+
+
+def _molecular_species_inputs_from_json_mapping(
+    species_inputs_mapping: dict,
+    context: str,
+) -> Mapping[str, "MolecularSpeciesInput"]:
+    from conductivity.analytical_conductivity_model import MolecularSpeciesInput
+
+    species_inputs: dict[str, MolecularSpeciesInput] = {}
+    for species_name, raw_species_mapping in species_inputs_mapping.items():
+        species_context = f"{context}.{species_name}"
+        species_mapping = _json_mapping(raw_species_mapping, species_context)
+        species_inputs[species_name] = MolecularSpeciesInput(
+            name=_required_json_string(species_mapping, "name", species_context),
+            role=_required_json_string(species_mapping, "role", species_context),
+            charge_number=_required_json_int(
+                species_mapping,
+                "charge_number",
+                species_context,
+            ),
+            smiles=_required_json_text(species_mapping, "smiles", species_context),
+            xyz_coordinates=_required_xyz_coordinates(
+                species_mapping,
+                "xyz_coordinates",
+                species_context,
+            ),
+            property_overrides=_required_float_mapping(
+                species_mapping,
+                "property_overrides",
+                species_context,
+            ),
+            coordination_sites=_required_string_tuple(
+                species_mapping,
+                "coordination_sites",
+                species_context,
+            ),
+        )
+    return species_inputs
+
+
+def _required_float_mapping(
+    mapping: dict,
+    key: str,
+    context: str,
+) -> Mapping[str, float]:
+    value_mapping = _required_json_mapping(mapping, key, context)
+    parsed_mapping: dict[str, float] = {}
+    for value_key, raw_value in value_mapping.items():
+        if not isinstance(value_key, str) or value_key == "":
+            raise ValueError(f"{context}.{key} contains an empty key")
+        if not isinstance(raw_value, (int, float)):
+            raise TypeError(f"{context}.{key}.{value_key} must be numeric")
+        parsed_mapping[value_key] = _finite_float(
+            float(raw_value),
+            f"{context}.{key}.{value_key}",
+        )
+    return parsed_mapping
+
+
+def _required_string_tuple(
+    mapping: dict,
+    key: str,
+    context: str,
+) -> tuple[str, ...]:
+    values = _required_json_list(mapping, key, context)
+    parsed_values: list[str] = []
+    for value_index, raw_value in enumerate(values):
+        value_context = f"{context}.{key}[{value_index}]"
+        if not isinstance(raw_value, str) or raw_value == "":
+            raise ValueError(f"{value_context} must be a nonempty string")
+        parsed_values.append(raw_value)
+    return tuple(parsed_values)
+
+
+def _required_xyz_coordinates(
+    mapping: dict,
+    key: str,
+    context: str,
+) -> tuple[tuple[str, float, float, float], ...]:
+    coordinate_rows = _required_json_list(mapping, key, context)
+    parsed_coordinates: list[tuple[str, float, float, float]] = []
+    for row_index, raw_coordinate_row in enumerate(coordinate_rows):
+        row_context = f"{context}.{key}[{row_index}]"
+        if not isinstance(raw_coordinate_row, list):
+            raise TypeError(f"{row_context} must be a list")
+        coordinate_row_length = 4
+        if len(raw_coordinate_row) != coordinate_row_length:
+            raise ValueError(f"{row_context} must contain element,x,y,z")
+        element_symbol = raw_coordinate_row[0]
+        if not isinstance(element_symbol, str) or element_symbol == "":
+            raise ValueError(f"{row_context}.element must be a nonempty string")
+        parsed_coordinates.append(
+            (
+                element_symbol,
+                _finite_float(float(raw_coordinate_row[1]), f"{row_context}.x"),
+                _finite_float(float(raw_coordinate_row[2]), f"{row_context}.y"),
+                _finite_float(float(raw_coordinate_row[3]), f"{row_context}.z"),
+            )
+        )
+    return tuple(parsed_coordinates)
+
+
+def _trajectory_primitive_target_artifact_from_mapping(
+    system_id: str,
+    target_mapping: dict,
+    context: str,
+) -> "TrajectoryPrimitiveTargetArtifact":
+    from conductivity.trajectory_primitive_targets import (
+        TrajectoryPrimitiveTargetArtifact,
+    )
+
+    block_targets = tuple(
+        _trajectory_block_target_from_mapping(
+            _json_mapping(raw_block_target, f"{context}.block_targets[{block_index}]"),
+            f"{context}.block_targets[{block_index}]",
+        )
+        for block_index, raw_block_target in enumerate(
+            _required_json_list(target_mapping, "block_targets", context)
+        )
+    )
+    return TrajectoryPrimitiveTargetArtifact(
+        system_id=system_id,
+        frame_count=_required_json_positive_int(target_mapping, "frame_count", context),
+        dt_s=_required_json_positive_float(target_mapping, "dt_s", context),
+        frame_stride=_required_json_positive_int(
+            target_mapping,
+            "frame_stride",
+            context,
+        ),
+        block_count=_required_json_positive_int(target_mapping, "block_count", context),
+        state_concentrations_mol_m3=_required_float_mapping(
+            target_mapping,
+            "state_concentrations_mol_m3",
+            context,
+        ),
+        state_occupancy_fractions=_required_float_mapping(
+            target_mapping,
+            "state_occupancy_fractions",
+            context,
+        ),
+        transition_rates_s_inv=_required_float_mapping(
+            target_mapping,
+            "transition_rates_s_inv",
+            context,
+        ),
+        transition_rate_targets_validated=_required_json_bool(
+            target_mapping,
+            "transition_rate_targets_validated",
+            context,
+        ),
+        transition_fluxes_mol_m3_s=_required_float_mapping(
+            target_mapping,
+            "transition_fluxes_mol_m3_s",
+            context,
+        ),
+        residence_times_s=_required_float_mapping(
+            target_mapping,
+            "residence_times_s",
+            context,
+        ),
+        displacement_moments_by_family=_displacement_moment_targets_from_json_mapping(
+            _required_json_mapping(
+                target_mapping,
+                "displacement_moments_by_family",
+                context,
+            ),
+            f"{context}.displacement_moments_by_family",
+        ),
+        displacement_moment_targets_validated=_required_json_bool(
+            target_mapping,
+            "displacement_moment_targets_validated",
+            context,
+        ),
+        markov_additive_sigma_mS_cm=_required_json_nonnegative_float(
+            target_mapping,
+            "markov_additive_sigma_mS_cm",
+            context,
+        ),
+        markov_direct_sigma_mS_cm=_required_json_nonnegative_float(
+            target_mapping,
+            "markov_direct_sigma_mS_cm",
+            context,
+        ),
+        markov_corrector_sigma_mS_cm=_required_json_nonnegative_float(
+            target_mapping,
+            "markov_corrector_sigma_mS_cm",
+            context,
+        ),
+        markov_additive_sigma_validated=_required_json_bool(
+            target_mapping,
+            "markov_additive_sigma_validated",
+            context,
+        ),
+        block_targets=block_targets,
+        block_state_concentration_standard_errors_mol_m3=_required_float_mapping(
+            target_mapping,
+            "block_state_concentration_standard_errors_mol_m3",
+            context,
+        ),
+        block_transition_rate_standard_errors_s_inv=_required_float_mapping(
+            target_mapping,
+            "block_transition_rate_standard_errors_s_inv",
+            context,
+        ),
+        block_displacement_moment_standard_errors_m2=_required_float_mapping(
+            target_mapping,
+            "block_displacement_moment_standard_errors_m2",
+            context,
+        ),
+        block_sigma_standard_error_mS_cm=_required_json_nonnegative_float(
+            target_mapping,
+            "block_sigma_standard_error_mS_cm",
+            context,
+        ),
+    )
+
+
+def _trajectory_block_target_from_mapping(
+    block_mapping: dict,
+    context: str,
+) -> "TrajectoryBlockPrimitiveTarget":
+    from conductivity.trajectory_primitive_targets import TrajectoryBlockPrimitiveTarget
+
+    return TrajectoryBlockPrimitiveTarget(
+        block_index=_required_json_nonnegative_int(
+            block_mapping,
+            "block_index",
+            context,
+        ),
+        frame_count=_required_json_positive_int(block_mapping, "frame_count", context),
+        step_count=_required_json_positive_int(block_mapping, "step_count", context),
+        state_concentrations_mol_m3=_required_float_mapping(
+            block_mapping,
+            "state_concentrations_mol_m3",
+            context,
+        ),
+        state_occupancy_fractions=_required_float_mapping(
+            block_mapping,
+            "state_occupancy_fractions",
+            context,
+        ),
+        transition_rates_s_inv=_required_float_mapping(
+            block_mapping,
+            "transition_rates_s_inv",
+            context,
+        ),
+        transition_rate_targets_validated=_required_json_bool(
+            block_mapping,
+            "transition_rate_targets_validated",
+            context,
+        ),
+        transition_fluxes_mol_m3_s=_required_float_mapping(
+            block_mapping,
+            "transition_fluxes_mol_m3_s",
+            context,
+        ),
+        residence_times_s=_required_float_mapping(
+            block_mapping,
+            "residence_times_s",
+            context,
+        ),
+        displacement_moments_by_family=_displacement_moment_targets_from_json_mapping(
+            _required_json_mapping(
+                block_mapping,
+                "displacement_moments_by_family",
+                context,
+            ),
+            f"{context}.displacement_moments_by_family",
+        ),
+        markov_additive_sigma_mS_cm=_required_json_nonnegative_float(
+            block_mapping,
+            "markov_additive_sigma_mS_cm",
+            context,
+        ),
+        markov_direct_sigma_mS_cm=_required_json_nonnegative_float(
+            block_mapping,
+            "markov_direct_sigma_mS_cm",
+            context,
+        ),
+        markov_corrector_sigma_mS_cm=_required_json_nonnegative_float(
+            block_mapping,
+            "markov_corrector_sigma_mS_cm",
+            context,
+        ),
+    )
+
+
+def _displacement_moment_targets_from_json_mapping(
+    moment_mapping: dict,
+    context: str,
+) -> Mapping[str, "TrajectoryDisplacementMomentTarget"]:
+    from conductivity.trajectory_primitive_targets import (
+        TrajectoryDisplacementMomentTarget,
+    )
+
+    moment_targets: dict[str, TrajectoryDisplacementMomentTarget] = {}
+    for family_label, raw_family_mapping in moment_mapping.items():
+        family_context = f"{context}.{family_label}"
+        family_mapping = _json_mapping(raw_family_mapping, family_context)
+        moment_targets[family_label] = TrajectoryDisplacementMomentTarget(
+            sample_count=_required_json_positive_int(
+                family_mapping,
+                "sample_count",
+                family_context,
+            ),
+            mean_displacement_m=_required_float_triplet(
+                family_mapping,
+                "mean_displacement_m",
+                family_context,
+            ),
+            mean_squared_axis_displacement_m2=_required_float_triplet(
+                family_mapping,
+                "mean_squared_axis_displacement_m2",
+                family_context,
+            ),
+            mean_squared_displacement_m2=_required_json_nonnegative_float(
+                family_mapping,
+                "mean_squared_displacement_m2",
+                family_context,
+            ),
+        )
+    return moment_targets
+
+
+def _required_float_triplet(
+    mapping: dict,
+    key: str,
+    context: str,
+) -> tuple[float, float, float]:
+    values = _required_json_list(mapping, key, context)
+    expected_value_count = 3
+    if len(values) != expected_value_count:
+        raise ValueError(f"{context}.{key} must contain three values")
+    return (
+        _finite_float(float(values[0]), f"{context}.{key}[0]"),
+        _finite_float(float(values[1]), f"{context}.{key}[1]"),
+        _finite_float(float(values[2]), f"{context}.{key}[2]"),
+    )
 
 
 def _primitive_parameters_from_artifact_mapping(
@@ -3892,6 +6701,15 @@ def _positive_float_tuple(values: tuple[float, ...], context: str) -> tuple[floa
     if not values:
         raise ValueError(f"{context} must be nonempty")
     return tuple(_positive_float(value, context) for value in values)
+
+
+def _nonnegative_float_tuple(
+    values: tuple[float, ...],
+    context: str,
+) -> tuple[float, ...]:
+    if not values:
+        raise ValueError(f"{context} must be nonempty")
+    return tuple(_nonnegative_float(value, context) for value in values)
 
 
 def _nonnegative_float(value: float, context: str) -> float:
@@ -4130,6 +6948,9 @@ class RowFilteredPrimitiveEvaluator:
                 full_evaluation.descriptor_calibration_targets,
                 self._selected_row_indices,
             ),
+            trajectory_primitive_calibration_targets=(
+                full_evaluation.trajectory_primitive_calibration_targets
+            ),
             predicted_sigmas_mS_cm=_select_tuple_values(
                 full_evaluation.predicted_sigmas_mS_cm,
                 self._selected_row_indices,
@@ -4166,6 +6987,14 @@ class RowFilteredPrimitiveEvaluator:
                     selected_corrector_residuals,
                 )
             ),
+            trajectory_concentration_loss=full_evaluation.trajectory_concentration_loss,
+            trajectory_transition_rate_loss=(
+                full_evaluation.trajectory_transition_rate_loss
+            ),
+            trajectory_displacement_moment_loss=(
+                full_evaluation.trajectory_displacement_moment_loss
+            ),
+            trajectory_sigma_loss_mS_cm=full_evaluation.trajectory_sigma_loss_mS_cm,
             cluster_activation_penalty=full_evaluation.cluster_activation_penalty,
             failed_rows=full_evaluation.failed_rows,
             maximum_mass_balance_residual=(
@@ -4270,6 +7099,11 @@ def fit_decomposed_conductivity_primitives() -> DecomposedFitResult:
 
     audit_options = default_molecular_property_db_audit_options()
     fit_options, coordinate_bounds = default_molecular_primitive_fit_configuration()
+    trajectory_primitive_calibration_targets = (
+        load_trajectory_primitive_calibration_targets(
+            fit_options.trajectory_primitive_target_paths,
+        )
+    )
     block_fit_options = replace(
         fit_options,
         cluster_activation_loss_weight=(
@@ -4297,11 +7131,13 @@ def fit_decomposed_conductivity_primitives() -> DecomposedFitResult:
         case_selection.cases,
         audit_options,
         block_fit_options,
+        trajectory_primitive_calibration_targets,
     )
     full_evaluator = MolecularPropertyDbPrimitiveEvaluator(
         case_selection.cases,
         audit_options,
         fit_options,
+        trajectory_primitive_calibration_targets,
     )
     decomposed_context = DecomposedFitContext(
         cases=case_selection.cases,
@@ -4319,7 +7155,18 @@ def fit_decomposed_conductivity_primitives() -> DecomposedFitResult:
         full_evaluator=full_evaluator,
         regularization_reference_parameters=REFERENCE_CONDUCTIVITY_PRIMITIVE_PARAMETERS,
     )
-    current_parameters = configured_conductivity_primitive_parameters()
+    configured_parameters = configured_conductivity_primitive_parameters()
+    validate_trajectory_concentration_target_coverage(
+        trajectory_primitive_calibration_targets,
+        configured_parameters,
+        audit_options,
+    )
+    current_parameters = initialize_topology_logk_offsets_from_trajectory_concentrations(
+        configured_parameters,
+        trajectory_primitive_calibration_targets,
+        audit_options,
+        coordinate_bounds,
+    )
     baseline_audit_result = audit_molecular_property_db_cases(
         case_selection.cases,
         current_parameters,
@@ -4572,7 +7419,7 @@ def _cluster_sink_row_indices(
     sorted_index_and_row = tuple(
         sorted(
             enumerate(audit_result.rows),
-            key=lambda index_and_row: abs(index_and_row[1].residual_mS_cm),
+            key=_indexed_absolute_residual_sort_key,
             reverse=True,
         )
     )
@@ -4603,7 +7450,7 @@ def _transport_role_direct_scaling_audit(
         row_result
         for row_result in sorted(
             audit_result.rows,
-            key=lambda row_result: abs(row_result.residual_mS_cm),
+            key=_absolute_residual_sort_key,
             reverse=True,
         )[: fit_options.residual_tail_count]
         if row_result.direct_capacity_failure
@@ -4834,6 +7681,11 @@ def main() -> None:
 
     audit_options = default_molecular_property_db_audit_options()
     fit_options, coordinate_bounds = default_molecular_primitive_fit_configuration()
+    trajectory_primitive_calibration_targets = (
+        load_trajectory_primitive_calibration_targets(
+            fit_options.trajectory_primitive_target_paths,
+        )
+    )
     registry_source = MolecularPropertyDbRegistrySource(
         solvent_registry=SOLVENTS,
         salt_registry=SALTS,
@@ -4853,8 +7705,38 @@ def main() -> None:
         case_selection.cases,
         audit_options,
         fit_options,
+        trajectory_primitive_calibration_targets,
     )
     configured_parameters = configured_conductivity_primitive_parameters()
+    configured_trajectory_coverages = validate_trajectory_concentration_target_coverage(
+        trajectory_primitive_calibration_targets,
+        configured_parameters,
+        audit_options,
+    )
+    initialized_parameters = initialize_topology_logk_offsets_from_trajectory_concentrations(
+        configured_parameters,
+        trajectory_primitive_calibration_targets,
+        audit_options,
+        coordinate_bounds,
+    )
+    initialized_trajectory_coverages = validate_trajectory_concentration_target_coverage(
+        trajectory_primitive_calibration_targets,
+        initialized_parameters,
+        audit_options,
+    )
+    print_trajectory_topology_initialization_changes(
+        configured_parameters,
+        initialized_parameters,
+    )
+    print_trajectory_concentration_target_coverage(
+        "configured",
+        configured_trajectory_coverages,
+    )
+    print_trajectory_concentration_target_coverage(
+        "initialized",
+        initialized_trajectory_coverages,
+    )
+    configured_parameters = initialized_parameters
     baseline_audit_result = audit_molecular_property_db_cases(
         case_selection.cases,
         configured_parameters,
@@ -4922,6 +7804,7 @@ def main() -> None:
         fit_options,
         speciation_coordinate_bounds,
         REFERENCE_CONDUCTIVITY_PRIMITIVE_PARAMETERS,
+        trajectory_primitive_calibration_targets,
     )
     speciation_fit_result = fit_conductivity_primitive_parameters(
         speciation_sensitivity_result.candidate.primitive_parameters,
@@ -5245,7 +8128,7 @@ def main() -> None:
     print("verified_candidate_worst_rows")
     for row_result in sorted(
         candidate_audit_result.rows,
-        key=lambda row: abs(row.residual_mS_cm),
+        key=_absolute_residual_sort_key,
         reverse=True,
     )[:audit_options.audit_worst_row_count]:
         print(

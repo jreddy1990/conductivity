@@ -23,7 +23,7 @@ from conductivity.molecular_descriptors import (
     ROLE_CATION,
     ROLE_SOLVENT,
 )
-from conductivity.molecular_electrolyte_mori_generator import (
+from conductivity.analytical_conductivity_model import (
     MolecularElectrolyteRecipe,
     MolecularMixtureProperties,
     MolecularMoriConductivityResult,
@@ -237,6 +237,24 @@ class ConductivityDecompositionDiagnostic:
     direct_capacity_failure: bool
     corrector_too_strong_failure: bool
     corrector_too_weak_failure: bool
+
+
+def _molecular_case_row_id_sort_key(
+    molecular_case: MolecularPropertyDbCase,
+) -> int:
+    return molecular_case.row_id
+
+
+def _formulation_group_representative_row_id_sort_key(
+    formulation_group: MolecularPropertyDbFormulationGroup,
+) -> int:
+    return formulation_group.representative_row_id
+
+
+def _cluster_sensitivity_abs_sort_key(
+    diagnostic: MolecularClusterSensitivityDiagnostic,
+) -> float:
+    return abs(diagnostic.sensitivity_mS_cm_per_logK)
 
 
 @dataclass(frozen=True)
@@ -550,11 +568,11 @@ def _group_duplicate_formulation_cases(
         grouped_cases.append(grouped_case)
         formulation_groups.append(formulation_group)
     return (
-        tuple(sorted(grouped_cases, key=lambda molecular_case: molecular_case.row_id)),
+        tuple(sorted(grouped_cases, key=_molecular_case_row_id_sort_key)),
         tuple(
             sorted(
                 formulation_groups,
-                key=lambda formulation_group: formulation_group.representative_row_id,
+                key=_formulation_group_representative_row_id_sort_key,
             )
         ),
     )
@@ -568,7 +586,7 @@ def _grouped_formulation_case(
     if not formulation_cases:
         raise ValueError("formulation group must contain at least one case")
     sorted_cases = tuple(
-        sorted(formulation_cases, key=lambda molecular_case: molecular_case.row_id)
+        sorted(formulation_cases, key=_molecular_case_row_id_sort_key)
     )
     representative_case = sorted_cases[0]
     empirical_sigmas = tuple(
@@ -1039,7 +1057,7 @@ def cluster_sensitivity_diagnostics_for_row(
     return tuple(
         sorted(
             diagnostics,
-            key=lambda diagnostic: abs(diagnostic.sensitivity_mS_cm_per_logK),
+            key=_cluster_sensitivity_abs_sort_key,
             reverse=True,
         )
     )
