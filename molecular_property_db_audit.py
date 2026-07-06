@@ -24,16 +24,23 @@ from conductivity.molecular_descriptors import (
     ROLE_SOLVENT,
 )
 from conductivity.analytical_conductivity_model import (
+    MarkovAdditiveEvent,
+    MarkovAdditiveEventFamilyAttribution,
     MolecularElectrolyteRecipe,
     MolecularMixtureProperties,
     MolecularMoriConductivityResult,
     MolecularMoriOptions,
+    MolecularSolventEnvironment,
+    MolecularTransportCenter,
+    OnsagerFrictionEdge,
     TRANSPORT_ROLE_CHARGED_TRIPLET_CENTER,
     TRANSPORT_ROLE_CLUSTER_COM_CENTER,
     TRANSPORT_ROLE_CONTACT_PAIR_CENTER,
     TRANSPORT_ROLE_FREE_ION_CENTER,
     TRANSPORT_ROLE_INTERNAL_POLARIZATION_CENTER,
+    TRANSPORT_ROLE_LIGAND_SHELL_CENTER,
     TRANSPORT_ROLE_SOLVENT_SEPARATED_PAIR_CENTER,
+    compute_markov_additive_event_family_attribution,
     compute_molecular_electrolyte_conductivity_with_diagnostic_cluster_shifts,
 )
 from conductivity.molecular_primitive_parameters import (
@@ -64,8 +71,188 @@ TRANSPORT_ROLE_DIRECT_CORRECTOR_ATTRIBUTION_LABELS = (
     TRANSPORT_ROLE_CHARGED_TRIPLET_CENTER,
     TRANSPORT_ROLE_CLUSTER_COM_CENTER,
     TRANSPORT_ROLE_INTERNAL_POLARIZATION_CENTER,
+    TRANSPORT_ROLE_LIGAND_SHELL_CENTER,
     TRANSPORT_ROLE_CONTACT_PAIR_CENTER,
 )
+PRIMITIVE_RESIDUAL_HEAD_SELF_CURRENT_MOBILITY = "D_self_D_R"
+PRIMITIVE_RESIDUAL_HEAD_REACTIVE_FLUX_DISPLACEMENT = "K_Q_d_M"
+PRIMITIVE_RESIDUAL_HEAD_MORI_MEMORY = "A_h"
+PRIMITIVE_RESIDUAL_HEAD_NONE = "none"
+PRIMITIVE_RESIDUAL_HEAD_UNCLASSIFIED = "unclassified_projected_primitive"
+PRIMITIVE_RESIDUAL_THEOREM_SELF_CURRENT_MOBILITY = "D_self_i,D_i,R_i"
+PRIMITIVE_RESIDUAL_THEOREM_REACTIVE_FLUX_DISPLACEMENT = "K_ij,Q_ij,d_ij,M_ij"
+PRIMITIVE_RESIDUAL_THEOREM_MORI_MEMORY = "A,h"
+PRIMITIVE_RESIDUAL_THEOREM_NONE = "none"
+PRIMITIVE_RESIDUAL_THEOREM_UNCLASSIFIED = "unclassified"
+PRIMITIVE_RESIDUAL_COMPONENT_DIRECT_CAPACITY = "direct_capacity_gap"
+PRIMITIVE_RESIDUAL_COMPONENT_MORI_CORRECTOR_TOO_STRONG = "mori_corrector_too_strong"
+PRIMITIVE_RESIDUAL_COMPONENT_MORI_CORRECTOR_TOO_WEAK = "mori_corrector_too_weak"
+PRIMITIVE_RESIDUAL_COMPONENT_SYNTHETIC_DIRECT_CAPACITY = (
+    "synthetic_direct_capacity_gap"
+)
+PRIMITIVE_RESIDUAL_COMPONENT_WITHIN_DECOMPOSITION = (
+    "residual_within_direct_corrector_decomposition"
+)
+PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_FREE_ION_SELF_CURRENT = (
+    "free_ion_self_current"
+)
+PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_FREE_CATION_SELF_CURRENT = (
+    "free_Li_self_current"
+)
+PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_FREE_ANION_SELF_CURRENT = (
+    "free_anion_self_current"
+)
+PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_SOLVENT_SEPARATED_PAIR_SELF_CURRENT = (
+    "SSIP_projected_self_current"
+)
+PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_CHARGED_CLUSTER_SELF_CURRENT = (
+    "charged_cluster_self_current"
+)
+PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_CONTACT_PAIR_SELF_CURRENT = (
+    "contact_pair_self_current"
+)
+PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_INTERNAL_POLARIZATION_SELF_CURRENT = (
+    "internal_polarization_self_current"
+)
+PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_LIGAND_SHELL_SELF_CURRENT = (
+    "ligand_shell_self_current"
+)
+PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_ASSOCIATED_STATE_EXCHANGE = (
+    "associated_state_exchange"
+)
+PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_ASSOCIATION_STRUCTURAL_HOP = (
+    "association_structural_hop"
+)
+PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_ASSOCIATION_CONVERSION = (
+    "association_conversion"
+)
+PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_CURRENT_MEMORY = "current_memory_A_h"
+PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_ATMOSPHERE_MEMORY = "atmosphere_memory_A_h"
+PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_LOCAL_OBSTRUCTION = "local_obstruction"
+PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_VISCOSITY = "viscosity"
+PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_ANION_SHAPE_FRICTION = "anion_shape_friction"
+PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_HYDRODYNAMIC_SIZE = "hydrodynamic_size"
+PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_CHARGE_CLOUD_MOBILITY = (
+    "charge_cloud_mobility"
+)
+PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_NONE = "none"
+PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_UNCLASSIFIED = (
+    "unclassified_projected_primitive"
+)
+EVENT_FAMILY_PROJECTED_SINGLE_CENTER_SELF_CURRENT = (
+    "projected_single_center_self_current"
+)
+EVENT_FAMILY_PROJECTED_SOLVENT_SEPARATED_PAIR_SELF_CURRENT = (
+    "projected_solvent_separated_pair_self_current"
+)
+EVENT_FAMILY_ONSAGER_SELF_TRANSPORT = "onsager_self_transport"
+EVENT_FAMILY_ASSOCIATION_STRUCTURAL_HOP = "association_structural_hop"
+EVENT_FAMILY_ASSOCIATED_STATE_EXCHANGE = "associated_state_exchange"
+EVENT_FAMILY_ASSOCIATION_CONVERSION = "association_conversion"
+EVENT_FAMILY_ATMOSPHERE_MORI_CORRECTION = "atmosphere_mori_correction"
+PROJECTED_CENTER_ROLE_TOKEN_CATION = ":role=cation:"
+PROJECTED_CENTER_ROLE_TOKEN_ANION = ":role=anion:"
+SELF_CURRENT_EVENT_FAMILY_LABELS = frozenset(
+    (
+        EVENT_FAMILY_PROJECTED_SINGLE_CENTER_SELF_CURRENT,
+        EVENT_FAMILY_PROJECTED_SOLVENT_SEPARATED_PAIR_SELF_CURRENT,
+        EVENT_FAMILY_ONSAGER_SELF_TRANSPORT,
+    )
+)
+REACTIVE_FLUX_EVENT_FAMILY_LABELS = frozenset(
+    (
+        EVENT_FAMILY_ASSOCIATION_STRUCTURAL_HOP,
+        EVENT_FAMILY_ASSOCIATED_STATE_EXCHANGE,
+        EVENT_FAMILY_ASSOCIATION_CONVERSION,
+    )
+)
+PRIMITIVE_RESIDUAL_HEAD_BY_EVENT_FAMILY = {
+    EVENT_FAMILY_PROJECTED_SINGLE_CENTER_SELF_CURRENT: (
+        PRIMITIVE_RESIDUAL_HEAD_SELF_CURRENT_MOBILITY
+    ),
+    EVENT_FAMILY_PROJECTED_SOLVENT_SEPARATED_PAIR_SELF_CURRENT: (
+        PRIMITIVE_RESIDUAL_HEAD_SELF_CURRENT_MOBILITY
+    ),
+    EVENT_FAMILY_ONSAGER_SELF_TRANSPORT: (
+        PRIMITIVE_RESIDUAL_HEAD_SELF_CURRENT_MOBILITY
+    ),
+    EVENT_FAMILY_ASSOCIATION_STRUCTURAL_HOP: (
+        PRIMITIVE_RESIDUAL_HEAD_REACTIVE_FLUX_DISPLACEMENT
+    ),
+    EVENT_FAMILY_ASSOCIATED_STATE_EXCHANGE: (
+        PRIMITIVE_RESIDUAL_HEAD_REACTIVE_FLUX_DISPLACEMENT
+    ),
+    EVENT_FAMILY_ASSOCIATION_CONVERSION: (
+        PRIMITIVE_RESIDUAL_HEAD_REACTIVE_FLUX_DISPLACEMENT
+    ),
+    EVENT_FAMILY_ATMOSPHERE_MORI_CORRECTION: PRIMITIVE_RESIDUAL_HEAD_MORI_MEMORY,
+}
+PRIMITIVE_RESIDUAL_THEOREM_BY_EVENT_FAMILY = {
+    EVENT_FAMILY_PROJECTED_SINGLE_CENTER_SELF_CURRENT: (
+        PRIMITIVE_RESIDUAL_THEOREM_SELF_CURRENT_MOBILITY
+    ),
+    EVENT_FAMILY_PROJECTED_SOLVENT_SEPARATED_PAIR_SELF_CURRENT: (
+        PRIMITIVE_RESIDUAL_THEOREM_SELF_CURRENT_MOBILITY
+    ),
+    EVENT_FAMILY_ONSAGER_SELF_TRANSPORT: (
+        PRIMITIVE_RESIDUAL_THEOREM_SELF_CURRENT_MOBILITY
+    ),
+    EVENT_FAMILY_ASSOCIATION_STRUCTURAL_HOP: (
+        PRIMITIVE_RESIDUAL_THEOREM_REACTIVE_FLUX_DISPLACEMENT
+    ),
+    EVENT_FAMILY_ASSOCIATED_STATE_EXCHANGE: (
+        PRIMITIVE_RESIDUAL_THEOREM_REACTIVE_FLUX_DISPLACEMENT
+    ),
+    EVENT_FAMILY_ASSOCIATION_CONVERSION: (
+        PRIMITIVE_RESIDUAL_THEOREM_REACTIVE_FLUX_DISPLACEMENT
+    ),
+    EVENT_FAMILY_ATMOSPHERE_MORI_CORRECTION: PRIMITIVE_RESIDUAL_THEOREM_MORI_MEMORY,
+}
+PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_BY_REACTIVE_EVENT_FAMILY = {
+    EVENT_FAMILY_ASSOCIATED_STATE_EXCHANGE: (
+        PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_ASSOCIATED_STATE_EXCHANGE
+    ),
+    EVENT_FAMILY_ASSOCIATION_STRUCTURAL_HOP: (
+        PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_ASSOCIATION_STRUCTURAL_HOP
+    ),
+    EVENT_FAMILY_ASSOCIATION_CONVERSION: (
+        PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_ASSOCIATION_CONVERSION
+    ),
+    EVENT_FAMILY_ATMOSPHERE_MORI_CORRECTION: (
+        PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_ATMOSPHERE_MEMORY
+    ),
+}
+PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_BY_SELF_CURRENT_EVENT_FAMILY = {
+    EVENT_FAMILY_PROJECTED_SINGLE_CENTER_SELF_CURRENT: (
+        PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_FREE_ION_SELF_CURRENT
+    ),
+    EVENT_FAMILY_PROJECTED_SOLVENT_SEPARATED_PAIR_SELF_CURRENT: (
+        PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_SOLVENT_SEPARATED_PAIR_SELF_CURRENT
+    ),
+}
+PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_BY_TRANSPORT_ROLE = {
+    TRANSPORT_ROLE_FREE_ION_CENTER: (
+        PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_FREE_ION_SELF_CURRENT
+    ),
+    TRANSPORT_ROLE_SOLVENT_SEPARATED_PAIR_CENTER: (
+        PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_SOLVENT_SEPARATED_PAIR_SELF_CURRENT
+    ),
+    TRANSPORT_ROLE_CHARGED_TRIPLET_CENTER: (
+        PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_CHARGED_CLUSTER_SELF_CURRENT
+    ),
+    TRANSPORT_ROLE_CLUSTER_COM_CENTER: (
+        PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_CHARGED_CLUSTER_SELF_CURRENT
+    ),
+    TRANSPORT_ROLE_CONTACT_PAIR_CENTER: (
+        PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_CONTACT_PAIR_SELF_CURRENT
+    ),
+    TRANSPORT_ROLE_INTERNAL_POLARIZATION_CENTER: (
+        PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_INTERNAL_POLARIZATION_SELF_CURRENT
+    ),
+    TRANSPORT_ROLE_LIGAND_SHELL_CENTER: (
+        PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_LIGAND_SHELL_SELF_CURRENT
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -87,6 +274,7 @@ class MolecularPropertyDbAuditOptions:
     neutral_hbond_donor_count: int
     ion_hbond_donor_count: int
     ion_hbond_acceptor_count: int
+    include_event_family_attribution: bool
 
 
 @dataclass(frozen=True)
@@ -151,6 +339,29 @@ class MolecularPropertyDbCaseSelection:
 
 
 @dataclass(frozen=True)
+class MolecularPrimitiveResidualOwner:
+    primitive_head: str
+    theorem_object: str
+    production_lever: str
+    residual_component: str
+    residual_mS_cm: float
+    evidence_label: str
+    source_label: str
+
+
+@dataclass(frozen=True)
+class MolecularPrimitiveResidualOwnerSummary:
+    primitive_head: str
+    theorem_object: str
+    production_lever: str
+    row_count: int
+    sum_abs_residual_mS_cm: float
+    mean_signed_residual_mS_cm: float
+    mean_abs_residual_mS_cm: float
+    top_event_family: str
+
+
+@dataclass(frozen=True)
 class MolecularPropertyDbRowResult:
     row_id: int
     source_row_ids: tuple[int, ...]
@@ -160,8 +371,23 @@ class MolecularPropertyDbRowResult:
     residual_mS_cm: float
     failed: bool
     failure_reason: str
+    proof_status: str
     direct_sigma_mS_cm: float
     corrector_sigma_mS_cm: float
+    onsager_ne_sigma_mS_cm: float
+    onsager_sigma_mS_cm: float
+    onsager_correlation_corrector_mS_cm: float
+    markov_state_changing_direct_sigma_mS_cm: float
+    markov_state_changing_corrector_sigma_mS_cm: float
+    projected_current_memory_corrector_sigma_mS_cm: float
+    atmosphere_current_memory_corrector_sigma_mS_cm: float
+    structural_current_memory_corrector_delta_mS_cm: float
+    sigma_without_structural_current_memory_mS_cm: float
+    onsager_edge_count: int
+    max_onsager_edge_friction: float
+    top_onsager_friction_edges: tuple[tuple[str, str, float], ...]
+    min_friction_matrix_eigenvalue: float
+    min_projected_mobility_eigenvalue: float
     direct_capacity_gap_mS_cm: float
     corrector_target_mS_cm: float
     corrector_residual_mS_cm: float
@@ -186,6 +412,11 @@ class MolecularPropertyDbRowResult:
     charged_cluster_direct_sigma_mS_cm: float
     charged_cluster_corrector_sigma_mS_cm: float
     charged_cluster_net_sigma_mS_cm: float
+    primitive_residual_owners: tuple[MolecularPrimitiveResidualOwner, ...]
+    markov_event_family_attributions: tuple[
+        MarkovAdditiveEventFamilyAttribution,
+        ...
+    ]
     cluster_thermodynamic_diagnostics: tuple[
         MolecularClusterThermodynamicDiagnostic,
         ...
@@ -257,6 +488,12 @@ def _cluster_sensitivity_abs_sort_key(
     return abs(diagnostic.sensitivity_mS_cm_per_logK)
 
 
+def _onsager_edge_friction_sort_key(
+    friction_edge: OnsagerFrictionEdge,
+) -> float:
+    return friction_edge.friction_coefficient_J_s_mol_m2
+
+
 @dataclass(frozen=True)
 class MolecularPropertyDbAuditResult:
     rows: tuple[MolecularPropertyDbRowResult, ...]
@@ -268,6 +505,7 @@ class MolecularPropertyDbAuditResult:
     bias_mS_cm: float
     pearson_r: float
     maximum_abs_residual_mS_cm: float
+    proof_statuses: tuple[str, ...]
     maximum_mass_balance_residual: float
     maximum_row_sum_residual: float
     maximum_stationary_residual: float
@@ -276,6 +514,10 @@ class MolecularPropertyDbAuditResult:
     zero_charge_sigma_mS_cm: float
     higher_viscosity_lowers_dilute_conductivity: bool
     higher_packing_lowers_local_mobility: bool
+    primitive_residual_owner_summaries: tuple[
+        MolecularPrimitiveResidualOwnerSummary,
+        ...
+    ]
 
 
 REFERENCE_LOGK_OFFSET_PARAMETER_VALUE = 0.0
@@ -288,6 +530,10 @@ LOGK_OFFSET_PARAMETER_NAMES = frozenset(
         "negative_charged_triplet_logK_offset",
         "neutral_cluster_logK_offset",
         "higher_charged_cluster_logK_offset",
+        "contact_pair_desolvation_offset_over_RT",
+        "solvent_separated_pair_desolvation_offset_over_RT",
+        "higher_charged_cluster_desolvation_offset_over_RT",
+        "internal_polarization_projection_offset",
         "cluster_order_logK_slope",
         "cluster_charge_magnitude_logK_slope",
     )
@@ -391,6 +637,10 @@ def default_molecular_property_db_audit_options() -> MolecularPropertyDbAuditOpt
         ion_hbond_acceptor_count=_required_nonnegative_config_int(
             config_mapping,
             "ion_hbond_acceptor_count",
+        ),
+        include_event_family_attribution=_required_config_bool(
+            config_mapping,
+            "include_event_family_attribution",
         ),
     )
 
@@ -759,6 +1009,9 @@ def audit_molecular_property_db_cases(
         bias_mS_cm=_mean_residual_or_zero(residuals),
         pearson_r=_pearson_or_zero(empirical_sigmas, predicted_sigmas),
         maximum_abs_residual_mS_cm=_maximum_abs_residual_or_zero(residuals),
+        proof_statuses=tuple(
+            sorted({row.proof_status for row in successful_rows})
+        ),
         maximum_mass_balance_residual=_maximum_successful_value(
             successful_rows,
             "mass_balance_residual_mol_m3",
@@ -782,6 +1035,9 @@ def audit_molecular_property_db_cases(
         zero_charge_sigma_mS_cm=zero_charge_sigma_mS_cm,
         higher_viscosity_lowers_dilute_conductivity=viscosity_monotonicity,
         higher_packing_lowers_local_mobility=packing_monotonicity,
+        primitive_residual_owner_summaries=(
+            _primitive_residual_owner_summaries(successful_rows)
+        ),
     )
 
 
@@ -801,6 +1057,59 @@ def _evaluate_molecular_property_db_case(
     corrector_sigma_mS_cm = (
         molecular_result.markov_additive_result.corrector_sigma_mS_cm
     )
+    onsager_transport_operator = (
+        molecular_result.projected_transport_model.onsager_transport_operator
+    )
+    onsager_ne_sigma_mS_cm = (
+        onsager_transport_operator.nernst_einstein_sigma_mS_cm
+    )
+    onsager_sigma_mS_cm = onsager_transport_operator.onsager_sigma_mS_cm
+    onsager_correlation_corrector_mS_cm = (
+        onsager_transport_operator.correlation_corrector_mS_cm
+    )
+    markov_state_changing_direct_sigma_mS_cm = (
+        direct_sigma_mS_cm - onsager_ne_sigma_mS_cm
+    )
+    markov_state_changing_corrector_sigma_mS_cm = (
+        corrector_sigma_mS_cm - onsager_correlation_corrector_mS_cm
+    )
+    friction_matrix = np.asarray(
+        onsager_transport_operator.friction_matrix,
+        dtype=float,
+    )
+    projected_mobility_matrix = np.asarray(
+        onsager_transport_operator.projected_mobility_matrix,
+        dtype=float,
+    )
+    min_friction_matrix_eigenvalue = 0.0
+    if friction_matrix.size:
+        min_friction_matrix_eigenvalue = float(
+            np.min(np.linalg.eigvalsh(friction_matrix))
+        )
+    min_projected_mobility_eigenvalue = 0.0
+    if projected_mobility_matrix.size:
+        min_projected_mobility_eigenvalue = float(
+            np.min(np.linalg.eigvalsh(projected_mobility_matrix))
+        )
+    max_onsager_edge_friction = 0.0
+    top_onsager_friction_edges: tuple[tuple[str, str, float], ...] = tuple()
+    if onsager_transport_operator.friction_edges:
+        max_onsager_edge_friction = max(
+            edge.friction_coefficient_J_s_mol_m2
+            for edge in onsager_transport_operator.friction_edges
+        )
+        top_onsager_friction_edges = tuple(
+            (
+                edge.first_state_label,
+                edge.second_state_label,
+                edge.friction_coefficient_J_s_mol_m2,
+            )
+            for edge in sorted(
+                onsager_transport_operator.friction_edges,
+                key=_onsager_edge_friction_sort_key,
+                reverse=True,
+            )[: options.audit_worst_row_count]
+        )
     decomposition_diagnostic = conductivity_decomposition_diagnostic(
         direct_sigma_mS_cm,
         corrector_sigma_mS_cm,
@@ -817,6 +1126,67 @@ def _evaluate_molecular_property_db_case(
     transport_role_sigma_rollup = _transport_role_event_sigma_rollup(
         molecular_result,
     )
+    direct_sigma_by_transport_role_mS_cm = transport_role_sigma_rollup[
+        "direct_sigma_by_transport_role_mS_cm"
+    ]
+    corrector_sigma_by_transport_role_mS_cm = transport_role_sigma_rollup[
+        "corrector_sigma_by_transport_role_mS_cm"
+    ]
+    net_sigma_by_transport_role_mS_cm = transport_role_sigma_rollup[
+        "net_sigma_by_transport_role_mS_cm"
+    ]
+    projected_current_memory_corrector_sigma_mS_cm = (
+        molecular_result.markov_additive_result.projected_current_memory_corrector_sigma_mS_cm
+    )
+    atmosphere_current_memory_corrector_sigma_mS_cm = (
+        molecular_result.markov_additive_result.atmosphere_corrector_sigma_mS_cm
+    )
+    structural_current_memory_corrector_delta_mS_cm = (
+        projected_current_memory_corrector_sigma_mS_cm
+        - atmosphere_current_memory_corrector_sigma_mS_cm
+    )
+    sigma_without_structural_current_memory_mS_cm = (
+        predicted_sigma_mS_cm + structural_current_memory_corrector_delta_mS_cm
+    )
+    markov_event_family_attributions: tuple[
+        MarkovAdditiveEventFamilyAttribution,
+        ...
+    ] = tuple()
+    primitive_residual_owners = (
+        _no_attribution_primitive_residual_owner()
+    )
+    if options.include_event_family_attribution:
+        markov_event_family_attributions = (
+            compute_markov_additive_event_family_attribution(
+                molecular_result.markov_additive_result,
+                molecular_result.events,
+                np.asarray(
+                    molecular_result.markov_state_concentrations_mol_m3,
+                    dtype=float,
+                ),
+                {
+                    event.label: event.family_label
+                    for event in molecular_result.events
+                },
+                molecular_case.recipe.temperature_K,
+                molecular_result.projected_current_memory_corrections,
+                molecular_result.projected_transport_model.onsager_transport_operator,
+            )
+        )
+        primitive_residual_owners = _primitive_residual_owners(
+            decomposition_diagnostic,
+            markov_event_family_attributions,
+            direct_sigma_by_transport_role_mS_cm,
+            molecular_result.events,
+            np.asarray(
+                molecular_result.markov_state_concentrations_mol_m3,
+                dtype=float,
+            ),
+            molecular_result.markov_state_labels,
+            molecular_result.transport_states,
+            molecular_result.solvent_environment,
+            molecular_case.recipe.temperature_K,
+        )
     return MolecularPropertyDbRowResult(
         row_id=molecular_case.row_id,
         source_row_ids=molecular_case.source_row_ids,
@@ -828,8 +1198,37 @@ def _evaluate_molecular_property_db_case(
         residual_mS_cm=predicted_sigma_mS_cm - molecular_case.empirical_sigma_mS_cm,
         failed=False,
         failure_reason="",
+        proof_status=molecular_result.proof_status,
         direct_sigma_mS_cm=direct_sigma_mS_cm,
         corrector_sigma_mS_cm=corrector_sigma_mS_cm,
+        onsager_ne_sigma_mS_cm=onsager_ne_sigma_mS_cm,
+        onsager_sigma_mS_cm=onsager_sigma_mS_cm,
+        onsager_correlation_corrector_mS_cm=(
+            onsager_correlation_corrector_mS_cm
+        ),
+        markov_state_changing_direct_sigma_mS_cm=(
+            markov_state_changing_direct_sigma_mS_cm
+        ),
+        markov_state_changing_corrector_sigma_mS_cm=(
+            markov_state_changing_corrector_sigma_mS_cm
+        ),
+        projected_current_memory_corrector_sigma_mS_cm=(
+            projected_current_memory_corrector_sigma_mS_cm
+        ),
+        atmosphere_current_memory_corrector_sigma_mS_cm=(
+            atmosphere_current_memory_corrector_sigma_mS_cm
+        ),
+        structural_current_memory_corrector_delta_mS_cm=(
+            structural_current_memory_corrector_delta_mS_cm
+        ),
+        sigma_without_structural_current_memory_mS_cm=(
+            sigma_without_structural_current_memory_mS_cm
+        ),
+        onsager_edge_count=len(onsager_transport_operator.friction_edges),
+        max_onsager_edge_friction=max_onsager_edge_friction,
+        top_onsager_friction_edges=top_onsager_friction_edges,
+        min_friction_matrix_eigenvalue=min_friction_matrix_eigenvalue,
+        min_projected_mobility_eigenvalue=min_projected_mobility_eigenvalue,
         direct_capacity_gap_mS_cm=(
             decomposition_diagnostic.direct_capacity_gap_mS_cm
         ),
@@ -844,15 +1243,11 @@ def _evaluate_molecular_property_db_case(
         corrector_too_weak_failure=(
             decomposition_diagnostic.corrector_too_weak_failure
         ),
-        direct_sigma_by_transport_role_mS_cm=(
-            transport_role_sigma_rollup["direct_sigma_by_transport_role_mS_cm"]
-        ),
+        direct_sigma_by_transport_role_mS_cm=direct_sigma_by_transport_role_mS_cm,
         corrector_sigma_by_transport_role_mS_cm=(
-            transport_role_sigma_rollup["corrector_sigma_by_transport_role_mS_cm"]
+            corrector_sigma_by_transport_role_mS_cm
         ),
-        net_sigma_by_transport_role_mS_cm=(
-            transport_role_sigma_rollup["net_sigma_by_transport_role_mS_cm"]
-        ),
+        net_sigma_by_transport_role_mS_cm=net_sigma_by_transport_role_mS_cm,
         charge_weighted_transport_concentration_mol_m3=(
             _charge_weighted_transport_concentration_mol_m3(molecular_result)
         ),
@@ -894,6 +1289,8 @@ def _evaluate_molecular_property_db_case(
         charged_cluster_net_sigma_mS_cm=charged_cluster_sigma_rollup[
             "charged_cluster_net_sigma_mS_cm"
         ],
+        primitive_residual_owners=primitive_residual_owners,
+        markov_event_family_attributions=markov_event_family_attributions,
         cluster_thermodynamic_diagnostics=(
             _cluster_thermodynamic_diagnostics(
                 molecular_case,
@@ -902,6 +1299,471 @@ def _evaluate_molecular_property_db_case(
             )
         ),
     )
+
+
+def _primitive_residual_owners(
+    decomposition_diagnostic: ConductivityDecompositionDiagnostic,
+    markov_event_family_attributions: tuple[
+        MarkovAdditiveEventFamilyAttribution,
+        ...
+    ],
+    direct_sigma_by_transport_role_mS_cm: Mapping[str, float],
+    events: tuple[MarkovAdditiveEvent, ...],
+    state_concentrations_mol_m3: np.ndarray,
+    state_labels: tuple[str, ...],
+    transport_states: tuple[MolecularTransportCenter, ...],
+    solvent_environment: MolecularSolventEnvironment,
+    temperature_K: float,
+) -> tuple[MolecularPrimitiveResidualOwner, ...]:
+    owners: list[MolecularPrimitiveResidualOwner] = []
+    leading_direct_family = _leading_direct_event_family(
+        markov_event_family_attributions,
+    )
+    if decomposition_diagnostic.direct_capacity_failure:
+        leading_direct_event = _leading_direct_event(
+            events,
+            state_concentrations_mol_m3,
+            temperature_K,
+        )
+        leading_transport_state = _transport_state_for_markov_event(
+            leading_direct_event,
+            state_labels,
+            transport_states,
+        )
+        owners.append(
+            MolecularPrimitiveResidualOwner(
+                primitive_head=_primitive_head_for_event_family(
+                    leading_direct_family.family_label
+                ),
+                theorem_object=_theorem_object_for_event_family(
+                    leading_direct_family.family_label
+                ),
+                production_lever=_production_lever_for_event_family(
+                    leading_direct_family.family_label,
+                    direct_sigma_by_transport_role_mS_cm,
+                    leading_direct_event.label,
+                    leading_transport_state,
+                    solvent_environment,
+                ),
+                residual_component=PRIMITIVE_RESIDUAL_COMPONENT_DIRECT_CAPACITY,
+                residual_mS_cm=decomposition_diagnostic.direct_capacity_gap_mS_cm,
+                evidence_label=leading_direct_event.family_label,
+                source_label="projected_generator_direct_capacity",
+            )
+        )
+    if decomposition_diagnostic.corrector_too_strong_failure:
+        owners.append(
+            MolecularPrimitiveResidualOwner(
+                primitive_head=PRIMITIVE_RESIDUAL_HEAD_MORI_MEMORY,
+                theorem_object=PRIMITIVE_RESIDUAL_THEOREM_MORI_MEMORY,
+                production_lever=PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_CURRENT_MEMORY,
+                residual_component=(
+                    PRIMITIVE_RESIDUAL_COMPONENT_MORI_CORRECTOR_TOO_STRONG
+                ),
+                residual_mS_cm=decomposition_diagnostic.corrector_residual_mS_cm,
+                evidence_label="corrector_sigma_mS_cm",
+                source_label="projected_mori_current_memory",
+            )
+        )
+    if decomposition_diagnostic.corrector_too_weak_failure:
+        owners.append(
+            MolecularPrimitiveResidualOwner(
+                primitive_head=PRIMITIVE_RESIDUAL_HEAD_MORI_MEMORY,
+                theorem_object=PRIMITIVE_RESIDUAL_THEOREM_MORI_MEMORY,
+                production_lever=PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_CURRENT_MEMORY,
+                residual_component=(
+                    PRIMITIVE_RESIDUAL_COMPONENT_MORI_CORRECTOR_TOO_WEAK
+                ),
+                residual_mS_cm=decomposition_diagnostic.corrector_residual_mS_cm,
+                evidence_label="corrector_sigma_mS_cm",
+                source_label="projected_mori_current_memory",
+            )
+        )
+    if owners:
+        return tuple(owners)
+    return (
+        MolecularPrimitiveResidualOwner(
+            primitive_head=PRIMITIVE_RESIDUAL_HEAD_NONE,
+            theorem_object=PRIMITIVE_RESIDUAL_THEOREM_NONE,
+            production_lever=PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_NONE,
+            residual_component=PRIMITIVE_RESIDUAL_COMPONENT_WITHIN_DECOMPOSITION,
+            residual_mS_cm=0.0,
+            evidence_label="conductivity_decomposition_diagnostic",
+            source_label="projected_generator_audit",
+        ),
+    )
+
+
+def _no_attribution_primitive_residual_owner() -> tuple[
+    MolecularPrimitiveResidualOwner,
+    ...
+]:
+    return (
+        MolecularPrimitiveResidualOwner(
+            primitive_head=PRIMITIVE_RESIDUAL_HEAD_NONE,
+            theorem_object=PRIMITIVE_RESIDUAL_THEOREM_NONE,
+            production_lever=PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_NONE,
+            residual_component=PRIMITIVE_RESIDUAL_COMPONENT_WITHIN_DECOMPOSITION,
+            residual_mS_cm=0.0,
+            evidence_label="event_family_attribution_disabled",
+            source_label="selected_row_fit_audit",
+        ),
+    )
+
+
+def _primitive_residual_owner_summaries(
+    successful_rows: tuple[MolecularPropertyDbRowResult, ...],
+) -> tuple[MolecularPrimitiveResidualOwnerSummary, ...]:
+    summary_records_by_key: dict[
+        tuple[str, str, str],
+        list[MolecularPrimitiveResidualOwner],
+    ] = {}
+    for row_result in successful_rows:
+        for residual_owner in row_result.primitive_residual_owners:
+            if residual_owner.primitive_head == PRIMITIVE_RESIDUAL_HEAD_NONE:
+                continue
+            summary_key = (
+                residual_owner.primitive_head,
+                residual_owner.theorem_object,
+                residual_owner.production_lever,
+            )
+            if summary_key not in summary_records_by_key:
+                summary_records_by_key[summary_key] = []
+            summary_records_by_key[summary_key].append(residual_owner)
+    summaries = tuple(
+        _primitive_residual_owner_summary_for_records(
+            primitive_head=summary_key[0],
+            theorem_object=summary_key[1],
+            production_lever=summary_key[2],
+            residual_owners=tuple(residual_owners),
+        )
+        for summary_key, residual_owners in summary_records_by_key.items()
+    )
+    return tuple(
+        sorted(
+            summaries,
+            key=_primitive_residual_owner_summary_abs_residual_sort_key,
+            reverse=True,
+        )
+    )
+
+
+def _primitive_residual_owner_summary_for_records(
+    primitive_head: str,
+    theorem_object: str,
+    production_lever: str,
+    residual_owners: tuple[MolecularPrimitiveResidualOwner, ...],
+) -> MolecularPrimitiveResidualOwnerSummary:
+    if not residual_owners:
+        raise ValueError("primitive residual owner summary requires records")
+    residual_values_mS_cm = tuple(
+        residual_owner.residual_mS_cm for residual_owner in residual_owners
+    )
+    absolute_residual_values_mS_cm = tuple(
+        abs(residual_value_mS_cm)
+        for residual_value_mS_cm in residual_values_mS_cm
+    )
+    return MolecularPrimitiveResidualOwnerSummary(
+        primitive_head=primitive_head,
+        theorem_object=theorem_object,
+        production_lever=production_lever,
+        row_count=len(residual_owners),
+        sum_abs_residual_mS_cm=math.fsum(absolute_residual_values_mS_cm),
+        mean_signed_residual_mS_cm=(
+            math.fsum(residual_values_mS_cm) / len(residual_values_mS_cm)
+        ),
+        mean_abs_residual_mS_cm=(
+            math.fsum(absolute_residual_values_mS_cm) / len(residual_owners)
+        ),
+        top_event_family=_top_event_family_for_residual_owners(residual_owners),
+    )
+
+
+def _primitive_residual_owner_summary_abs_residual_sort_key(
+    summary: MolecularPrimitiveResidualOwnerSummary,
+) -> float:
+    return summary.sum_abs_residual_mS_cm
+
+
+def _top_event_family_for_residual_owners(
+    residual_owners: tuple[MolecularPrimitiveResidualOwner, ...],
+) -> str:
+    abs_residual_by_event_family: dict[str, float] = {}
+    for residual_owner in residual_owners:
+        event_family = residual_owner.evidence_label
+        abs_residual_mS_cm = abs(residual_owner.residual_mS_cm)
+        if event_family not in abs_residual_by_event_family:
+            abs_residual_by_event_family[event_family] = 0.0
+        abs_residual_by_event_family[event_family] += abs_residual_mS_cm
+    if not abs_residual_by_event_family:
+        raise ValueError("top event family requires residual owners")
+    return max(
+        abs_residual_by_event_family,
+        key=abs_residual_by_event_family.__getitem__,
+    )
+
+
+def _leading_direct_event_family(
+    markov_event_family_attributions: tuple[
+        MarkovAdditiveEventFamilyAttribution,
+        ...
+    ],
+) -> MarkovAdditiveEventFamilyAttribution:
+    direct_attributions = tuple(
+        attribution
+        for attribution in markov_event_family_attributions
+        if attribution.direct_sigma_mS_cm > 0.0
+    )
+    if not direct_attributions:
+        raise ValueError("primitive residual owner requires a direct event family")
+    return max(
+        direct_attributions,
+        key=_event_family_direct_sigma_mS_cm,
+    )
+
+
+def _event_family_direct_sigma_mS_cm(
+    attribution: MarkovAdditiveEventFamilyAttribution,
+) -> float:
+    return attribution.direct_sigma_mS_cm
+
+
+def _leading_direct_event(
+    events: tuple[MarkovAdditiveEvent, ...],
+    state_concentrations_mol_m3: np.ndarray,
+    temperature_K: float,
+) -> MarkovAdditiveEvent:
+    if state_concentrations_mol_m3.ndim != 1:
+        raise ValueError("state_concentrations_mol_m3 must be one-dimensional")
+    event_direct_sigma_pairs = tuple(
+        (event, _direct_sigma_for_event_mS_cm(event, state_concentrations_mol_m3, temperature_K))
+        for event in events
+    )
+    positive_event_direct_sigma_pairs = tuple(
+        event_direct_sigma_pair
+        for event_direct_sigma_pair in event_direct_sigma_pairs
+        if event_direct_sigma_pair[1] > 0.0
+    )
+    if not positive_event_direct_sigma_pairs:
+        raise ValueError("primitive residual owner requires a direct event")
+    leading_event, _leading_direct_sigma_mS_cm = max(
+        positive_event_direct_sigma_pairs,
+        key=_event_direct_sigma_pair_sort_key,
+    )
+    return leading_event
+
+
+def _event_direct_sigma_pair_sort_key(
+    event_direct_sigma_pair: tuple[MarkovAdditiveEvent, float],
+) -> float:
+    return event_direct_sigma_pair[1]
+
+
+def _direct_sigma_for_event_mS_cm(
+    event: MarkovAdditiveEvent,
+    state_concentrations_mol_m3: np.ndarray,
+    temperature_K: float,
+) -> float:
+    if (
+        event.from_state_index < 0
+        or event.from_state_index >= state_concentrations_mol_m3.shape[0]
+    ):
+        raise ValueError(f"{event.label}.from_state_index out of range")
+    second_moment_tensor = np.asarray(
+        event.charge_displacement_second_moment_m2,
+        dtype=float,
+    )
+    if second_moment_tensor.shape != (3, 3):
+        raise ValueError(
+            f"{event.label}.charge_displacement_second_moment_m2 shape mismatch"
+        )
+    event_rate_s_inv = _positive_float(event.rate_s_inv, f"{event.label}.rate_s_inv")
+    source_concentration_mol_m3 = state_concentrations_mol_m3[event.from_state_index]
+    direct_density_m2_mol_m3_s = (
+        0.5
+        * source_concentration_mol_m3
+        * event_rate_s_inv
+        * float(np.trace(second_moment_tensor))
+        / 3.0
+    )
+    return (
+        F
+        * F
+        / (R * temperature_K)
+        * direct_density_m2_mol_m3_s
+        * S_M_TO_MS_CM
+    )
+
+
+def _transport_state_for_markov_event(
+    event: MarkovAdditiveEvent,
+    state_labels: tuple[str, ...],
+    transport_states: tuple[MolecularTransportCenter, ...],
+) -> MolecularTransportCenter:
+    if event.from_state_index < 0 or event.from_state_index >= len(state_labels):
+        raise ValueError(f"{event.label}.from_state_index out of range")
+    event_state_label = state_labels[event.from_state_index]
+    transport_state_label = _transport_state_label_from_markov_state_label(
+        event_state_label
+    )
+    for transport_state in transport_states:
+        if transport_state.label == transport_state_label:
+            return transport_state
+    raise ValueError(
+        f"{event.label} source state {event_state_label} has no transport state"
+    )
+
+
+def _transport_state_label_from_markov_state_label(state_label: str) -> str:
+    mobile_suffix = ":mobile"
+    if state_label.endswith(mobile_suffix):
+        return state_label[: -len(mobile_suffix)]
+    return state_label
+
+
+def _production_lever_for_event_family(
+    family_label: str,
+    direct_sigma_by_transport_role_mS_cm: Mapping[str, float],
+    leading_direct_event_label: str,
+    leading_transport_state: MolecularTransportCenter,
+    solvent_environment: MolecularSolventEnvironment,
+) -> str:
+    if family_label in PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_BY_SELF_CURRENT_EVENT_FAMILY:
+        if family_label == EVENT_FAMILY_PROJECTED_SINGLE_CENTER_SELF_CURRENT:
+            return _production_lever_for_single_center_event(
+                leading_direct_event_label,
+                leading_transport_state,
+                solvent_environment,
+            )
+        return PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_BY_SELF_CURRENT_EVENT_FAMILY[
+            family_label
+        ]
+    if family_label == EVENT_FAMILY_ONSAGER_SELF_TRANSPORT:
+        return _production_lever_for_direct_transport_role(
+            _leading_direct_transport_role(direct_sigma_by_transport_role_mS_cm)
+        )
+    if family_label in PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_BY_REACTIVE_EVENT_FAMILY:
+        return PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_BY_REACTIVE_EVENT_FAMILY[
+            family_label
+        ]
+    return PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_UNCLASSIFIED
+
+
+def _production_lever_for_single_center_event(
+    event_label: str,
+    transport_state: MolecularTransportCenter,
+    solvent_environment: MolecularSolventEnvironment,
+) -> str:
+    mobility_factor_lever = _dominant_mobility_factor_lever(
+        transport_state,
+        solvent_environment,
+    )
+    if mobility_factor_lever:
+        return mobility_factor_lever
+    return _production_lever_for_single_center_event_label(event_label)
+
+
+def _production_lever_for_single_center_event_label(event_label: str) -> str:
+    if PROJECTED_CENTER_ROLE_TOKEN_CATION in event_label:
+        return PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_FREE_CATION_SELF_CURRENT
+    if PROJECTED_CENTER_ROLE_TOKEN_ANION in event_label:
+        return PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_FREE_ANION_SELF_CURRENT
+    return PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_FREE_ION_SELF_CURRENT
+
+
+def _dominant_mobility_factor_lever(
+    transport_state: MolecularTransportCenter,
+    solvent_environment: MolecularSolventEnvironment,
+) -> str:
+    if transport_state.center_charge_number == 0:
+        return ""
+    factor_scores = {
+        PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_LOCAL_OBSTRUCTION: (
+            _positive_factor_log_score(
+                1.0 + transport_state.local_obstruction_factor,
+                f"{transport_state.label}.local_obstruction_friction_factor",
+            )
+        ),
+        PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_VISCOSITY: (
+            _positive_factor_log_score(
+                solvent_environment.viscosity_cP,
+                "solvent_environment.viscosity_cP",
+            )
+        ),
+        PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_HYDRODYNAMIC_SIZE: (
+            _positive_factor_log_score(
+                transport_state.hydrodynamic_radius_A,
+                f"{transport_state.label}.hydrodynamic_radius_A",
+            )
+        ),
+        PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_CHARGE_CLOUD_MOBILITY: (
+            _positive_factor_log_score(
+                _charge_cloud_compactness_factor(transport_state),
+                f"{transport_state.label}.charge_cloud_compactness_factor",
+            )
+        ),
+    }
+    if transport_state.center_charge_number < 0:
+        factor_scores[PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_ANION_SHAPE_FRICTION] = (
+            _positive_factor_log_score(
+                transport_state.ligand_field_asymmetry,
+                f"{transport_state.label}.ligand_field_asymmetry",
+            )
+        )
+    return max(factor_scores, key=factor_scores.__getitem__)
+
+
+def _positive_factor_log_score(value: float, label: str) -> float:
+    parsed_value = _positive_float(value, label)
+    return abs(math.log(parsed_value))
+
+
+def _charge_cloud_compactness_factor(
+    transport_state: MolecularTransportCenter,
+) -> float:
+    charge_cloud_radius_A = _positive_float(
+        transport_state.charge_cloud_radius_A,
+        f"{transport_state.label}.charge_cloud_radius_A",
+    )
+    hydrodynamic_radius_A = _positive_float(
+        transport_state.hydrodynamic_radius_A,
+        f"{transport_state.label}.hydrodynamic_radius_A",
+    )
+    return hydrodynamic_radius_A / charge_cloud_radius_A
+
+
+def _leading_direct_transport_role(
+    direct_sigma_by_transport_role_mS_cm: Mapping[str, float],
+) -> str:
+    leading_transport_role = ""
+    leading_direct_sigma_mS_cm = 0.0
+    for transport_role, direct_sigma_mS_cm in (
+        direct_sigma_by_transport_role_mS_cm.items()
+    ):
+        if direct_sigma_mS_cm > leading_direct_sigma_mS_cm:
+            leading_transport_role = transport_role
+            leading_direct_sigma_mS_cm = direct_sigma_mS_cm
+    if not leading_transport_role:
+        raise ValueError("primitive residual owner requires a direct transport role")
+    return leading_transport_role
+
+
+def _production_lever_for_direct_transport_role(transport_role: str) -> str:
+    if transport_role in PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_BY_TRANSPORT_ROLE:
+        return PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_BY_TRANSPORT_ROLE[transport_role]
+    return PRIMITIVE_RESIDUAL_PRODUCTION_LEVER_UNCLASSIFIED
+
+
+def _primitive_head_for_event_family(family_label: str) -> str:
+    if family_label in PRIMITIVE_RESIDUAL_HEAD_BY_EVENT_FAMILY:
+        return PRIMITIVE_RESIDUAL_HEAD_BY_EVENT_FAMILY[family_label]
+    return PRIMITIVE_RESIDUAL_HEAD_UNCLASSIFIED
+
+
+def _theorem_object_for_event_family(family_label: str) -> str:
+    if family_label in PRIMITIVE_RESIDUAL_THEOREM_BY_EVENT_FAMILY:
+        return PRIMITIVE_RESIDUAL_THEOREM_BY_EVENT_FAMILY[family_label]
+    return PRIMITIVE_RESIDUAL_THEOREM_UNCLASSIFIED
 
 
 def _compute_case_result(
@@ -1267,12 +2129,15 @@ def _event_sigma_rollup_for_transport_labels(
             f"{event.label}.rate_s_inv",
         )
         source_concentration_mol_m3 = state_concentrations[event.from_state_index]
+        second_moment_tensor = np.asarray(
+            event.charge_displacement_second_moment_m2,
+            dtype=float,
+        )
         direct_axis_density += (
             0.5
             * source_concentration_mol_m3
             * event_rate_s_inv
-            * displacement
-            * displacement
+            * np.diag(second_moment_tensor)
         )
         drift_by_state[event.from_state_index, :] += event_rate_s_inv * displacement
     direct_sigma_mS_cm = _axis_density_sigma_mS_cm(
@@ -1286,10 +2151,98 @@ def _event_sigma_rollup_for_transport_labels(
         state_concentrations=state_concentrations,
         temperature_K=molecular_result.solvent_environment.temperature_K,
     )
+    corrector_sigma_mS_cm += math.fsum(
+        current_memory_correction.correction_sigma_mS_cm
+        for current_memory_correction in (
+            molecular_result.projected_current_memory_corrections
+        )
+        if current_memory_correction.transport_state_label in transport_state_labels
+    )
+    onsager_sigma_rollup = _onsager_transport_sigma_rollup_for_transport_labels(
+        molecular_result,
+        transport_state_labels,
+    )
+    direct_sigma_mS_cm += onsager_sigma_rollup["direct_sigma_mS_cm"]
+    corrector_sigma_mS_cm += onsager_sigma_rollup["corrector_sigma_mS_cm"]
     return {
         "direct_sigma_mS_cm": direct_sigma_mS_cm,
         "corrector_sigma_mS_cm": corrector_sigma_mS_cm,
         "net_sigma_mS_cm": direct_sigma_mS_cm - corrector_sigma_mS_cm,
+    }
+
+
+def _onsager_transport_sigma_rollup_for_transport_labels(
+    molecular_result: MolecularMoriConductivityResult,
+    transport_state_labels: tuple[str, ...],
+) -> Mapping[str, float]:
+    onsager_operator = (
+        molecular_result.projected_transport_model.onsager_transport_operator
+    )
+    if not transport_state_labels or not onsager_operator.state_labels:
+        return {
+            "direct_sigma_mS_cm": 0.0,
+            "corrector_sigma_mS_cm": 0.0,
+        }
+    operator_state_labels = tuple(onsager_operator.state_labels)
+    operator_concentrations = np.asarray(
+        onsager_operator.concentrations_mol_m3,
+        dtype=float,
+    )
+    operator_charge_numbers = np.asarray(
+        onsager_operator.charge_numbers,
+        dtype=float,
+    )
+    operator_diffusivities = np.asarray(
+        onsager_operator.bare_diffusivities_m2_s,
+        dtype=float,
+    )
+    mobility_matrix = np.asarray(
+        onsager_operator.projected_mobility_matrix,
+        dtype=float,
+    )
+    selected_operator_labels = {
+        f"{transport_state_label}:mobile" for transport_state_label in transport_state_labels
+    }
+    state_mask = np.asarray(
+        [
+            operator_state_label in selected_operator_labels
+            for operator_state_label in operator_state_labels
+        ],
+        dtype=bool,
+    )
+    if not np.any(state_mask):
+        return {
+            "direct_sigma_mS_cm": 0.0,
+            "corrector_sigma_mS_cm": 0.0,
+        }
+    temperature_K = molecular_result.solvent_environment.temperature_K
+    total_charge_transport_vector = operator_concentrations * operator_charge_numbers
+    subset_charge_transport_vector = total_charge_transport_vector * state_mask
+    direct_sigma_S_m = (
+        (F * F / (R * temperature_K))
+        * float(
+            np.sum(
+                operator_concentrations[state_mask]
+                * operator_charge_numbers[state_mask]
+                * operator_charge_numbers[state_mask]
+                * operator_diffusivities[state_mask]
+            )
+        )
+    )
+    marginal_net_sigma_S_m = (
+        F
+        * F
+        * float(
+            subset_charge_transport_vector
+            @ mobility_matrix
+            @ total_charge_transport_vector
+        )
+    )
+    return {
+        "direct_sigma_mS_cm": float(direct_sigma_S_m * S_M_TO_MS_CM),
+        "corrector_sigma_mS_cm": float(
+            (direct_sigma_S_m - marginal_net_sigma_S_m) * S_M_TO_MS_CM
+        ),
     }
 
 
@@ -1317,6 +2270,11 @@ def _event_label_matches_transport_labels(
             "solvent_separated_pair_residual_center_translation:"
             f"{transport_state_label}:"
         )
+        association_prefix = f"association_conversion:{transport_state_label}:"
+        structural_hop_prefix = (
+            f"association_structural_hop:{transport_state_label}:"
+        )
+        reverse_transport_fragment = f":{transport_state_label}"
         if (
             event_label.startswith(ordinary_prefix)
             or event_label.startswith(capture_prefix)
@@ -1324,6 +2282,16 @@ def _event_label_matches_transport_labels(
             or event_label.startswith(ssip_relative_prefix)
             or event_label.startswith(ssip_com_prefix)
             or event_label.startswith(ssip_residual_prefix)
+            or event_label.startswith(association_prefix)
+            or event_label.startswith(structural_hop_prefix)
+            or (
+                event_label.startswith("association_conversion:")
+                and reverse_transport_fragment in event_label
+            )
+            or (
+                event_label.startswith("association_structural_hop:")
+                and reverse_transport_fragment in event_label
+            )
         ):
             return True
     return False

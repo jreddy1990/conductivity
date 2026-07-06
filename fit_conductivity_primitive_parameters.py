@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import math
 import random
@@ -68,6 +69,12 @@ SPECIATION_FIT_PARAMETER_NAMES = (
     "negative_charged_triplet_logK_offset",
     "neutral_cluster_logK_offset",
     "higher_charged_cluster_logK_offset",
+    "contact_pair_desolvation_offset_over_RT",
+    "solvent_separated_pair_desolvation_offset_over_RT",
+    "higher_charged_cluster_desolvation_offset_over_RT",
+    "internal_polarization_projection_offset",
+    "internal_polarization_projection_ionic_strength_slope",
+    "internal_polarization_projection_counterion_crowding_slope",
     "cluster_order_logK_slope",
     "cluster_charge_magnitude_logK_slope",
     "cluster_hydrodynamic_radius_scale",
@@ -80,6 +87,10 @@ CLUSTER_SENSITIVITY_PARAMETER_NAMES = (
     "negative_charged_triplet_logK_offset",
     "neutral_cluster_logK_offset",
     "higher_charged_cluster_logK_offset",
+    "contact_pair_desolvation_offset_over_RT",
+    "solvent_separated_pair_desolvation_offset_over_RT",
+    "higher_charged_cluster_desolvation_offset_over_RT",
+    "internal_polarization_projection_offset",
     "cluster_order_logK_slope",
     "cluster_charge_magnitude_logK_slope",
 )
@@ -112,11 +123,32 @@ MOBILITY_EVENT_FIT_PARAMETER_NAMES = (
     "atmosphere_rel_scale",
     "charge_cloud_radius_scale",
     "cross_relaxation_scale",
-    "jump_length_scale",
-    "atmosphere_capture_scale",
-    "atmosphere_exit_scale",
-    "association_conversion_rate_scale",
-    "orientation_relaxation_rate_scale",
+)
+
+ONSAGER_OPERATOR_FIT_PARAMETER_NAMES = (
+    "hydrodynamic_radius_scale_positive_ion",
+    "hydrodynamic_radius_scale_negative_ion",
+    "hydrodynamic_radius_scale_cluster",
+    "shape_friction_exponent",
+    "free_volume_exponent",
+    "dielectric_mobility_exponent",
+    "solvation_mobility_exponent",
+    "positive_ion_charge_density_mobility_exponent",
+    "negative_ion_charge_density_mobility_exponent",
+    "positive_ion_counteranion_charge_cloud_mobility_exponent",
+    "negative_ion_charge_cloud_mobility_exponent",
+    "negative_ion_intrinsic_dielectric_drag_mobility_exponent",
+    "negative_ion_shape_delocalization_mobility_exponent",
+    "positive_ion_anion_disorder_mobility_exponent",
+    "negative_ion_anion_disorder_mobility_exponent",
+    "local_obstruction_strength",
+    "local_obstruction_free_volume_exponent",
+    "local_obstruction_ionic_strength_exponent",
+    "local_obstruction_additive_solvation_exponent",
+    "local_obstruction_size_exponent",
+    "local_obstruction_charge_density_exponent",
+    "local_obstruction_solvation_exponent",
+    "charge_cloud_radius_scale",
 )
 
 _CLUSTER_KIND_LOGK_PARAMETER_BY_KIND = {
@@ -136,10 +168,18 @@ PRIMITIVE_FIT_PROGRESS_ARTIFACT_TYPE = (
     "molecular_conductivity_primitive_fit_progress"
 )
 TRAJECTORY_TARGET_LABEL_SEPARATOR = ":"
-TRAJECTORY_TOPOLOGY_LOGK_PARAMETER_BY_ROLE = {
-    "contact_pair_center": "contact_pair_logK_offset",
-    "solvent_separated_pair_center": "solvent_separated_pair_logK_offset",
-    "internal_polarization_center": "higher_charged_cluster_logK_offset",
+TRAJECTORY_CONTACT_PAIR_ROLE = "contact_pair_center"
+CONTACT_PAIR_DESOLVATION_PARAMETER_NAME = "contact_pair_desolvation_offset_over_RT"
+TRAJECTORY_POPULATION_PARAMETER_UPDATES_BY_ROLE = {
+    TRAJECTORY_CONTACT_PAIR_ROLE: (
+        (CONTACT_PAIR_DESOLVATION_PARAMETER_NAME, -1.0),
+    ),
+    "solvent_separated_pair_center": (
+        ("solvent_separated_pair_logK_offset", 1.0),
+    ),
+    "internal_polarization_center": (
+        ("internal_polarization_projection_offset", 1.0),
+    ),
 }
 
 
@@ -164,10 +204,6 @@ class PrimitiveFitOptions:
     cluster_activation_min_charged_cluster_net_sigma_mS_cm: float
     direct_capacity_loss_weight: float
     corrector_loss_weight: float
-    trajectory_concentration_loss_weight: float
-    trajectory_transition_rate_loss_weight: float
-    trajectory_displacement_moment_loss_weight: float
-    trajectory_sigma_loss_weight: float
     role_direct_scaling_regularization_weight: float
     role_direct_scaling_lower_bound: float
     role_direct_scaling_upper_bound: float
@@ -202,6 +238,7 @@ class PrimitiveFitOptions:
     prediction_sensitivity_reported_correlation_pair_count: int
     candidate_output_path: str
     progress_output_path: str
+    decomposition_report_output_path: str
     promotion_maximum_mae_mS_cm: float
     promotion_maximum_abs_bias_mS_cm: float
     promotion_maximum_worst_abs_residual_mS_cm: float
@@ -264,6 +301,8 @@ class PrimitiveFitDatasetEvaluation:
     trajectory_transition_rate_loss: float
     trajectory_displacement_moment_loss: float
     trajectory_sigma_loss_mS_cm: float
+    trajectory_concentration_unreachable_target_count: int
+    trajectory_concentration_under_floor_target_count: int
     cluster_activation_penalty: float
     failed_rows: int
     maximum_mass_balance_residual: float
@@ -338,6 +377,11 @@ class MolecularPropertyDbPrimitiveEvaluator:
             self._audit_options,
             self._fit_options,
         )
+        trajectory_coverages = trajectory_concentration_target_coverage(
+            self._trajectory_primitive_calibration_targets,
+            primitive_parameters,
+            self._audit_options,
+        )
         return PrimitiveFitDatasetEvaluation(
             descriptor_calibration_targets=self._descriptor_calibration_targets,
             trajectory_primitive_calibration_targets=(
@@ -378,6 +422,14 @@ class MolecularPropertyDbPrimitiveEvaluator:
                 trajectory_losses.displacement_moment_loss
             ),
             trajectory_sigma_loss_mS_cm=trajectory_losses.sigma_loss_mS_cm,
+            trajectory_concentration_unreachable_target_count=sum(
+                len(coverage.unreachable_target_labels)
+                for coverage in trajectory_coverages
+            ),
+            trajectory_concentration_under_floor_target_count=sum(
+                len(coverage.under_floor_target_labels)
+                for coverage in trajectory_coverages
+            ),
             cluster_activation_penalty=_cluster_activation_penalty(
                 self._cases,
                 primitive_parameters,
@@ -518,40 +570,44 @@ def _trajectory_primitive_loss_breakdown(
             audit_options,
         )
         concentration_losses.append(
-            _log_mapping_loss(
+            _uncertainty_normalized_mapping_loss(
                 _transport_center_concentration_targets(analytical_result),
                 target_artifact.state_concentrations_mol_m3,
+                target_artifact.block_state_concentration_standard_errors_mol_m3,
                 f"{trajectory_target.system_id}.state_concentrations_mol_m3",
             )
         )
         if target_artifact.transition_rate_targets_validated:
             transition_rate_losses.append(
-                _log_mapping_loss(
+                _uncertainty_normalized_mapping_loss(
                     _transition_rate_targets_from_analytical_result(
                         analytical_result
                     ),
                     target_artifact.transition_rates_s_inv,
+                    target_artifact.block_transition_rate_standard_errors_s_inv,
                     f"{trajectory_target.system_id}.transition_rates_s_inv",
                 )
             )
         if target_artifact.displacement_moment_targets_validated:
             displacement_moment_losses.append(
-                _log_mapping_loss(
+                _uncertainty_normalized_mapping_loss(
                     _displacement_moment_targets_from_analytical_result(
                         analytical_result,
                     ),
                     _mean_squared_displacement_targets(
                         target_artifact.displacement_moments_by_family,
                     ),
+                    target_artifact.block_displacement_moment_standard_errors_m2,
                     f"{trajectory_target.system_id}.displacement_moments_by_family",
                 )
             )
         if target_artifact.markov_additive_sigma_validated:
             sigma_losses_mS_cm.append(
-                _smooth_l1_loss_mS_cm(
-                    analytical_result.sigma_mS_cm
-                    - target_artifact.markov_additive_sigma_mS_cm,
-                    fit_options.huber_delta_mS_cm,
+                _uncertainty_normalized_scalar_loss(
+                    analytical_result.sigma_mS_cm,
+                    target_artifact.markov_additive_sigma_mS_cm,
+                    target_artifact.block_sigma_standard_error_mS_cm,
+                    f"{trajectory_target.system_id}.markov_additive_sigma_mS_cm",
                 )
             )
     return TrajectoryPrimitiveLossBreakdown(
@@ -913,10 +969,12 @@ def initialize_topology_logk_offsets_from_trajectory_concentrations(
     trajectory_targets: tuple[TrajectoryPrimitiveCalibrationTarget, ...],
     audit_options: "MolecularPropertyDbAuditOptions",
     coordinate_bounds: tuple[PrimitiveParameterTransform, ...],
+    fit_options: PrimitiveFitOptions,
 ) -> ConductivityPrimitiveParameterSet:
     if not trajectory_targets:
         return primitive_parameters
     validate_conductivity_primitive_parameters(primitive_parameters)
+    _validate_fit_options(fit_options)
     coordinate_bound_by_name = {
         coordinate_bound.name: coordinate_bound
         for coordinate_bound in _ordered_coordinate_bounds(coordinate_bounds)
@@ -958,9 +1016,8 @@ def initialize_topology_logk_offsets_from_trajectory_concentrations(
             target_role, _target_species_name = _trajectory_target_label_parts(
                 target_label,
             )
-            if target_role not in TRAJECTORY_TOPOLOGY_LOGK_PARAMETER_BY_ROLE:
+            if target_role not in TRAJECTORY_POPULATION_PARAMETER_UPDATES_BY_ROLE:
                 continue
-            parameter_name = TRAJECTORY_TOPOLOGY_LOGK_PARAMETER_BY_ROLE[target_role]
             predicted_concentration_mol_m3 = max(
                 concentration_floor_mol_m3,
                 _predicted_mapping_value_or_zero(
@@ -977,37 +1034,487 @@ def initialize_topology_logk_offsets_from_trajectory_concentrations(
                 parsed_target_concentration_mol_m3,
                 concentration_floor_mol_m3,
             )
-            if parameter_name not in numerator_by_parameter_name:
-                numerator_by_parameter_name[parameter_name] = 0.0
-                denominator_by_parameter_name[parameter_name] = 0.0
-            numerator_by_parameter_name[parameter_name] += (
-                target_weight * log_concentration_ratio
+            for parameter_name, update_sign in (
+                TRAJECTORY_POPULATION_PARAMETER_UPDATES_BY_ROLE[target_role]
+            ):
+                if parameter_name == CONTACT_PAIR_DESOLVATION_PARAMETER_NAME:
+                    continue
+                if parameter_name not in numerator_by_parameter_name:
+                    numerator_by_parameter_name[parameter_name] = 0.0
+                    denominator_by_parameter_name[parameter_name] = 0.0
+                numerator_by_parameter_name[parameter_name] += (
+                    target_weight * update_sign * log_concentration_ratio
+                )
+                denominator_by_parameter_name[parameter_name] += target_weight
+    if numerator_by_parameter_name:
+        for parameter_name, numerator_value in numerator_by_parameter_name.items():
+            if parameter_name not in coordinate_bound_by_name:
+                raise ValueError(f"missing coordinate bound for {parameter_name}")
+            denominator_value = _positive_float(
+                denominator_by_parameter_name[parameter_name],
+                f"{parameter_name}.trajectory_initialization_weight",
             )
-            denominator_by_parameter_name[parameter_name] += target_weight
-    if not numerator_by_parameter_name:
-        return primitive_parameters
-    for parameter_name, numerator_value in numerator_by_parameter_name.items():
-        if parameter_name not in coordinate_bound_by_name:
-            raise ValueError(f"missing coordinate bound for {parameter_name}")
-        denominator_value = _positive_float(
-            denominator_by_parameter_name[parameter_name],
-            f"{parameter_name}.trajectory_initialization_weight",
+            current_coordinate = _finite_float(
+                updated_parameter_mapping[parameter_name],
+                f"{parameter_name}.current_coordinate",
+            )
+            proposed_coordinate = (
+                current_coordinate + numerator_value / denominator_value
+            )
+            coordinate_bound = coordinate_bound_by_name[parameter_name]
+            updated_parameter_mapping[parameter_name] = min(
+                coordinate_bound.upper,
+                max(coordinate_bound.lower, proposed_coordinate),
+            )
+    initialized_parameters = conductivity_primitive_parameters_from_mapping(
+        updated_parameter_mapping,
+    )
+    validate_conductivity_primitive_parameters(initialized_parameters)
+    return _initialize_contact_pair_desolvation_from_trajectory_response(
+        initialized_parameters,
+        trajectory_targets,
+        audit_options,
+        coordinate_bound_by_name,
+        fit_options.minimum_coordinate_step,
+    )
+
+
+@dataclass(frozen=True)
+class _ContactPairReachabilityPoint:
+    coordinate_value: float
+    log_concentration_residual: float
+
+
+@dataclass(frozen=True)
+class _ContactPairReachabilityProbe:
+    successful: bool
+    coordinate_value: float
+    log_concentration_residual: float
+    failure_reason: str
+
+
+@dataclass(frozen=True)
+class _ContactPairReachabilityBracket:
+    bracketed: bool
+    overprediction_point: _ContactPairReachabilityPoint
+    underprediction_point: _ContactPairReachabilityPoint
+    evaluated_points: tuple[_ContactPairReachabilityPoint, ...]
+
+
+@dataclass(frozen=True)
+class _ContactPairLogResidual:
+    has_contact_pair_targets: bool
+    log_concentration_residual: float
+
+
+def _initialize_contact_pair_desolvation_from_trajectory_response(
+    primitive_parameters: ConductivityPrimitiveParameterSet,
+    trajectory_targets: tuple[TrajectoryPrimitiveCalibrationTarget, ...],
+    audit_options: "MolecularPropertyDbAuditOptions",
+    coordinate_bound_by_name: Mapping[str, PrimitiveParameterTransform],
+    coordinate_tolerance: float,
+) -> ConductivityPrimitiveParameterSet:
+    validate_conductivity_primitive_parameters(primitive_parameters)
+    if CONTACT_PAIR_DESOLVATION_PARAMETER_NAME not in coordinate_bound_by_name:
+        raise ValueError(
+            f"missing coordinate bound for {CONTACT_PAIR_DESOLVATION_PARAMETER_NAME}"
         )
-        current_coordinate = _finite_float(
-            updated_parameter_mapping[parameter_name],
-            f"{parameter_name}.current_coordinate",
+    parameter_mapping = conductivity_primitive_parameters_to_mapping(
+        primitive_parameters,
+    )
+    coordinate_bound = coordinate_bound_by_name[CONTACT_PAIR_DESOLVATION_PARAMETER_NAME]
+    tolerance = _positive_float(
+        coordinate_tolerance,
+        "contact_pair_reachability_coordinate_tolerance",
+    )
+    current_probe = _contact_pair_reachability_probe(
+        parameter_mapping,
+        parameter_mapping[CONTACT_PAIR_DESOLVATION_PARAMETER_NAME],
+        trajectory_targets,
+        audit_options,
+    )
+    if not current_probe.successful:
+        if current_probe.failure_reason == "no_contact_pair_targets":
+            return primitive_parameters
+        raise ValueError(
+            "contact-pair reachability initialization failed at current "
+            f"coordinate: {current_probe.failure_reason}"
         )
-        proposed_coordinate = current_coordinate + numerator_value / denominator_value
-        coordinate_bound = coordinate_bound_by_name[parameter_name]
-        updated_parameter_mapping[parameter_name] = min(
+    current_point = _contact_pair_probe_point(current_probe)
+    candidate_points = [current_point]
+    if current_point.log_concentration_residual < 0.0:
+        bracket_result = _contact_pair_overprediction_bracket_below_current(
+            parameter_mapping,
+            trajectory_targets,
+            audit_options,
+            coordinate_bound.lower,
+            current_point,
+            tolerance,
+        )
+    else:
+        bracket_result = _contact_pair_underprediction_bracket_above_current(
+            parameter_mapping,
+            trajectory_targets,
+            audit_options,
+            current_point,
             coordinate_bound.upper,
-            max(coordinate_bound.lower, proposed_coordinate),
+            tolerance,
         )
+    candidate_points.extend(bracket_result.evaluated_points)
+    if bracket_result.bracketed:
+        solved_point = _solve_contact_pair_response_bracket(
+            parameter_mapping,
+            trajectory_targets,
+            audit_options,
+            bracket_result.overprediction_point,
+            bracket_result.underprediction_point,
+            tolerance,
+        )
+        candidate_points.append(solved_point)
+    best_point = _best_contact_pair_reachability_point(tuple(candidate_points))
+    if best_point.coordinate_value == current_point.coordinate_value:
+        return primitive_parameters
+    updated_parameter_mapping = dict(parameter_mapping)
+    updated_parameter_mapping[CONTACT_PAIR_DESOLVATION_PARAMETER_NAME] = (
+        best_point.coordinate_value
+    )
     initialized_parameters = conductivity_primitive_parameters_from_mapping(
         updated_parameter_mapping,
     )
     validate_conductivity_primitive_parameters(initialized_parameters)
     return initialized_parameters
+
+
+def _contact_pair_probe_point(
+    probe: _ContactPairReachabilityProbe,
+) -> _ContactPairReachabilityPoint:
+    if not probe.successful:
+        raise ValueError(f"contact-pair probe failed: {probe.failure_reason}")
+    return _ContactPairReachabilityPoint(
+        coordinate_value=probe.coordinate_value,
+        log_concentration_residual=probe.log_concentration_residual,
+    )
+
+
+def _contact_pair_overprediction_bracket_below_current(
+    parameter_mapping: Mapping[str, float],
+    trajectory_targets: tuple[TrajectoryPrimitiveCalibrationTarget, ...],
+    audit_options: "MolecularPropertyDbAuditOptions",
+    lower_coordinate: float,
+    current_underprediction_point: _ContactPairReachabilityPoint,
+    coordinate_tolerance: float,
+) -> _ContactPairReachabilityBracket:
+    underprediction_point = current_underprediction_point
+    lower_boundary = _finite_float(
+        lower_coordinate,
+        "contact_pair_reachability_lower_coordinate",
+    )
+    evaluated_points: list[_ContactPairReachabilityPoint] = []
+    iteration_count = _coordinate_bisection_iteration_count(
+        underprediction_point.coordinate_value - lower_boundary,
+        coordinate_tolerance,
+    )
+    for iteration_index in range(iteration_count):
+        if not lower_boundary < underprediction_point.coordinate_value:
+            break
+        probe_coordinate = 0.5 * (
+            lower_boundary + underprediction_point.coordinate_value
+        )
+        if not coordinate_tolerance < (
+            underprediction_point.coordinate_value - probe_coordinate
+        ):
+            break
+        probe = _contact_pair_reachability_probe(
+            parameter_mapping,
+            probe_coordinate,
+            trajectory_targets,
+            audit_options,
+        )
+        if not probe.successful:
+            lower_boundary = probe_coordinate
+            continue
+        probe_point = _contact_pair_probe_point(probe)
+        evaluated_points.append(probe_point)
+        if 0.0 <= probe_point.log_concentration_residual:
+            return _ContactPairReachabilityBracket(
+                bracketed=True,
+                overprediction_point=probe_point,
+                underprediction_point=underprediction_point,
+                evaluated_points=tuple(evaluated_points),
+            )
+        underprediction_point = probe_point
+        _nonnegative_int(iteration_index, "contact_pair_bracket_iteration")
+    return _ContactPairReachabilityBracket(
+        bracketed=False,
+        overprediction_point=underprediction_point,
+        underprediction_point=underprediction_point,
+        evaluated_points=tuple(evaluated_points),
+    )
+
+
+def _contact_pair_underprediction_bracket_above_current(
+    parameter_mapping: Mapping[str, float],
+    trajectory_targets: tuple[TrajectoryPrimitiveCalibrationTarget, ...],
+    audit_options: "MolecularPropertyDbAuditOptions",
+    current_overprediction_point: _ContactPairReachabilityPoint,
+    upper_coordinate: float,
+    coordinate_tolerance: float,
+) -> _ContactPairReachabilityBracket:
+    overprediction_point = current_overprediction_point
+    upper_boundary = _finite_float(
+        upper_coordinate,
+        "contact_pair_reachability_upper_coordinate",
+    )
+    evaluated_points: list[_ContactPairReachabilityPoint] = []
+    iteration_count = _coordinate_bisection_iteration_count(
+        upper_boundary - overprediction_point.coordinate_value,
+        coordinate_tolerance,
+    )
+    for iteration_index in range(iteration_count):
+        if not overprediction_point.coordinate_value < upper_boundary:
+            break
+        probe_coordinate = 0.5 * (
+            overprediction_point.coordinate_value + upper_boundary
+        )
+        if not coordinate_tolerance < (
+            probe_coordinate - overprediction_point.coordinate_value
+        ):
+            break
+        probe = _contact_pair_reachability_probe(
+            parameter_mapping,
+            probe_coordinate,
+            trajectory_targets,
+            audit_options,
+        )
+        if not probe.successful:
+            upper_boundary = probe_coordinate
+            continue
+        probe_point = _contact_pair_probe_point(probe)
+        evaluated_points.append(probe_point)
+        if probe_point.log_concentration_residual <= 0.0:
+            return _ContactPairReachabilityBracket(
+                bracketed=True,
+                overprediction_point=overprediction_point,
+                underprediction_point=probe_point,
+                evaluated_points=tuple(evaluated_points),
+            )
+        overprediction_point = probe_point
+        _nonnegative_int(iteration_index, "contact_pair_bracket_iteration")
+    return _ContactPairReachabilityBracket(
+        bracketed=False,
+        overprediction_point=overprediction_point,
+        underprediction_point=overprediction_point,
+        evaluated_points=tuple(evaluated_points),
+    )
+
+
+def _solve_contact_pair_response_bracket(
+    parameter_mapping: Mapping[str, float],
+    trajectory_targets: tuple[TrajectoryPrimitiveCalibrationTarget, ...],
+    audit_options: "MolecularPropertyDbAuditOptions",
+    overprediction_point: _ContactPairReachabilityPoint,
+    underprediction_point: _ContactPairReachabilityPoint,
+    coordinate_tolerance: float,
+) -> _ContactPairReachabilityPoint:
+    if not overprediction_point.coordinate_value < underprediction_point.coordinate_value:
+        raise ValueError("contact-pair response bracket has inverted coordinates")
+    if overprediction_point.log_concentration_residual < 0.0:
+        raise ValueError("contact-pair response bracket missing overprediction side")
+    if 0.0 < underprediction_point.log_concentration_residual:
+        raise ValueError("contact-pair response bracket missing underprediction side")
+    best_point = _best_contact_pair_reachability_point(
+        (overprediction_point, underprediction_point)
+    )
+    iteration_count = _coordinate_bisection_iteration_count(
+        underprediction_point.coordinate_value - overprediction_point.coordinate_value,
+        coordinate_tolerance,
+    )
+    bracket_overprediction_point = overprediction_point
+    bracket_underprediction_point = underprediction_point
+    for iteration_index in range(iteration_count):
+        if not coordinate_tolerance < (
+            bracket_underprediction_point.coordinate_value
+            - bracket_overprediction_point.coordinate_value
+        ):
+            break
+        probe_coordinate = 0.5 * (
+            bracket_overprediction_point.coordinate_value
+            + bracket_underprediction_point.coordinate_value
+        )
+        probe = _contact_pair_reachability_probe(
+            parameter_mapping,
+            probe_coordinate,
+            trajectory_targets,
+            audit_options,
+        )
+        if not probe.successful:
+            raise ValueError(
+                "contact-pair response solve failed inside a feasible bracket: "
+                f"{probe.failure_reason}"
+            )
+        probe_point = _contact_pair_probe_point(probe)
+        best_point = _best_contact_pair_reachability_point(
+            (best_point, probe_point)
+        )
+        if 0.0 <= probe_point.log_concentration_residual:
+            bracket_overprediction_point = probe_point
+        else:
+            bracket_underprediction_point = probe_point
+        _nonnegative_int(iteration_index, "contact_pair_solve_iteration")
+    return best_point
+
+
+def _coordinate_bisection_iteration_count(
+    coordinate_span: float,
+    coordinate_tolerance: float,
+) -> int:
+    span = _nonnegative_float(coordinate_span, "coordinate_bisection_span")
+    tolerance = _positive_float(
+        coordinate_tolerance,
+        "coordinate_bisection_tolerance",
+    )
+    if span <= tolerance:
+        return 1
+    return int(math.ceil(math.log2(span / tolerance))) + 1
+
+
+def _contact_pair_reachability_probe(
+    parameter_mapping: Mapping[str, float],
+    contact_pair_desolvation_offset_over_RT: float,
+    trajectory_targets: tuple[TrajectoryPrimitiveCalibrationTarget, ...],
+    audit_options: "MolecularPropertyDbAuditOptions",
+) -> _ContactPairReachabilityProbe:
+    coordinate_value = _finite_float(
+        contact_pair_desolvation_offset_over_RT,
+        CONTACT_PAIR_DESOLVATION_PARAMETER_NAME,
+    )
+    updated_parameter_mapping = dict(parameter_mapping)
+    updated_parameter_mapping[CONTACT_PAIR_DESOLVATION_PARAMETER_NAME] = (
+        coordinate_value
+    )
+    try:
+        primitive_parameters = conductivity_primitive_parameters_from_mapping(
+            updated_parameter_mapping,
+        )
+        residual = _contact_pair_log_concentration_residual(
+            primitive_parameters,
+            trajectory_targets,
+            audit_options,
+        )
+    except (
+        FloatingPointError,
+        OverflowError,
+        ValueError,
+        np.linalg.LinAlgError,
+    ) as exc:
+        return _ContactPairReachabilityProbe(
+            successful=False,
+            coordinate_value=coordinate_value,
+            log_concentration_residual=0.0,
+            failure_reason=f"{type(exc).__name__}:{exc}",
+        )
+    if not residual.has_contact_pair_targets:
+        return _ContactPairReachabilityProbe(
+            successful=False,
+            coordinate_value=coordinate_value,
+            log_concentration_residual=0.0,
+            failure_reason="no_contact_pair_targets",
+        )
+    return _ContactPairReachabilityProbe(
+        successful=True,
+        coordinate_value=coordinate_value,
+        log_concentration_residual=residual.log_concentration_residual,
+        failure_reason="",
+    )
+
+
+def _contact_pair_log_concentration_residual(
+    primitive_parameters: ConductivityPrimitiveParameterSet,
+    trajectory_targets: tuple[TrajectoryPrimitiveCalibrationTarget, ...],
+    audit_options: "MolecularPropertyDbAuditOptions",
+) -> _ContactPairLogResidual:
+    weighted_residual_sum = 0.0
+    weight_sum = 0.0
+    for trajectory_target in trajectory_targets:
+        analytical_result = _trajectory_target_analytical_result(
+            trajectory_target,
+            primitive_parameters,
+            audit_options,
+        )
+        predicted_concentrations = _transport_center_concentration_targets(
+            analytical_result,
+        )
+        reachable_labels = _reachable_transport_center_target_labels(
+            analytical_result,
+        )
+        concentration_floor_mol_m3 = _trajectory_concentration_floor_mol_m3(
+            analytical_result,
+        )
+        for target_label, target_concentration_mol_m3 in (
+            trajectory_target.primitive_target_artifact.state_concentrations_mol_m3.items()
+        ):
+            target_role, _target_species_name = _trajectory_target_label_parts(
+                target_label,
+            )
+            if target_role != TRAJECTORY_CONTACT_PAIR_ROLE:
+                continue
+            if target_label not in reachable_labels:
+                continue
+            parsed_target_concentration_mol_m3 = _nonnegative_float(
+                target_concentration_mol_m3,
+                (
+                    f"{trajectory_target.system_id}.{target_label}"
+                    ".contact_pair_target_concentration_mol_m3"
+                ),
+            )
+            if parsed_target_concentration_mol_m3 <= 0.0:
+                continue
+            predicted_concentration_mol_m3 = max(
+                concentration_floor_mol_m3,
+                _predicted_mapping_value_or_zero(
+                    predicted_concentrations,
+                    target_label,
+                    (
+                        f"{trajectory_target.system_id}."
+                        "contact_pair_state_concentrations_mol_m3"
+                    ),
+                ),
+            )
+            target_weight = max(
+                parsed_target_concentration_mol_m3,
+                concentration_floor_mol_m3,
+            )
+            weighted_residual_sum += target_weight * (
+                math.log(predicted_concentration_mol_m3)
+                - math.log(parsed_target_concentration_mol_m3)
+            )
+            weight_sum += target_weight
+    if weight_sum <= 0.0:
+        return _ContactPairLogResidual(
+            has_contact_pair_targets=False,
+            log_concentration_residual=0.0,
+        )
+    return _ContactPairLogResidual(
+        has_contact_pair_targets=True,
+        log_concentration_residual=_finite_float(
+            weighted_residual_sum / weight_sum,
+            "contact_pair_log_concentration_residual",
+        ),
+    )
+
+
+def _best_contact_pair_reachability_point(
+    contact_pair_points: tuple[_ContactPairReachabilityPoint, ...],
+) -> _ContactPairReachabilityPoint:
+    if not contact_pair_points:
+        raise ValueError("contact_pair_points must be nonempty")
+    best_point = contact_pair_points[0]
+    for candidate_point in contact_pair_points[1:]:
+        if abs(candidate_point.log_concentration_residual) < abs(
+            best_point.log_concentration_residual
+        ):
+            best_point = candidate_point
+    return best_point
 
 
 def _trajectory_target_label_parts(target_label: str) -> tuple[str, str]:
@@ -1137,7 +1644,11 @@ def print_trajectory_topology_initialization_changes(
         initialized_parameters,
     )
     reported_parameter_names = tuple(
-        dict.fromkeys(TRAJECTORY_TOPOLOGY_LOGK_PARAMETER_BY_ROLE.values())
+        dict.fromkeys(
+            parameter_name
+            for update_tuple in TRAJECTORY_POPULATION_PARAMETER_UPDATES_BY_ROLE.values()
+            for parameter_name, _update_sign in update_tuple
+        )
     )
     for parameter_name in reported_parameter_names:
         if parameter_name not in baseline_mapping:
@@ -1193,6 +1704,55 @@ def _log_mapping_loss(
     return _mean_squared_dimensionless_loss(residuals, context)
 
 
+def _uncertainty_normalized_mapping_loss(
+    predicted_values_by_label: Mapping[str, float],
+    target_values_by_label: Mapping[str, float],
+    standard_errors_by_label: Mapping[str, float],
+    context: str,
+) -> float:
+    if not target_values_by_label:
+        return 0.0
+    residuals: list[float] = []
+    for target_label, target_value in target_values_by_label.items():
+        label = _nonempty_string(target_label, f"{context}.target_label")
+        if label not in standard_errors_by_label:
+            raise ValueError(f"{context}.{label} is missing block standard error")
+        parsed_target_value = _nonnegative_float(
+            target_value,
+            f"{context}.{label}.target",
+        )
+        standard_error = _positive_float(
+            standard_errors_by_label[label],
+            f"{context}.{label}.standard_error",
+        )
+        predicted_value = _predicted_mapping_value_or_zero(
+            predicted_values_by_label,
+            label,
+            context,
+        )
+        residuals.append((predicted_value - parsed_target_value) / standard_error)
+    return _mean_squared_dimensionless_loss(residuals, context)
+
+
+def _uncertainty_normalized_scalar_loss(
+    predicted_value: float,
+    target_value: float,
+    standard_error: float,
+    context: str,
+) -> float:
+    parsed_predicted_value = _nonnegative_float(
+        predicted_value,
+        f"{context}.predicted",
+    )
+    parsed_target_value = _nonnegative_float(target_value, f"{context}.target")
+    parsed_standard_error = _positive_float(
+        standard_error,
+        f"{context}.standard_error",
+    )
+    residual = (parsed_predicted_value - parsed_target_value) / parsed_standard_error
+    return _mean_squared_dimensionless_loss([residual], context)
+
+
 def _predicted_mapping_value_or_zero(
     predicted_values_by_label: Mapping[str, float],
     target_label: str,
@@ -1246,7 +1806,7 @@ def _measured_consumed_parameter_fields(
             "parameter_consumption_perturbation_scales must include a value "
             "that differs from one"
         )
-    consumed_parameter_fields: list[str] = []
+    consumed_parameter_name_set = set(_projected_primitive_parameter_fields())
     for parameter_name in CONDUCTIVITY_PRIMITIVE_PARAMETER_FIELD_NAMES:
         if _parameter_is_consumed_by_any_perturbation(
             cases,
@@ -1256,8 +1816,34 @@ def _measured_consumed_parameter_fields(
             parameter_name,
             perturbation_scales,
         ):
-            consumed_parameter_fields.append(parameter_name)
-    return tuple(consumed_parameter_fields)
+            consumed_parameter_name_set.add(parameter_name)
+    return tuple(
+        parameter_name
+        for parameter_name in CONDUCTIVITY_PRIMITIVE_PARAMETER_FIELD_NAMES
+        if parameter_name in consumed_parameter_name_set
+    )
+
+
+def _projected_primitive_parameter_fields() -> tuple[str, ...]:
+    from conductivity.analytical_conductivity_model import (
+        CONDUCTIVITY_PRIMITIVE_PARAMETER_THEOREM_ROLE_BY_NAME,
+    )
+
+    missing_parameter_names = tuple(
+        parameter_name
+        for parameter_name in CONDUCTIVITY_PRIMITIVE_PARAMETER_FIELD_NAMES
+        if parameter_name not in CONDUCTIVITY_PRIMITIVE_PARAMETER_THEOREM_ROLE_BY_NAME
+    )
+    if missing_parameter_names:
+        raise ValueError(
+            "primitive theorem-role map is missing parameter fields "
+            f"{missing_parameter_names}"
+        )
+    return tuple(
+        parameter_name
+        for parameter_name in CONDUCTIVITY_PRIMITIVE_PARAMETER_FIELD_NAMES
+        if parameter_name in CONDUCTIVITY_PRIMITIVE_PARAMETER_THEOREM_ROLE_BY_NAME
+    )
 
 
 def _parameter_is_consumed_by_any_perturbation(
@@ -1519,24 +2105,6 @@ def default_molecular_primitive_fit_configuration() -> tuple[
             fit_config_mapping,
             "corrector_loss_weight",
         ),
-        trajectory_concentration_loss_weight=_required_nonnegative_config_float(
-            fit_config_mapping,
-            "trajectory_concentration_loss_weight",
-        ),
-        trajectory_transition_rate_loss_weight=_required_nonnegative_config_float(
-            fit_config_mapping,
-            "trajectory_transition_rate_loss_weight",
-        ),
-        trajectory_displacement_moment_loss_weight=(
-            _required_nonnegative_config_float(
-                fit_config_mapping,
-                "trajectory_displacement_moment_loss_weight",
-            )
-        ),
-        trajectory_sigma_loss_weight=_required_nonnegative_config_float(
-            fit_config_mapping,
-            "trajectory_sigma_loss_weight",
-        ),
         role_direct_scaling_regularization_weight=(
             _required_nonnegative_config_float(
                 fit_config_mapping,
@@ -1695,6 +2263,10 @@ def default_molecular_primitive_fit_configuration() -> tuple[
             fit_config_mapping,
             "progress_output_path",
         ),
+        decomposition_report_output_path=_required_config_string(
+            fit_config_mapping,
+            "decomposition_report_output_path",
+        ),
         promotion_maximum_mae_mS_cm=_required_positive_config_float(
             fit_config_mapping,
             "promotion_maximum_mae_mS_cm",
@@ -1739,6 +2311,8 @@ def validate_molecular_property_db_audit_result(
             "molecular property-DB audit failed row count "
             f"{audit_result.failed_rows} exceeds {fit_options.maximum_failed_rows}"
         )
+    if audit_result.evaluated_rows and not audit_result.proof_statuses:
+        raise ValueError("molecular property-DB audit missing proof_statuses")
     _threshold_or_raise(
         audit_result.maximum_mass_balance_residual,
         fit_options.maximum_mass_balance_residual,
@@ -1934,7 +2508,10 @@ class PrimitivePromotionMetrics:
     bias_mS_cm: float
     pearson_r: float
     worst_abs_residual_mS_cm: float
+    proof_statuses: tuple[str, ...]
     failed_rows: int
+    trajectory_concentration_unreachable_target_count: int
+    trajectory_concentration_under_floor_target_count: int
     maximum_mass_balance_residual: float
     maximum_row_sum_residual: float
     maximum_stationary_residual: float
@@ -2582,19 +3159,10 @@ def evaluate_primitive_parameter_candidate(
             + options.residual_tail_loss_weight * tail_huber_loss_mS_cm
             + options.direct_capacity_loss_weight * direct_capacity_loss_mS_cm
             + options.corrector_loss_weight * corrector_loss_mS_cm
-            + (
-                options.trajectory_concentration_loss_weight
-                * trajectory_concentration_loss
-            )
-            + (
-                options.trajectory_transition_rate_loss_weight
-                * trajectory_transition_rate_loss
-            )
-            + (
-                options.trajectory_displacement_moment_loss_weight
-                * trajectory_displacement_moment_loss
-            )
-            + options.trajectory_sigma_loss_weight * trajectory_sigma_loss_mS_cm
+            + trajectory_concentration_loss
+            + trajectory_transition_rate_loss
+            + trajectory_displacement_moment_loss
+            + trajectory_sigma_loss_mS_cm
             + coordinate_regularization_loss
             + cluster_activation_loss
         )
@@ -3220,22 +3788,6 @@ def _validate_fit_options(options: PrimitiveFitOptions) -> None:
         "corrector_loss_weight",
     )
     _nonnegative_float(
-        options.trajectory_concentration_loss_weight,
-        "trajectory_concentration_loss_weight",
-    )
-    _nonnegative_float(
-        options.trajectory_transition_rate_loss_weight,
-        "trajectory_transition_rate_loss_weight",
-    )
-    _nonnegative_float(
-        options.trajectory_displacement_moment_loss_weight,
-        "trajectory_displacement_moment_loss_weight",
-    )
-    _nonnegative_float(
-        options.trajectory_sigma_loss_weight,
-        "trajectory_sigma_loss_weight",
-    )
-    _nonnegative_float(
         options.role_direct_scaling_regularization_weight,
         "role_direct_scaling_regularization_weight",
     )
@@ -3492,6 +4044,16 @@ def _candidate_rejection_reasons(
         )
     if evaluation.failed_rows > options.maximum_failed_rows:
         reasons.append("failed_rows")
+    if (
+        0 < evaluation.trajectory_concentration_unreachable_target_count
+        and options.trajectory_primitive_target_paths
+    ):
+        reasons.append("trajectory_c_unreachable")
+    if (
+        0 < evaluation.trajectory_concentration_under_floor_target_count
+        and options.trajectory_primitive_target_paths
+    ):
+        reasons.append("trajectory_c_under_floor")
     if min(predicted_sigmas_mS_cm) < 0.0:
         reasons.append("negative_conductivity")
     _append_threshold_reason(
@@ -4461,28 +5023,25 @@ def _prediction_sensitivity_values(
             f"{context_text}.predicted_sigmas_mS_cm",
         )
     )
-    if options.trajectory_concentration_loss_weight > 0.0:
+    if options.trajectory_primitive_target_paths:
         sensitivity_values.append(
             _nonnegative_float(
                 evaluation.trajectory_concentration_loss,
                 f"{context_text}.trajectory_concentration_loss",
             )
         )
-    if options.trajectory_transition_rate_loss_weight > 0.0:
         sensitivity_values.append(
             _nonnegative_float(
                 evaluation.trajectory_transition_rate_loss,
                 f"{context_text}.trajectory_transition_rate_loss",
             )
         )
-    if options.trajectory_displacement_moment_loss_weight > 0.0:
         sensitivity_values.append(
             _nonnegative_float(
                 evaluation.trajectory_displacement_moment_loss,
                 f"{context_text}.trajectory_displacement_moment_loss",
             )
         )
-    if options.trajectory_sigma_loss_weight > 0.0:
         sensitivity_values.append(
             _nonnegative_float(
                 evaluation.trajectory_sigma_loss_mS_cm,
@@ -4506,16 +5065,8 @@ def _prediction_sensitivity_weights(
         )
         for descriptor_target in descriptor_targets
     ]
-    if options.trajectory_concentration_loss_weight > 0.0:
-        sensitivity_weights.append(options.trajectory_concentration_loss_weight)
-    if options.trajectory_transition_rate_loss_weight > 0.0:
-        sensitivity_weights.append(options.trajectory_transition_rate_loss_weight)
-    if options.trajectory_displacement_moment_loss_weight > 0.0:
-        sensitivity_weights.append(
-            options.trajectory_displacement_moment_loss_weight
-        )
-    if options.trajectory_sigma_loss_weight > 0.0:
-        sensitivity_weights.append(options.trajectory_sigma_loss_weight)
+    if options.trajectory_primitive_target_paths:
+        sensitivity_weights.extend((1.0, 1.0, 1.0, 1.0))
     return tuple(
         _positive_float(sensitivity_weight, f"{context_text}.sensitivity_weight")
         for sensitivity_weight in sensitivity_weights
@@ -5041,6 +5592,10 @@ def primitive_parameter_promotion_rejection_reasons(
     candidate_metrics: PrimitivePromotionMetrics,
     options: PrimitiveFitOptions,
 ) -> tuple[str, ...]:
+    from conductivity.analytical_conductivity_model import (
+        PROJECTED_READOUT_PROVEN_DESCRIPTOR_CLOSURE_EMPIRICAL,
+    )
+
     _validate_fit_options(options)
     reasons: list[str] = []
     if (
@@ -5060,6 +5615,15 @@ def primitive_parameter_promotion_rejection_reasons(
         > options.promotion_maximum_worst_abs_residual_mS_cm
     ):
         reasons.append("worst_residual_target")
+    if (
+        PROJECTED_READOUT_PROVEN_DESCRIPTOR_CLOSURE_EMPIRICAL
+        in candidate_metrics.proof_statuses
+    ):
+        reasons.append("descriptor_closure_empirical")
+    if 0 < candidate_metrics.trajectory_concentration_unreachable_target_count:
+        reasons.append("trajectory_c_unreachable")
+    if 0 < candidate_metrics.trajectory_concentration_under_floor_target_count:
+        reasons.append("trajectory_c_under_floor")
     if candidate_metrics.failed_rows > options.maximum_failed_rows:
         reasons.append("failed_rows")
     _append_threshold_reason(
@@ -5250,6 +5814,7 @@ def write_default_calibration_error_decomposition_report(
             trajectory_targets,
             audit_options,
             coordinate_bounds,
+            fit_options,
         )
     )
     snapshot_parameter_sets = [
@@ -5266,17 +5831,13 @@ def write_default_calibration_error_decomposition_report(
                 ),
             )
         )
-    report_mapping = calibration_error_decomposition_report_mapping(
+    write_calibration_error_decomposition_report(
+        str(output_path),
         tuple(snapshot_parameter_sets),
         case_selection.cases,
         audit_options,
         fit_options,
         trajectory_targets,
-    )
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(
-        json.dumps(report_mapping, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
     )
 
 
@@ -5815,6 +6376,32 @@ def calibration_error_decomposition_report_mapping(
     }
 
 
+def write_calibration_error_decomposition_report(
+    report_path: str,
+    snapshot_parameter_sets: tuple[
+        tuple[str, ConductivityPrimitiveParameterSet],
+        ...,
+    ],
+    cases: tuple["MolecularPropertyDbCase", ...],
+    audit_options: "MolecularPropertyDbAuditOptions",
+    fit_options: PrimitiveFitOptions,
+    trajectory_targets: tuple[TrajectoryPrimitiveCalibrationTarget, ...],
+) -> None:
+    output_path = Path(_nonempty_string(report_path, "report_path"))
+    report_mapping = calibration_error_decomposition_report_mapping(
+        snapshot_parameter_sets,
+        cases,
+        audit_options,
+        fit_options,
+        trajectory_targets,
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps(report_mapping, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
 def _calibration_snapshot_decomposition_mapping(
     snapshot_name: str,
     primitive_parameters: ConductivityPrimitiveParameterSet,
@@ -5877,6 +6464,10 @@ def _calibration_snapshot_decomposition_mapping(
                 1 for row in audit_result.rows if row.corrector_too_weak_failure
             ),
         },
+        "row_buckets": _calibration_row_bucket_report_mapping(
+            audit_result.rows,
+            fit_options,
+        ),
         "worst_rows": tuple(
             _calibration_worst_row_mapping(row_result, fit_options)
             for row_result in tuple(
@@ -5888,6 +6479,80 @@ def _calibration_snapshot_decomposition_mapping(
             )[: fit_options.residual_tail_count]
         ),
     }
+
+
+def _calibration_row_bucket_report_mapping(
+    row_results: tuple["MolecularPropertyDbRowResult", ...],
+    fit_options: PrimitiveFitOptions,
+) -> dict:
+    if not row_results:
+        raise ValueError("calibration row bucket report requires rows")
+    return {
+        "direct_capacity_failures": _calibration_row_bucket_mapping(
+            "direct_capacity_failures",
+            tuple(row for row in row_results if row.direct_capacity_failure),
+            fit_options,
+        ),
+        "corrector_too_strong_failures": _calibration_row_bucket_mapping(
+            "corrector_too_strong_failures",
+            tuple(row for row in row_results if row.corrector_too_strong_failure),
+            fit_options,
+        ),
+        "corrector_too_weak_failures": _calibration_row_bucket_mapping(
+            "corrector_too_weak_failures",
+            tuple(row for row in row_results if row.corrector_too_weak_failure),
+            fit_options,
+        ),
+        "worst_residual_tail": _calibration_row_bucket_mapping(
+            "worst_residual_tail",
+            tuple(
+                sorted(
+                    row_results,
+                    key=_absolute_residual_sort_key,
+                    reverse=True,
+                )
+            )[: fit_options.residual_tail_count],
+            fit_options,
+        ),
+    }
+
+
+def _calibration_row_bucket_mapping(
+    bucket_name: str,
+    row_results: tuple["MolecularPropertyDbRowResult", ...],
+    fit_options: PrimitiveFitOptions,
+) -> dict:
+    bucket_name_text = _nonempty_string(bucket_name, "bucket_name")
+    sorted_rows = tuple(
+        sorted(
+            row_results,
+            key=_absolute_residual_sort_key,
+            reverse=True,
+        )
+    )
+    return {
+        "bucket_name": bucket_name_text,
+        "row_count": len(sorted_rows),
+        "mean_abs_residual_mS_cm": _mean_abs_row_residual_mS_cm(sorted_rows),
+        "rows": tuple(
+            _calibration_worst_row_mapping(row_result, fit_options)
+            for row_result in sorted_rows
+        ),
+    }
+
+
+def _mean_abs_row_residual_mS_cm(
+    row_results: tuple["MolecularPropertyDbRowResult", ...],
+) -> float:
+    if not row_results:
+        return 0.0
+    return float(
+        math.fsum(
+            abs(_finite_float(row_result.residual_mS_cm, "row_residual_mS_cm"))
+            for row_result in row_results
+        )
+        / len(row_results)
+    )
 
 
 def _trajectory_coverage_mapping(
@@ -5923,6 +6588,7 @@ def _calibration_worst_row_mapping(
     return {
         "row_id": row_result.row_id,
         "source_row_ids": row_result.source_row_ids,
+        "proof_status": row_result.proof_status,
         "empirical_sigma_mS_cm": row_result.empirical_sigma_mS_cm,
         "predicted_sigma_mS_cm": row_result.predicted_sigma_mS_cm,
         "residual_mS_cm": row_result.residual_mS_cm,
@@ -6649,7 +7315,23 @@ def _primitive_promotion_metrics_mapping(
             metrics.worst_abs_residual_mS_cm,
             "metrics.worst_abs_residual_mS_cm",
         ),
+        "proof_statuses": tuple(
+            _nonempty_string(proof_status, "metrics.proof_status")
+            for proof_status in metrics.proof_statuses
+        ),
         "failed_rows": int(_nonnegative_int(metrics.failed_rows, "metrics.failed_rows")),
+        "trajectory_concentration_unreachable_target_count": int(
+            _nonnegative_int(
+                metrics.trajectory_concentration_unreachable_target_count,
+                "metrics.trajectory_concentration_unreachable_target_count",
+            )
+        ),
+        "trajectory_concentration_under_floor_target_count": int(
+            _nonnegative_int(
+                metrics.trajectory_concentration_under_floor_target_count,
+                "metrics.trajectory_concentration_under_floor_target_count",
+            )
+        ),
         "maximum_mass_balance_residual": _nonnegative_float(
             metrics.maximum_mass_balance_residual,
             "metrics.maximum_mass_balance_residual",
@@ -6681,6 +7363,27 @@ def _primitive_promotion_metrics_mapping(
             metrics.higher_packing_lowers_local_mobility
         ),
     }
+
+
+def _trajectory_concentration_coverage_counts(
+    trajectory_targets: tuple[TrajectoryPrimitiveCalibrationTarget, ...],
+    primitive_parameters: ConductivityPrimitiveParameterSet,
+    audit_options: "MolecularPropertyDbAuditOptions",
+) -> tuple[int, int]:
+    if not trajectory_targets:
+        return (0, 0)
+    coverages = trajectory_concentration_target_coverage(
+        trajectory_targets,
+        primitive_parameters,
+        audit_options,
+    )
+    unreachable_target_count = sum(
+        len(coverage.unreachable_target_labels) for coverage in coverages
+    )
+    under_floor_target_count = sum(
+        len(coverage.under_floor_target_labels) for coverage in coverages
+    )
+    return (unreachable_target_count, under_floor_target_count)
 
 
 def _finite_float(value: float, context: str) -> float:
@@ -6798,29 +7501,7 @@ def _print_prediction_sensitivity_diagnostics(
         )
 
 
-DIRECT_CAPACITY_BLOCK_PARAMETER_NAMES = (
-    "coulomb_scale",
-    "desolvation_scale",
-    "coordination_scale",
-    "steric_free_energy_scale",
-    "cluster_entropy_penalty_scale",
-    "association_crowding_stabilization_scale",
-    "association_crowding_ionic_strength_exponent",
-    "association_crowding_charge_density_exponent",
-    "activity_debye_scale",
-    "activity_size_scale",
-    "activity_hard_sphere_scale",
-    "cluster_activity_scale",
-    "pair_logK_offset",
-    "solvent_separated_pair_logK_offset",
-    "contact_pair_logK_offset",
-    "positive_charged_triplet_logK_offset",
-    "negative_charged_triplet_logK_offset",
-    "neutral_cluster_logK_offset",
-    "higher_charged_cluster_logK_offset",
-    "cluster_order_logK_slope",
-    "cluster_charge_magnitude_logK_slope",
-    "cluster_hydrodynamic_radius_scale",
+C_STABLE_DIRECT_CAPACITY_BLOCK_PARAMETER_NAMES = (
     "hydrodynamic_radius_scale_positive_ion",
     "hydrodynamic_radius_scale_negative_ion",
     "hydrodynamic_radius_scale_cluster",
@@ -6851,11 +7532,6 @@ CORRECTOR_BLOCK_PARAMETER_NAMES = (
     "atmosphere_rel_scale",
     "charge_cloud_radius_scale",
     "cross_relaxation_scale",
-    "jump_length_scale",
-    "atmosphere_capture_scale",
-    "atmosphere_exit_scale",
-    "association_conversion_rate_scale",
-    "orientation_relaxation_rate_scale",
 )
 
 CLUSTER_SINK_BLOCK_PARAMETER_NAMES = (
@@ -6914,131 +7590,51 @@ class DecomposedFitContext:
     cases: tuple["MolecularPropertyDbCase", ...]
     audit_options: "MolecularPropertyDbAuditOptions"
     fit_options: PrimitiveFitOptions
+    trajectory_primitive_calibration_targets: tuple[
+        TrajectoryPrimitiveCalibrationTarget,
+        ...,
+    ]
     coordinate_bounds: tuple[PrimitiveParameterTransform, ...]
     full_evaluator: ConductivityPrimitiveParameterEvaluator
     regularization_reference_parameters: ConductivityPrimitiveParameterSet
 
 
-class RowFilteredPrimitiveEvaluator:
+class SelectedRowPrimitiveEvaluator:
     def __init__(
         self,
-        base_evaluator: ConductivityPrimitiveParameterEvaluator,
+        cases: tuple["MolecularPropertyDbCase", ...],
+        audit_options: "MolecularPropertyDbAuditOptions",
+        fit_options: PrimitiveFitOptions,
+        trajectory_primitive_calibration_targets: tuple[
+            TrajectoryPrimitiveCalibrationTarget,
+            ...,
+        ],
         selected_row_indices: tuple[int, ...],
+        consumed_parameter_fields: tuple[str, ...],
     ) -> None:
         if not selected_row_indices:
-            raise ValueError("row-filtered evaluator requires selected rows")
-        self._base_evaluator = base_evaluator
-        self._selected_row_indices = selected_row_indices
+            raise ValueError("selected-row evaluator requires selected rows")
+        if not consumed_parameter_fields:
+            raise ValueError("selected-row evaluator requires consumed parameter fields")
+        selected_cases = tuple(cases[row_index] for row_index in selected_row_indices)
+        selected_audit_options = replace(
+            audit_options,
+            include_event_family_attribution=False,
+        )
+        self._selected_evaluator = MolecularPropertyDbPrimitiveEvaluator(
+            selected_cases,
+            selected_audit_options,
+            fit_options,
+            trajectory_primitive_calibration_targets,
+        )
+        self._selected_evaluator._consumed_parameter_fields = consumed_parameter_fields
+        self._selected_evaluator._has_measured_consumed_parameter_fields = True
 
     def evaluate(
         self,
         primitive_parameters: ConductivityPrimitiveParameterSet,
     ) -> PrimitiveFitDatasetEvaluation:
-        full_evaluation = self._base_evaluator.evaluate(primitive_parameters)
-        selected_direct_capacity_gaps = _select_tuple_values(
-            full_evaluation.direct_capacity_gaps_mS_cm,
-            self._selected_row_indices,
-        )
-        selected_corrector_residuals = _select_tuple_values(
-            full_evaluation.corrector_residuals_mS_cm,
-            self._selected_row_indices,
-        )
-        return PrimitiveFitDatasetEvaluation(
-            descriptor_calibration_targets=_select_descriptor_calibration_targets(
-                full_evaluation.descriptor_calibration_targets,
-                self._selected_row_indices,
-            ),
-            trajectory_primitive_calibration_targets=(
-                full_evaluation.trajectory_primitive_calibration_targets
-            ),
-            predicted_sigmas_mS_cm=_select_tuple_values(
-                full_evaluation.predicted_sigmas_mS_cm,
-                self._selected_row_indices,
-            ),
-            direct_sigmas_mS_cm=_select_tuple_values(
-                full_evaluation.direct_sigmas_mS_cm,
-                self._selected_row_indices,
-            ),
-            corrector_sigmas_mS_cm=_select_tuple_values(
-                full_evaluation.corrector_sigmas_mS_cm,
-                self._selected_row_indices,
-            ),
-            direct_capacity_gaps_mS_cm=selected_direct_capacity_gaps,
-            corrector_targets_mS_cm=_select_tuple_values(
-                full_evaluation.corrector_targets_mS_cm,
-                self._selected_row_indices,
-            ),
-            corrector_residuals_mS_cm=selected_corrector_residuals,
-            direct_capacity_failure_count=sum(
-                direct_capacity_gap_mS_cm > 0.0
-                for direct_capacity_gap_mS_cm in selected_direct_capacity_gaps
-            ),
-            corrector_too_strong_failure_count=sum(
-                direct_capacity_gap_mS_cm <= 0.0 and corrector_residual_mS_cm > 0.0
-                for direct_capacity_gap_mS_cm, corrector_residual_mS_cm in zip(
-                    selected_direct_capacity_gaps,
-                    selected_corrector_residuals,
-                )
-            ),
-            corrector_too_weak_failure_count=sum(
-                direct_capacity_gap_mS_cm <= 0.0 and corrector_residual_mS_cm < 0.0
-                for direct_capacity_gap_mS_cm, corrector_residual_mS_cm in zip(
-                    selected_direct_capacity_gaps,
-                    selected_corrector_residuals,
-                )
-            ),
-            trajectory_concentration_loss=full_evaluation.trajectory_concentration_loss,
-            trajectory_transition_rate_loss=(
-                full_evaluation.trajectory_transition_rate_loss
-            ),
-            trajectory_displacement_moment_loss=(
-                full_evaluation.trajectory_displacement_moment_loss
-            ),
-            trajectory_sigma_loss_mS_cm=full_evaluation.trajectory_sigma_loss_mS_cm,
-            cluster_activation_penalty=full_evaluation.cluster_activation_penalty,
-            failed_rows=full_evaluation.failed_rows,
-            maximum_mass_balance_residual=(
-                full_evaluation.maximum_mass_balance_residual
-            ),
-            maximum_row_sum_residual=full_evaluation.maximum_row_sum_residual,
-            maximum_stationary_residual=(
-                full_evaluation.maximum_stationary_residual
-            ),
-            maximum_detailed_balance_residual=(
-                full_evaluation.maximum_detailed_balance_residual
-            ),
-            maximum_event_reversal_residual=(
-                full_evaluation.maximum_event_reversal_residual
-            ),
-            zero_charge_sigma_mS_cm=full_evaluation.zero_charge_sigma_mS_cm,
-            higher_viscosity_lowers_dilute_conductivity=(
-                full_evaluation.higher_viscosity_lowers_dilute_conductivity
-            ),
-            higher_packing_lowers_local_mobility=(
-                full_evaluation.higher_packing_lowers_local_mobility
-            ),
-            consumed_parameter_fields=full_evaluation.consumed_parameter_fields,
-        )
-
-
-def _select_descriptor_calibration_targets(
-    descriptor_targets: tuple[DescriptorCalibrationTarget, ...],
-    selected_row_indices: tuple[int, ...],
-) -> tuple[DescriptorCalibrationTarget, ...]:
-    validated_targets = _validated_descriptor_calibration_targets(descriptor_targets)
-    if not selected_row_indices:
-        raise ValueError("selected_row_indices must be nonempty")
-    return tuple(validated_targets[row_index] for row_index in selected_row_indices)
-
-
-def _select_tuple_values(
-    values: tuple[float, ...],
-    selected_row_indices: tuple[int, ...],
-) -> tuple[float, ...]:
-    if not values:
-        raise ValueError("cannot select from an empty tuple")
-    return tuple(values[row_index] for row_index in selected_row_indices)
-
+        return self._selected_evaluator.evaluate(primitive_parameters)
 
 def _coordinate_bounds_for_parameter_names(
     coordinate_bounds: tuple[PrimitiveParameterTransform, ...],
@@ -7143,6 +7739,7 @@ def fit_decomposed_conductivity_primitives() -> DecomposedFitResult:
         cases=case_selection.cases,
         audit_options=audit_options,
         fit_options=block_fit_options,
+        trajectory_primitive_calibration_targets=trajectory_primitive_calibration_targets,
         coordinate_bounds=coordinate_bounds,
         full_evaluator=block_evaluator,
         regularization_reference_parameters=REFERENCE_CONDUCTIVITY_PRIMITIVE_PARAMETERS,
@@ -7151,6 +7748,7 @@ def fit_decomposed_conductivity_primitives() -> DecomposedFitResult:
         cases=case_selection.cases,
         audit_options=audit_options,
         fit_options=fit_options,
+        trajectory_primitive_calibration_targets=trajectory_primitive_calibration_targets,
         coordinate_bounds=coordinate_bounds,
         full_evaluator=full_evaluator,
         regularization_reference_parameters=REFERENCE_CONDUCTIVITY_PRIMITIVE_PARAMETERS,
@@ -7166,7 +7764,9 @@ def fit_decomposed_conductivity_primitives() -> DecomposedFitResult:
         trajectory_primitive_calibration_targets,
         audit_options,
         coordinate_bounds,
+        fit_options,
     )
+    initialized_parameters = current_parameters
     baseline_audit_result = audit_molecular_property_db_cases(
         case_selection.cases,
         current_parameters,
@@ -7178,7 +7778,7 @@ def fit_decomposed_conductivity_primitives() -> DecomposedFitResult:
         "direct_capacity",
         current_parameters,
         baseline_audit_result,
-        DIRECT_CAPACITY_BLOCK_PARAMETER_NAMES,
+        C_STABLE_DIRECT_CAPACITY_BLOCK_PARAMETER_NAMES,
         tuple(
             row_index
             for row_index, row_result in enumerate(baseline_audit_result.rows)
@@ -7254,12 +7854,29 @@ def fit_decomposed_conductivity_primitives() -> DecomposedFitResult:
         candidate_audit_result,
         fit_options,
     )
+    baseline_trajectory_coverage_counts = _trajectory_concentration_coverage_counts(
+        trajectory_primitive_calibration_targets,
+        current_parameters,
+        audit_options,
+    )
+    candidate_trajectory_coverage_counts = _trajectory_concentration_coverage_counts(
+        trajectory_primitive_calibration_targets,
+        loaded_candidate_parameters,
+        audit_options,
+    )
     baseline_metrics = PrimitivePromotionMetrics(
         mae_mS_cm=baseline_audit_result.mae_mS_cm,
         bias_mS_cm=baseline_audit_result.bias_mS_cm,
         pearson_r=baseline_audit_result.pearson_r,
         worst_abs_residual_mS_cm=baseline_audit_result.maximum_abs_residual_mS_cm,
+        proof_statuses=baseline_audit_result.proof_statuses,
         failed_rows=baseline_audit_result.failed_rows,
+        trajectory_concentration_unreachable_target_count=(
+            baseline_trajectory_coverage_counts[0]
+        ),
+        trajectory_concentration_under_floor_target_count=(
+            baseline_trajectory_coverage_counts[1]
+        ),
         maximum_mass_balance_residual=(
             baseline_audit_result.maximum_mass_balance_residual
         ),
@@ -7284,7 +7901,14 @@ def fit_decomposed_conductivity_primitives() -> DecomposedFitResult:
         bias_mS_cm=candidate_audit_result.bias_mS_cm,
         pearson_r=candidate_audit_result.pearson_r,
         worst_abs_residual_mS_cm=candidate_audit_result.maximum_abs_residual_mS_cm,
+        proof_statuses=candidate_audit_result.proof_statuses,
         failed_rows=candidate_audit_result.failed_rows,
+        trajectory_concentration_unreachable_target_count=(
+            candidate_trajectory_coverage_counts[0]
+        ),
+        trajectory_concentration_under_floor_target_count=(
+            candidate_trajectory_coverage_counts[1]
+        ),
         maximum_mass_balance_residual=(
             candidate_audit_result.maximum_mass_balance_residual
         ),
@@ -7316,6 +7940,23 @@ def fit_decomposed_conductivity_primitives() -> DecomposedFitResult:
         candidate_metrics,
         case_selection.source_labeled_rows,
         promotion_rejection_reasons,
+    )
+    write_calibration_error_decomposition_report(
+        fit_options.decomposition_report_output_path,
+        (
+            ("c_initialized_baseline", initialized_parameters),
+            (
+                "after_direct_capacity_block",
+                direct_capacity_result.accepted_parameters,
+            ),
+            ("after_corrector_block", corrector_result.accepted_parameters),
+            ("after_cluster_sink_block", cluster_sink_result.accepted_parameters),
+            ("verified_candidate", loaded_candidate_parameters),
+        ),
+        case_selection.cases,
+        audit_options,
+        fit_options,
+        trajectory_primitive_calibration_targets,
     )
     return DecomposedFitResult(
         direct_capacity_result=direct_capacity_result,
@@ -7349,9 +7990,13 @@ def _run_decomposed_block(
         decomposed_context.coordinate_bounds,
         _unique_parameter_names(block_parameter_names),
     )
-    block_evaluator = RowFilteredPrimitiveEvaluator(
-        decomposed_context.full_evaluator,
+    block_evaluator = SelectedRowPrimitiveEvaluator(
+        decomposed_context.cases,
+        decomposed_context.audit_options,
+        decomposed_context.fit_options,
+        decomposed_context.trajectory_primitive_calibration_targets,
         selected_row_indices,
+        _unique_parameter_names(block_parameter_names),
     )
     sensitivity_diagnostics = primitive_prediction_sensitivity_diagnostics(
         initial_parameters,
@@ -7379,9 +8024,18 @@ def _run_decomposed_block(
         candidate_audit_result,
         decomposed_context.fit_options,
     )
+    starting_evaluation = decomposed_context.full_evaluator.evaluate(
+        initial_parameters,
+    )
+    candidate_evaluation = decomposed_context.full_evaluator.evaluate(
+        fit_result.best_candidate.primitive_parameters,
+    )
     accepted = _block_candidate_preserves_full_audit(
         starting_audit_result,
         candidate_audit_result,
+        starting_evaluation,
+        candidate_evaluation,
+        decomposed_context.fit_options,
     )
     accepted_parameters = (
         fit_result.best_candidate.primitive_parameters
@@ -7401,14 +8055,307 @@ def _run_decomposed_block(
     )
 
 
+def _tail_and_failure_row_indices(audit_result, fit_options):
+    worst_residual_row_indices = tuple(
+        row_index
+        for row_index, _row_result in sorted(
+            enumerate(audit_result.rows),
+            key=_indexed_absolute_residual_sort_key,
+            reverse=True,
+        )[: fit_options.residual_tail_count]
+    )
+    failure_row_indices = tuple(
+        row_index
+        for row_index, row_result in enumerate(audit_result.rows)
+        if (
+            row_result.direct_capacity_failure
+            or row_result.corrector_too_strong_failure
+            or row_result.corrector_too_weak_failure
+        )
+    )
+    normal_row_indices = tuple(
+        row_index
+        for row_index, row_result in enumerate(audit_result.rows)
+        if row_index not in set(worst_residual_row_indices + failure_row_indices)
+        and not row_result.failed
+    )
+    stratified_normal_row_indices = []
+    if normal_row_indices:
+        normal_sample_count = min(
+            fit_options.residual_tail_count,
+            len(normal_row_indices),
+        )
+        for sample_index in range(normal_sample_count):
+            if normal_sample_count == 1:
+                stratified_normal_row_indices.append(normal_row_indices[0])
+                continue
+            row_position = int(
+                round(
+                    sample_index
+                    * (len(normal_row_indices) - 1)
+                    / (normal_sample_count - 1)
+                )
+            )
+            stratified_normal_row_indices.append(normal_row_indices[row_position])
+    return tuple(
+        sorted(
+            set(
+                worst_residual_row_indices
+                + failure_row_indices
+                + tuple(stratified_normal_row_indices)
+            )
+        )
+    )
+
+
+def fit_onsager_operator_primitives(
+    calibration_subset_mode: Literal[
+        "full_property_db",
+        "tail_and_failure_rows",
+    ],
+):
+    from data.electrolyte_property_db import DATA
+    from data.species_data import ADDITIVES, CATION_PROPERTIES, SALTS, SOLVENTS
+    from conductivity.molecular_property_db_audit import (
+        MolecularPropertyDbRegistrySource,
+        REFERENCE_CONDUCTIVITY_PRIMITIVE_PARAMETERS,
+        audit_molecular_property_db_cases,
+        build_molecular_property_db_case_selection,
+        configured_conductivity_primitive_parameters,
+        default_molecular_property_db_audit_options,
+    )
+
+    if calibration_subset_mode not in {
+        "full_property_db",
+        "tail_and_failure_rows",
+    }:
+        raise ValueError(
+            "calibration_subset_mode must be full_property_db or "
+            "tail_and_failure_rows"
+        )
+    audit_options = default_molecular_property_db_audit_options()
+    fit_options, coordinate_bounds = default_molecular_primitive_fit_configuration()
+    fit_options = replace(
+        fit_options,
+        cluster_activation_loss_weight=0.0,
+        latin_hypercube_samples_per_parameter=0.02,
+        coordinate_search_rounds=0,
+        powell_max_iterations_per_parameter=0.0,
+        powell_max_function_evaluations_per_parameter=0.0,
+    )
+    trajectory_primitive_calibration_targets = (
+        load_trajectory_primitive_calibration_targets(
+            fit_options.trajectory_primitive_target_paths,
+        )
+    )
+    registry_source = MolecularPropertyDbRegistrySource(
+        solvent_registry=SOLVENTS,
+        salt_registry=SALTS,
+        additive_registry=ADDITIVES,
+        cation_registry=CATION_PROPERTIES,
+    )
+    case_selection = build_molecular_property_db_case_selection(
+        tuple(DATA),
+        registry_source,
+        audit_options,
+    )
+    evaluator = MolecularPropertyDbPrimitiveEvaluator(
+        case_selection.cases,
+        audit_options,
+        fit_options,
+        trajectory_primitive_calibration_targets,
+    )
+    configured_parameters = configured_conductivity_primitive_parameters()
+    initialized_parameters = initialize_topology_logk_offsets_from_trajectory_concentrations(
+        configured_parameters,
+        trajectory_primitive_calibration_targets,
+        audit_options,
+        coordinate_bounds,
+        fit_options,
+    )
+    baseline_audit_result = audit_molecular_property_db_cases(
+        case_selection.cases,
+        initialized_parameters,
+        audit_options,
+    )
+    validate_molecular_property_db_audit_result(
+        baseline_audit_result,
+        fit_options,
+    )
+    selected_row_indices = tuple(range(len(case_selection.cases)))
+    if calibration_subset_mode == "tail_and_failure_rows":
+        selected_row_indices = _tail_and_failure_row_indices(
+            baseline_audit_result,
+            fit_options,
+        )
+    block_evaluator = evaluator
+    if calibration_subset_mode == "tail_and_failure_rows":
+        block_evaluator = SelectedRowPrimitiveEvaluator(
+            case_selection.cases,
+            audit_options,
+            fit_options,
+            trajectory_primitive_calibration_targets,
+            selected_row_indices,
+            ONSAGER_OPERATOR_FIT_PARAMETER_NAMES,
+        )
+    onsager_coordinate_bounds = _coordinate_bounds_for_parameter_names(
+        coordinate_bounds,
+        ONSAGER_OPERATOR_FIT_PARAMETER_NAMES,
+    )
+    active_coordinate_bounds = onsager_coordinate_bounds
+    fit_result = fit_conductivity_primitive_parameters(
+        initialized_parameters,
+        REFERENCE_CONDUCTIVITY_PRIMITIVE_PARAMETERS,
+        active_coordinate_bounds,
+        block_evaluator,
+        fit_options,
+    )
+    write_primitive_parameter_candidate_config(
+        fit_options.candidate_output_path,
+        fit_result.best_candidate.primitive_parameters,
+        case_selection.source_labeled_rows,
+    )
+    loaded_candidate_parameters = (
+        load_primitive_parameters_from_candidate_config_artifact(
+            fit_options.candidate_output_path
+        )
+    )
+    candidate_audit_result = audit_molecular_property_db_cases(
+        case_selection.cases,
+        loaded_candidate_parameters,
+        audit_options,
+    )
+    validate_molecular_property_db_audit_result(
+        candidate_audit_result,
+        fit_options,
+    )
+    baseline_trajectory_coverage_counts = _trajectory_concentration_coverage_counts(
+        trajectory_primitive_calibration_targets,
+        initialized_parameters,
+        audit_options,
+    )
+    candidate_trajectory_coverage_counts = _trajectory_concentration_coverage_counts(
+        trajectory_primitive_calibration_targets,
+        loaded_candidate_parameters,
+        audit_options,
+    )
+    baseline_metrics = PrimitivePromotionMetrics(
+        mae_mS_cm=baseline_audit_result.mae_mS_cm,
+        bias_mS_cm=baseline_audit_result.bias_mS_cm,
+        pearson_r=baseline_audit_result.pearson_r,
+        worst_abs_residual_mS_cm=baseline_audit_result.maximum_abs_residual_mS_cm,
+        proof_statuses=baseline_audit_result.proof_statuses,
+        failed_rows=baseline_audit_result.failed_rows,
+        trajectory_concentration_unreachable_target_count=(
+            baseline_trajectory_coverage_counts[0]
+        ),
+        trajectory_concentration_under_floor_target_count=(
+            baseline_trajectory_coverage_counts[1]
+        ),
+        maximum_mass_balance_residual=(
+            baseline_audit_result.maximum_mass_balance_residual
+        ),
+        maximum_row_sum_residual=baseline_audit_result.maximum_row_sum_residual,
+        maximum_stationary_residual=baseline_audit_result.maximum_stationary_residual,
+        maximum_detailed_balance_residual=(
+            baseline_audit_result.maximum_detailed_balance_residual
+        ),
+        maximum_event_reversal_residual=(
+            baseline_audit_result.maximum_event_reversal_residual
+        ),
+        zero_charge_sigma_mS_cm=baseline_audit_result.zero_charge_sigma_mS_cm,
+        higher_viscosity_lowers_dilute_conductivity=(
+            baseline_audit_result.higher_viscosity_lowers_dilute_conductivity
+        ),
+        higher_packing_lowers_local_mobility=(
+            baseline_audit_result.higher_packing_lowers_local_mobility
+        ),
+    )
+    candidate_metrics = PrimitivePromotionMetrics(
+        mae_mS_cm=candidate_audit_result.mae_mS_cm,
+        bias_mS_cm=candidate_audit_result.bias_mS_cm,
+        pearson_r=candidate_audit_result.pearson_r,
+        worst_abs_residual_mS_cm=candidate_audit_result.maximum_abs_residual_mS_cm,
+        proof_statuses=candidate_audit_result.proof_statuses,
+        failed_rows=candidate_audit_result.failed_rows,
+        trajectory_concentration_unreachable_target_count=(
+            candidate_trajectory_coverage_counts[0]
+        ),
+        trajectory_concentration_under_floor_target_count=(
+            candidate_trajectory_coverage_counts[1]
+        ),
+        maximum_mass_balance_residual=(
+            candidate_audit_result.maximum_mass_balance_residual
+        ),
+        maximum_row_sum_residual=candidate_audit_result.maximum_row_sum_residual,
+        maximum_stationary_residual=(
+            candidate_audit_result.maximum_stationary_residual
+        ),
+        maximum_detailed_balance_residual=(
+            candidate_audit_result.maximum_detailed_balance_residual
+        ),
+        maximum_event_reversal_residual=(
+            candidate_audit_result.maximum_event_reversal_residual
+        ),
+        zero_charge_sigma_mS_cm=candidate_audit_result.zero_charge_sigma_mS_cm,
+        higher_viscosity_lowers_dilute_conductivity=(
+            candidate_audit_result.higher_viscosity_lowers_dilute_conductivity
+        ),
+        higher_packing_lowers_local_mobility=(
+            candidate_audit_result.higher_packing_lowers_local_mobility
+        ),
+    )
+    promotion_rejection_reasons = primitive_parameter_promotion_rejection_reasons(
+        baseline_metrics,
+        candidate_metrics,
+        fit_options,
+    )
+    write_primitive_parameter_candidate_artifact(
+        fit_options.candidate_output_path,
+        loaded_candidate_parameters,
+        baseline_metrics,
+        candidate_metrics,
+        case_selection.source_labeled_rows,
+        promotion_rejection_reasons,
+    )
+    return fit_result
+
+
 def _block_candidate_preserves_full_audit(
     starting_audit_result: "MolecularPropertyDbAuditResult",
     candidate_audit_result: "MolecularPropertyDbAuditResult",
+    starting_evaluation: PrimitiveFitDatasetEvaluation,
+    candidate_evaluation: PrimitiveFitDatasetEvaluation,
+    fit_options: PrimitiveFitOptions,
 ) -> bool:
+    _validate_fit_options(fit_options)
     return (
         candidate_audit_result.mae_mS_cm <= starting_audit_result.mae_mS_cm
         and candidate_audit_result.maximum_abs_residual_mS_cm
         <= starting_audit_result.maximum_abs_residual_mS_cm
+        and _candidate_preserves_trajectory_c_stability(
+            starting_evaluation,
+            candidate_evaluation,
+            fit_options,
+        )
+    )
+
+
+def _candidate_preserves_trajectory_c_stability(
+    starting_evaluation: PrimitiveFitDatasetEvaluation,
+    candidate_evaluation: PrimitiveFitDatasetEvaluation,
+    fit_options: PrimitiveFitOptions,
+) -> bool:
+    _validate_fit_options(fit_options)
+    if not fit_options.trajectory_primitive_target_paths:
+        return True
+    return (
+        candidate_evaluation.trajectory_concentration_unreachable_target_count
+        <= starting_evaluation.trajectory_concentration_unreachable_target_count
+        and candidate_evaluation.trajectory_concentration_under_floor_target_count
+        <= starting_evaluation.trajectory_concentration_under_floor_target_count
+        and candidate_evaluation.trajectory_concentration_loss
+        <= starting_evaluation.trajectory_concentration_loss
     )
 
 
@@ -7667,7 +8614,7 @@ def _print_transport_role_direct_scaling_audit(
         )
 
 
-def main() -> None:
+def _run_full_fit_main() -> None:
     from data.electrolyte_property_db import DATA
     from data.species_data import ADDITIVES, CATION_PROPERTIES, SALTS, SOLVENTS
     from conductivity.molecular_property_db_audit import (
@@ -7718,6 +8665,7 @@ def main() -> None:
         trajectory_primitive_calibration_targets,
         audit_options,
         coordinate_bounds,
+        fit_options,
     )
     initialized_trajectory_coverages = validate_trajectory_concentration_target_coverage(
         trajectory_primitive_calibration_targets,
@@ -7850,6 +8798,16 @@ def main() -> None:
         candidate_audit_result,
         fit_options,
     )
+    baseline_trajectory_coverage_counts = _trajectory_concentration_coverage_counts(
+        trajectory_primitive_calibration_targets,
+        configured_parameters,
+        audit_options,
+    )
+    candidate_trajectory_coverage_counts = _trajectory_concentration_coverage_counts(
+        trajectory_primitive_calibration_targets,
+        loaded_candidate_parameters,
+        audit_options,
+    )
     baseline_metrics = PrimitivePromotionMetrics(
         mae_mS_cm=baseline_audit_result.mae_mS_cm,
         bias_mS_cm=baseline_audit_result.bias_mS_cm,
@@ -7857,7 +8815,14 @@ def main() -> None:
         worst_abs_residual_mS_cm=(
             baseline_audit_result.maximum_abs_residual_mS_cm
         ),
+        proof_statuses=baseline_audit_result.proof_statuses,
         failed_rows=baseline_audit_result.failed_rows,
+        trajectory_concentration_unreachable_target_count=(
+            baseline_trajectory_coverage_counts[0]
+        ),
+        trajectory_concentration_under_floor_target_count=(
+            baseline_trajectory_coverage_counts[1]
+        ),
         maximum_mass_balance_residual=(
             baseline_audit_result.maximum_mass_balance_residual
         ),
@@ -7886,7 +8851,14 @@ def main() -> None:
         worst_abs_residual_mS_cm=(
             candidate_audit_result.maximum_abs_residual_mS_cm
         ),
+        proof_statuses=candidate_audit_result.proof_statuses,
         failed_rows=candidate_audit_result.failed_rows,
+        trajectory_concentration_unreachable_target_count=(
+            candidate_trajectory_coverage_counts[0]
+        ),
+        trajectory_concentration_under_floor_target_count=(
+            candidate_trajectory_coverage_counts[1]
+        ),
         maximum_mass_balance_residual=(
             candidate_audit_result.maximum_mass_balance_residual
         ),
@@ -8157,6 +9129,81 @@ def main() -> None:
             f"{parameter_name}="
             f"{getattr(promotion_candidate.primitive_parameters, parameter_name):.17g}"
         )
+
+
+def main() -> None:
+    argument_parser = argparse.ArgumentParser()
+    argument_parser.add_argument(
+        "--block",
+        choices=("full_decomposed", "onsager_operator"),
+        default="full_decomposed",
+    )
+    argument_parser.add_argument(
+        "--subset",
+        choices=("full_property_db", "tail_and_failure_rows"),
+        default="full_property_db",
+    )
+    parsed_arguments = argument_parser.parse_args()
+    if parsed_arguments.block == "onsager_operator":
+        fit_result = fit_onsager_operator_primitives(parsed_arguments.subset)
+        print("molecular_primitive_parameter_fit")
+        print("fit_block=onsager_operator")
+        print(f"subset_mode={parsed_arguments.subset}")
+        print(f"candidate_count={fit_result.candidate_count}")
+        print(
+            "accepted_candidate_count="
+            f"{fit_result.accepted_candidate_count}"
+        )
+        print(
+            "best_mae_mS_cm="
+            f"{fit_result.best_candidate.mae_mS_cm:.6f}"
+        )
+        print(
+            "best_bias_mS_cm="
+            f"{fit_result.best_candidate.bias_mS_cm:.6f}"
+        )
+        print(
+            "best_worst_abs_residual_mS_cm="
+            f"{fit_result.best_candidate.worst_abs_residual_mS_cm:.6f}"
+        )
+        return
+    if parsed_arguments.block == "full_decomposed":
+        decomposed_fit_result = fit_decomposed_conductivity_primitives()
+        print("molecular_primitive_parameter_fit")
+        print("fit_block=full_decomposed")
+        print(
+            "direct_capacity_block_accepted="
+            f"{decomposed_fit_result.direct_capacity_result.accepted}"
+        )
+        print(
+            "corrector_block_accepted="
+            f"{decomposed_fit_result.corrector_result.accepted}"
+        )
+        print(
+            "cluster_sink_block_accepted="
+            f"{decomposed_fit_result.cluster_sink_result.accepted}"
+        )
+        print(
+            "final_joint_block_accepted="
+            f"{decomposed_fit_result.final_result.accepted}"
+        )
+        print(
+            "candidate_mae_mS_cm="
+            f"{decomposed_fit_result.candidate_audit_result.mae_mS_cm:.6f}"
+        )
+        print(
+            "candidate_bias_mS_cm="
+            f"{decomposed_fit_result.candidate_audit_result.bias_mS_cm:.6f}"
+        )
+        print(
+            "candidate_worst_abs_residual_mS_cm="
+            f"{decomposed_fit_result.candidate_audit_result.maximum_abs_residual_mS_cm:.6f}"
+        )
+        print(
+            "promotion_rejection_reasons="
+            f"{','.join(decomposed_fit_result.promotion_rejection_reasons)}"
+        )
+        return
 
 
 if __name__ == "__main__":

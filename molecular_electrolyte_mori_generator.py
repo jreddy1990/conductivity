@@ -407,6 +407,10 @@ def _molecular_solvent_environment(
             recipe,
             descriptors,
         ),
+        solvent_volume_fractions=dict(recipe.solvents),
+        solvent_coordination_affinity_J_mol=(
+            _mixture_solvent_coordination_affinity_J_mol(recipe, descriptors)
+        ),
     )
 
 
@@ -2848,6 +2852,31 @@ def _mixture_mean_molecular_volume_A3(
     return _positive_float(
         weighted_volume_A3 / concentration_weight,
         "mixture_mean_molecular_volume_A3",
+    )
+
+
+def _mixture_solvent_coordination_affinity_J_mol(
+    recipe: MolecularElectrolyteRecipe,
+    descriptors: Mapping[str, MolecularSpeciesDescriptor],
+) -> float:
+    solvent_fraction_sum = math.fsum(
+        _nonnegative_float(volume_fraction, f"{species_name}.volume_fraction")
+        for species_name, volume_fraction in recipe.solvents.items()
+    )
+    _positive_float(solvent_fraction_sum, "solvent_volume_fraction_sum")
+    weighted_coordination_affinity_J_mol = 0.0
+    for species_name, volume_fraction in recipe.solvents.items():
+        descriptor = descriptors[species_name]
+        weighted_coordination_affinity_J_mol += (
+            _nonnegative_float(volume_fraction, f"{species_name}.volume_fraction")
+            * _positive_float(
+                descriptor.coordination_affinity_J_mol,
+                f"{species_name}.coordination_affinity_J_mol",
+            )
+        )
+    return _positive_float(
+        weighted_coordination_affinity_J_mol / solvent_fraction_sum,
+        "mixture_solvent_coordination_affinity_J_mol",
     )
 
 

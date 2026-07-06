@@ -1,12 +1,10 @@
-"""Trajectory primitive-target extraction for conductivity calibration.
+"""Trajectory primitive projection and conductivity oracle extraction.
 
-This module turns observed trajectories into primitive calibration evidence for the
-descriptor analytical conductivity model.  It estimates hidden primitive
-targets such as occupancies, reversible transition rates, residence times, and
-charge-displacement moments.  The descriptor model remains the production map:
-descriptors plus primitive parameters produce c_theta, Q_theta, d_theta, and
-conductivity.  This module only supplies trajectory-derived targets for the
-calibration objective.
+This module turns observed trajectories into finite projected conductivity
+primitives: occupancies, reversible transition rates, residence times,
+charge-displacement moments, self-current tensors, and the Markov-additive
+readout.  Descriptor recipe predictions are evaluated against these primitive
+objects by reporting projection gaps and recipe gaps separately.
 """
 
 from __future__ import annotations
@@ -205,6 +203,49 @@ class TrajectoryPrimitiveTargetArtifact:
 
 
 @dataclass(frozen=True)
+class ProjectedGeneratorReactiveFlux:
+    from_state_label: str
+    to_state_label: str
+    symmetric_flux_mol_m3_s: float
+    forward_rate_s_inv: float
+    reverse_rate_s_inv: float
+
+
+@dataclass(frozen=True)
+class ProjectedGeneratorConditionalMoment:
+    from_state_label: str
+    to_state_label: str
+    sample_count: int
+    mean_charge_displacement_m: tuple[float, float, float]
+    second_moment_m2: tuple[tuple[float, float, float], ...]
+    covariance_m2: tuple[tuple[float, float, float], ...]
+
+
+@dataclass(frozen=True)
+class ProjectedGeneratorSelfCurrentTensor:
+    state_label: str
+    sample_count: int
+    concentration_mol_m3: float
+    diffusion_tensor_m2_s: tuple[tuple[float, float, float], ...]
+
+
+@dataclass(frozen=True)
+class ProjectedGeneratorPrimitiveSet:
+    state_labels: tuple[str, ...]
+    state_concentrations_mol_m3: Mapping[str, float]
+    state_occupancy_fractions: Mapping[str, float]
+    reactive_fluxes: tuple[ProjectedGeneratorReactiveFlux, ...]
+    conditional_displacement_moments: tuple[
+        ProjectedGeneratorConditionalMoment,
+        ...
+    ]
+    self_current_tensors: tuple[ProjectedGeneratorSelfCurrentTensor, ...]
+    markov_input: MarkovAdditiveConductivityInput
+    markov_conductivity_result: MarkovAdditiveConductivityResult
+    diagnostics: TrajectoryPrimitiveTargetProcessDiagnostics
+
+
+@dataclass(frozen=True)
 class _PF6CenterFrame:
     li_centers_A: np.ndarray
     pf6_centers_A: np.ndarray
@@ -247,6 +288,43 @@ def compute_sampled_trajectory_markov_additive_conductivity(
         conductivity_result=conductivity_result,
         diagnostics=diagnostics,
         state_index_remap=state_index_remap,
+    )
+
+
+def project_sampled_trajectory_to_generator_primitives(
+    sample_input: TrajectoryMarkovAdditiveSampleInput,
+) -> ProjectedGeneratorPrimitiveSet:
+    """Project sampled trajectory observations into GK generator primitives.
+
+    The returned object is the generic projected-generator target:
+    equilibrium populations, symmetric reactive fluxes, conditional
+    charge-displacement moments, within-state self-current tensors, and the
+    Markov-additive conductivity readout from the same samples.
+    """
+
+    process_result = compute_sampled_trajectory_markov_additive_conductivity(
+        sample_input,
+    )
+    markov_input = process_result.markov_input
+    state_concentrations = _state_concentration_targets(
+        sample_input.state_labels,
+        markov_input,
+    )
+    return ProjectedGeneratorPrimitiveSet(
+        state_labels=markov_input.state_labels,
+        state_concentrations_mol_m3=state_concentrations,
+        state_occupancy_fractions=_state_occupancy_fraction_targets(sample_input),
+        reactive_fluxes=_projected_reactive_fluxes(markov_input),
+        conditional_displacement_moments=(
+            _projected_conditional_displacement_moments(sample_input)
+        ),
+        self_current_tensors=_projected_self_current_tensors(
+            sample_input,
+            state_concentrations,
+        ),
+        markov_input=markov_input,
+        markov_conductivity_result=process_result.conductivity_result,
+        diagnostics=process_result.diagnostics,
     )
 
 
@@ -503,6 +581,217 @@ def build_sampled_trajectory_markov_additive_input(
         ),
         diagnostics,
         state_index_remap,
+    )
+
+
+def _projected_reactive_fluxes(
+    markov_input: MarkovAdditiveConductivityInput,
+) -> tuple[ProjectedGeneratorReactiveFlux, ...]:
+    state_concentrations = np.asarray(
+        markov_input.state_concentrations_mol_m3,
+        dtype=float,
+    )
+    flux_by_ordered_pair: dict[tuple[int, int], float] = defaultdict(float)
+    rate_by_ordered_pair: dict[tuple[int, int], float] = defaultdict(float)
+    for event in markov_input.events:
+        if event.from_state_index == event.to_state_index:
+            continue
+        ordered_pair = (event.from_state_index, event.to_state_index)
+        event_flux = (
+            state_concentrations[event.from_state_index] * event.rate_s_inv
+        )
+        flux_by_ordered_pair[ordered_pair] += float(event_flux)
+        rate_by_ordered_pair[ordered_pair] += float(event.rate_s_inv)
+    reactive_fluxes: list[ProjectedGeneratorReactiveFlux] = []
+    unordered_pairs = {
+        (
+            min(first_state_index, second_state_index),
+            max(first_state_index, second_state_index),
+        )
+        for first_state_index, second_state_index in flux_by_ordered_pair
+    }
+    for lower_state_index, upper_state_index in sorted(unordered_pairs):
+        forward_flux = flux_by_ordered_pair[(lower_state_index, upper_state_index)]
+        reverse_flux = flux_by_ordered_pair[(upper_state_index, lower_state_index)]
+        tolerance = math.sqrt(np.finfo(float).eps) * max(
+            1.0,
+            abs(forward_flux),
+            abs(reverse_flux),
+        )
+        if abs(forward_flux - reverse_flux) > tolerance:
+            raise ValueError(
+                "reactive flux samples are not detailed-balanced for "
+                f"{markov_input.state_labels[lower_state_index]} <-> "
+                f"{markov_input.state_labels[upper_state_index]}",
+            )
+        reactive_fluxes.append(
+            ProjectedGeneratorReactiveFlux(
+                from_state_label=markov_input.state_labels[lower_state_index],
+                to_state_label=markov_input.state_labels[upper_state_index],
+                symmetric_flux_mol_m3_s=0.5 * (forward_flux + reverse_flux),
+                forward_rate_s_inv=rate_by_ordered_pair[
+                    (lower_state_index, upper_state_index)
+                ],
+                reverse_rate_s_inv=rate_by_ordered_pair[
+                    (upper_state_index, lower_state_index)
+                ],
+            ),
+        )
+    return tuple(reactive_fluxes)
+
+
+def _projected_conditional_displacement_moments(
+    sample_input: TrajectoryMarkovAdditiveSampleInput,
+) -> tuple[ProjectedGeneratorConditionalMoment, ...]:
+    state_labels = _validated_state_labels(sample_input.state_labels)
+    from_state_indices = _validated_sample_state_indices(
+        sample_input.from_state_index_by_step,
+        len(state_labels),
+        "from_state_index_by_step",
+    )
+    to_state_indices = _validated_sample_state_indices(
+        sample_input.to_state_index_by_step,
+        len(state_labels),
+        "to_state_index_by_step",
+    )
+    charge_displacements = _validated_charge_displacements(
+        sample_input.charge_displacement_by_step_m,
+        int(from_state_indices.shape[0]),
+    )
+    samples_by_transition: dict[tuple[int, int], list[np.ndarray]] = defaultdict(list)
+    for sample_index, charge_displacement_m in enumerate(charge_displacements):
+        from_state_index = int(from_state_indices[sample_index])
+        to_state_index = int(to_state_indices[sample_index])
+        if from_state_index == to_state_index:
+            continue
+        samples_by_transition[(from_state_index, to_state_index)].append(
+            charge_displacement_m,
+        )
+    conditional_moments: list[ProjectedGeneratorConditionalMoment] = []
+    for transition_key in sorted(samples_by_transition):
+        displacement_samples = np.asarray(
+            samples_by_transition[transition_key],
+            dtype=float,
+        )
+        mean_displacement = np.mean(displacement_samples, axis=0)
+        second_moment = np.einsum(
+            "ni,nj->ij",
+            displacement_samples,
+            displacement_samples,
+        ) / float(displacement_samples.shape[0])
+        covariance = second_moment - np.outer(mean_displacement, mean_displacement)
+        _validate_positive_semidefinite_matrix(
+            covariance,
+            "conditional_displacement_moment.covariance_m2",
+        )
+        from_state_index, to_state_index = transition_key
+        conditional_moments.append(
+            ProjectedGeneratorConditionalMoment(
+                from_state_label=state_labels[from_state_index],
+                to_state_label=state_labels[to_state_index],
+                sample_count=int(displacement_samples.shape[0]),
+                mean_charge_displacement_m=tuple(
+                    float(component) for component in mean_displacement
+                ),
+                second_moment_m2=_matrix_to_tuple(second_moment),
+                covariance_m2=_matrix_to_tuple(covariance),
+            ),
+        )
+    return tuple(conditional_moments)
+
+
+def _projected_self_current_tensors(
+    sample_input: TrajectoryMarkovAdditiveSampleInput,
+    state_concentrations_mol_m3: Mapping[str, float],
+) -> tuple[ProjectedGeneratorSelfCurrentTensor, ...]:
+    state_labels = _validated_state_labels(sample_input.state_labels)
+    from_state_indices = _validated_sample_state_indices(
+        sample_input.from_state_index_by_step,
+        len(state_labels),
+        "from_state_index_by_step",
+    )
+    to_state_indices = _validated_sample_state_indices(
+        sample_input.to_state_index_by_step,
+        len(state_labels),
+        "to_state_index_by_step",
+    )
+    charge_displacements = _validated_charge_displacements(
+        sample_input.charge_displacement_by_step_m,
+        int(from_state_indices.shape[0]),
+    )
+    dt_s = _positive_float(sample_input.dt_s, "dt_s")
+    displacement_zero_tolerance_m = _nonnegative_float(
+        sample_input.displacement_zero_tolerance_m,
+        "displacement_zero_tolerance_m",
+    )
+    self_samples_by_state: dict[int, list[np.ndarray]] = defaultdict(list)
+    for sample_index, charge_displacement_m in enumerate(charge_displacements):
+        from_state_index = int(from_state_indices[sample_index])
+        to_state_index = int(to_state_indices[sample_index])
+        if from_state_index != to_state_index:
+            continue
+        if float(np.linalg.norm(charge_displacement_m)) <= displacement_zero_tolerance_m:
+            continue
+        self_samples_by_state[from_state_index].append(charge_displacement_m)
+
+    self_current_tensors: list[ProjectedGeneratorSelfCurrentTensor] = []
+    for state_index in sorted(self_samples_by_state):
+        displacement_samples = np.asarray(
+            self_samples_by_state[state_index],
+            dtype=float,
+        )
+        diffusion_tensor = np.einsum(
+            "ni,nj->ij",
+            displacement_samples,
+            displacement_samples,
+        ) / (2.0 * dt_s * float(displacement_samples.shape[0]))
+        _validate_positive_semidefinite_matrix(
+            diffusion_tensor,
+            "self_current_tensor.diffusion_tensor_m2_s",
+        )
+        state_label = state_labels[state_index]
+        self_current_tensors.append(
+            ProjectedGeneratorSelfCurrentTensor(
+                state_label=state_label,
+                sample_count=int(displacement_samples.shape[0]),
+                concentration_mol_m3=float(
+                    state_concentrations_mol_m3[state_label],
+                ),
+                diffusion_tensor_m2_s=_matrix_to_tuple(diffusion_tensor),
+            ),
+        )
+    return tuple(self_current_tensors)
+
+
+def _validate_positive_semidefinite_matrix(
+    matrix: np.ndarray,
+    label: str,
+) -> None:
+    if matrix.shape != (3, 3):
+        raise ValueError(f"{label} must have shape (3, 3), got {matrix.shape}")
+    if not np.allclose(matrix, matrix.T):
+        raise ValueError(f"{label} must be symmetric")
+    eigenvalues = np.linalg.eigvalsh(matrix)
+    tolerance = math.sqrt(np.finfo(float).eps) * max(
+        1.0,
+        float(np.max(np.abs(eigenvalues))),
+    )
+    minimum_eigenvalue = float(np.min(eigenvalues))
+    if minimum_eigenvalue < -tolerance:
+        raise ValueError(
+            f"{label} minimum eigenvalue {minimum_eigenvalue} is below "
+            f"tolerance {-tolerance}",
+        )
+
+
+def _matrix_to_tuple(
+    matrix: np.ndarray,
+) -> tuple[tuple[float, float, float], ...]:
+    if matrix.shape != (3, 3):
+        raise ValueError(f"matrix must have shape (3, 3), got {matrix.shape}")
+    return tuple(
+        tuple(float(matrix[row_index, column_index]) for column_index in range(3))
+        for row_index in range(3)
     )
 
 
@@ -1175,6 +1464,18 @@ def _primitive_target_artifact_from_sample_input(
         transition_rates,
     )
     displacement_moments = _displacement_moment_targets(sample_input)
+    block_transition_rate_standard_errors = _block_mapping_standard_errors(
+        block_targets,
+        "transition_rates_s_inv",
+        tuple(transition_rates),
+    )
+    block_displacement_moment_standard_errors = _block_displacement_standard_errors(
+        block_targets,
+        displacement_moments,
+    )
+    block_sigma_standard_error_mS_cm = _standard_error(
+        tuple(block.markov_additive_sigma_mS_cm for block in block_targets),
+    )
 
     return TrajectoryPrimitiveTargetArtifact(
         system_id=system_id,
@@ -1185,11 +1486,19 @@ def _primitive_target_artifact_from_sample_input(
         state_concentrations_mol_m3=state_concentrations,
         state_occupancy_fractions=state_occupancy_fractions,
         transition_rates_s_inv=transition_rates,
-        transition_rate_targets_validated=False,
+        transition_rate_targets_validated=_mapping_targets_are_block_stable(
+            transition_rates,
+            block_transition_rate_standard_errors,
+        ),
         transition_fluxes_mol_m3_s=transition_fluxes,
         residence_times_s=residence_times,
         displacement_moments_by_family=displacement_moments,
-        displacement_moment_targets_validated=False,
+        displacement_moment_targets_validated=(
+            _displacement_targets_are_block_stable(
+                displacement_moments,
+                block_displacement_moment_standard_errors,
+            )
+        ),
         markov_additive_sigma_mS_cm=(
             process_result.conductivity_result.sigma_mS_cm
         ),
@@ -1199,7 +1508,10 @@ def _primitive_target_artifact_from_sample_input(
         markov_corrector_sigma_mS_cm=(
             process_result.conductivity_result.corrector_sigma_mS_cm
         ),
-        markov_additive_sigma_validated=False,
+        markov_additive_sigma_validated=_scalar_target_is_block_stable(
+            process_result.conductivity_result.sigma_mS_cm,
+            block_sigma_standard_error_mS_cm,
+        ),
         block_targets=block_targets,
         block_state_concentration_standard_errors_mol_m3=(
             _block_mapping_standard_errors(
@@ -1209,18 +1521,12 @@ def _primitive_target_artifact_from_sample_input(
             )
         ),
         block_transition_rate_standard_errors_s_inv=(
-            _block_mapping_standard_errors(
-                block_targets,
-                "transition_rates_s_inv",
-                tuple(transition_rates),
-            )
+            block_transition_rate_standard_errors
         ),
         block_displacement_moment_standard_errors_m2=(
-            _block_displacement_standard_errors(block_targets, displacement_moments)
+            block_displacement_moment_standard_errors
         ),
-        block_sigma_standard_error_mS_cm=_standard_error(
-            tuple(block.markov_additive_sigma_mS_cm for block in block_targets),
-        ),
+        block_sigma_standard_error_mS_cm=block_sigma_standard_error_mS_cm,
     )
 
 
@@ -1493,6 +1799,66 @@ def _standard_error(values: tuple[float, ...]) -> float:
     return float(np.std(value_array, ddof=1) / math.sqrt(len(values)))
 
 
+def _mapping_targets_are_block_stable(
+    target_values: Mapping[str, float],
+    standard_errors: Mapping[str, float],
+) -> bool:
+    if not target_values:
+        return False
+    for target_label, target_value in target_values.items():
+        target_magnitude = abs(_finite_float(target_value, target_label))
+        standard_error = _finite_float(
+            standard_errors[target_label],
+            f"{target_label}.standard_error",
+        )
+        if target_magnitude == 0.0:
+            if standard_error != 0.0:
+                return False
+            continue
+        if not standard_error <= target_magnitude:
+            return False
+    return True
+
+
+def _scalar_target_is_block_stable(
+    target_value: float,
+    standard_error: float,
+) -> bool:
+    target_magnitude = abs(_finite_float(target_value, "scalar_target"))
+    validated_standard_error = _finite_float(standard_error, "scalar_standard_error")
+    if target_magnitude == 0.0:
+        return validated_standard_error == 0.0
+    return validated_standard_error <= target_magnitude
+
+
+def _displacement_targets_are_block_stable(
+    displacement_moments: Mapping[str, TrajectoryDisplacementMomentTarget],
+    standard_errors: Mapping[str, float],
+) -> bool:
+    if not displacement_moments:
+        return False
+    second_moment_by_label = {
+        label: moment.mean_squared_displacement_m2
+        for label, moment in displacement_moments.items()
+    }
+    if not _mapping_targets_are_block_stable(
+        second_moment_by_label,
+        standard_errors,
+    ):
+        return False
+    for transition_label, moment in displacement_moments.items():
+        second_moment = _finite_float(
+            moment.mean_squared_displacement_m2,
+            f"{transition_label}.mean_squared_displacement_m2",
+        )
+        mean_norm_squared = math.fsum(
+            component * component for component in moment.mean_displacement_m
+        )
+        if second_moment + np.finfo(float).eps < mean_norm_squared:
+            return False
+    return True
+
+
 def _trajectory_events_from_samples(
     pair_samples_by_state_pair: Mapping[tuple[int, int], Sequence[np.ndarray]],
     self_samples_by_state: Mapping[int, Sequence[np.ndarray]],
@@ -1680,16 +2046,23 @@ def _state_concentrations_from_occupancy(
 
 
 def _positive_float(value: float, label: str) -> float:
-    parsed_value = float(value)
-    if not math.isfinite(parsed_value) or parsed_value <= 0.0:
+    parsed_value = _finite_float(value, label)
+    if parsed_value <= 0.0:
         raise ValueError(f"{label} must be positive and finite")
     return parsed_value
 
 
 def _nonnegative_float(value: float, label: str) -> float:
-    parsed_value = float(value)
-    if not math.isfinite(parsed_value) or parsed_value < 0.0:
+    parsed_value = _finite_float(value, label)
+    if parsed_value < 0.0:
         raise ValueError(f"{label} must be nonnegative and finite")
+    return parsed_value
+
+
+def _finite_float(value: float, label: str) -> float:
+    parsed_value = float(value)
+    if not math.isfinite(parsed_value):
+        raise ValueError(f"{label} must be finite")
     return parsed_value
 
 

@@ -32,6 +32,10 @@ class ConductivityPrimitiveParameterSet:
     negative_charged_triplet_logK_offset: float
     neutral_cluster_logK_offset: float
     higher_charged_cluster_logK_offset: float
+    contact_pair_desolvation_offset_over_RT: float
+    solvent_separated_pair_desolvation_offset_over_RT: float
+    higher_charged_cluster_desolvation_offset_over_RT: float
+    internal_polarization_projection_offset: float
     cluster_order_logK_slope: float
     cluster_charge_magnitude_logK_slope: float
     cluster_hydrodynamic_radius_scale: float
@@ -67,6 +71,8 @@ class ConductivityPrimitiveParameterSet:
     atmosphere_exit_scale: float
     association_conversion_rate_scale: float
     orientation_relaxation_rate_scale: float
+    internal_polarization_projection_ionic_strength_slope: float
+    internal_polarization_projection_counterion_crowding_slope: float
 
 
 CONDUCTIVITY_PRIMITIVE_PARAMETER_FIELD_NAMES = tuple(
@@ -132,6 +138,10 @@ class ConductivityPrimitiveSignedOffsets:
     negative_charged_triplet_logK_offset: float
     neutral_cluster_logK_offset: float
     higher_charged_cluster_logK_offset: float
+    contact_pair_desolvation_offset_over_RT: float
+    solvent_separated_pair_desolvation_offset_over_RT: float
+    higher_charged_cluster_desolvation_offset_over_RT: float
+    internal_polarization_projection_offset: float
     cluster_order_logK_slope: float
     cluster_charge_magnitude_logK_slope: float
 

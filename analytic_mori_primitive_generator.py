@@ -1023,6 +1023,7 @@ def _evaluate_analytic_mori_conductivity_with_options(
                 for event in markov_additive_events
             },
             temperature_K,
+            tuple(),
         )
     )
     uncertainty_certificate = _uncertainty_certificate(

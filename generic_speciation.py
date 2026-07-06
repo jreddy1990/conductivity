@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Mapping, Sequence
+from typing import Mapping
 
 import numpy as np
 
@@ -44,6 +44,8 @@ class MolecularSolventEnvironment:
     temperature_K: float
     solvent_effective_radius_A: float
     mean_molecular_volume_A3: float
+    solvent_volume_fractions: Mapping[str, float]
+    solvent_coordination_affinity_J_mol: float
 
 
 @dataclass(frozen=True)
@@ -87,6 +89,7 @@ class _ClusterFreeEnergyTerms:
     coulomb_J_mol: float
     desolvation_J_mol: float
     coordination_J_mol: float
+    solvation_competition_J_mol: float
     steric_J_mol: float
     entropy_J_mol: float
     standard_state_correction_J_mol: float
@@ -98,6 +101,28 @@ class _PairFreeEnergyTerms:
     coulomb_J_mol: float
     desolvation_J_mol: float
     coordination_J_mol: float
+    solvation_competition_J_mol: float
+
+
+@dataclass(frozen=True)
+class PMFTerm:
+    name: str
+    free_energy_J_mol: float
+    source: str
+
+
+@dataclass(frozen=True)
+class SolvationCompetitionPMFPartition:
+    salt_label: str
+    cation_label: str
+    anion_label: str
+    solvent_composition: Mapping[str, float]
+    temperature_K: float
+    basin_labels: tuple[str, ...]
+    basin_boundaries: Mapping[str, tuple[float, float]]
+    pmf_terms: tuple[PMFTerm, ...]
+    restricted_partition_weights: Mapping[str, float]
+    concentrations_mol_m3: Mapping[str, float]
 
 
 @dataclass(frozen=True)
@@ -112,6 +137,9 @@ class GenericSpeciationResult:
     cluster_templates: tuple[ClusterStateTemplate, ...]
     free_component_concentrations_mol_m3: Mapping[str, float]
     cluster_concentrations_mol_m3: Mapping[str, float]
+    solvation_competition_pmf_partitions: tuple[
+        SolvationCompetitionPMFPartition, ...
+    ]
     mass_balance_residual_mol_m3: float
 
 
@@ -163,6 +191,7 @@ def solve_generic_mass_balance(
             cluster_templates=tuple(cluster_templates),
             free_component_concentrations_mol_m3={},
             cluster_concentrations_mol_m3={},
+            solvation_competition_pmf_partitions=tuple(),
             mass_balance_residual_mol_m3=0.0,
         )
     component_names = tuple(component.species_name for component in components)
@@ -188,6 +217,7 @@ def solve_generic_mass_balance(
                 for index, component in enumerate(components)
             },
             cluster_concentrations_mol_m3={},
+            solvation_competition_pmf_partitions=tuple(),
             mass_balance_residual_mol_m3=0.0,
         )
     free_concentrations = _solve_free_concentrations(
@@ -219,6 +249,16 @@ def solve_generic_mass_balance(
             for index, component in enumerate(components)
         },
         cluster_concentrations_mol_m3=cluster_concentrations,
+        solvation_competition_pmf_partitions=solvation_competition_pmf_partition(
+            components,
+            cluster_templates,
+            {
+                component.species_name: float(free_concentrations[index])
+                for index, component in enumerate(components)
+            },
+            cluster_concentrations,
+            solvent_environment,
+        ),
         mass_balance_residual_mol_m3=float(np.max(np.abs(residual))),
     )
 
@@ -472,6 +512,7 @@ def _cluster_standard_free_energy_terms(
     coulomb_J_mol = 0.0
     desolvation_J_mol = 0.0
     coordination_J_mol = 0.0
+    solvation_competition_J_mol = 0.0
     for first_index, first_center in enumerate(geometry):
         for second_center in geometry[first_index + 1:]:
             first_component = component_by_name[first_center.species_name]
@@ -490,6 +531,7 @@ def _cluster_standard_free_energy_terms(
             coulomb_J_mol += pair_terms.coulomb_J_mol
             desolvation_J_mol += pair_terms.desolvation_J_mol
             coordination_J_mol += pair_terms.coordination_J_mol
+            solvation_competition_J_mol += pair_terms.solvation_competition_J_mol
     total_ion_count = sum(stoichiometric_counts)
     steric_J_mol = (
         primitive_parameters.steric_free_energy_scale
@@ -533,6 +575,7 @@ def _cluster_standard_free_energy_terms(
         coulomb_J_mol
         + desolvation_J_mol
         + coordination_J_mol
+        + solvation_competition_J_mol
         + steric_J_mol
         + entropy_J_mol
         + standard_state_correction_J_mol
@@ -542,6 +585,7 @@ def _cluster_standard_free_energy_terms(
         coulomb_J_mol=float(coulomb_J_mol),
         desolvation_J_mol=float(desolvation_J_mol),
         coordination_J_mol=float(coordination_J_mol),
+        solvation_competition_J_mol=float(solvation_competition_J_mol),
         steric_J_mol=float(steric_J_mol),
         entropy_J_mol=float(entropy_J_mol),
         standard_state_correction_J_mol=float(standard_state_correction_J_mol),
@@ -694,6 +738,14 @@ def _pair_interaction_free_energy_terms(
         center_distance_A,
         solvent_environment,
     )
+    solvation_competition_energy_J_mol = (
+        _pair_solvation_competition_penalty_J_mol(
+            first_component,
+            second_component,
+            solvent_environment,
+            primitive_parameters,
+        )
+    )
     return _PairFreeEnergyTerms(
         coulomb_J_mol=float(
             primitive_parameters.coulomb_scale * coulomb_energy_J_mol
@@ -704,7 +756,170 @@ def _pair_interaction_free_energy_terms(
         coordination_J_mol=float(
             primitive_parameters.coordination_scale * coordination_energy_J_mol
         ),
+        solvation_competition_J_mol=float(solvation_competition_energy_J_mol),
     )
+
+
+def solvation_competition_pmf_partition(
+    components: tuple[IonComponent, ...],
+    cluster_templates: tuple[ClusterStateTemplate, ...],
+    free_component_concentrations_mol_m3: Mapping[str, float],
+    cluster_concentrations_mol_m3: Mapping[str, float],
+    solvent_environment: MolecularSolventEnvironment,
+) -> tuple[SolvationCompetitionPMFPartition, ...]:
+    _validate_solvent_environment(solvent_environment)
+    component_by_name = {component.species_name: component for component in components}
+    partitions: list[SolvationCompetitionPMFPartition] = []
+    for cluster_template in cluster_templates:
+        if len(cluster_template.stoichiometry) != 2:
+            continue
+        charged_species_names = tuple(cluster_template.stoichiometry)
+        first_component = component_by_name[charged_species_names[0]]
+        second_component = component_by_name[charged_species_names[1]]
+        if first_component.charge_number * second_component.charge_number >= 0:
+            continue
+        cation_component = (
+            first_component if first_component.charge_number > 0 else second_component
+        )
+        anion_component = (
+            first_component if first_component.charge_number < 0 else second_component
+        )
+        cation_concentration = free_component_concentrations_mol_m3[
+            cation_component.species_name
+        ]
+        anion_concentration = free_component_concentrations_mol_m3[
+            anion_component.species_name
+        ]
+        cluster_concentration = cluster_concentrations_mol_m3[cluster_template.label]
+        total_partition_concentration = _positive_float(
+            cation_concentration + anion_concentration + cluster_concentration,
+            f"{cluster_template.label}.partition_total_concentration_mol_m3",
+        )
+        partitions.append(
+            SolvationCompetitionPMFPartition(
+                salt_label=f"{cation_component.species_name}:{anion_component.species_name}",
+                cation_label=cation_component.species_name,
+                anion_label=anion_component.species_name,
+                solvent_composition=dict(solvent_environment.solvent_volume_fractions),
+                temperature_K=solvent_environment.temperature_K,
+                basin_labels=(
+                    "free_ion_center",
+                    SOLVENT_SEPARATED_PAIR_CLUSTER_KIND,
+                    CONTACT_PAIR_CLUSTER_KIND,
+                    NEUTRAL_CLUSTER_KIND,
+                    HIGHER_CHARGED_CLUSTER_KIND,
+                ),
+                basin_boundaries=_solvation_competition_basin_boundaries_A(
+                    cation_component,
+                    anion_component,
+                    solvent_environment,
+                ),
+                pmf_terms=(
+                    PMFTerm("coulomb", cluster_template.coulomb_J_mol, "pair_pmf"),
+                    PMFTerm(
+                        "desolvation",
+                        cluster_template.desolvation_J_mol,
+                        "pair_pmf",
+                    ),
+                    PMFTerm(
+                        "coordination",
+                        cluster_template.coordination_J_mol,
+                        "pair_pmf",
+                    ),
+                    PMFTerm(
+                        "solvation_competition",
+                        cluster_template.standard_free_energy_J_mol
+                        - cluster_template.coulomb_J_mol
+                        - cluster_template.desolvation_J_mol
+                        - cluster_template.coordination_J_mol
+                        - cluster_template.steric_J_mol
+                        - cluster_template.entropy_J_mol
+                        - cluster_template.standard_state_correction_J_mol,
+                        "solvent_shell_competition_pmf",
+                    ),
+                ),
+                restricted_partition_weights={
+                    "free_ion_center": float(
+                        (cation_concentration + anion_concentration)
+                        / total_partition_concentration
+                    ),
+                    cluster_template.cluster_kind: float(
+                        cluster_concentration / total_partition_concentration
+                    ),
+                },
+                concentrations_mol_m3={
+                    cation_component.species_name: float(cation_concentration),
+                    anion_component.species_name: float(anion_concentration),
+                    cluster_template.label: float(cluster_concentration),
+                },
+            )
+        )
+    return tuple(partitions)
+
+
+def _pair_solvation_competition_penalty_J_mol(
+    first_component: IonComponent,
+    second_component: IonComponent,
+    solvent_environment: MolecularSolventEnvironment,
+    primitive_parameters: ConductivityPrimitiveParameterSet,
+) -> float:
+    if first_component.charge_number * second_component.charge_number >= 0:
+        return 0.0
+    solvent_competition_affinity_J_mol = _solvent_shell_competition_affinity_J_mol(
+        solvent_environment
+    )
+    ion_pair_coordination_affinity_J_mol = PAIR_COORDINATION_AVERAGE_FACTOR * (
+        first_component.descriptor.coordination_affinity_J_mol
+        + second_component.descriptor.coordination_affinity_J_mol
+    )
+    competition_penalty_J_mol = (
+        solvent_competition_affinity_J_mol - ion_pair_coordination_affinity_J_mol
+    )
+    if competition_penalty_J_mol <= 0.0:
+        return 0.0
+    ionic_strength_ratio = _analytical_ionic_strength_ratio(
+        (first_component, second_component)
+    )
+    crowding_denominator = 1.0 + (
+        primitive_parameters.association_crowding_stabilization_scale
+        * ionic_strength_ratio
+        ** primitive_parameters.association_crowding_ionic_strength_exponent
+    )
+    return float(
+        competition_penalty_J_mol
+        / _positive_float(crowding_denominator, "solvation_competition_crowding")
+    )
+
+
+def _solvent_shell_competition_affinity_J_mol(
+    solvent_environment: MolecularSolventEnvironment,
+) -> float:
+    return _positive_float(
+        solvent_environment.solvent_coordination_affinity_J_mol,
+        "solvent_coordination_affinity_J_mol",
+    )
+
+
+def _solvation_competition_basin_boundaries_A(
+    cation_component: IonComponent,
+    anion_component: IonComponent,
+    solvent_environment: MolecularSolventEnvironment,
+) -> Mapping[str, tuple[float, float]]:
+    contact_upper_A = (
+        cation_component.descriptor.cavity_radius_A
+        + anion_component.descriptor.cavity_radius_A
+    )
+    ssip_upper_A = contact_upper_A + (
+        2.0 * solvent_environment.solvent_effective_radius_A
+    )
+    return {
+        CONTACT_PAIR_CLUSTER_KIND: (0.0, float(contact_upper_A)),
+        SOLVENT_SEPARATED_PAIR_CLUSTER_KIND: (
+            float(contact_upper_A),
+            float(ssip_upper_A),
+        ),
+        "free_ion_center": (float(ssip_upper_A), math.inf),
+    }
 
 
 def _cluster_label(
@@ -1318,6 +1533,23 @@ def _validate_solvent_environment(
 ) -> None:
     _positive_float(solvent_environment.dielectric_constant, "dielectric_constant")
     _positive_float(solvent_environment.viscosity_cP, "viscosity_cP")
+    _positive_float(
+        solvent_environment.solvent_effective_radius_A,
+        "solvent_effective_radius_A",
+    )
+    _positive_float(
+        solvent_environment.mean_molecular_volume_A3,
+        "mean_molecular_volume_A3",
+    )
+    _positive_float(
+        solvent_environment.solvent_coordination_affinity_J_mol,
+        "solvent_coordination_affinity_J_mol",
+    )
+    solvent_fraction_sum = math.fsum(
+        _nonnegative_float(volume_fraction, f"{solvent_name}.volume_fraction")
+        for solvent_name, volume_fraction in solvent_environment.solvent_volume_fractions.items()
+    )
+    _positive_float(solvent_fraction_sum, "solvent_volume_fraction_sum")
     _nonnegative_float(
         solvent_environment.hard_sphere_volume_fraction,
         "hard_sphere_volume_fraction",

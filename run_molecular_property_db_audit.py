@@ -8,8 +8,10 @@ from dataclasses import dataclass
 from data.electrolyte_property_db import DATA
 from data.species_data import ADDITIVES, CATION_PROPERTIES, SALTS, SOLVENTS
 from conductivity.fit_conductivity_primitive_parameters import (
+    default_molecular_primitive_fit_configuration,
     load_primitive_parameters_from_candidate_artifact,
     load_primitive_parameters_from_promoted_candidate_artifact,
+    validate_molecular_property_db_audit_result,
 )
 from conductivity.molecular_primitive_parameters import (
     ConductivityPrimitiveParameterSet,
@@ -17,19 +19,34 @@ from conductivity.molecular_primitive_parameters import (
 from conductivity.molecular_property_db_audit import (
     MolecularClusterSensitivityDiagnostic,
     MolecularClusterThermodynamicDiagnostic,
+    MolecularPropertyDbAuditResult,
     MolecularPropertyDbRegistrySource,
     MolecularPropertyDbRowResult,
     audit_molecular_property_db_cases,
     build_molecular_property_db_case_selection,
     cluster_sensitivity_diagnostics_for_row,
     configured_conductivity_primitive_parameters,
-    default_molecular_primitive_fit_configuration,
     default_molecular_property_db_audit_options,
-    validate_molecular_property_db_audit_result,
 )
 
 CONFIGURED_BASELINE_CONFIG_NAME = "configured_baseline"
 FITTED_CANDIDATE_CONFIG_NAME = "fitted_candidate"
+
+
+def _row_abs_residual_mS_cm(row_result: MolecularPropertyDbRowResult) -> float:
+    return abs(row_result.residual_mS_cm)
+
+
+def _cluster_diagnostic_concentration_mol_m3(
+    diagnostic: MolecularClusterThermodynamicDiagnostic,
+) -> float:
+    return diagnostic.concentration_mol_m3
+
+
+def _cluster_diagnostic_standard_free_energy_over_RT(
+    diagnostic: MolecularClusterThermodynamicDiagnostic,
+) -> float:
+    return diagnostic.standard_free_energy_over_RT
 
 
 def main() -> None:
@@ -89,6 +106,7 @@ def main() -> None:
         "higher_packing_lowers_local_mobility="
         f"{result.higher_packing_lowers_local_mobility}"
     )
+    _print_primitive_residual_owner_summaries(result)
     multi_row_formulation_groups = tuple(
         formulation_group for formulation_group in case_selection.formulation_groups
         if len(formulation_group.source_row_ids) > 1
@@ -118,7 +136,7 @@ def main() -> None:
     }
     for row_result in sorted(
         result.rows,
-        key=lambda row: abs(row.residual_mS_cm),
+        key=_row_abs_residual_mS_cm,
         reverse=True,
     )[:options.audit_worst_row_count]:
         print(
@@ -126,6 +144,18 @@ def main() -> None:
             "empirical_target={empirical:.6f} empirical_spread={spread:.6f} "
             "predicted={predicted:.6f} "
             "residual={residual:.6f} direct={direct:.6f} corrector={corrector:.6f} "
+            "onsager_ne={onsager_ne:.6f} onsager_sigma={onsager_sigma:.6f} "
+            "onsager_corrector={onsager_corrector:.6f} "
+            "markov_state_changing_direct={markov_direct:.6f} "
+            "markov_state_changing_corrector={markov_corrector:.6f} "
+            "projected_current_memory_corrector={current_memory_corrector:.6f} "
+            "atmosphere_current_memory_corrector={atmosphere_memory_corrector:.6f} "
+            "structural_current_memory_delta={structural_memory_delta:.6f} "
+            "sigma_without_structural_current_memory={sigma_without_structural_memory:.6f} "
+            "onsager_edge_count={onsager_edge_count} "
+            "max_onsager_edge_friction={max_onsager_edge_friction:.6e} "
+            "min_friction_matrix_eigenvalue={min_friction_eigenvalue:.6e} "
+            "min_projected_mobility_eigenvalue={min_mobility_eigenvalue:.6e} "
             "direct_capacity_gap={direct_gap:.6f} "
             "corrector_target={corrector_target:.6f} "
             "corrector_residual={corrector_residual:.6f} "
@@ -147,6 +177,31 @@ def main() -> None:
                 residual=row_result.residual_mS_cm,
                 direct=row_result.direct_sigma_mS_cm,
                 corrector=row_result.corrector_sigma_mS_cm,
+                onsager_ne=row_result.onsager_ne_sigma_mS_cm,
+                onsager_sigma=row_result.onsager_sigma_mS_cm,
+                onsager_corrector=row_result.onsager_correlation_corrector_mS_cm,
+                markov_direct=row_result.markov_state_changing_direct_sigma_mS_cm,
+                markov_corrector=(
+                    row_result.markov_state_changing_corrector_sigma_mS_cm
+                ),
+                current_memory_corrector=(
+                    row_result.projected_current_memory_corrector_sigma_mS_cm
+                ),
+                atmosphere_memory_corrector=(
+                    row_result.atmosphere_current_memory_corrector_sigma_mS_cm
+                ),
+                structural_memory_delta=(
+                    row_result.structural_current_memory_corrector_delta_mS_cm
+                ),
+                sigma_without_structural_memory=(
+                    row_result.sigma_without_structural_current_memory_mS_cm
+                ),
+                onsager_edge_count=row_result.onsager_edge_count,
+                max_onsager_edge_friction=row_result.max_onsager_edge_friction,
+                min_friction_eigenvalue=row_result.min_friction_matrix_eigenvalue,
+                min_mobility_eigenvalue=(
+                    row_result.min_projected_mobility_eigenvalue
+                ),
                 direct_gap=row_result.direct_capacity_gap_mS_cm,
                 corrector_target=row_result.corrector_target_mS_cm,
                 corrector_residual=row_result.corrector_residual_mS_cm,
@@ -168,6 +223,15 @@ def main() -> None:
                 failed=row_result.failed,
                 reason=row_result.failure_reason,
             )
+        )
+        _print_event_family_attributions(
+            row_result,
+            options.audit_worst_row_count,
+        )
+        _print_primitive_residual_owners(row_result)
+        _print_top_onsager_friction_edges(
+            row_result,
+            options.audit_worst_row_count,
         )
         _print_top_cluster_diagnostics(
             row_result,
@@ -235,12 +299,12 @@ def _print_top_cluster_diagnostics(
 ) -> None:
     top_by_concentration = sorted(
         row_result.cluster_thermodynamic_diagnostics,
-        key=lambda diagnostic: diagnostic.concentration_mol_m3,
+        key=_cluster_diagnostic_concentration_mol_m3,
         reverse=True,
     )[:cluster_diagnostic_count]
     top_by_free_energy = sorted(
         row_result.cluster_thermodynamic_diagnostics,
-        key=lambda diagnostic: diagnostic.standard_free_energy_over_RT,
+        key=_cluster_diagnostic_standard_free_energy_over_RT,
     )[:cluster_diagnostic_count]
     print("  top_clusters_by_concentration")
     for diagnostic in top_by_concentration:
@@ -248,6 +312,90 @@ def _print_top_cluster_diagnostics(
     print("  top_clusters_by_most_favorable_deltaG")
     for diagnostic in top_by_free_energy:
         _print_cluster_diagnostic(diagnostic)
+
+
+def _print_event_family_attributions(
+    row_result: MolecularPropertyDbRowResult,
+    event_family_count: int,
+) -> None:
+    print("  event_family_attribution")
+    for attribution in row_result.markov_event_family_attributions[:event_family_count]:
+        print(
+            "    family={family} direct={direct:.6f} "
+            "corrector={corrector:.6f} net={net:.6f} "
+            "direct_fraction={direct_fraction:.6f} "
+            "net_fraction={net_fraction:.6f}".format(
+                family=attribution.family_label,
+                direct=attribution.direct_sigma_mS_cm,
+                corrector=attribution.marginal_corrector_sigma_mS_cm,
+                net=attribution.marginal_net_sigma_mS_cm,
+                direct_fraction=attribution.direct_fraction,
+                net_fraction=attribution.marginal_net_fraction,
+            )
+        )
+
+
+def _print_primitive_residual_owners(
+    row_result: MolecularPropertyDbRowResult,
+) -> None:
+    print("  primitive_residual_owners")
+    for owner in row_result.primitive_residual_owners:
+        print(
+            "    primitive_head={primitive_head} theorem_object={theorem_object} "
+            "production_lever={production_lever} "
+            "component={component} residual={residual:.6f} "
+            "evidence={evidence} source={source}".format(
+                primitive_head=owner.primitive_head,
+                theorem_object=owner.theorem_object,
+                production_lever=owner.production_lever,
+                component=owner.residual_component,
+                residual=owner.residual_mS_cm,
+                evidence=owner.evidence_label,
+                source=owner.source_label,
+            )
+        )
+
+
+def _print_primitive_residual_owner_summaries(
+    result: MolecularPropertyDbAuditResult,
+) -> None:
+    print("primitive_residual_owner_summary")
+    for summary in result.primitive_residual_owner_summaries:
+        print(
+            "primitive_head={primitive_head} theorem_object={theorem_object} "
+            "production_lever={production_lever} row_count={row_count} "
+            "sum_abs_residual_mS_cm={sum_abs:.6f} "
+            "mean_signed_residual_mS_cm={mean_signed:.6f} "
+            "mean_abs_residual_mS_cm={mean_abs:.6f} "
+            "top_event_family={top_event_family}".format(
+                primitive_head=summary.primitive_head,
+                theorem_object=summary.theorem_object,
+                production_lever=summary.production_lever,
+                row_count=summary.row_count,
+                sum_abs=summary.sum_abs_residual_mS_cm,
+                mean_signed=summary.mean_signed_residual_mS_cm,
+                mean_abs=summary.mean_abs_residual_mS_cm,
+                top_event_family=summary.top_event_family,
+            )
+        )
+
+
+def _print_top_onsager_friction_edges(
+    row_result: MolecularPropertyDbRowResult,
+    edge_count: int,
+) -> None:
+    print("  top_onsager_friction_edges")
+    for first_state_label, second_state_label, friction_coefficient_J_s_mol_m2 in (
+        row_result.top_onsager_friction_edges[:edge_count]
+    ):
+        print(
+            "    first_state={first_state} second_state={second_state} "
+            "friction_coefficient_J_s_mol_m2={friction:.6e}".format(
+                first_state=first_state_label,
+                second_state=second_state_label,
+                friction=friction_coefficient_J_s_mol_m2,
+            )
+        )
 
 
 def _print_cluster_sensitivity_diagnostics(
