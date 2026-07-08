@@ -1,0 +1,729 @@
+schema: conductivity_physical_species_record_v1
+name: FEC
+role: additive
+source:
+  smiles: O=C1OCC(F)O1
+  force_field: openff-2.2.0.offxml
+  partial_charge_method: am1bcc
+  metadata_source: data.species_data.ADDITIVES[FEC]
+formal_charge_e: 0.0
+molecular_weight_kg_mol: 0.10604000000000001
+density_kg_m3: 1454.0
+partial_molar_volume_m3_mol: 7.292984869325998e-05
+sites:
+- site_id: 0
+  element: O
+  atomic_number: 8
+  mass_kg: 2.656767855833204e-26
+  steric_radius_m: 1.5199061025329047e-10
+  hydrodynamic_radius_m: 1.5199061025329047e-10
+  volume_m3: 1.470750096255665e-29
+  lj_sigma_m: 3.0398122050658094e-10
+  lj_epsilon_J: 1.4604479715012282e-21
+  charge_number: -0.5324
+  charge_cloud_radius_m: 1.5199061025329047e-10
+  born_radius_m: 1.5199061025329047e-10
+  polarizability_SI: 0.0
+  donor_flag: 1
+  acceptor_flag: 1
+  hba_count_contribution: 1
+  hbd_count_contribution: 0
+  parameter_ids:
+    vdw: n17
+    vdw_smirks: '[#8:1]'
+  derived_radius_source: one_half_openff_sage_lj_sigma
+- site_id: 1
+  element: C
+  atomic_number: 6
+  mass_kg: 1.9944369410337947e-26
+  steric_radius_m: 1.7403234434725327e-10
+  hydrodynamic_radius_m: 1.7403234434725327e-10
+  volume_m3: 2.207895532953099e-29
+  lj_sigma_m: 3.4806468869450653e-10
+  lj_epsilon_J: 6.036110252557086e-22
+  charge_number: 0.8538
+  charge_cloud_radius_m: 1.7403234434725327e-10
+  born_radius_m: 1.7403234434725327e-10
+  polarizability_SI: 0.0
+  donor_flag: 0
+  acceptor_flag: 0
+  hba_count_contribution: 0
+  hbd_count_contribution: 0
+  parameter_ids:
+    vdw: n14
+    vdw_smirks: '[#6:1]'
+  derived_radius_source: one_half_openff_sage_lj_sigma
+- site_id: 2
+  element: O
+  atomic_number: 8
+  mass_kg: 2.656767855833204e-26
+  steric_radius_m: 1.5125532452176564e-10
+  hydrodynamic_radius_m: 1.5125532452176564e-10
+  volume_m3: 1.4495080261738072e-29
+  lj_sigma_m: 3.025106490435313e-10
+  lj_epsilon_J: 1.1704444896579881e-21
+  charge_number: -0.3998
+  charge_cloud_radius_m: 1.5125532452176564e-10
+  born_radius_m: 1.5125532452176564e-10
+  polarizability_SI: 0.0
+  donor_flag: 1
+  acceptor_flag: 1
+  hba_count_contribution: 1
+  hbd_count_contribution: 0
+  parameter_ids:
+    vdw: n18
+    vdw_smirks: '[#8X2H0+0:1]'
+  derived_radius_source: one_half_openff_sage_lj_sigma
+- site_id: 3
+  element: C
+  atomic_number: 6
+  mass_kg: 1.9944369410337947e-26
+  steric_radius_m: 1.6897658808133102e-10
+  hydrodynamic_radius_m: 1.6897658808133102e-10
+  volume_m3: 2.0210088696061118e-29
+  lj_sigma_m: 3.3795317616266205e-10
+  lj_epsilon_J: 7.561914180674489e-22
+  charge_number: 0.0715
+  charge_cloud_radius_m: 1.6897658808133102e-10
+  born_radius_m: 1.6897658808133102e-10
+  polarizability_SI: 0.0
+  donor_flag: 0
+  acceptor_flag: 0
+  hba_count_contribution: 0
+  hbd_count_contribution: 0
+  parameter_ids:
+    vdw: n16
+    vdw_smirks: '[#6X4:1]'
+  derived_radius_source: one_half_openff_sage_lj_sigma
+- site_id: 4
+  element: C
+  atomic_number: 6
+  mass_kg: 1.9944369410337947e-26
+  steric_radius_m: 1.6897658808133102e-10
+  hydrodynamic_radius_m: 1.6897658808133102e-10
+  volume_m3: 2.0210088696061118e-29
+  lj_sigma_m: 3.3795317616266205e-10
+  lj_epsilon_J: 7.561914180674489e-22
+  charge_number: 0.34149999999999997
+  charge_cloud_radius_m: 1.6897658808133102e-10
+  born_radius_m: 1.6897658808133102e-10
+  polarizability_SI: 0.0
+  donor_flag: 0
+  acceptor_flag: 0
+  hba_count_contribution: 0
+  hbd_count_contribution: 0
+  parameter_ids:
+    vdw: n16
+    vdw_smirks: '[#6X4:1]'
+  derived_radius_source: one_half_openff_sage_lj_sigma
+- site_id: 5
+  element: F
+  atomic_number: 9
+  mass_kg: 3.1547590799645406e-26
+  steric_radius_m: 1.5590727567455937e-10
+  hydrodynamic_radius_m: 1.5590727567455937e-10
+  volume_m3: 1.5874050497794992e-29
+  lj_sigma_m: 3.1181455134911874e-10
+  lj_epsilon_J: 4.238094228803778e-22
+  charge_number: -0.20920000000000002
+  charge_cloud_radius_m: 1.5590727567455937e-10
+  born_radius_m: 1.5590727567455937e-10
+  polarizability_SI: 0.0
+  donor_flag: 1
+  acceptor_flag: 1
+  hba_count_contribution: 1
+  hbd_count_contribution: 0
+  parameter_ids:
+    vdw: n23
+    vdw_smirks: '[#9:1]'
+  derived_radius_source: one_half_openff_sage_lj_sigma
+- site_id: 6
+  element: O
+  atomic_number: 8
+  mass_kg: 2.656767855833204e-26
+  steric_radius_m: 1.5125532452176564e-10
+  hydrodynamic_radius_m: 1.5125532452176564e-10
+  volume_m3: 1.4495080261738072e-29
+  lj_sigma_m: 3.025106490435313e-10
+  lj_epsilon_J: 1.1704444896579881e-21
+  charge_number: -0.4258
+  charge_cloud_radius_m: 1.5125532452176564e-10
+  born_radius_m: 1.5125532452176564e-10
+  polarizability_SI: 0.0
+  donor_flag: 1
+  acceptor_flag: 1
+  hba_count_contribution: 1
+  hbd_count_contribution: 0
+  parameter_ids:
+    vdw: n18
+    vdw_smirks: '[#8X2H0+0:1]'
+  derived_radius_source: one_half_openff_sage_lj_sigma
+- site_id: 7
+  element: H
+  atomic_number: 1
+  mass_kg: 1.67373537056227e-27
+  steric_radius_m: 1.291612855419598e-10
+  hydrodynamic_radius_m: 1.291612855419598e-10
+  volume_m3: 9.025799586606703e-30
+  lj_sigma_m: 2.583225710839196e-10
+  lj_epsilon_J: 1.1400644408070263e-22
+  charge_number: 0.0948
+  charge_cloud_radius_m: 1.291612855419598e-10
+  born_radius_m: 1.291612855419598e-10
+  polarizability_SI: 0.0
+  donor_flag: 0
+  acceptor_flag: 0
+  hba_count_contribution: 0
+  hbd_count_contribution: 0
+  parameter_ids:
+    vdw: n3
+    vdw_smirks: '[#1:1]-[#6X4]-[#7,#8,#9,#16,#17,#35]'
+  derived_radius_source: one_half_openff_sage_lj_sigma
+- site_id: 8
+  element: H
+  atomic_number: 1
+  mass_kg: 1.67373537056227e-27
+  steric_radius_m: 1.291612855419598e-10
+  hydrodynamic_radius_m: 1.291612855419598e-10
+  volume_m3: 9.025799586606703e-30
+  lj_sigma_m: 2.583225710839196e-10
+  lj_epsilon_J: 1.1400644408070263e-22
+  charge_number: 0.0948
+  charge_cloud_radius_m: 1.291612855419598e-10
+  born_radius_m: 1.291612855419598e-10
+  polarizability_SI: 0.0
+  donor_flag: 0
+  acceptor_flag: 0
+  hba_count_contribution: 0
+  hbd_count_contribution: 0
+  parameter_ids:
+    vdw: n3
+    vdw_smirks: '[#1:1]-[#6X4]-[#7,#8,#9,#16,#17,#35]'
+  derived_radius_source: one_half_openff_sage_lj_sigma
+- site_id: 9
+  element: H
+  atomic_number: 1
+  mass_kg: 1.67373537056227e-27
+  steric_radius_m: 1.1465866502466167e-10
+  hydrodynamic_radius_m: 1.1465866502466167e-10
+  volume_m3: 6.314067962540425e-30
+  lj_sigma_m: 2.2931733004932334e-10
+  lj_epsilon_J: 1.0907881867576938e-22
+  charge_number: 0.1108
+  charge_cloud_radius_m: 1.1465866502466167e-10
+  born_radius_m: 1.1465866502466167e-10
+  polarizability_SI: 0.0
+  donor_flag: 0
+  acceptor_flag: 0
+  hba_count_contribution: 0
+  hbd_count_contribution: 0
+  parameter_ids:
+    vdw: n4
+    vdw_smirks: '[#1:1]-[#6X4](-[#7,#8,#9,#16,#17,#35])-[#7,#8,#9,#16,#17,#35]'
+  derived_radius_source: one_half_openff_sage_lj_sigma
+bonds:
+- site_i: 0
+  site_j: 1
+  k_J_m2_mol: 6.376738168364007e+26
+  r0_m: 1.2250022961830002e-10
+  parameter_id: b21
+  smirks: '[#6:1]=[#8X1+0,#8X2+1:2]'
+- site_i: 1
+  site_j: 2
+  k_J_m2_mol: 2.437950383670599e+26
+  r0_m: 1.356061963393e-10
+  parameter_id: b20
+  smirks: '[#6X3:1](=[#8X1])-[#8X2H0:2]'
+- site_i: 1
+  site_j: 6
+  k_J_m2_mol: 2.437950383670599e+26
+  r0_m: 1.356061963393e-10
+  parameter_id: b20
+  smirks: '[#6X3:1](=[#8X1])-[#8X2H0:2]'
+- site_i: 2
+  site_j: 3
+  k_J_m2_mol: 1.8998468433236813e+26
+  r0_m: 1.436323905911e-10
+  parameter_id: b16
+  smirks: '[#6X4:1]-[#8X2H0:2]'
+- site_i: 3
+  site_j: 4
+  k_J_m2_mol: 1.8016420362391335e+26
+  r0_m: 1.533627603844e-10
+  parameter_id: b1
+  smirks: '[#6X4:1]-[#6X4:2]'
+- site_i: 3
+  site_j: 7
+  k_J_m2_mol: 2.994230625576251e+26
+  r0_m: 1.0942064607519999e-10
+  parameter_id: b84
+  smirks: '[#6X4:1]-[#1:2]'
+- site_i: 3
+  site_j: 8
+  k_J_m2_mol: 2.994230625576251e+26
+  r0_m: 1.0942064607519999e-10
+  parameter_id: b84
+  smirks: '[#6X4:1]-[#1:2]'
+- site_i: 4
+  site_j: 5
+  k_J_m2_mol: 2.409304693575293e+26
+  r0_m: 1.3593155597860002e-10
+  parameter_id: b69
+  smirks: '[#6X4:1]-[#9:2]'
+- site_i: 4
+  site_j: 6
+  k_J_m2_mol: 1.8998468433236813e+26
+  r0_m: 1.436323905911e-10
+  parameter_id: b16
+  smirks: '[#6X4:1]-[#8X2H0:2]'
+- site_i: 4
+  site_j: 9
+  k_J_m2_mol: 2.994230625576251e+26
+  r0_m: 1.0942064607519999e-10
+  parameter_id: b84
+  smirks: '[#6X4:1]-[#1:2]'
+angles:
+- site_i: 0
+  site_j: 1
+  site_k: 2
+  k_J_rad2_mol: 529778.3599698496
+  theta0_rad: 2.15732975541902
+  parameter_id: a15
+  smirks: '[#8X1:1]~[#6X3:2]~[#8:3]'
+- site_i: 0
+  site_j: 1
+  site_k: 6
+  k_J_rad2_mol: 529778.3599698496
+  theta0_rad: 2.15732975541902
+  parameter_id: a15
+  smirks: '[#8X1:1]~[#6X3:2]~[#8:3]'
+- site_i: 1
+  site_j: 2
+  site_k: 3
+  k_J_rad2_mol: 765827.3009099272
+  theta0_rad: 1.8879760441412774
+  parameter_id: a41
+  smirks: '[*;r5:1]1@[*;r5:2]@[*;r5:3]@[*;r5]@[*;r5]1'
+- site_i: 1
+  site_j: 6
+  site_k: 4
+  k_J_rad2_mol: 765827.3009099272
+  theta0_rad: 1.8879760441412774
+  parameter_id: a41
+  smirks: '[*;r5:1]1@[*;r5:2]@[*;r5:3]@[*;r5]@[*;r5]1'
+- site_i: 2
+  site_j: 1
+  site_k: 6
+  k_J_rad2_mol: 765827.3009099272
+  theta0_rad: 1.8879760441412774
+  parameter_id: a41
+  smirks: '[*;r5:1]1@[*;r5:2]@[*;r5:3]@[*;r5]@[*;r5]1'
+- site_i: 2
+  site_j: 3
+  site_k: 4
+  k_J_rad2_mol: 765827.3009099272
+  theta0_rad: 1.8879760441412774
+  parameter_id: a41
+  smirks: '[*;r5:1]1@[*;r5:2]@[*;r5:3]@[*;r5]@[*;r5]1'
+- site_i: 2
+  site_j: 3
+  site_k: 7
+  k_J_rad2_mol: 558616.8716678696
+  theta0_rad: 1.9187809938653142
+  parameter_id: a1
+  smirks: '[*:1]~[#6X4:2]-[*:3]'
+- site_i: 2
+  site_j: 3
+  site_k: 8
+  k_J_rad2_mol: 558616.8716678696
+  theta0_rad: 1.9187809938653142
+  parameter_id: a1
+  smirks: '[*:1]~[#6X4:2]-[*:3]'
+- site_i: 3
+  site_j: 4
+  site_k: 5
+  k_J_rad2_mol: 558616.8716678696
+  theta0_rad: 1.9187809938653142
+  parameter_id: a1
+  smirks: '[*:1]~[#6X4:2]-[*:3]'
+- site_i: 3
+  site_j: 4
+  site_k: 6
+  k_J_rad2_mol: 765827.3009099272
+  theta0_rad: 1.8879760441412774
+  parameter_id: a41
+  smirks: '[*;r5:1]1@[*;r5:2]@[*;r5:3]@[*;r5]@[*;r5]1'
+- site_i: 3
+  site_j: 4
+  site_k: 9
+  k_J_rad2_mol: 558616.8716678696
+  theta0_rad: 1.9187809938653142
+  parameter_id: a1
+  smirks: '[*:1]~[#6X4:2]-[*:3]'
+- site_i: 4
+  site_j: 3
+  site_k: 7
+  k_J_rad2_mol: 558616.8716678696
+  theta0_rad: 1.9187809938653142
+  parameter_id: a1
+  smirks: '[*:1]~[#6X4:2]-[*:3]'
+- site_i: 4
+  site_j: 3
+  site_k: 8
+  k_J_rad2_mol: 558616.8716678696
+  theta0_rad: 1.9187809938653142
+  parameter_id: a1
+  smirks: '[*:1]~[#6X4:2]-[*:3]'
+- site_i: 5
+  site_j: 4
+  site_k: 6
+  k_J_rad2_mol: 558616.8716678696
+  theta0_rad: 1.9187809938653142
+  parameter_id: a1
+  smirks: '[*:1]~[#6X4:2]-[*:3]'
+- site_i: 5
+  site_j: 4
+  site_k: 9
+  k_J_rad2_mol: 558616.8716678696
+  theta0_rad: 1.9187809938653142
+  parameter_id: a1
+  smirks: '[*:1]~[#6X4:2]-[*:3]'
+- site_i: 6
+  site_j: 4
+  site_k: 9
+  k_J_rad2_mol: 558616.8716678696
+  theta0_rad: 1.9187809938653142
+  parameter_id: a1
+  smirks: '[*:1]~[#6X4:2]-[*:3]'
+- site_i: 7
+  site_j: 3
+  site_k: 8
+  k_J_rad2_mol: 307746.90553511784
+  theta0_rad: 1.8911395297826343
+  parameter_id: a2
+  smirks: '[#1:1]-[#6X4:2]-[#1:3]'
+torsions:
+- kind: ProperTorsions
+  site_i: 0
+  site_j: 1
+  site_k: 2
+  site_l: 3
+  terms:
+  - Vn_J_mol: 7378.932753108328
+    periodicity: 2
+    phase_rad: 3.141592653589793
+    idivf: 1.0
+  parameter_id: t111
+  smirks: '[*:1]-[#8X2:2]@[#6X3:3]~[*:4]'
+- kind: ProperTorsions
+  site_i: 0
+  site_j: 1
+  site_k: 6
+  site_l: 4
+  terms:
+  - Vn_J_mol: 7378.932753108328
+    periodicity: 2
+    phase_rad: 3.141592653589793
+    idivf: 1.0
+  parameter_id: t111
+  smirks: '[*:1]-[#8X2:2]@[#6X3:3]~[*:4]'
+- kind: ProperTorsions
+  site_i: 1
+  site_j: 2
+  site_k: 3
+  site_l: 4
+  terms:
+  - Vn_J_mol: 465.691587083456
+    periodicity: 3
+    phase_rad: 0.0
+    idivf: 1.0
+  - Vn_J_mol: 1836.4054461696562
+    periodicity: 1
+    phase_rad: 3.141592653589793
+    idivf: 1.0
+  parameter_id: t97
+  smirks: '[#6X4:1]-[#6X4:2]-[#8X2:3]-[#6X3:4]'
+- kind: ProperTorsions
+  site_i: 1
+  site_j: 2
+  site_k: 3
+  site_l: 7
+  terms:
+  - Vn_J_mol: 3302.5738618580417
+    periodicity: 3
+    phase_rad: 0.0
+    idivf: 3.0
+  parameter_id: t95
+  smirks: '[*:1]-[#6X4:2]-[#8X2H0:3]-[*:4]'
+- kind: ProperTorsions
+  site_i: 1
+  site_j: 2
+  site_k: 3
+  site_l: 8
+  terms:
+  - Vn_J_mol: 3302.5738618580417
+    periodicity: 3
+    phase_rad: 0.0
+    idivf: 3.0
+  parameter_id: t95
+  smirks: '[*:1]-[#6X4:2]-[#8X2H0:3]-[*:4]'
+- kind: ProperTorsions
+  site_i: 1
+  site_j: 6
+  site_k: 4
+  site_l: 3
+  terms:
+  - Vn_J_mol: 465.691587083456
+    periodicity: 3
+    phase_rad: 0.0
+    idivf: 1.0
+  - Vn_J_mol: 1836.4054461696562
+    periodicity: 1
+    phase_rad: 3.141592653589793
+    idivf: 1.0
+  parameter_id: t97
+  smirks: '[#6X4:1]-[#6X4:2]-[#8X2:3]-[#6X3:4]'
+- kind: ProperTorsions
+  site_i: 1
+  site_j: 6
+  site_k: 4
+  site_l: 5
+  terms:
+  - Vn_J_mol: 3302.5738618580417
+    periodicity: 3
+    phase_rad: 0.0
+    idivf: 3.0
+  parameter_id: t95
+  smirks: '[*:1]-[#6X4:2]-[#8X2H0:3]-[*:4]'
+- kind: ProperTorsions
+  site_i: 1
+  site_j: 6
+  site_k: 4
+  site_l: 9
+  terms:
+  - Vn_J_mol: 3302.5738618580417
+    periodicity: 3
+    phase_rad: 0.0
+    idivf: 3.0
+  parameter_id: t95
+  smirks: '[*:1]-[#6X4:2]-[#8X2H0:3]-[*:4]'
+- kind: ProperTorsions
+  site_i: 2
+  site_j: 1
+  site_k: 6
+  site_l: 4
+  terms:
+  - Vn_J_mol: 7378.932753108328
+    periodicity: 2
+    phase_rad: 3.141592653589793
+    idivf: 1.0
+  parameter_id: t111
+  smirks: '[*:1]-[#8X2:2]@[#6X3:3]~[*:4]'
+- kind: ProperTorsions
+  site_i: 2
+  site_j: 3
+  site_k: 4
+  site_l: 5
+  terms:
+  - Vn_J_mol: 602.098025233632
+    periodicity: 3
+    phase_rad: 0.0
+    idivf: 1.0
+  parameter_id: t1
+  smirks: '[*:1]-[#6X4:2]-[#6X4:3]-[*:4]'
+- kind: ProperTorsions
+  site_i: 2
+  site_j: 3
+  site_k: 4
+  site_l: 6
+  terms:
+  - Vn_J_mol: -64.1729711102644
+    periodicity: 3
+    phase_rad: 0.0
+    idivf: 1.0
+  - Vn_J_mol: 1753.7249071928943
+    periodicity: 2
+    phase_rad: 0.0
+    idivf: 1.0
+  parameter_id: t5
+  smirks: '[#8X2:1]-[#6X4:2]-[#6X4:3]-[#8X2:4]'
+- kind: ProperTorsions
+  site_i: 2
+  site_j: 3
+  site_k: 4
+  site_l: 9
+  terms:
+  - Vn_J_mol: 548.6675899149401
+    periodicity: 3
+    phase_rad: 0.0
+    idivf: 1.0
+  - Vn_J_mol: 1826.511275304912
+    periodicity: 1
+    phase_rad: 0.0
+    idivf: 1.0
+  parameter_id: t9
+  smirks: '[#1:1]-[#6X4:2]-[#6X4:3]-[#8X2:4]'
+- kind: ProperTorsions
+  site_i: 3
+  site_j: 2
+  site_k: 1
+  site_l: 6
+  terms:
+  - Vn_J_mol: 7378.932753108328
+    periodicity: 2
+    phase_rad: 3.141592653589793
+    idivf: 1.0
+  parameter_id: t111
+  smirks: '[*:1]-[#8X2:2]@[#6X3:3]~[*:4]'
+- kind: ProperTorsions
+  site_i: 5
+  site_j: 4
+  site_k: 3
+  site_l: 7
+  terms:
+  - Vn_J_mol: 402.43004666720026
+    periodicity: 3
+    phase_rad: 0.0
+    idivf: 1.0
+  - Vn_J_mol: 1798.045392013805
+    periodicity: 1
+    phase_rad: 0.0
+    idivf: 1.0
+  parameter_id: t10
+  smirks: '[#1:1]-[#6X4:2]-[#6X4:3]-[#9:4]'
+- kind: ProperTorsions
+  site_i: 5
+  site_j: 4
+  site_k: 3
+  site_l: 8
+  terms:
+  - Vn_J_mol: 402.43004666720026
+    periodicity: 3
+    phase_rad: 0.0
+    idivf: 1.0
+  - Vn_J_mol: 1798.045392013805
+    periodicity: 1
+    phase_rad: 0.0
+    idivf: 1.0
+  parameter_id: t10
+  smirks: '[#1:1]-[#6X4:2]-[#6X4:3]-[#9:4]'
+- kind: ProperTorsions
+  site_i: 6
+  site_j: 4
+  site_k: 3
+  site_l: 7
+  terms:
+  - Vn_J_mol: 548.6675899149401
+    periodicity: 3
+    phase_rad: 0.0
+    idivf: 1.0
+  - Vn_J_mol: 1826.511275304912
+    periodicity: 1
+    phase_rad: 0.0
+    idivf: 1.0
+  parameter_id: t9
+  smirks: '[#1:1]-[#6X4:2]-[#6X4:3]-[#8X2:4]'
+- kind: ProperTorsions
+  site_i: 6
+  site_j: 4
+  site_k: 3
+  site_l: 8
+  terms:
+  - Vn_J_mol: 548.6675899149401
+    periodicity: 3
+    phase_rad: 0.0
+    idivf: 1.0
+  - Vn_J_mol: 1826.511275304912
+    periodicity: 1
+    phase_rad: 0.0
+    idivf: 1.0
+  parameter_id: t9
+  smirks: '[#1:1]-[#6X4:2]-[#6X4:3]-[#8X2:4]'
+- kind: ProperTorsions
+  site_i: 7
+  site_j: 3
+  site_k: 4
+  site_l: 9
+  terms:
+  - Vn_J_mol: 953.9296294310489
+    periodicity: 3
+    phase_rad: 0.0
+    idivf: 1.0
+  parameter_id: t3
+  smirks: '[#1:1]-[#6X4:2]-[#6X4:3]-[#1:4]'
+- kind: ProperTorsions
+  site_i: 8
+  site_j: 3
+  site_k: 4
+  site_l: 9
+  terms:
+  - Vn_J_mol: 953.9296294310489
+    periodicity: 3
+    phase_rad: 0.0
+    idivf: 1.0
+  parameter_id: t3
+  smirks: '[#1:1]-[#6X4:2]-[#6X4:3]-[#1:4]'
+- kind: ImproperTorsions
+  site_i: 0
+  site_j: 1
+  site_k: 2
+  site_l: 6
+  terms:
+  - Vn_J_mol: 54039.27492493552
+    periodicity: 2
+    phase_rad: 3.141592653589793
+    idivf: 1.0
+  parameter_id: i2
+  smirks: '[*:1]~[#6X3:2](~[#8X1:3])~[#8:4]'
+constraints:
+- site_i: 3
+  site_j: 7
+  parameter_id: c1
+  smirks: '[#1:1]-[*:2]'
+- site_i: 3
+  site_j: 8
+  parameter_id: c1
+  smirks: '[#1:1]-[*:2]'
+- site_i: 4
+  site_j: 9
+  parameter_id: c1
+  smirks: '[#1:1]-[*:2]'
+reference_conformer_coordinates_m:
+- - 2.738105910860659e-10
+  - -2.375374301335391e-11
+  - 1.9632382131697583e-11
+- - 1.5158871857488371e-10
+  - -1.7025300437021463e-11
+  - -1.1520979618471408e-11
+- - 6.079937723270676e-11
+  - -1.2126065158647366e-10
+  - -1.594181702508956e-11
+- - -7.077095880465667e-11
+  - -6.782531362182786e-11
+  - -4.149773712440552e-12
+- - -5.5655421355259906e-11
+  - 8.226102748649608e-11
+  - -3.003879113643436e-12
+- - -6.464699428485983e-11
+  - 1.2793116160975757e-10
+  - 1.2766536600940374e-10
+- - 7.88421630961836e-11
+  - 9.643539632341226e-11
+  - -4.8823536772564395e-11
+- - -1.1147639248749819e-10
+  - -1.0340540282822682e-10
+  - 9.243517727397523e-11
+- - -1.3354600446736435e-10
+  - -1.0435993451127529e-10
+  - -8.582082787205833e-11
+- - -1.2894507859020261e-10
+  - 1.3100276057851286e-10
+  - -7.047211130080928e-11
+coordinate_map:
+  type: site_cartesian_coordinates
+  dimension: 30
+  unwrapping: molecule-contiguous periodic image tracking
+dielectric_constant: 107.0
+viscosity_Pa_s: 0.0040999999999999995
+donor_number: 14.5
+acceptor_number: 20.0

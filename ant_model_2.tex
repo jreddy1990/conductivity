@@ -1,0 +1,3919 @@
+\documentclass[11pt]{article}
+
+\usepackage{amsmath,amssymb,mathtools,bm,booktabs,longtable}
+\usepackage[margin=1in]{geometry}
+
+\newcommand{\dd}{\,\mathrm d}
+\newcommand{\R}{\mathbb R}
+\newcommand{\E}{\mathbb E}
+\newcommand{\Tr}{\operatorname{Tr}}
+\newcommand{\diag}{\operatorname{diag}}
+\newcommand{\rank}{\operatorname{rank}}
+\newcommand{\argmax}{\operatorname*{arg\,max}}
+\newcommand{\argmin}{\operatorname*{arg\,min}}
+\newcommand{\one}{\mathbf 1}
+\newcommand{\zero}{\mathbf 0}
+\newcommand{\eps}{\varepsilon}
+
+\begin{document}
+
+\section*{Complete Projected Analytical Conductivity Model}
+\subsection*{From Composition to Generator to Scalar Conductivity}
+
+\subsection*{Purpose}
+
+The model maps one electrolyte composition \(x\) to one scalar conductivity
+\[
+\sigma(x)\quad [\mathrm{S\,m^{-1}}],
+\]
+or equivalently
+\[
+\sigma_{\mathrm{mS/cm}}(x)=10\,\sigma(x).
+\]
+
+No Green--Kubo time integral is evaluated in production.
+No Einstein--Helfand long-time slope is evaluated in production.
+The model computes conductivity from projected equilibrium, flux, displacement,
+self-current, and memory primitives.
+
+\[
+x
+\longmapsto
+\mathcal L
+\longmapsto
+(U_x,D_x,P_x,\mathcal A,\Psi)
+\longmapsto
+(c,K,Q,d,M,D^{\rm self},A,h)
+\longmapsto
+\sigma.
+\]
+
+Here \(\mathcal L\) is the physical species library (defined below) that turns
+a bare recipe into the numerical functions \(U_x,D_x,P_x,\mathcal A,\Psi\)
+required by the generator formalism. The document is organized so that every
+symbol appearing in the final boxed formula is traceable, in order, back to
+the composition \(x\).
+
+\section{Notation and operation glossary}
+
+\subsection{Vectors, matrices, tensors}
+
+A vector is a column vector unless stated otherwise.
+
+For vectors \(u,v\in\R^n\),
+\[
+u^\top v=\sum_{i=1}^n u_i v_i.
+\]
+
+For a square matrix \(B\),
+\[
+\Tr(B)=\sum_i B_{ii}.
+\]
+
+For a symmetric matrix \(B\),
+\[
+B\succeq0
+\]
+means
+\[
+y^\top B y\ge0
+\qquad
+\text{for all }y.
+\]
+
+For a tensor \(T_i\in\R^{3\times3}\),
+\[
+\Tr(T_i)=T_{i,xx}+T_{i,yy}+T_{i,zz}.
+\]
+
+\subsection{The symbol \(B^\#\)}
+
+The symbol
+\[
+B^\#
+\]
+means the Moore--Penrose pseudoinverse when \(B\) is a symmetric positive
+semidefinite matrix.
+
+Implementation:
+
+1. Compute the eigendecomposition
+\[
+B=V\Lambda V^\top,
+\]
+where
+\[
+\Lambda=\diag(\lambda_1,\ldots,\lambda_m),
+\qquad
+\lambda_r\ge0.
+\]
+
+2. Choose numerical tolerance
+\[
+\tau_{\#}=10^{-12}\max_r \lambda_r.
+\]
+
+3. Define
+\[
+\lambda_r^\#=
+\begin{cases}
+1/\lambda_r, & \lambda_r>\tau_{\#},\\
+0, & \lambda_r\le\tau_{\#}.
+\end{cases}
+\]
+
+4. Return
+\[
+B^\#=V\diag(\lambda_1^\#,\ldots,\lambda_m^\#)V^\top.
+\]
+
+If a vector \(y\) has nonzero projection into the nullspace of \(B\), then
+\[
+y^\top B^\# y
+\]
+silently discards that null component. For a physical memory matrix this is
+allowed only if the discarded component is numerically zero. Therefore require
+\[
+\|(I-BB^\#)y\| \le \tau_{\rm null}\|y\|
+\]
+for each current-coupling vector \(y\), with for example
+\[
+\tau_{\rm null}=10^{-8}.
+\]
+
+For the finite Markov generator \(Q\), do not directly form \((-Q)^\#\).
+Instead solve the constrained Poisson system defined in Section~\ref{sec:finitestate}.
+
+\section{Composition input}
+\label{sec:compinput}
+
+The electrolyte composition is
+\[
+x=
+\left(
+T,\,
+\{C_a\}_{a\in\mathcal C},\,
+\{\phi_s\}_{s\in\mathcal S},\,
+\mathcal P
+\right).
+\]
+
+Definitions:
+
+\[
+T>0
+\]
+is temperature in K.
+
+\[
+\mathcal C
+\]
+is the set of conserved components, for example Li, PF6, FSI, solvent molecules,
+neutral additives, or coarse-grained site classes.
+
+\[
+C_a
+\quad [\mathrm{mol\,m^{-3}}]
+\]
+is the analytical total concentration of conserved component \(a\).
+
+\[
+\phi_s
+\]
+is the liquid fraction of solvent/additive species \(s\).
+
+\[
+\mathcal P
+\]
+is the physical parameter map needed to construct the generator:
+\[
+\mathcal P
+=
+\left(
+\text{charge sites},
+\text{topology},
+\text{interaction parameters},
+\text{mobility parameters},
+\text{basin definitions},
+\text{memory coordinate definitions}
+\right).
+\]
+
+A recipe containing only names such as EC, DMC, LiPF6, FEC, VC, FSI, and
+concentrations is not mathematically enough. The model requires enough
+information to build the following functions:
+\[
+U_x(q),
+\qquad
+D_x(q),
+\qquad
+P_x(q),
+\qquad
+A_i\subset\Omega_x,
+\qquad
+\psi_\alpha(q).
+\]
+
+\(\mathcal P\) as stated above is an input \emph{requirement}, not yet a
+\emph{construction}. Section~\ref{sec:c2g} makes this precise: it shows why
+\(\mathcal P\) cannot be inferred from species names and concentrations alone,
+and Section~\ref{sec:library} expands \(\mathcal P\) into an explicit,
+buildable species library \(\mathcal L\) from which every one of
+\(U_x,D_x,P_x,A_i,\psi_\alpha\) is derived mechanically.
+
+\section{Composition unit conversion}
+\label{sec:unitconv}
+
+The model accepts electrolyte formulations as they appear in experimental
+practice:
+\begin{itemize}
+\item Solvents in volume/volume fractions (v/v),
+\item Salts in molar concentration (mol~L$^{-1}$, i.e.\ M),
+\item Additives in weight percent (wt\%).
+\end{itemize}
+
+This section converts those external units into the canonical model inputs
+\(\{C_a\}_{a\in\mathcal C}\) in \(\mathrm{mol\,m^{-3}}\) and
+\(\{\phi_s\}_{s\in\mathcal S}\) in dimensionless volume fractions.
+
+\subsection{Temperature}
+
+Temperature is supplied in \(\mathrm K\). If supplied in \({}^\circ\mathrm C\):
+\[
+T = T_{{}^\circ\mathrm C} + 273.15.
+\]
+
+\subsection{Solvents: volume fraction}
+
+Suppose the formulation specifies solvents \(s_1,\ldots,s_{n_{\rm solv}}\) at
+volume-to-volume ratios \(v_1:v_2:\cdots:v_{n_{\rm solv}}\).
+
+Step 1. Normalize to volume fractions:
+\[
+\phi_{s_k}^{\rm raw}
+=
+\frac{v_k}{\sum_{\ell=1}^{n_{\rm solv}} v_\ell}.
+\]
+
+Step 2. Correct for additive volume displacement. Let the additive mass
+fractions \(f_{\rm add,j}^{\rm wt}\) (defined below) add a total volume
+\(V_{\rm add}\) per unit of total system volume. Set
+\[
+\phi_{s_k}
+=
+\phi_{s_k}^{\rm raw}\,(1-V_{\rm add}).
+\]
+
+For the initial computation, set \(V_{\rm add}=0\) and update after additives
+are converted, iterating once or until convergence.
+
+Step 3. Pass \(\phi_{s_k}\) to the molecule-count algorithm
+(Section~\ref{sec:library}).
+
+\subsection{Salts: molarity to SI concentration}
+
+A salt concentration specified in \(\mathrm{mol\,L^{-1}}\) (molarity) is
+converted to \(\mathrm{mol\,m^{-3}}\) (SI) by:
+\[
+C_{\rm salt}^{\rm SI}
+=
+C_{\rm salt}^{\rm M} \times 10^3
+\quad [\mathrm{mol\,m^{-3}}].
+\]
+
+For a salt \(\mathrm{Li_{\nu_+}A_{\nu_-}}\) with stoichiometric coefficients
+\(\nu_+,\nu_-\):
+\[
+C_{\rm Li} = \nu_+ C_{\rm salt}^{\rm SI},
+\qquad
+C_{\rm A} = \nu_- C_{\rm salt}^{\rm SI}.
+\]
+
+For mixed salts (e.g.\ \(0.6\,\mathrm{M}\) LiPF$_6$ \(+\) \(0.4\,\mathrm{M}\)
+LiFSI), all sources contribute to the same Li pool:
+\[
+C_{\rm Li}
+=
+\sum_{\rm salts} \nu_{+,k} C_{\rm salt\,k}^{\rm SI}.
+\]
+
+Separate anion concentrations are kept distinct:
+\[
+C_{\rm PF6} = \nu_{-,\rm PF6} C_{\rm LiPF6}^{\rm SI},
+\qquad
+C_{\rm FSI} = \nu_{-,\rm FSI} C_{\rm LiFSI}^{\rm SI}.
+\]
+
+Charge neutrality check:
+\[
+\sum_a z_a^{\rm net} C_a = 0.
+\]
+
+If this fails, the formulation is physically inconsistent.
+
+\subsection{Additives: weight percent to concentration}
+
+An additive \(j\) specified in wt\% is converted as follows.
+
+Let:
+\[
+f_j^{\rm wt} = \frac{\text{mass of additive }j}{\text{total solution mass}}
+\]
+be the weight fraction (wt\%$/100$).
+
+The solution density at composition \(x\) is estimated as a mixture rule:
+\[
+\rho_{\rm soln}
+=
+\frac{1}
+{\displaystyle
+\sum_s \phi_s/\rho_s
++
+\sum_{\rm salts} C_k^{\rm SI} M_k / (\rho_k N_A \times 10^3)
+},
+\]
+where \(\rho_s\) is pure solvent density in \(\mathrm{kg\,m^{-3}}\), \(M_k\)
+is salt molar mass in \(\mathrm{g\,mol^{-1}}\), and the sum for salts accounts
+for the dissolved ion volume. An iterative estimate starting from solvent-only
+density converges in 1--3 steps.
+
+Then mass concentration is:
+\[
+\rho_j^{\rm mass}
+=
+f_j^{\rm wt}\,\rho_{\rm soln}
+\quad [\mathrm{kg\,m^{-3}}].
+\]
+
+Molar concentration:
+\[
+C_j
+=
+\frac{\rho_j^{\rm mass}}{M_j\times 10^{-3}}
+\quad [\mathrm{mol\,m^{-3}}],
+\]
+where \(M_j\) is the additive molar mass in \(\mathrm{g\,mol^{-1}}\).
+
+If the additive is a \emph{neutral ligand} (e.g.\ FEC, VC) and its
+concentration is small relative to solvents, it may optionally be expressed as
+a volume fraction instead:
+\[
+\phi_j
+=
+\frac{C_j M_j \times 10^{-3}}{\rho_j}
+\quad [\text{dimensionless}].
+\]
+
+The model accepts \emph{both}: include the additive in \(\{C_a\}\) with a
+stoichiometry vector \(\nu_{i,j}\) if it participates in basin/motif formation,
+or in \(\{\phi_s\}\) if it acts purely as a dilute solvent. Do not count it
+twice.
+
+\subsection{Canonical input tuple}
+
+After the conversions above, the canonical model input is
+\[
+x
+=
+\bigl(
+T,\,
+\{C_a\}_{a\in\mathcal C},\,
+\{\phi_s\}_{s\in\mathcal S},\,
+\mathcal L
+\bigr),
+\]
+with \(C_a\) in \(\mathrm{mol\,m^{-3}}\), \(\phi_s\) dimensionless, and
+\(\mathcal L\) the physical library (Section~\ref{sec:library}).
+
+\subsection{Summary conversion table}
+
+\[
+\begin{array}{lll}
+\toprule
+\text{External unit} & \text{Symbol} & \text{Canonical model input} \\
+\midrule
+\text{Solvent v/v ratio } v_k & v_1:\cdots:v_{n} &
+\phi_{s_k}=v_k/\sum_\ell v_\ell \\[4pt]
+\text{Salt molarity} & C^{\rm M}\,[\mathrm{M}] &
+C_a^{\rm SI}=C^{\rm M}\times 10^3\,[\mathrm{mol\,m^{-3}}] \\[4pt]
+\text{Additive wt\%} & f^{\rm wt}\,[\%] &
+C_j = f^{\rm wt}\rho_{\rm soln}/(100\,M_j\times 10^{-3})\,[\mathrm{mol\,m^{-3}}] \\[4pt]
+\text{Temperature} & T_{{}^\circ\mathrm C}\,[{}^\circ\mathrm C] &
+T=T_{{}^\circ\mathrm C}+273.15\,[\mathrm K] \\
+\bottomrule
+\end{array}
+\]
+
+\section{Composition-to-generator construction}
+\label{sec:c2g}
+
+\subsection{Why recipe names alone are not a mathematical model}
+
+Let a recipe-only composition be
+\[
+r=
+\left(
+T,\,
+\{C_a\}_{a\in\mathcal C},\,
+\{\phi_s\}_{s\in\mathcal S}
+\right),
+\]
+where \(C_a\) are analytical concentrations and \(\phi_s\) are liquid fractions.
+This is exactly the tuple \((T,\{C_a\},\{\phi_s\})\) of Section~\ref{sec:compinput},
+with \(\mathcal P\) omitted.
+
+A recipe-only object \(r\) does not determine conductivity, because it does
+not determine:
+\[
+U_x(q),\qquad D_x(q),\qquad P_x(q),\qquad A_i,\qquad \psi_\alpha(q).
+\]
+
+Therefore the conductivity map is not
+\[
+r\mapsto \sigma.
+\]
+
+The full composition is
+\[
+x=(r,\mathcal L),
+\]
+where \(\mathcal L\) is the physical species library. The conductivity map is
+\[
+(r,\mathcal L)\mapsto \sigma.
+\]
+
+If \(\mathcal L\) is absent, the first-principles map is undefined. Equivalently,
+\(\mathcal P=\mathcal P(\mathcal L)\): the physical parameter map of
+Section~\ref{sec:compinput} is precisely what the library \(\mathcal L\)
+supplies.
+
+\subsection{Non-identifiability lemma}
+
+Suppose only \(r\) is given. Let two libraries \(\mathcal L_1,\mathcal L_2\)
+have the same species names and concentrations but different microscopic
+mobility tensors:
+\[
+D_x^{(2)}(q)=\alpha D_x^{(1)}(q),
+\qquad
+\alpha\neq1.
+\]
+
+Keeping the same \(U_x,P_x,A_i,\psi_\alpha\), the self-current tensors scale as
+\[
+D_{i,2}^{\rm self}
+=
+\alpha D_{i,1}^{\rm self},
+\]
+and the capacity fluxes scale as
+\[
+K_{ij}^{(2)}
+=
+\alpha K_{ij}^{(1)}
+\]
+for overdamped Smoluchowski dynamics because
+\[
+K_{ij}
+=
+\int
+\nabla q_{ij}^{\top}D_x\nabla q_{ij}\,\rho_x(\dd q).
+\]
+
+Thus, unless the memory correction exactly compensates for all scaling,
+\[
+\sigma(r,\mathcal L_2)\neq\sigma(r,\mathcal L_1).
+\]
+
+So \(r\) alone cannot uniquely define \(\sigma\). The library \(\mathcal L\) is
+part of the mathematical input, not an implementation detail.
+
+\section{Physical species library}
+\label{sec:library}
+
+The species library is
+\[
+\mathcal L=
+\left(
+\{\mathcal T_s\}_{s\in\mathcal S_{\rm mol}},
+\{\mathcal Q_s\}_{s\in\mathcal S_{\rm mol}},
+\{\Theta_{st}\}_{s,t},
+\mathcal B,
+\mathcal M,
+\mathcal R,
+\mathcal \Psi
+\right).
+\]
+
+Here:
+\[
+\mathcal S_{\rm mol}
+=
+\text{set of molecular, ionic, solvent, salt, and additive species}.
+\]
+\[
+\mathcal T_s
+=
+\text{topology of species }s.
+\]
+\[
+\mathcal Q_s
+=
+\text{charge-site model of species }s.
+\]
+\[
+\Theta_{st}
+=
+\text{interaction parameters between species }s,t.
+\]
+\[
+\mathcal B
+=
+\text{basin-definition library}.
+\]
+\[
+\mathcal M
+=
+\text{mobility/friction library}.
+\]
+\[
+\mathcal R
+=
+\text{reaction-coordinate and transition-surface library}.
+\]
+\[
+\mathcal \Psi
+=
+\text{Mori memory-coordinate library}.
+\]
+
+\subsection{Species topology}
+
+For each species \(s\), define a finite set of sites
+\[
+\mathcal I_s=\{1,\ldots,n_s\}.
+\]
+
+Each site \(u\in\mathcal I_s\) has:
+\[
+m_{su}>0
+\quad
+\text{mass},
+\]
+\[
+a_{su}>0
+\quad
+\text{hydrodynamic radius},
+\]
+\[
+\sigma_{su}>0,\quad \epsilon_{su}\ge0
+\quad
+\text{short-range nonbonded parameters},
+\]
+\[
+z_{su}\in\mathbb R
+\quad
+\text{formal or partial charge number},
+\]
+\[
+\alpha_{su}\ge0
+\quad
+\text{polarizability, if used}.
+\]
+
+The topology also contains bonded edges:
+\[
+\mathcal E_s^{\rm bond}
+\subset
+\mathcal I_s\times\mathcal I_s,
+\]
+angles:
+\[
+\mathcal E_s^{\rm angle}
+\subset
+\mathcal I_s^3,
+\]
+and torsions:
+\[
+\mathcal E_s^{\rm torsion}
+\subset
+\mathcal I_s^4.
+\]
+
+\subsection{Molecule counts}
+
+For a simulation cell of volume \(V_{\rm cell}\), component count is
+\[
+N_a=\operatorname{round}(C_aN_A V_{\rm cell}),
+\]
+where \(N_A\) is Avogadro's number.
+
+For solvents/additives specified by volume fraction \(\phi_s\), with molar mass
+\(M_s\) and density \(\rho_s\), the number density is
+\[
+n_s^{\rm pure}
+=
+\frac{\rho_s}{M_s}N_A.
+\]
+
+The target count is
+\[
+N_s
+=
+\operatorname{round}\left(
+\phi_s n_s^{\rm pure} V_{\rm cell}
+\right).
+\]
+
+If both mass/volume fractions and molar concentrations are specified, solve the
+volume-filling constraint:
+\[
+V_{\rm cell}
+=
+\sum_s \frac{N_sM_s}{\rho_sN_A}
++
+\sum_a \bar v_a N_a,
+\]
+where \(\bar v_a\) is the partial molar volume of component \(a\). This is solved
+by fixed-point iteration:
+\[
+V_{\rm cell}^{(k+1)}
+=
+\sum_s \frac{N_s^{(k)}M_s}{\rho_sN_A}
++
+\sum_a \bar v_a N_a^{(k)}.
+\]
+
+Stop when
+\[
+\frac{|V_{\rm cell}^{(k+1)}-V_{\rm cell}^{(k)}|}
+{V_{\rm cell}^{(k)}}<\tau_V.
+\]
+
+\section{Configuration space}
+\label{sec:configspace}
+
+\subsection{Abstract coordinate}
+
+Let
+\[
+q\in\Omega_x\subseteq\R^d
+\]
+be the model coordinate.
+
+For atomistic coordinates:
+\[
+q=(r_1,\ldots,r_N),
+\qquad
+r_a\in\R^3.
+\]
+
+For a reduced analytical model:
+\[
+q=
+\left(
+r_{\rm Li-A},
+s_{\rm pair},
+n_{\rm Li-solv},
+n_{\rm Li-lig},
+\omega_{\rm A},
+n_{\rm cluster},
+\rho_{\rm local},
+p_{\rm atm},
+\ldots
+\right).
+\]
+
+Every component of \(q\) must have:
+
+1. a unit,
+2. a physical meaning,
+3. a gradient,
+4. a mobility entry in \(D_x(q)\),
+5. a role in \(U_x(q)\), \(P_x(q)\), a basin \(A_i\), or a memory coordinate
+\(\psi_\alpha\).
+
+\subsection{Concrete construction from the species library}
+
+After molecule counts (Section~\ref{sec:library}) are fixed, the abstract
+coordinate \(q\) above is instantiated concretely as the collection of all
+site positions:
+\[
+q=
+\{r_{m,u}\}_{m=1}^{N_{\rm mol},\,u\in\mathcal I_{s(m)}}.
+\]
+
+Here \(m\) indexes molecules, \(s(m)\) is the species of molecule \(m\), and
+\[
+r_{m,u}\in\mathbb R^3.
+\]
+
+The full coordinate dimension is
+\[
+d=3\sum_m n_{s(m)}.
+\]
+
+The configuration space is periodic:
+\[
+\Omega_x=
+[0,L_x)\times[0,L_y)\times[0,L_z)
+\]
+for each site coordinate, with unwrapped coordinates stored separately for
+transport. (The reduced-coordinate case is treated formally in
+Section~\ref{sec:reduced}.)
+
+\section{Charge polarization}
+\label{sec:polarization}
+
+\subsection{Abstract definition}
+
+Define formal-charge polarization:
+\[
+P_x(q)=\sum_{\alpha\in\mathcal Q} z_\alpha r_\alpha^{\rm unwrap}(q)
+\in\R^3.
+\]
+
+Here:
+\[
+\mathcal Q
+=
+\text{set of charge sites},
+\]
+\[
+z_\alpha
+=
+\text{dimensionless charge number of site }\alpha,
+\]
+\[
+r_\alpha^{\rm unwrap}(q)
+=
+\text{unwrapped position of charge site }\alpha.
+\]
+
+The gradient of charge polarization is
+\[
+G_P(q)=\nabla_q P_x(q)\in\R^{3\times d}.
+\]
+
+Component notation:
+\[
+(G_P)_{a\ell}(q)
+=
+\frac{\partial P_{x,a}(q)}{\partial q_\ell},
+\]
+where \(a\in\{x,y,z\}\).
+
+Using formal charge units, the final conductivity prefactor is
+\[
+\frac{F^2}{RT}.
+\]
+
+If physical charge units are used instead, the prefactor changes to
+\[
+\frac{1}{k_BT\,V}.
+\]
+
+This document uses formal charge units.
+
+\subsection{Concrete construction from species topology}
+
+For every molecule \(m\) and site \(u\), the charge number is
+\[
+z_{m,u}=z_{s(m),u}
+\]
+(taken from the charge-site model \(\mathcal Q_{s}\) of Section~\ref{sec:library}).
+
+The unwrapped site position is
+\[
+R_{m,u}^{\rm unwrap}(q).
+\]
+
+The formal-charge polarization is then
+\[
+P_x(q)
+=
+\sum_{m}\sum_{u\in\mathcal I_{s(m)}}
+z_{m,u}R_{m,u}^{\rm unwrap}(q)
+\in\mathbb R^3,
+\]
+which instantiates the abstract sum over \(\mathcal Q\) above with
+\(\mathcal Q=\{(m,u)\}\).
+
+The gradient is
+\[
+G_P(q)=\nabla_qP_x(q)\in\R^{3\times d}.
+\]
+
+For coordinate component \(r_{m,u,\ell}\), where \(\ell\in\{x,y,z\}\),
+\[
+\frac{\partial P_{x,a}}{\partial r_{m,u,\ell}}
+=
+z_{m,u}\delta_{a\ell}.
+\]
+
+If a reduced coordinate \(\xi(q)\) is used instead of atomistic coordinates,
+then the reduced charge-polarization gradient is obtained by the chain rule:
+\[
+\nabla_{\xi}P_x
+=
+\nabla_qP_x
+\left(\frac{\partial \xi}{\partial q}\right)^{\#}.
+\]
+
+\section{Force-field / free-energy construction}
+\label{sec:forcefield}
+
+\subsection{Abstract decomposition}
+
+Define molar free energy
+\[
+U_x:\Omega_x\to\R
+\qquad [\mathrm{J\,mol^{-1}}].
+\]
+
+It may be decomposed as
+\[
+U_x(q)
+=
+U_{\rm bonded}
++
+U_{\rm rep}
++
+U_{\rm disp}
++
+U_{\rm Coul}
++
+U_{\rm pol}
++
+U_{\rm solv}
++
+U_{\rm coord}
++
+U_{\rm pack}
++
+U_{\rm atm}
++
+U_{\rm ext}.
+\]
+
+The exact decomposition is not important in the abstract generator formalism
+(Section~\ref{sec:generator}); what matters there is that \(U_x(q)\) is a
+numerical function evaluable at quadrature points. The subsections below give
+the concrete construction of that function from the species library
+\(\mathcal L\), so that \(U_x\) is no longer a free input but a derived
+quantity.
+
+\subsection{Intramolecular bonded energy}
+
+Bond term:
+\[
+U_{\rm bond}(q)
+=
+N_A
+\sum_m
+\sum_{(u,v)\in\mathcal E_{s(m)}^{\rm bond}}
+\frac12 k_{uv}^{\rm bond}
+\left(
+|r_{m,u}-r_{m,v}|-r_{uv}^0
+\right)^2.
+\]
+
+Angle term:
+\[
+U_{\rm angle}(q)
+=
+N_A
+\sum_m
+\sum_{(u,v,w)\in\mathcal E_{s(m)}^{\rm angle}}
+\frac12 k_{uvw}^{\rm angle}
+\left(
+\theta_{uvw}(q)-\theta_{uvw}^0
+\right)^2.
+\]
+
+Torsion term:
+\[
+U_{\rm torsion}(q)
+=
+N_A
+\sum_m
+\sum_{(u,v,w,z)\in\mathcal E_{s(m)}^{\rm torsion}}
+\sum_{n=1}^{n_{\max}}
+\frac12 V_n
+\left[
+1+\cos(n\varphi_{uvwz}(q)-\gamma_n)
+\right].
+\]
+
+Thus:
+\[
+U_{\rm intra}=U_{\rm bond}+U_{\rm angle}+U_{\rm torsion}.
+\]
+
+\subsection{Lennard--Jones / short-range energy}
+
+For two sites \(a=(m,u)\), \(b=(n,v)\), with \(a<b\), define minimum-image
+separation:
+\[
+r_{ab}=|r_a-r_b|_{\rm PBC}.
+\]
+
+Mixing rules:
+\[
+\sigma_{ab}=\frac{\sigma_a+\sigma_b}{2},
+\qquad
+\epsilon_{ab}=\sqrt{\epsilon_a\epsilon_b}.
+\]
+
+Lennard--Jones energy:
+\[
+U_{\rm LJ}(q)
+=
+N_A
+\sum_{a<b}
+4\epsilon_{ab}
+\left[
+\left(\frac{\sigma_{ab}}{r_{ab}}\right)^{12}
+-
+\left(\frac{\sigma_{ab}}{r_{ab}}\right)^6
+\right]f_{\rm cut}(r_{ab}).
+\]
+
+The cutoff switching function is:
+\[
+f_{\rm cut}(r)=
+\begin{cases}
+1, & r\le r_{\rm on},\\
+1-10s^3+15s^4-6s^5, & r_{\rm on}<r<r_{\rm off},\\
+0, & r\ge r_{\rm off},
+\end{cases}
+\]
+where
+\[
+s=\frac{r-r_{\rm on}}{r_{\rm off}-r_{\rm on}}.
+\]
+
+\subsection{Electrostatics}
+
+Let
+\[
+q_a^{\rm SI}=e z_a.
+\]
+
+For periodic boundaries, use Ewald electrostatics:
+\[
+U_{\rm Coul}(q)
+=
+N_A
+\frac{1}{4\pi\epsilon_0\epsilon_\infty}
+\left[
+U_{\rm real}
++
+U_{\rm reciprocal}
++
+U_{\rm self}
++
+U_{\rm surface}
+\right].
+\]
+
+Real-space term:
+\[
+U_{\rm real}
+=
+\frac12
+\sum_{a\ne b}
+q_a^{\rm SI}q_b^{\rm SI}
+\frac{\operatorname{erfc}(\alpha r_{ab})}{r_{ab}}.
+\]
+
+Reciprocal-space term:
+\[
+U_{\rm reciprocal}
+=
+\frac{2\pi}{V_{\rm cell}}
+\sum_{k\ne0}
+\frac{\exp[-k^2/(4\alpha^2)]}{k^2}
+\left|
+\sum_a q_a^{\rm SI}\exp(i k\cdot r_a)
+\right|^2.
+\]
+
+Self term:
+\[
+U_{\rm self}
+=
+-\frac{\alpha}{\sqrt\pi}
+\sum_a (q_a^{\rm SI})^2.
+\]
+
+For conducting boundary conditions:
+\[
+U_{\rm surface}=0.
+\]
+
+For vacuum boundary condition:
+\[
+U_{\rm surface}
+=
+\frac{2\pi}{3V_{\rm cell}}
+\left|
+\sum_a q_a^{\rm SI}r_a
+\right|^2.
+\]
+
+\subsection{Polarization, if used}
+
+Let induced dipoles be \(\mu_a\), polarizabilities \(\alpha_a\), and electric
+fields \(E_a(q)\). The polarization energy is
+\[
+U_{\rm pol}(q,\{\mu_a\})
+=
+N_A
+\left[
+\sum_a
+\frac12
+\mu_a^\top\alpha_a^{-1}\mu_a
+-
+\sum_a \mu_a^\top E_a(q)
++
+\frac12
+\sum_{a\ne b}\mu_a^\top T_{ab}\mu_b
+\right].
+\]
+
+The induced dipoles are minimized out:
+\[
+\{\mu_a^\star(q)\}
+=
+\argmin_{\{\mu_a\}}U_{\rm pol}(q,\{\mu_a\}).
+\]
+
+Then:
+\[
+U_{\rm pol}^{\rm eff}(q)
+=
+U_{\rm pol}(q,\{\mu_a^\star(q)\}).
+\]
+
+If polarization is not used:
+\[
+U_{\rm pol}^{\rm eff}(q)=0.
+\]
+
+\subsection{Solvation and coordination free energy}
+
+Define smooth coordination number between center \(a\) and ligand class \(L\):
+\[
+n_{aL}(q)
+=
+\sum_{b\in L}
+s_{aL}(r_{ab}),
+\]
+where
+\[
+s_{aL}(r)
+=
+\frac{1}{1+(r/r_{aL}^0)^{p_{aL}}}.
+\]
+
+Coordination energy:
+\[
+U_{\rm coord}(q)
+=
+N_A
+\sum_{a,L}
+\Delta g_{aL}^{\rm coord}
+\,n_{aL}(q).
+\]
+
+Solvation-shell competition energy:
+\[
+U_{\rm solv}(q)
+=
+N_A
+\sum_a
+F_a^{\rm solv}
+\left(
+n_{aL_1}(q),
+n_{aL_2}(q),
+\ldots
+\right).
+\]
+
+A concrete convex shell penalty is:
+\[
+F_a^{\rm solv}(n_1,\ldots,n_m)
+=
+\frac12
+\sum_{\ell,\ell'}
+K^a_{\ell\ell'}
+(n_\ell-\bar n_\ell^a)
+(n_{\ell'}-\bar n_{\ell'}^a).
+\]
+
+\subsection{Packing / excluded-volume free energy}
+
+Let local occupied volume fraction be
+\[
+\varphi(q)
+=
+\sum_a v_a W_a(q),
+\]
+where \(v_a\) is molecular volume and \(W_a(q)\) is a normalized local kernel.
+
+Carnahan--Starling-like packing penalty:
+\[
+U_{\rm pack}(q)
+=
+N_A RT
+\sum_{\ell}
+w_\ell^{\rm grid}
+\frac{
+\varphi_\ell(4-3\varphi_\ell)
+}{
+(1-\varphi_\ell)^2
+}.
+\]
+
+\subsection{Total effective free energy}
+
+The final free energy is:
+\[
+U_x(q)
+=
+U_{\rm intra}
++
+U_{\rm LJ}
++
+U_{\rm Coul}
++
+U_{\rm pol}^{\rm eff}
++
+U_{\rm coord}
++
+U_{\rm solv}
++
+U_{\rm pack}.
+\]
+
+This is the concrete realization of the abstract decomposition given at the
+start of this section (\(U_{\rm bonded}\to U_{\rm intra}\),
+\(U_{\rm rep}+U_{\rm disp}\to U_{\rm LJ}\), \(U_{\rm atm}\) and
+\(U_{\rm ext}\) absorbed into \(U_{\rm coord}/U_{\rm solv}\) as needed).
+
+The equilibrium measure is:
+\[
+\mu_x(\dd q)
+=
+Z_x^{-1}\exp[-U_x(q)/(RT)]\,\dd q.
+\]
+
+\section{Mobility tensor construction}
+\label{sec:mobility}
+
+\subsection{Abstract requirement}
+
+Define
+\[
+D_x(q)\in\R^{d\times d}
+\qquad [\mathrm{m^2\,s^{-1}}].
+\]
+
+It must satisfy
+\[
+D_x(q)=D_x(q)^\top,
+\qquad
+D_x(q)\succeq0.
+\]
+
+If built from resistance:
+\[
+D_x(q)=k_BT\,R_x(q)^\#.
+\]
+
+Resistance may be assembled abstractly as
+\[
+R_x(q)
+=
+R_{\rm hydro}
++
+R_{\rm crowd}
++
+R_{\rm charge\ cloud}
++
+R_{\rm atmosphere}
++
+R_{\rm cage}
++
+R_{\rm constraint}.
+\]
+
+The subsections below give the concrete construction of \(R_x(q)\) (and hence
+\(D_x(q)\)) from the mobility/friction library \(\mathcal M\subset\mathcal L\).
+
+\subsection{Resistance tensor}
+
+Define a generalized resistance matrix
+\[
+R_x(q)\in\mathbb R^{d\times d},
+\]
+decomposed concretely as:
+\[
+R_x(q)
+=
+R_{\rm Stokes}(q)
++
+R_{\rm hydro}(q)
++
+R_{\rm constraint}(q)
++
+R_{\rm atmosphere}(q)
++
+R_{\rm cage}(q)
++
+R_{\rm microvisc}(q).
+\]
+
+\subsection{Local viscosity}
+
+Let the local viscosity be:
+\[
+\eta(q)
+=
+\eta_{\rm bulk}(x)
+\,
+f_{\rm salt}(I(q))
+\,
+f_{\rm additive}(q)
+\,
+f_{\rm free\ volume}(\varphi(q)).
+\]
+
+A concrete form:
+\[
+f_{\rm salt}(I)=1+A_{\eta}\sqrt{I}+B_{\eta}I,
+\]
+\[
+f_{\rm additive}(q)
+=
+1+
+\sum_L a_L n_L(q),
+\]
+\[
+f_{\rm free\ volume}(\varphi)
+=
+\left(1-\frac{\varphi}{\varphi_{\max}}\right)^{-\gamma}.
+\]
+
+\subsection{Stokes resistance}
+
+For site \(a\):
+\[
+\zeta_a(q)=6\pi\eta(q)a_a.
+\]
+
+The diagonal Stokes resistance is:
+\[
+R_{\rm Stokes,ab}(q)
+=
+\zeta_a(q)I_3\delta_{ab}.
+\]
+
+\subsection{Hydrodynamic cross mobility}
+
+If hydrodynamic interactions are included, use Rotne--Prager--Yamakawa mobility
+\[
+H_{ab}(q)
+=
+\begin{cases}
+\frac{1}{6\pi\eta a_a}I_3, & a=b,\\[4pt]
+\frac{1}{8\pi\eta r_{ab}}
+\left[
+I_3+\hat r_{ab}\hat r_{ab}^{\top}
++
+\frac{2(a_a^2+a_b^2)}{3r_{ab}^2}
+\left(
+I_3-3\hat r_{ab}\hat r_{ab}^{\top}
+\right)
+\right], & a\ne b,\ r_{ab}>a_a+a_b.
+\end{cases}
+\]
+
+Then
+\[
+D_{\rm hydro}(q)=k_BT\,H(q).
+\]
+
+If using resistance form:
+\[
+R_{\rm hydro}(q)=k_BT\,D_{\rm hydro}(q)^\#.
+\]
+
+\subsection{Constraint resistance}
+
+For a constraint mode \(m\) with direction vector \(s_m(q)\), lifetime
+\(\tau_m(q)\), and length \(\ell_m(q)\), define:
+\[
+R_{\rm constraint}^{(m)}(q)
+=
+k_BT
+\frac{\tau_m(q)}{\ell_m(q)^2}
+s_m(q)s_m(q)^\top.
+\]
+
+Sum:
+\[
+R_{\rm constraint}(q)=\sum_m R_{\rm constraint}^{(m)}(q).
+\]
+
+\subsection{Atmosphere resistance}
+
+Let charge density mode be
+\[
+\rho_z(k;q)
+=
+\sum_a z_a \exp(i k\cdot r_a).
+\]
+
+For Debye screening:
+\[
+\kappa^2(q)
+=
+\frac{F^2}{\epsilon_0\epsilon_r RT}
+\sum_i z_i^2 c_i(q).
+\]
+
+Atmosphere resistance projected onto charge form factors:
+\[
+R_{\rm atmosphere}(q)
+=
+\sum_{k\in\mathcal K}
+\Gamma(k;\kappa,\eta,\epsilon_r)
+\,g_k(q)g_k(q)^\top,
+\]
+where \(g_k(q)=\nabla_q\rho_z(k;q)\) and \(\Gamma\ge0\) is the finite-size
+PNP--Stokes response kernel.
+
+A simple admissible diagonal kernel is:
+\[
+\Gamma(k;\kappa,\eta,\epsilon_r)
+=
+\Gamma_0
+\frac{k^2}{(k^2+\kappa^2)^2}
+\eta.
+\]
+
+\subsection{Total mobility}
+
+The diffusion/mobility tensor is:
+\[
+D_x(q)=k_BT\,R_x(q)^\#.
+\]
+
+Validation:
+\[
+D_x(q)=D_x(q)^\top,\qquad D_x(q)\succeq0.
+\]
+
+\section{Generator}
+\label{sec:generator}
+
+With \(U_x\) (Section~\ref{sec:forcefield}) and \(D_x\)
+(Section~\ref{sec:mobility}) now concretely constructed from the species
+library \(\mathcal L\), the reversible generator is well defined.
+
+\subsection{Thermal factor}
+
+Use the molar gas constant
+\[
+R=8.31446261815324\ \mathrm{J\,mol^{-1}\,K^{-1}}.
+\]
+
+Define
+\[
+\beta_{\rm mol}=\frac{1}{RT}.
+\]
+
+Then
+\[
+\exp[-\beta_{\rm mol}U_x(q)]
+\]
+is the Boltzmann factor.
+
+\subsection{Reversible generator}
+
+For overdamped Smoluchowski dynamics:
+\[
+L_x f(q)
+=
+\frac{1}{\mu_x(q)}
+\nabla_q\cdot
+\left(
+\mu_x(q)D_x(q)\nabla_q f(q)
+\right).
+\]
+
+Equivalently:
+\[
+L_x f
+=
+D_x:\nabla_q\nabla_q f
++
+\left[
+\nabla_q\cdot D_x
+-
+\beta_{\rm mol}D_x\nabla_q U_x
+\right]\cdot\nabla_q f.
+\]
+
+The equilibrium measure is
+\[
+\mu_x(\dd q)
+=
+Z_x^{-1}
+\exp[-\beta_{\rm mol}U_x(q)]
+\dd q.
+\]
+
+The model does not need to simulate \(L_x\) in production. It uses \(L_x\)
+through quadrature, committor/capacity solves, transition-path moment solves,
+and Mori inner products.
+
+\section{Reduced generator derived from full atomistic generator}
+\label{sec:reduced}
+
+If the model uses reduced coordinates
+\[
+\xi=\Xi(q)\in\mathbb R^m,
+\]
+then the reduced PMF is not arbitrary. It is:
+\[
+U_{\rm red}(\xi)
+=
+-RT
+\log
+\int_{\Omega_x}
+\delta(\Xi(q)-\xi)
+\exp[-U_x(q)/(RT)]\,\dd q.
+\]
+
+The reduced mobility is the conditional projection:
+\[
+D_{\rm red}(\xi)
+=
+\E_{\mu_x}
+\left[
+\nabla_q\Xi(q)D_x(q)\nabla_q\Xi(q)^\top
+\mid
+\Xi(q)=\xi
+\right].
+\]
+
+The reduced polarization is:
+\[
+P_{\rm red}(\xi)
+=
+\E_{\mu_x}
+\left[
+P_x(q)\mid\Xi(q)=\xi
+\right].
+\]
+
+The reduced basins are:
+\[
+A_i^{\rm red}
+=
+\{\xi:\xi\in B_i\},
+\]
+where
+\[
+B_i=\Xi(A_i).
+\]
+
+Thus, a reduced model is first-principles only if
+\[
+U_{\rm red},D_{\rm red},P_{\rm red},A_i^{\rm red},\psi^{\rm red}
+\]
+are derived by conditional projection from the atomistic generator, not fitted
+as independent descriptor functions. Every reduced-coordinate object used
+elsewhere in this document (Section~\ref{sec:configspace}) must satisfy this
+requirement.
+
+\section{Projection basins}
+\label{sec:basins}
+
+Choose \(N\) disjoint basins:
+\[
+\mathcal A=\{A_1,\ldots,A_N\},
+\]
+where
+\[
+A_i\subset\Omega_x,
+\qquad
+A_i\cap A_j=\varnothing \quad(i\ne j).
+\]
+
+Every coordinate \(q\) used in the finite model is assigned to exactly one
+basin:
+\[
+s(q)=i
+\quad
+\Longleftrightarrow
+\quad
+q\in A_i.
+\]
+
+Each basin \(A_i\) has a stoichiometry vector:
+\[
+\nu_i=(\nu_{i,a})_{a\in\mathcal C}.
+\]
+
+\[
+\nu_{i,a}
+=
+\text{number of conserved component }a\text{ in basin/motif }i.
+\]
+
+Examples:
+\[
+\nu_{i,\mathrm{Li}}=1
+\]
+for a motif containing one Li.
+\[
+\nu_{i,\mathrm{PF6}}=1
+\]
+for a motif containing one PF6.
+\[
+\nu_{i,\mathrm{FEC}}=1
+\]
+for a Li--FEC ligand motif.
+
+A basin is a coordinate set, not a terminal correction.
+
+\subsection{Concrete basin definitions from physical coordinates}
+
+\subsubsection{Switching functions}
+
+Define smooth pair contact:
+\[
+s_{ab}(q)
+=
+\frac{1}{1+(r_{ab}(q)/r_{ab}^0)^p}.
+\]
+
+Define coordination number:
+\[
+n_{aL}(q)=\sum_{b\in L}s_{ab}(q).
+\]
+
+Define ion-pair graph edge:
+\[
+E_{a b}^{\rm pair}(q)
+=
+\mathbf 1\{r_{ab}(q)<r_{\rm pair}^{\rm cut}\}.
+\]
+
+Define ligand-shell indicator:
+\[
+E_{aL}^{\rm lig}(q)
+=
+\mathbf 1\{n_{aL}(q)\ge n_{aL}^{\rm cut}\}.
+\]
+
+Define cluster graph:
+\[
+G(q)=(V,E(q)),
+\]
+where vertices are charged species and
+\[
+(a,b)\in E(q)
+\iff
+E_{ab}^{\rm pair}(q)=1.
+\]
+
+Cluster membership is connected component membership in \(G(q)\).
+
+\subsubsection{Pair basins}
+
+For Li--anion pair \((\ell,a)\), define:
+\[
+r_{\ell a}=|r_\ell-r_a|.
+\]
+
+Contact ion pair:
+\[
+A_{\rm CIP}
+=
+\{q:r_{\ell a}<r_{\rm CIP}\}.
+\]
+
+Solvent-separated ion pair:
+\[
+A_{\rm SSIP}
+=
+\{q:r_{\rm CIP}\le r_{\ell a}<r_{\rm SSIP}\}.
+\]
+
+Free state:
+\[
+A_{\rm free}
+=
+\{q:r_{\ell a}\ge r_{\rm SSIP}\ \text{for all nearby anions}\}.
+\]
+
+\subsubsection{Ligand-conditioned basins}
+
+Neutral ligand occupancy around Li:
+\[
+n_{\ell L}(q)=\sum_{b\in L}s_{\ell b}(q).
+\]
+
+Li--ligand basin:
+\[
+A_{\rm LiL}
+=
+\{q:n_{\ell L}(q)\ge n_{\rm lig}^{\rm cut}\}.
+\]
+
+Ligand-separated SSIP:
+\[
+A_{\rm LiL\cdots A}
+=
+A_{\rm SSIP}
+\cap
+A_{\rm LiL}
+\cap
+\{r_{\ell a}\in[r_{\rm CIP},r_{\rm SSIP})\}.
+\]
+
+\subsubsection{Anion-orientation basins}
+
+Let \(u_a(q)\) be the principal axis of anion \(a\), and
+\[
+\hat r_{\ell a}=\frac{r_a-r_\ell}{|r_a-r_\ell|}.
+\]
+
+Define orientation coordinate:
+\[
+\omega_a(q)=u_a(q)\cdot \hat r_{\ell a}.
+\]
+
+Orientation basin:
+\[
+A_{\omega,k}
+=
+\{q:\omega_k^-\le\omega_a(q)<\omega_k^+\}.
+\]
+
+\subsubsection{Final basin index}
+
+The final basin is the joint bin:
+\[
+A_i=
+A_{\rm pair}
+\cap
+A_{\rm ligand}
+\cap
+A_{\rm cluster}
+\cap
+A_{\rm orientation}
+\cap
+A_{\rm cage}
+\cap
+A_{\rm atmosphere}.
+\]
+
+The set of all nonempty joint bins forms:
+\[
+\mathcal A=\{A_1,\ldots,A_N\}.
+\]
+
+This concrete construction instantiates the abstract disjoint decomposition
+\(\mathcal A=\{A_1,\ldots,A_N\}\) given at the start of this section, together
+with the stoichiometry vectors \(\nu_i\).
+
+\section{Quadrature}
+\label{sec:quadrature}
+
+For each basin \(A_i\), choose quadrature points and weights:
+\[
+\{(q_{i\ell},w_{i\ell})\}_{\ell=1}^{n_i}.
+\]
+
+Each
+\[
+q_{i\ell}\in A_i.
+\]
+
+Weights satisfy
+\[
+\int_{A_i} f(q)\dd q
+\approx
+\sum_{\ell=1}^{n_i}w_{i\ell}f(q_{i\ell}).
+\]
+
+Weights may be generated by:
+
+1. tensor quadrature,
+2. sparse grid quadrature,
+3. finite element quadrature,
+4. Monte Carlo / importance quadrature,
+5. umbrella-sampling reweighting.
+
+The model only requires that the same weights are used consistently in all
+basin integrals.
+
+\section{Mass balance through chemical potentials}
+\label{sec:massbalance}
+
+\subsection{Why chemical potentials are needed}
+
+Composition gives conserved totals \(C_a\). The projected basins \(A_i\) are
+motif states that consume conserved components according to \(\nu_{i,a}\).
+Therefore the basin populations \(c_i\) must satisfy:
+\[
+\sum_i\nu_{i,a}c_i=C_a
+\qquad
+\text{for every conserved component }a.
+\]
+
+This is achieved by component chemical potentials \(\lambda_a\). (This is the
+same requirement obtained if one starts directly from the composition
+\(x=(r,\mathcal L)\) and asks for basin populations consistent with
+conservation of \(\{C_a\}\); the construction below is the unique consistent
+solution.)
+
+\subsection{Grand-canonical restricted basin weight}
+
+For each basin \(i\), define
+\[
+Z_i(\lambda)
+=
+\int_{A_i}
+\exp
+\left[
+-\beta_{\rm mol}U_x(q)
++
+\sum_{a\in\mathcal C}\nu_{i,a}\lambda_a
+\right]\dd q.
+\]
+
+The dimensionless chemical potential \(\lambda_a\) is measured in units of
+\(RT\). It is not in J/mol. If using molar chemical potential
+\(\mu_a^{\rm chem}\), then
+\[
+\lambda_a=\frac{\mu_a^{\rm chem}}{RT}.
+\]
+
+Use standard concentration
+\[
+C^\circ=1000\ \mathrm{mol\,m^{-3}}.
+\]
+
+Then basin concentration is
+\[
+c_i(\lambda)=C^\circ Z_i(\lambda).
+\]
+
+Quadrature form:
+\[
+Z_i(\lambda)
+\approx
+\sum_{\ell=1}^{n_i}
+w_{i\ell}
+\exp
+\left[
+-\beta_{\rm mol}U_x(q_{i\ell})
++
+\sum_{a\in\mathcal C}\nu_{i,a}\lambda_a
+\right].
+\]
+
+\subsection{Mass-balance residual}
+
+For every conserved component \(a\), define
+\[
+r_a(\lambda)
+=
+\sum_{i=1}^N\nu_{i,a}c_i(\lambda)-C_a.
+\]
+
+The chemical potential solve is:
+\[
+r_a(\lambda^\star)=0
+\qquad
+\forall a.
+\]
+
+\subsection{Jacobian}
+
+The derivative is
+\[
+\frac{\partial c_i}{\partial\lambda_b}
+=
+\nu_{i,b}c_i.
+\]
+
+Therefore
+\[
+J_{ab}(\lambda)
+=
+\frac{\partial r_a}{\partial\lambda_b}
+=
+\sum_{i=1}^N\nu_{i,a}\nu_{i,b}c_i(\lambda).
+\]
+
+\subsection{Newton algorithm}
+
+Input:
+\[
+C_a,\quad \nu_{i,a},\quad U_x,\quad A_i,\quad q_{i\ell},\quad w_{i\ell}.
+\]
+
+Tolerance:
+\[
+\tau_{\rm mass}=10^{-10}.
+\]
+
+Maximum iterations:
+\[
+N_{\rm Newton}=100.
+\]
+
+Initialization:
+\[
+\lambda_a^{(0)}
+=
+\log
+\left(
+\frac{\max(C_a,C_{\min})}{C^\circ}
+\right),
+\]
+with
+\[
+C_{\min}=10^{-30}\ \mathrm{mol\,m^{-3}}.
+\]
+
+Iteration \(k\):
+
+1. Compute all \(Z_i(\lambda^{(k)})\).
+
+2. Compute all
+\[
+c_i^{(k)}=C^\circ Z_i(\lambda^{(k)}).
+\]
+
+3. Compute residual
+\[
+r_a^{(k)}
+=
+\sum_i\nu_{i,a}c_i^{(k)}-C_a.
+\]
+
+4. Compute normalized residual
+\[
+\eta^{(k)}
+=
+\max_a
+\frac{|r_a^{(k)}|}
+{\max(C_a,C_{\min})}.
+\]
+
+5. Stop if
+\[
+\eta^{(k)}<\tau_{\rm mass}.
+\]
+
+6. Compute Jacobian
+\[
+J_{ab}^{(k)}
+=
+\sum_i\nu_{i,a}\nu_{i,b}c_i^{(k)}.
+\]
+
+7. Solve the linear Newton system
+\[
+J^{(k)}\Delta\lambda^{(k)}=-r^{(k)}.
+\]
+
+If \(J^{(k)}\) is singular or ill-conditioned, use Tikhonov-regularized solve:
+\[
+\left(J^{(k)}+\epsilon_J I\right)\Delta\lambda^{(k)}=-r^{(k)},
+\]
+where
+\[
+\epsilon_J=10^{-12}\max(1,\|J^{(k)}\|_2).
+\]
+
+8. Backtracking line search:
+
+Start with
+\[
+\alpha=1.
+\]
+
+Trial:
+\[
+\lambda_{\rm trial}=\lambda^{(k)}+\alpha\Delta\lambda^{(k)}.
+\]
+
+Compute
+\[
+\eta_{\rm trial}.
+\]
+
+Accept the step if
+\[
+\eta_{\rm trial}<\eta^{(k)}.
+\]
+
+If not accepted, set
+\[
+\alpha\leftarrow \frac12\alpha
+\]
+and try again.
+
+Fail if
+\[
+\alpha<2^{-40}.
+\]
+
+9. Update:
+\[
+\lambda^{(k+1)}=\lambda_{\rm trial}.
+\]
+
+After convergence:
+\[
+\lambda^\star=\lambda^{(k)}.
+\]
+
+The final concentration is:
+\[
+c_i=c_i(\lambda^\star).
+\]
+
+\subsection{Density quadrature weights}
+
+Define the concentration-density quadrature weight:
+\[
+W_{i\ell}
+=
+C^\circ
+w_{i\ell}
+\exp
+\left[
+-\beta_{\rm mol}U_x(q_{i\ell})
++
+\sum_a\nu_{i,a}\lambda_a^\star
+\right].
+\]
+
+Then
+\[
+c_i=\sum_{\ell=1}^{n_i}W_{i\ell}.
+\]
+
+These \(W_{i\ell}\) are used in all basin averages.
+
+\section{Reactive fluxes}
+\label{sec:fluxes}
+
+\subsection{Purpose}
+
+Reactive fluxes determine how often the projected process moves between basins.
+They produce:
+\[
+K_{ij},\quad Q_{ij}.
+\]
+\[
+K_{ij}
+\quad [\mathrm{mol\,m^{-3}\,s^{-1}}]
+\]
+is the symmetric concentration flux between basin \(i\) and basin \(j\).
+\[
+Q_{ij}
+\quad [\mathrm{s^{-1}}]
+\]
+is the finite-state transition rate from \(i\) to \(j\).
+
+\subsection{Committor definition}
+
+For an edge \((i,j)\), define the committor:
+\[
+q_{ij}(q)
+=
+\Pr_q(\tau_j<\tau_i).
+\]
+
+Here
+\[
+\tau_i=\inf\{t:X_t\in A_i\}.
+\]
+
+The committor satisfies:
+\[
+L_x q_{ij}=0
+\quad
+\text{on }\Omega_{ij}=\Omega_x\setminus(A_i\cup A_j),
+\]
+\[
+q_{ij}=0
+\quad
+\text{on }A_i,
+\]
+\[
+q_{ij}=1
+\quad
+\text{on }A_j.
+\]
+
+\subsection{How to solve the committor numerically}
+
+Choose finite element basis functions
+\[
+\{\varphi_m(q)\}_{m=1}^{M}
+\]
+on the transition domain \(\Omega_{ij}\).
+
+Approximate:
+\[
+q_{ij}(q)\approx \sum_{m=1}^{M}u_m\varphi_m(q).
+\]
+
+Boundary nodes on \(A_i\) are fixed to \(0\).
+Boundary nodes on \(A_j\) are fixed to \(1\).
+
+For interior degrees of freedom, solve:
+\[
+S u = f,
+\]
+where the stiffness matrix is
+\[
+S_{mn}
+=
+\int_{\Omega_{ij}}
+\nabla\varphi_m(q)^\top
+D_x(q)
+\nabla\varphi_n(q)
+\,\rho_x(\dd q),
+\]
+and \(\rho_x\) is the concentration measure:
+\[
+\rho_x(\dd q)
+=
+C^\circ
+\exp
+\left[
+-\beta_{\rm mol}U_x(q)
++
+\sum_a\nu_{s(q),a}\lambda_a^\star
+\right]\dd q.
+\]
+
+The right-hand side \(f\) comes only from known boundary values after
+eliminating Dirichlet nodes.
+
+After solving \(u\), evaluate
+\[
+\nabla q_{ij}(q)
+\]
+at transition quadrature points.
+
+\subsection{Capacity flux}
+
+The symmetric capacity flux is:
+\[
+K_{ij}
+=
+\int_{\Omega_{ij}}
+\nabla q_{ij}(q)^\top
+D_x(q)
+\nabla q_{ij}(q)\,
+\rho_x(\dd q).
+\]
+
+Using transition quadrature points \(q_{ij,\ell}^{\Sigma}\), weights
+\(w_{ij,\ell}^{\Sigma}\), and committor gradients
+\[
+g_{ij,\ell}=\nabla q_{ij}(q_{ij,\ell}^{\Sigma}),
+\]
+compute:
+\[
+K_{ij}
+\approx
+\sum_{\ell}
+W_{ij,\ell}^{\Sigma}
+g_{ij,\ell}^{\top}
+D_x(q_{ij,\ell}^{\Sigma})
+g_{ij,\ell}.
+\]
+
+The transition-surface concentration weight is:
+\[
+W_{ij,\ell}^{\Sigma}
+=
+C^\circ
+w_{ij,\ell}^{\Sigma}
+\exp
+\left[
+-\beta_{\rm mol}U_x(q_{ij,\ell}^{\Sigma})
++
+\sum_a\nu_{s(q_{ij,\ell}^{\Sigma}),a}\lambda_a^\star
+\right].
+\]
+
+Set:
+\[
+K_{ji}=K_{ij}.
+\]
+
+Set:
+\[
+K_{ii}=0.
+\]
+
+\subsection{Finite generator}
+
+For \(i\ne j\):
+\[
+Q_{ij}=\frac{K_{ij}}{c_i}.
+\]
+
+For diagonal entries:
+\[
+Q_{ii}=-\sum_{j\ne i}Q_{ij}.
+\]
+
+Validation:
+
+1. Row sums:
+\[
+\sum_j Q_{ij}=0.
+\]
+
+2. Detailed balance:
+\[
+c_iQ_{ij}=c_jQ_{ji}.
+\]
+
+3. Stationarity:
+\[
+\sum_i c_iQ_{ij}=0.
+\]
+
+\section{Transition-path displacement moments}
+\label{sec:tpmoments}
+
+\subsection{Purpose}
+
+Transition-path moments determine charge transported during state changes.
+They produce:
+\[
+d_{ij},\quad M_{ij}.
+\]
+\[
+d_{ij}\in\R^3
+\quad [\mathrm{m}]
+\]
+is mean formal-charge displacement for transition \(i\to j\).
+\[
+M_{ij}\in\R^{3\times3}
+\quad [\mathrm{m^2}]
+\]
+is second moment of formal-charge displacement for transition \(i\to j\).
+
+\subsection{Doob-conditioned drift and reactive path sampling}
+
+For edge \((i,j)\), use the committor \(q_{ij}\).
+
+The process conditioned to reach \(A_j\) before \(A_i\) has Doob-transformed
+drift:
+\[
+b^{(ij)}(q)
+=
+b(q)+2D_x(q)\nabla\log q_{ij}(q),
+\]
+where
+\[
+b(q)=\nabla_q\cdot D_x(q)-\beta_{\rm mol}D_x(q)\nabla_q U_x(q)
+\]
+is the original overdamped drift.
+
+The conditioned short-path SDE is:
+\[
+\dd q_t
+=
+b^{(ij)}(q_t)\dd t
++
+\sqrt{2D_x(q_t)}\dd W_t.
+\]
+
+Initial points are sampled from the reactive exit distribution on the
+\(i\)-side boundary:
+\[
+p_{\rm exit}(q)
+\propto
+\rho_x(q)
+\,n_{ij}(q)^\top D_x(q)\nabla q_{ij}(q),
+\]
+where \(n_{ij}\) is the outward normal from \(A_i\) toward \(A_j\).
+
+For each sampled path:
+
+1. Start at \(q_0\) from \(p_{\rm exit}\).
+
+2. Integrate the conditioned SDE (Euler--Maruyama)
+\[
+q_{n+1}
+=
+q_n
++
+b^{(ij)}(q_n)\Delta t
++
+\sqrt{2D_x(q_n)\Delta t}\,\eta_n,
+\qquad
+\eta_n\sim\mathcal N(0,I),
+\]
+until hitting \(A_j\), i.e.\ until
+\[
+\tau_j=\inf\{t:q_t\in A_j\}.
+\]
+
+3. Record endpoint \(q_\tau\).
+
+4. Compute charge displacement:
+\[
+\Delta P_{ij,\ell}=P_x(q_\tau)-P_x(q_0).
+\]
+
+This is a local transition-path calculation, not a long-time GK integral.
+
+\subsection{Weighted moment estimator}
+
+Given path samples
+\[
+\{(\Delta P_{ij,\ell},w_{ij,\ell}^{\rm path})\}_{\ell=1}^{n_{ij}^{\rm path}},
+\]
+compute:
+\[
+S_{ij}^{\rm path}=\sum_\ell w_{ij,\ell}^{\rm path}.
+\]
+
+Then:
+\[
+d_{ij}
+=
+\frac{1}{S_{ij}^{\rm path}}
+\sum_\ell
+w_{ij,\ell}^{\rm path}\Delta P_{ij,\ell}.
+\]
+
+\[
+M_{ij}
+=
+\frac{1}{S_{ij}^{\rm path}}
+\sum_\ell
+w_{ij,\ell}^{\rm path}
+\Delta P_{ij,\ell}\Delta P_{ij,\ell}^{\top}.
+\]
+
+Set reverse moments:
+\[
+d_{ji}=-d_{ij},
+\qquad
+M_{ji}=M_{ij}.
+\]
+
+Set:
+\[
+d_{ii}=0,
+\qquad
+M_{ii}=0.
+\]
+
+\subsection{Displacement-scale validation}
+
+For every transition displacement sample, require:
+\[
+\|\Delta P_{ij,\ell}\| \le L_{\max}.
+\]
+
+For molecular local transitions, choose for example:
+\[
+L_{\max}=10^{-8}\ \mathrm{m}.
+\]
+
+A transition displacement of order meters must fail, because \(P_x\) is an
+unwrapped molecular charge displacement in meters.
+
+\section{Within-state self-current}
+\label{sec:selfcurrent}
+
+\subsection{Purpose}
+
+Self-current captures continuous unbounded charge mobility while the projected
+state does not change. It produces:
+\[
+D_i^{\rm self}\in\R^{3\times3}
+\qquad [\mathrm{m^2\,s^{-1}}].
+\]
+
+\subsection{Unbounded transport projector}
+
+For each basin \(A_i\), define:
+\[
+\Pi_i(q)\in\R^{d\times d}.
+\]
+
+\(\Pi_i(q)\) projects coordinate motion onto directions that produce
+unbounded DC charge transport.
+
+Examples:
+
+1. Free ion translation:
+\[
+\Pi_i=I
+\]
+on that ion's translational coordinates.
+
+2. Bound internal pair vibration:
+\[
+\Pi_i=0
+\]
+for the bounded internal coordinate.
+
+3. Neutral pair center-of-mass translation:
+\[
+\Pi_i=I_{\rm COM}
+\]
+but
+\[
+G_P\Pi_i=0
+\]
+if the neutral pair is exactly charge-neutral and co-moving.
+
+4. Partner-switch or identity-diffusion coordinate:
+\[
+\Pi_i
+\]
+is nonzero only along the unbounded identity coordinate.
+
+\subsection{Self-current integral}
+
+For each state:
+\[
+D_i^{\rm self}
+=
+\frac{1}{c_i}
+\int_{A_i}
+G_P(q)
+\Pi_i(q)
+D_x(q)
+\Pi_i(q)^\top
+G_P(q)^\top
+\,\rho_x(\dd q).
+\]
+
+Quadrature:
+\[
+D_i^{\rm self}
+\approx
+\frac{1}{c_i}
+\sum_{\ell=1}^{n_i}
+W_{i\ell}
+G_P(q_{i\ell})
+\Pi_i(q_{i\ell})
+D_x(q_{i\ell})
+\Pi_i(q_{i\ell})^\top
+G_P(q_{i\ell})^\top.
+\]
+
+Validation:
+\[
+D_i^{\rm self}=D_i^{\rm self\top},
+\qquad
+D_i^{\rm self}\succeq0.
+\]
+
+\subsection{Multi-center charge covariance}
+
+If a basin contains multiple charged centers, do not use
+\[
+z_{\rm net}^2D_{\rm COM}.
+\]
+
+Let
+\[
+z_i=(z_1,\ldots,z_m)^\top
+\]
+be the charge vector of centers in basin \(i\), and let
+\[
+D_i^{\rm centers}\in\R^{m\times m}
+\]
+be the state-local mobility covariance of those centers along one Cartesian
+axis.
+
+Then charge mobility is:
+\[
+D_Q(i)=z_i^\top D_i^{\rm centers}z_i.
+\]
+
+For a Li--anion pair:
+\[
+z=(+1,-1)^\top.
+\]
+
+Thus:
+\[
+D_Q
+=
+D_{\rm Li}
++
+D_{\rm A}
+-
+2D_{\rm Li,A}.
+\]
+
+If
+\[
+D_{\rm Li,A}<0,
+\]
+then the cross term raises conductivity.
+
+\section{Direct projected diffusivity-density}
+\label{sec:directB}
+
+Define:
+\[
+B
+=
+\sum_i c_iD_i^{\rm self}
++
+\frac{1}{2}\sum_i\sum_jK_{ij}M_{ij}.
+\]
+
+Units:
+\[
+[c_iD_i^{\rm self}]
+=
+\mathrm{mol\,m^{-3}}\cdot\mathrm{m^2\,s^{-1}}
+=
+\mathrm{mol\,m^{-1}\,s^{-1}}.
+\]
+
+\[
+[K_{ij}M_{ij}]
+=
+\mathrm{mol\,m^{-3}\,s^{-1}}\cdot \mathrm{m^2}
+=
+\mathrm{mol\,m^{-1}\,s^{-1}}.
+\]
+
+So:
+\[
+[B]=\mathrm{mol\,m^{-1}\,s^{-1}}.
+\]
+
+\section{Finite-state memory correction}
+\label{sec:finitestate}
+
+\subsection{State drift}
+
+For each state:
+\[
+b_i=\sum_jQ_{ij}d_{ij}\in\R^3.
+\]
+
+Component:
+\[
+b_{i,a}=\sum_jQ_{ij}d_{ij,a}.
+\]
+
+\subsection{Poisson equation}
+
+For each Cartesian axis \(a\), solve:
+\[
+-Q\chi_a=b_a.
+\]
+
+Because \(Q\) has a zero eigenvalue, impose gauge:
+\[
+\sum_i c_i\chi_{i,a}=0.
+\]
+
+\subsection{Numerical solve}
+
+Construct block matrix:
+\[
+\mathcal M
+=
+\begin{bmatrix}
+-Q & \one\\
+c^\top & 0
+\end{bmatrix}.
+\]
+
+Construct right-hand side:
+\[
+y_a=
+\begin{bmatrix}
+b_a\\
+0
+\end{bmatrix}.
+\]
+
+Solve:
+\[
+\mathcal M
+\begin{bmatrix}
+\chi_a\\
+\lambda_a^{Q}
+\end{bmatrix}
+=
+y_a.
+\]
+
+Here \(\lambda_a^{Q}\) is a Lagrange multiplier enforcing the gauge.
+
+The solution vector is:
+\[
+\chi_a=(\chi_{1,a},\ldots,\chi_{N,a})^\top.
+\]
+
+\subsection{Correction tensor}
+
+\[
+C^Q_{ab}
+=
+\sum_i c_i b_{i,a}\chi_{i,b}.
+\]
+
+Thus:
+\[
+C^Q\in\R^{3\times3}.
+\]
+
+Symmetrize numerically:
+\[
+C^Q\leftarrow\frac12(C^Q+C^{Q\top}).
+\]
+
+\section{Continuous Mori memory correction}
+\label{sec:mori}
+
+\subsection{Memory coordinates}
+
+Choose memory coordinates:
+\[
+\Psi(q)
+=
+(\psi_1(q),\ldots,\psi_m(q))^\top.
+\]
+
+Examples:
+\[
+\psi_{\rm atm}(q)
+=
+\text{ionic-atmosphere polarization coordinate},
+\]
+\[
+\psi_{\rm cage}(q)
+=
+\text{solvent-cage/backjump coordinate},
+\]
+\[
+\psi_{\rm partner}(q)
+=
+\text{partner residence coordinate},
+\]
+\[
+\psi_{\rm orient}(q)
+=
+\text{anion orientation coordinate}.
+\]
+
+\subsection{Concrete memory coordinate definitions}
+
+\subsubsection{Charge-density / atmosphere modes}
+
+For wavevector \(k\):
+\[
+\psi_{k,c}(q)=
+\sum_a z_a\cos(k\cdot r_a),
+\]
+\[
+\psi_{k,s}(q)=
+\sum_a z_a\sin(k\cdot r_a).
+\]
+
+\subsubsection{Cage coordinate}
+
+Let \(r_\ell\) be Li position and \(\mathcal N_\ell(q)\) its solvent cage.
+Cage center:
+\[
+R_{\rm cage}(q)
+=
+\frac{\sum_{b\in\mathcal N_\ell(q)}w_b r_b}
+{\sum_{b\in\mathcal N_\ell(q)}w_b}.
+\]
+
+Cage displacement coordinate:
+\[
+\psi_{\rm cage}(q)=
+(r_\ell-R_{\rm cage})\cdot e_{\rm cage},
+\]
+where \(e_{\rm cage}\) is a declared cage-axis basis vector.
+
+\subsubsection{Partner-residence coordinate}
+
+For current partner \(a^\star(q)\):
+\[
+\psi_{\rm partner}(q)
+=
+s_{\ell a^\star}(q).
+\]
+
+\subsubsection{Ligand-shell residence coordinate}
+
+\[
+\psi_{\rm ligand}(q)
+=
+n_{\ell L}(q)-\bar n_{\ell L}.
+\]
+
+\subsubsection{Anion orientation memory}
+
+\[
+\psi_{\rm orient}(q)
+=
+u_a(q)\cdot \hat r_{\ell a}.
+\]
+
+\subsubsection{Local free-volume memory}
+
+\[
+\psi_{\rm fv}(q)
+=
+\varphi(q)-\bar\varphi.
+\]
+
+Collect:
+\[
+\Psi(q)
+=
+(\psi_1(q),\ldots,\psi_m(q))^\top.
+\]
+
+\subsection{State-indicator orthogonalization}
+
+For each state \(A_i\):
+\[
+\bar\psi_i
+=
+\frac{1}{c_i}
+\int_{A_i}\Psi(q)\rho_x(\dd q).
+\]
+
+Quadrature:
+\[
+\bar\psi_i
+=
+\frac{1}{c_i}
+\sum_{\ell}W_{i\ell}\Psi(q_{i\ell}).
+\]
+
+Define:
+\[
+\Psi^\perp(q)=\Psi(q)-\bar\psi_{s(q)}.
+\]
+
+This prevents double-counting memory already represented by finite state
+indicators.
+
+If \(\bar\psi_{s(q)}\) is piecewise constant, then inside a basin:
+\[
+\nabla_q\Psi^\perp(q)=\nabla_q\Psi(q).
+\]
+
+At basin boundaries, discontinuities are already handled by the finite-state
+Poisson correction (Section~\ref{sec:finitestate}).
+
+\subsection{Gradient}
+
+Define:
+\[
+G_\psi(q)
+=
+\nabla_q\Psi^\perp(q)
+\in\R^{m\times d}.
+\]
+
+Component:
+\[
+(G_\psi)_{\alpha\ell}
+=
+\frac{\partial\psi_\alpha^\perp}{\partial q_\ell}.
+\]
+
+\subsection{Mori matrix}
+
+\[
+A_{\alpha\gamma}
+=
+\int
+\nabla\psi_\alpha^\perp(q)^\top
+D_x(q)
+\nabla\psi_\gamma^\perp(q)
+\,\rho_x(\dd q).
+\]
+
+Quadrature:
+\[
+A
+\approx
+\sum_i\sum_{\ell}
+W_{i\ell}
+G_\psi(q_{i\ell})
+D_x(q_{i\ell})
+G_\psi(q_{i\ell})^\top.
+\]
+
+Units:
+\[
+[A]=\mathrm{mol\,m^{-3}}\cdot \mathrm{m^2\,s^{-1}}\cdot [\psi]^2/[q]^2.
+\]
+
+\subsection{Current coupling}
+
+\[
+h_{\alpha a}
+=
+\int
+\nabla\psi_\alpha^\perp(q)^\top
+D_x(q)
+\nabla P_a(q)
+\,\rho_x(\dd q).
+\]
+
+Quadrature:
+\[
+h
+\approx
+\sum_i\sum_\ell
+W_{i\ell}
+G_\psi(q_{i\ell})
+D_x(q_{i\ell})
+G_P(q_{i\ell})^\top.
+\]
+
+\[
+h\in\R^{m\times3}.
+\]
+
+\subsection{Mori correction}
+
+Compute pseudoinverse:
+\[
+A^\#
+\]
+by eigendecomposition as defined in Section~1.
+
+Then:
+\[
+C^\psi=h^\top A^\# h.
+\]
+
+\[
+C^\psi\in\R^{3\times3}.
+\]
+
+Symmetrize numerically:
+\[
+C^\psi\leftarrow\frac12(C^\psi+C^{\psi\top}).
+\]
+
+\section{Projected diffusivity-density}
+\label{sec:Dproj}
+
+\[
+D_{\rm proj}
+=
+B-C^Q-C^\psi.
+\]
+
+Symmetrize:
+\[
+D_{\rm proj}\leftarrow\frac12(D_{\rm proj}+D_{\rm proj}^{\top}).
+\]
+
+If small negative eigenvalues occur from numerical roundoff, project to PSD:
+
+1. Eigendecompose:
+\[
+D_{\rm proj}=V\diag(\eta_1,\eta_2,\eta_3)V^\top.
+\]
+
+2. Set:
+\[
+\eta_r^+=\max(\eta_r,0).
+\]
+
+3. Reconstruct:
+\[
+D_{\rm proj}^{+}=V\diag(\eta_1^+,\eta_2^+,\eta_3^+)V^\top.
+\]
+
+Use this projection only if:
+\[
+\min_r\eta_r\ge -\tau_D\max_r|\eta_r|,
+\]
+for example
+\[
+\tau_D=10^{-10}.
+\]
+
+If the negative eigenvalue is larger than tolerance, fail because the primitive
+set is physically inconsistent.
+
+\section{Final scalar conductivity}
+\label{sec:finalsigma}
+
+The isotropic projected diffusivity-density is:
+\[
+D_{\rm iso}
+=
+\frac13\Tr(D_{\rm proj}).
+\]
+
+Conductivity:
+\[
+\sigma_{\rm S/m}
+=
+\frac{F^2}{RT}D_{\rm iso}.
+\]
+
+Here:
+\[
+F=96485.33212\ \mathrm{C\,mol^{-1}}.
+\]
+
+Units:
+\[
+\frac{F^2}{RT}
+\cdot
+\mathrm{mol\,m^{-1}\,s^{-1}}
+=
+\mathrm{S\,m^{-1}}.
+\]
+
+Convert:
+\[
+\sigma_{\rm mS/cm}=10\sigma_{\rm S/m}.
+\]
+
+Final result:
+\[
+\boxed{
+\sigma_{\rm mS/cm}
+=
+10\frac{F^2}{3RT}
+\Tr
+\left[
+\sum_i c_iD_i^{\rm self}
++
+\frac12\sum_{i,j}K_{ij}M_{ij}
+-
+C^Q
+-
+h^\top A^\#h
+\right].
+}
+\]
+
+\section{Complete numerical algorithm}
+\label{sec:algorithm}
+
+Input:
+\[
+x=(T,\{C_a\},\{\phi_s\},\mathcal L),
+\]
+where, per Sections~\ref{sec:c2g}--\ref{sec:library}, \(\mathcal L\) supplies
+the physical parameter map \(\mathcal P\).
+
+Output:
+\[
+\sigma_{\rm mS/cm}(x).
+\]
+
+Algorithm:
+
+\begin{enumerate}
+
+\item Build molecule counts from \(\mathcal L\) and \((\{C_a\},\{\phi_s\})\)
+(Section~\ref{sec:library}), then build coordinate space \(\Omega_x\) and
+coordinate vector \(q\) (Section~\ref{sec:configspace}).
+
+\item Build numerical functions:
+\[
+U_x(q)\ (\text{Section~\ref{sec:forcefield}}),
+\qquad
+D_x(q)\ (\text{Section~\ref{sec:mobility}}),
+\qquad
+P_x(q),
+\qquad
+G_P(q)=\nabla P_x(q)\ (\text{Section~\ref{sec:polarization}}).
+\]
+
+\item Build basin set:
+\[
+A_1,\ldots,A_N
+\]
+(Section~\ref{sec:basins}).
+
+\item Assign stoichiometry:
+\[
+\nu_{i,a}.
+\]
+
+\item Generate quadrature:
+\[
+(q_{i\ell},w_{i\ell})
+\quad
+\text{for each basin }A_i
+\]
+(Section~\ref{sec:quadrature}).
+
+\item Solve chemical potentials \(\lambda^\star\) by damped Newton
+(Section~\ref{sec:massbalance}):
+\[
+r_a(\lambda)=\sum_i\nu_{i,a}C^\circ Z_i(\lambda)-C_a,
+\]
+\[
+J_{ab}(\lambda)=\sum_i\nu_{i,a}\nu_{i,b}c_i(\lambda),
+\]
+\[
+J\Delta\lambda=-r.
+\]
+Backtrack until normalized residual decreases. Stop when
+\[
+\max_a\frac{|r_a|}{\max(C_a,C_{\min})}<10^{-10}.
+\]
+
+\item Compute density weights:
+\[
+W_{i\ell}
+=
+C^\circ
+w_{i\ell}
+\exp
+\left[
+-\frac{U_x(q_{i\ell})}{RT}
++
+\sum_a\nu_{i,a}\lambda_a^\star
+\right].
+\]
+
+\item Compute populations:
+\[
+c_i=\sum_\ell W_{i\ell}.
+\]
+
+\item For every transition edge \((i,j)\), solve the committor PDE
+(Section~\ref{sec:fluxes}):
+\[
+L_xq_{ij}=0,
+\quad
+q_{ij}|_{A_i}=0,
+\quad
+q_{ij}|_{A_j}=1.
+\]
+Use finite elements or finite volumes. The linear system is:
+\[
+S u=f,
+\]
+with
+\[
+S_{mn}
+=
+\int
+\nabla\varphi_m^\top D_x\nabla\varphi_n
+\,\rho_x(\dd q).
+\]
+
+\item Compute capacity flux:
+\[
+K_{ij}
+=
+\int
+\nabla q_{ij}^\top D_x\nabla q_{ij}
+\,\rho_x(\dd q).
+\]
+Set:
+\[
+K_{ji}=K_{ij}.
+\]
+
+\item Compute generator:
+\[
+Q_{ij}=K_{ij}/c_i,
+\qquad
+Q_{ii}=-\sum_{j\ne i}Q_{ij}.
+\]
+
+\item For every transition edge, sample local conditioned transition paths
+(Section~\ref{sec:tpmoments}) with Doob drift:
+\[
+b^{(ij)}(q)
+=
+\nabla\cdot D_x(q)-\frac{1}{RT}D_x(q)\nabla U_x(q)
++
+2D_x(q)\nabla\log q_{ij}(q).
+\]
+For each path, compute:
+\[
+\Delta P=P(q_{\rm end})-P(q_{\rm start}).
+\]
+
+\item Compute transition moments:
+\[
+d_{ij}
+=
+\frac{\sum_\ell w_\ell^{\rm path}\Delta P_\ell}
+{\sum_\ell w_\ell^{\rm path}},
+\qquad
+M_{ij}
+=
+\frac{\sum_\ell w_\ell^{\rm path}\Delta P_\ell\Delta P_\ell^\top}
+{\sum_\ell w_\ell^{\rm path}}.
+\]
+Set:
+\[
+d_{ji}=-d_{ij},
+\qquad
+M_{ji}=M_{ij}.
+\]
+
+\item Define unbounded projectors \(\Pi_i(q)\) (Section~\ref{sec:selfcurrent}).
+
+\item Compute self-current tensors:
+\[
+D_i^{\rm self}
+=
+\frac{1}{c_i}
+\sum_\ell
+W_{i\ell}
+G_P(q_{i\ell})
+\Pi_i(q_{i\ell})
+D_x(q_{i\ell})
+\Pi_i(q_{i\ell})^\top
+G_P(q_{i\ell})^\top.
+\]
+
+\item Compute direct tensor:
+\[
+B=
+\sum_i c_iD_i^{\rm self}
++
+\frac12\sum_{i,j}K_{ij}M_{ij}.
+\]
+
+\item Compute drift:
+\[
+b_i=\sum_jQ_{ij}d_{ij}.
+\]
+
+\item For each Cartesian axis \(a\), solve (Section~\ref{sec:finitestate}):
+\[
+\begin{bmatrix}
+-Q & \one\\
+c^\top & 0
+\end{bmatrix}
+\begin{bmatrix}
+\chi_a\\
+\lambda_a^Q
+\end{bmatrix}
+=
+\begin{bmatrix}
+b_a\\
+0
+\end{bmatrix}.
+\]
+
+\item Compute finite-state correction:
+\[
+C^Q_{ab}=\sum_i c_i b_{i,a}\chi_{i,b}.
+\]
+
+\item Build memory coordinates \(\Psi(q)\) (Section~\ref{sec:mori}).
+
+\item Orthogonalize memory coordinates by state:
+\[
+\Psi^\perp(q)=\Psi(q)-\bar\Psi_{s(q)}.
+\]
+
+\item Compute memory gradient:
+\[
+G_\psi(q)=\nabla\Psi^\perp(q).
+\]
+
+\item Compute Mori matrix:
+\[
+A=
+\sum_i\sum_\ell
+W_{i\ell}
+G_\psi(q_{i\ell})
+D_x(q_{i\ell})
+G_\psi(q_{i\ell})^\top.
+\]
+
+\item Compute current coupling:
+\[
+h=
+\sum_i\sum_\ell
+W_{i\ell}
+G_\psi(q_{i\ell})
+D_x(q_{i\ell})
+G_P(q_{i\ell})^\top.
+\]
+
+\item Compute pseudoinverse \(A^\#\) by eigendecomposition.
+
+\item Compute continuous Mori correction:
+\[
+C^\psi=h^\top A^\#h.
+\]
+
+\item Compute projected diffusivity-density:
+\[
+D_{\rm proj}=B-C^Q-C^\psi.
+\]
+
+\item Compute scalar conductivity:
+\[
+\sigma_{\rm mS/cm}
+=
+10\frac{F^2}{3RT}\Tr(D_{\rm proj}).
+\]
+
+\end{enumerate}
+
+\section{Effect identification}
+
+An effect is any composition, coordinate, or parameter perturbation \(\theta\)
+that changes at least one primitive:
+\[
+c,\ K,\ Q,\ d,\ M,\ D^{\rm self},\ A,\ h.
+\]
+
+To identify the effect numerically, perturb \(\theta\) by a small amount
+\[
+\delta\theta.
+\]
+
+Compute central differences:
+\[
+\partial_\theta X
+\approx
+\frac{X(\theta+\delta\theta)-X(\theta-\delta\theta)}
+{2\delta\theta}
+\]
+for
+\[
+X\in
+\{c,K,d,M,D^{\rm self},A,h,\sigma\}.
+\]
+
+Primitive ownership scores:
+\[
+S_c(\theta)=\|\partial_\theta c\|_2,
+\]
+\[
+S_K(\theta)=\|\partial_\theta K\|_F,
+\]
+\[
+S_{dM}(\theta)=
+\|\partial_\theta d\|_F+\|\partial_\theta M\|_F,
+\]
+\[
+S_{D}(\theta)=\|\partial_\theta D^{\rm self}\|_F,
+\]
+\[
+S_{Ah}(\theta)=\|\partial_\theta A\|_F+\|\partial_\theta h\|_F.
+\]
+
+Assign the effect to the largest nonzero ownership score.
+
+\section{Conductivity-effect ledger}
+
+\[
+\begin{array}{lll}
+\toprule
+\text{Effect} & \text{Primitive location} & \text{Computation}\\
+\midrule
+\text{Free-ion fraction} & c_i & \partial c_i/\partial\theta\\
+\text{Ion association} & c_i,K_{ij} & \partial c,\partial K\\
+\text{SSIP/CIP balance} & c_i,K_{ij},D_i^{\rm self} & \partial c,\partial K,\partial D\\
+\text{Aggregate formation} & c_i,K_{ij},M_{ij},D_i^{\rm self} & \partial c,\partial K,\partial M,\partial D\\
+\text{Neutral ligand coordination} & c_i,K_{ij},A,h & \partial c,\partial K,\partial A,\partial h\\
+\text{Solvation competition} & U_x\to c_i,K_{ij} & \partial U\to\partial c,\partial K\\
+\text{Coulomb association} & U_x\to c_i,K_{ij} & \partial U\to\partial c,\partial K\\
+\text{Born/desolvation} & U_x\to c_i,K_{ij} & \partial U\to\partial c,\partial K\\
+\text{Activity/nonideality} & U_x\to c_i,K_{ij} & \partial U\to\partial c,\partial K\\
+\text{Viscosity} & D_x\to D_i^{\rm self},K_{ij},A & \partial D\to\partial D^{\rm self},\partial K,\partial A\\
+\text{Hydrodynamic size} & D_x\to D_i^{\rm self},K_{ij} & \partial D\\
+\text{Anion shape/denticity} & U_x,D_x,K_{ij},A,h & \partial U,\partial D,\partial K,\partial A,\partial h\\
+\text{Charge-cloud radius} & U_x,D_x,A,h & \partial U,\partial D,\partial A,\partial h\\
+\text{Local crowding/free volume} & U_x,D_x,K_{ij},A,h & \partial U,\partial D,\partial K,\partial A,\partial h\\
+\text{Li--anion co-motion} & D_i^{\rm self},M_{ij} & D_{\rm Li,A}>0\\
+\text{Li--anion anti-correlation} & D_i^{\rm self},M_{ij} & D_{\rm Li,A}<0\\
+\text{Partner switching} & K_{ij},d_{ij},M_{ij},A,h & \partial K,\partial d,\partial M,\partial A,\partial h\\
+\text{Identity diffusion} & K_{ij},d_{ij},M_{ij} & \partial K,\partial d,\partial M\\
+\text{Structural hopping} & K_{ij},d_{ij},M_{ij} & \partial K,\partial d,\partial M\\
+\text{Bound neutral polarization} & A,h & \partial A,\partial h\\
+\text{Cage/backjump} & C^Q \text{ or } A,h & \partial C^Q,\partial A,\partial h\\
+\text{Ion-atmosphere relaxation} & A,h & \partial A,\partial h\\
+\text{Electrophoretic drag} & D_x \text{ or } A,h & \partial D,\partial A,\partial h\\
+\text{Debye screening} & U_x,D_x,A,h & \partial U,\partial D,\partial A,\partial h\\
+\text{Solvent-shell residence} & c_i,K_{ij},A,h & \partial c,\partial K,\partial A,\partial h\\
+\text{Ligand-shell residence} & c_i,K_{ij},A,h & \partial c,\partial K,\partial A,\partial h\\
+\text{Temperature} & RT,U_x,D_x,K_{ij},F^2/(RT) & \partial_T\sigma\\
+\text{Dielectric response} & U_x,D_x,A,h & \partial U,\partial D,\partial A,\partial h\\
+\text{Salt concentration} & c_i,U_x,D_x,K_{ij},A,h & \partial c,\partial U,\partial D,\partial K,\partial A,\partial h\\
+\text{Additive microviscosity} & D_x,K_{ij} & \partial D,\partial K\\
+\text{Bulky-anion/ligand conductivity increase} & D_i^{\rm self}\text{ or }M_{ij} &
+D_{\rm Li,A|i}<0\text{ or partner-switch }M_{ij}\\
+\bottomrule
+\end{array}
+\]
+
+\section{Basis refinement without production Green--Kubo}
+
+Let the current memory basis be
+\[
+\Phi=(\phi_1,\ldots,\phi_m).
+\]
+
+For a candidate missing coordinate \(g(q)\), compute:
+\[
+A_{gg}
+=
+\int
+\nabla g^\top D_x\nabla g\,\rho_x(\dd q),
+\]
+\[
+A_{g\Phi}
+=
+\int
+\nabla g^\top D_x\nabla\Phi\,\rho_x(\dd q),
+\]
+\[
+h_g
+=
+\int
+\nabla g^\top D_xG_P^\top\,\rho_x(\dd q).
+\]
+
+Let
+\[
+A_{\Phi\Phi}
+=
+\int
+\nabla\Phi^\top D_x\nabla\Phi\,\rho_x(\dd q),
+\]
+\[
+h_\Phi
+=
+\int
+\nabla\Phi^\top D_xG_P^\top\,\rho_x(\dd q).
+\]
+
+Remove what is already represented:
+\[
+\tilde h_g
+=
+h_g-A_{g\Phi}A_{\Phi\Phi}^\#h_\Phi.
+\]
+\[
+\tilde A_{gg}
+=
+A_{gg}-A_{g\Phi}A_{\Phi\Phi}^\#A_{\Phi g}.
+\]
+
+Score:
+\[
+S(g)
+=
+\frac{\|\tilde h_g\|_2^2}{\tilde A_{gg}}.
+\]
+
+Add:
+\[
+g^\star=\argmax_g S(g).
+\]
+
+Stop when:
+\[
+\max_gS(g)<\tau_{\rm basis}
+\]
+and
+\[
+|\sigma_{n+1}-\sigma_n|<\tau_\sigma.
+\]
+
+This is the production convergence procedure. It uses the generator integrals,
+not a long-time GK integral.
+
+\section{Convergence proof}
+
+Let the exact conductivity be
+\[
+\sigma_{\rm GK}
+=
+\frac{F^2}{3RT}
+\sum_{a=1}^3
+\langle J_a,(-L_x)^\#J_a\rangle_{\mu_x}.
+\]
+
+Let \(V_n\) be the span of all state indicators and memory coordinates used at
+basis level \(n\) (i.e.\ the span growing by successive application of the
+basis-refinement procedure above). Let \(u_a^\star\) solve:
+\[
+-L_xu_a^\star=J_a.
+\]
+
+Let \(u_{n,a}\in V_n\) solve the Galerkin projection:
+\[
+\langle v,(-L_x)u_{n,a}\rangle_{\mu_x}
+=
+\langle v,J_a\rangle_{\mu_x}
+\qquad
+\forall v\in V_n.
+\]
+
+Then:
+\[
+\sigma_{\rm GK}-\sigma_n
+=
+\frac{F^2}{3RT}
+\sum_{a=1}^3
+\|u_a^\star-u_{n,a}\|_E^2,
+\]
+where
+\[
+\|f\|_E^2=\langle f,(-L_x)f\rangle_{\mu_x}.
+\]
+
+If
+\[
+\overline{\bigcup_n V_n}^{\|\cdot\|_E}
+\]
+contains every \(u_a^\star\), then:
+\[
+\sigma_n\to\sigma_{\rm GK}.
+\]
+
+This proves completeness: the projected estimator of
+Section~\ref{sec:finalsigma}, refined by the basis-selection procedure above,
+converges to the exact Green--Kubo conductivity even though no long-time
+Green--Kubo integral is ever evaluated in production.
+
+\section{Conductivity-behavior test suite}
+\label{sec:tests}
+
+This section defines tests that a correct implementation must pass or
+\emph{explicitly} flag. Each test identifies \emph{which} primitive
+(\(c,K,Q,d,M,D^{\rm self},A,h\)) must carry a physical effect.
+If an implementation cannot attribute an effect to a specific primitive,
+the effect is not encoded.
+
+\subsection{A. Current-correlation and readout tests}
+
+\paragraph{A1: Nernst--Einstein carrier.}
+Construct a model with one charged diffusive state \(i\) with diffusivity
+\(D\) and charge \(z\). Assert:
+\[
+\sigma
+=
+\frac{F^2}{RT}c_i z^2 D.
+\]
+This tests that \(c_i D_i^{\rm self}\) is the direct carrier term.
+
+\paragraph{A2: Poisson/Mori corrector on a two-state jump.}
+Construct a correlated two-state jump with states \(i,j\), flux \(K_{ij}\),
+and opposite displacements \(d_{ji}=-d_{ij}\neq0\).
+Check that:
+\[
+\sigma_{\rm direct}
+=
+\frac{F^2}{RT}\tfrac{1}{2}(K_{ij}|d_{ij}|^2+K_{ji}|d_{ji}|^2),
+\]
+and that the finite-state Poisson corrector \(C^Q\neq0\) when the system is
+persistent, i.e.\ when the state-conditioned drift \(b_i\neq0\).
+A direct-only readout is \emph{wrong} for correlated jumps.
+
+\paragraph{A3: Opposite-charge velocity covariance.}
+In a two-ion system with charges \(+1,-1\) and negative Li--anion velocity
+covariance:
+\[
+D_{\rm Li,A}<0.
+\]
+Assert:
+\[
+D_Q = D_{\rm Li}+D_{\rm A}-2D_{\rm Li,A}>D_{\rm Li}+D_{\rm A}.
+\]
+Conductivity must \emph{increase} relative to uncorrelated motion.
+
+\paragraph{A4: State-current drift coupling.}
+Construct a state with nonzero state-conditioned drift \(b_i\neq0\) (by
+choosing \(Q_{ij}d_{ij}\neq0\) for some neighbor \(j\)). Assert \(C^Q\neq0\).
+If the only route to a corrector is a long-time GK integral, fail.
+
+\paragraph{A5: Null current mode.}
+Construct a memory coordinate \(\psi\) with \(A_{\psi\psi}=0\) but
+\(h_\psi\neq0\). The model must fail loudly (nullspace consistency check
+of Section~1) and not return a pseudo-inverse correction.
+
+\paragraph{A6: Zero-displacement motif exchange.}
+Construct two states \(i,j\) that are identical in composition except
+by solvent orientation label. Set \(d_{ij}=0\). Assert \(K_{ij}d_{ij}=0\)
+contributes nothing to the direct tensor \(B\). Motif exchange alone
+does not produce conductivity.
+
+\paragraph{A7: Structural hop with charge displacement.}
+Construct a partner-switch event \(i\to j\) where Li trades anion partner.
+Assert \(d_{ij}\neq0\) and that this contributes \(K_{ij}M_{ij}\) to \(B\).
+Verify the reverse event has \(d_{ji}=-d_{ij}\).
+
+\paragraph{A8: Detailed balance and stationarity.}
+For every generator \(Q\), assert:
+\[
+\sum_j Q_{ij}=0,
+\qquad
+c_i Q_{ij}=c_j Q_{ji},
+\qquad
+\sum_i c_i Q_{ij}=0.
+\]
+Finite \(\sigma\) is invalid if any of these fail.
+
+\subsection{B. Speciation and population tests}
+
+\paragraph{B1: Free-ion fraction.}
+Increase the Coulomb association strength (e.g.\ scale the Li--anion pairing
+free energy by \(\alpha>1\)). Assert \(c_{\rm free}\) decreases and
+\(c_{\rm CIP}+c_{\rm SSIP}\) increases.
+
+\paragraph{B2: Shared Li pool for mixed salts.}
+Supply a formulation with LiPF6 and LiFSI. Assert that Li appears in exactly
+one conserved component \(C_{\rm Li}\), not one per salt.
+Check \(C_{\rm PF6}\) and \(C_{\rm FSI}\) are separate components.
+Check that \(C_{\rm Li}=C_{\rm LiPF6}^{\rm SI}+C_{\rm LiFSI}^{\rm SI}\) after conversion.
+
+\paragraph{B3: SSIP population.}
+In a model with CIP and SSIP basins, assert that \(c_{\rm SSIP}\) changes
+when solvent donor number or Li--anion separation threshold changes.
+Assert that changes in \(c_{\rm SSIP}\) propagate to \(D_{\rm SSIP}^{\rm self}\)
+and \(K_{{\rm SSIP},j}\).
+
+\paragraph{B4: Li-additive coordination motif.}
+Supply FEC or VC as a neutral additive.
+Assert that a Li--FEC coordinated motif basin \(A_{\rm LiL}\) is populated
+when the coordination affinity \(\Delta g_{\rm Li,FEC}^{\rm coord}\) is attractive.
+If \(c_{\rm LiL}=0\) despite attractive coordination, fail.
+A test that finds FEC changes only \(\eta\) and never \(c_{\rm LiL}\) must fail.
+
+\paragraph{B5: Aggregate formation.}
+For high salt concentration, assert that aggregate basins (Li$_2$A$^+$,
+LiA$_2^-$, Li$_2$A$_2$, higher) appear in \(\{c_i\}\) when the free energies
+support them.
+Generic stoichiometric clusters must be expressible; no species-name shortcuts.
+
+\paragraph{B6: Neutral cluster charge covariance.}
+For a neutral Li$_2$A$_2$ cluster, assert that the model uses
+\(z_i^\top D_i^{\rm centers}z_i\) with \(z_i=(+1,+1,-1,-1)^\top\),
+not \(z_{\rm net}^2 D_{\rm COM}=0\).
+
+\paragraph{B7: Activity and nonideality.}
+Increase ionic strength by scaling \(C_{\rm Li}\). Assert that activity
+corrections change \(c_i\) (basin populations) via \(U_x\), not via a terminal
+multiplication of the final \(\sigma\).
+
+\paragraph{B8: Born desolvation.}
+Change the Born radius \(r_{\rm Born}\) of the anion. Assert that pair and
+cluster free energies change and therefore \(c_{\rm CIP}/c_{\rm SSIP}\) changes.
+
+\subsection{C. State-local mobility and obstruction tests}
+
+\paragraph{C1: Viscosity.}
+Increase mixture viscosity \(\eta\) by a factor \(\alpha\). Assert that
+\(D_x(q)\) scales as \(1/\alpha\) (Stokes--Einstein), and therefore
+\(D_i^{\rm self}\), \(K_{ij}\), and \(A\) all change upstream of \(\sigma\).
+
+\paragraph{C2: Temperature.}
+Change \(T\). Assert that \(k_BT\) in \(D_x(q)\), the Boltzmann factor
+\(\exp[-U_x/(RT)]\), the viscosity (if temperature-dependent), and the
+prefactor \(F^2/(RT)\) all respond consistently.
+
+\paragraph{C3: Hydrodynamic radius.}
+Increase the hydrodynamic radius \(a_a\) of a carrier. Assert that
+\(\zeta_a=6\pi\eta a_a\) increases, \(D_x\) decreases, and \(D_i^{\rm self}\)
+decreases proportionally.
+
+\paragraph{C4: Cluster hydrodynamic radius.}
+For a charged cluster (CIP, aggregate), assert that \(D_i^{\rm self}\) uses the
+\emph{cluster} hydrodynamic radius, not the free-ion radius.
+
+\paragraph{C5: Anion shape and denticity.}
+Introduce a bulky or asymmetric anion via its hydrodynamic radius, charge-cloud
+radius, and ligand-field asymmetry descriptors (not by name).
+Assert that \(D_i^{\rm self}\), \(K_{ij}\), \(A\), and \(h\) all change.
+A test row that finds the bulky anion changes only a scalar radius and
+not shape/orientation/covariance descriptors must fail.
+
+\paragraph{C6: Free volume and crowding.}
+Increase the occupied volume fraction \(\varphi\). Assert that
+\(f_{\rm free\ volume}(\varphi)\) increases \(\eta\), which decreases
+\(D_x\) and propagates to \(D_i^{\rm self}\) and \(K_{ij}\).
+Near maximum packing \(\varphi\to\varphi_{\max}\), the model must fail or
+strongly suppress mobility, not extrapolate silently.
+
+\paragraph{C7: Dense high-salt obstruction.}
+At high salt molarity (e.g.\ 2--4 M), assert that finite ionic volume is
+wired into \emph{both} mobility \(D_x\) and the finite generator rates
+\(K_{ij}\). A model that increases salt without changing mobility or rates
+must fail.
+
+\subsection{D. Solvent/additive-specific but name-blind tests}
+
+\paragraph{D1: FEC as coordinating neutral ligand.}
+Supply FEC via its descriptors (donor number, coordination affinity,
+H-bond donor count, molecular volume, polarizability, etc.) without
+using the label ``FEC'' inside the generator. Assert:
+\begin{enumerate}
+\item Li--FEC coordination motif population \(c_{\rm LiFEC}>0\) when
+coordination affinity is attractive.
+\item The motif participates in \(K_{ij}\) and \(D_i^{\rm self}\).
+\end{enumerate}
+
+\paragraph{D2: FEC viscosity and solvation effects are separate.}
+Assert that FEC loading enters:
+\begin{enumerate}
+\item \(\eta\) via \(f_{\rm additive}\) (viscosity path).
+\item \(c_{\rm LiFEC}\) via coordination free energy (speciation path).
+\end{enumerate}
+Both must be non-zero and separately attributable via primitive ownership scores.
+
+\paragraph{D3: FEC + bulky anion anticorrelation.}
+Construct a model with moderate FEC loading and a bulky/delocalized anion.
+Assert that the state-local covariance
+\[
+D_Q(\alpha)
+=
+D_{{\rm Li}|\alpha}+D_{{\rm A}|\alpha}-2D_{{\rm Li,A}|\alpha}
+\]
+in the Li--FEC--anion SSIP basin is \emph{different} from that in the
+ordinary SSIP basin. Assert that the sign of \(D_{{\rm Li,A}|\alpha}\) can
+change, and that conductivity can \emph{increase} despite the viscosity penalty.
+A model that can only express ``FEC raises \(\eta\)'' and ``bulky anion adds drag''
+but cannot express the changed Li--anion cross-current covariance must fail.
+
+\paragraph{D4: Additive-separated SSIP basin.}
+Assert that a Li--FEC--anion basin (Li and anion separated by FEC in the
+first shell) is representable as a distinct basin \(A_{\rm LiL\cdots A}\)
+(Section~\ref{sec:basins}) with its own \(c_i,D_i^{\rm self},K_{ij}\).
+
+\paragraph{D5: No species-name generator keys.}
+Inspect all basin labels, motif labels, memory coordinate definitions, and
+transition edges. Assert that none contains the string identifiers
+``FEC'', ``VC'', ``PF6'', ``FSI'', ``TFSI'', ``EC'', ``DMC'' as
+generator keys. These are only allowed as registry lookup labels during
+the descriptor-building phase.
+
+\subsection{E. Ion-atmosphere and electrostatic memory tests}
+
+\paragraph{E1: Debye screening length.}
+Change ionic strength \(I=\tfrac{1}{2}\sum_i z_i^2 c_i\). Assert that
+\(\kappa^2 \propto I\) changes, that \(R_{\rm atmosphere}\) changes,
+and that this propagates to \(A\) and \(h\).
+
+\paragraph{E2: Electrophoretic and relaxation drag.}
+Assert that the atmosphere resistance has two separately attributable
+components:
+\[
+D_{\rm full} = D_{\rm no\text{-}atm} - \Delta D_{\rm ep} - \Delta D_{\rm rel}.
+\]
+Report diagonal Li-center drag, diagonal anion-center drag, and
+Li--anion cross-relaxation drag independently.
+
+\paragraph{E3: Charge-cloud form factor.}
+Increase the charge-cloud radius of the anion. Assert that the atmosphere
+resistance kernel \(\Gamma(k;\kappa,\eta,\epsilon_r)\) changes via the
+form factor attenuation, reducing relaxation drag.
+
+\paragraph{E4: Neutral-pair atmosphere cancellation.}
+Construct a co-located neutral Li--anion pair. Assert that long-wavelength
+atmosphere resistance nearly cancels (opposing charge currents cancel in
+\(\rho_z(k\to0)\)).
+
+\paragraph{E5: Atmosphere memory capture.}
+Slower state exit time (smaller \(K_{ij}\)) relative to atmosphere relaxation
+time must increase the atmosphere memory in \(A,h\) and reduce effective
+conductivity. This must not be a terminal scalar gate but appear as a
+change in the \(A,h\) primitives.
+
+\subsection{F. Multi-center transport tests}
+
+\paragraph{F1: Charge covariance, not net-charge COM.}
+For every multi-site state, assert that
+\[
+D_Q(i) = z_i^\top D_i^{\rm centers} z_i
+\]
+is used, not \(z_{\rm net}^2 D_{\rm COM}\).
+When \(z_{\rm net}=0\), the former can be non-zero; the latter is always zero.
+
+\paragraph{F2: Perfect comotion limit.}
+In a Li--anion pair state with equal and perfectly correlated diffusivities
+\(D_{\rm Li}=D_{\rm A}=D_0\) and \(D_{\rm Li,A}=D_0\), assert:
+\[
+D_Q = D_0+D_0-2D_0=0.
+\]
+This must be the non-degrading completion test for charge-neutral co-motion.
+
+\paragraph{F3: SSIP relative motion.}
+In the SSIP basin, assert that the Li--anion cross-mobility
+\(D_{\rm Li,A|\text{SSIP}}\) is distinct from its value in the CIP basin.
+The relative motion is a state-derived conditional covariance, not a
+formal-charge constant.
+
+\paragraph{F4: Bridge/network motif.}
+Supply a multidentate anion with coordination sites \(n_s>1\). Assert that
+bridge/network basin concentrations are non-zero when anion concentration
+and coordination geometry support them. A model that omits bridge/network
+populations when multidentate descriptors are present must fail.
+
+\subsection{G. Cage, backjump, and structural memory tests}
+
+\paragraph{G1: Solvent cage trapping.}
+Introduce a caged substate with restricted mobility \(\Pi_{\rm caged}=0\).
+Assert that \(c_{\rm caged}D_{\rm caged}^{\rm self}=0\) and therefore
+cage-trapped population reduces effective conductivity through speciation.
+
+\paragraph{G2: Backjump anticorrelation.}
+Construct a two-edge cycle \(i\to j\to i\) with anti-persistent charge
+displacements \(d_{ij}=d_{ji}\) (same direction) but opposite physical
+expectation (backjump). Assert that \(C^Q>0\) and reduces \(\sigma\)
+below the uncorrected \(B\).
+
+\paragraph{G3: Orientation relaxation memory.}
+Introduce anion orientation memory coordinate \(\psi_{\rm orient}\).
+Assert that changing orientation relaxation rate changes \(A\) and \(h\),
+not the direct \(B\), i.e.\ orientation relaxation is a memory correction,
+not a direct carrier effect.
+
+\paragraph{G4: Structural cage exchange (zero displacement).}
+Construct a mobile/caged exchange event with \(d_{ij}=0\). Assert it
+contributes zero to \(K_{ij}d_{ij}\) and appears only through changing
+\(c_i\) and therefore state-local \(D_i^{\rm self}\) weights.
+
+\subsection{H. Concentration and high-loading tests}
+
+\paragraph{H1: Salt molarity sweep.}
+Sweep salt molarity from 0.1 to 4 M. Assert that:
+\begin{enumerate}
+\item Carrier density \(c_{\rm free}\) first increases then decreases.
+\item Ionic strength changes \(\kappa\) and \(R_{\rm atmosphere}\).
+\item Viscosity increases via \(f_{\rm salt}(I)\).
+\item Packing \(\varphi\) increases and enters \(D_x\).
+\item Activity changes association equilibrium via \(U_x\).
+\item All five effects appear separately in the primitive ownership scores.
+\end{enumerate}
+
+\paragraph{H2: Flat or overshooting concentration behavior.}
+If a test electrolyte (e.g.\ 1 M LiPF6 in EC:DMC) shows a flat or
+overshooting conductivity vs.\ concentration curve relative to data, the
+attribution test must identify which primitive family owns the residual:
+free-carrier mobility \((D_i^{\rm self})\), association \((K_{ij},c_i)\),
+atmosphere \((A,h)\), cage/backjump \((C^Q)\), or finite-volume obstruction
+\((D_x)\).
+
+\paragraph{H3: Packing saturation.}
+Increase volume fraction \(\varphi\) toward \(\varphi_{\max}\). Assert
+that \(U_{\rm pack}\to\infty\) and \(D_x\to0\) before packing limit is
+exceeded. The model must fail loudly if \(\varphi>\varphi_{\max}\).
+
+\subsection{I. Solvent matrix tests}
+
+\paragraph{I1: Bulk viscosity.}
+Increase \(\eta_{\rm bulk}(x)\). Assert that \(\zeta_a=6\pi\eta a_a\)
+increases, \(D_x\) decreases, and \(\sigma\) decreases through mobility,
+not a terminal correction.
+
+\paragraph{I2: Bulk dielectric.}
+Change \(\epsilon_r\). Assert changes in \(\kappa\),
+\(U_{\rm Coul}\) (through \(\epsilon_\infty\)), Born solvation, and
+\(R_{\rm atmosphere}\). These must change \(c_i\) and \(K_{ij}\) upstream.
+
+\paragraph{I3: Solvent composition.}
+Change EC:DMC ratio. Assert that viscosity, dielectric, donor/acceptor
+environment, packing, and coordination all respond via their respective
+descriptors. Species names must not appear as generator keys.
+
+\paragraph{I4: Temperature dependence.}
+Assert joint consistency: \(F^2/(RT)\), \(k_BT\) in \(D_x=k_BTR_x^\#\),
+Boltzmann weights \(\exp[-U_x/(RT)]\), and viscosity \(\eta(T)\) all change
+monotonically and consistently with direction of temperature change.
+
+\subsection{J. Audit and dataset effects}
+
+\paragraph{J1: Primitive-gap decomposition.}
+For any composition, the implementation must be able to report:
+\[
+\sigma = \sigma_{\rm vehicular} + \sigma_{\rm jump/memory} - \sigma_{\rm correctors},
+\]
+where:
+\[
+\sigma_{\rm vehicular}
+=
+\frac{F^2}{3RT}
+\Tr\bigl[\textstyle\sum_i c_iD_i^{\rm self}\bigr],
+\]
+\[
+\sigma_{\rm jump/memory}
+=
+\frac{F^2}{3RT}
+\Tr\bigl[\tfrac12\textstyle\sum_{i,j}K_{ij}M_{ij}\bigr],
+\]
+\[
+\sigma_{\rm correctors}
+=
+\frac{F^2}{3RT}
+\Tr\bigl[C^Q+h^\top A^\#h\bigr].
+\]
+If the implementation cannot split these, the primitives are not separately
+accessible.
+
+\paragraph{J2: Motif population ledger.}
+For every formulation, report:
+\[
+c_{\rm free},\quad c_{\rm SSIP},\quad c_{\rm CIP},
+\quad c_{\rm LiL},\quad c_{\rm agg},\quad c_{\rm bridge}.
+\]
+These must be non-negative and sum to satisfy mass balance.
+
+\paragraph{J3: Top primitive attribution.}
+Perturb each primitive family (\(c\), \(K\), \(d/M\), \(D^{\rm self}\),
+\(A,h\)) by \(\pm\delta\) and report the primitives in decreasing order of
+\(\partial\sigma/\partial X\). The top attribution should be physically
+interpretable.
+
+\paragraph{J4: Ablation audit.}
+The following ablations are \emph{diagnostic only} (never production corrections):
+\begin{enumerate}
+\item Association off: set \(c_{\rm CIP}=c_{\rm SSIP}=0\).
+\item Atmosphere off: set \(R_{\rm atmosphere}=0\).
+\item Viscosity off: set \(\eta=\eta_{\rm bulk}\) only.
+\item Obstruction off: set \(f_{\rm free\ volume}=1\).
+\item Cage/memory off: set \(C^Q=0\), \(h=0\).
+\end{enumerate}
+Report the change in \(\sigma\) for each ablation.
+
+\paragraph{J5: No row dropping.}
+Failed or non-converged compositions must be recorded with their reason,
+not silently removed from metrics or test sets.
+
+\subsection{K. Descriptor completeness tests}
+
+Before computing conductivity, assert that the species library \(\mathcal L\)
+supplies the following for every species:
+
+\[
+\begin{array}{ll}
+\toprule
+\text{Descriptor family} & \text{Required fields} \\
+\midrule
+\text{Identity} & z_{su},\ M_s,\ \rho_s \\
+\text{Size/shape} & a_{su}\ (\text{hydrodynamic}),\ \sigma_{su}\ (\text{LJ}),\
+v_s\ (\text{molecular volume}) \\
+\text{Electrostatics} & \epsilon_{su},\ \alpha_{su},\ r_{\rm Born,s},\
+r_{\rm cloud,s} \\
+\text{Coordination/solvation} & \Delta g_{aL}^{\rm coord},\ n_s^{\rm sites},\
+n_s^{\rm HBA},\ n_s^{\rm HBD} \\
+\text{Transport} & \eta_s^{\rm pure},\ \epsilon_{r,s}^{\rm pure},\ T \\
+\bottomrule
+\end{array}
+\]
+
+If any required field is missing and no default is declared, fail before
+returning a conductivity value.
+
+\subsection{L. Minimal pass/fail checklist}
+
+An implementation must \textbf{fail} if any of the following are true:
+
+\begin{enumerate}
+\item FEC (or any neutral additive with attractive coordination affinity)
+changes \(\eta\) but creates no Li-ligand motif concentration
+\(c_{\rm LiL}\).
+\item A bulky or asymmetric anion changes only a scalar radius and not its
+shape, charge-cloud, orientation/denticity, or Li--anion covariance.
+\item SSIP relative/anti-correlated motion is hard-coded from formal charge
+rather than computed as conditional covariance.
+\item A neutral multi-charge state uses \(z_{\rm net}^2 D_{\rm COM}\) instead
+of \(z_i^\top D_i^{\rm centers} z_i\).
+\item Mixed salts count Li once per salt source, violating the shared-pool
+requirement.
+\item A pure motif-exchange event \((d_{ij}=0)\) has nonzero contribution to
+the direct conductivity tensor \(B\).
+\item High salt loading changes carrier count but not finite volume, viscosity,
+activity, atmosphere resistance, or mobility simultaneously.
+\item Ion atmosphere appears as a scalar terminal correction to \(\sigma\),
+not as entries in \(A\) and \(h\).
+\item The Poisson/Mori correctors \(C^Q\) and \(h^\top A^\# h\) are both
+identically zero in a system that has cage, atmosphere, partner-switch,
+or state-current memory.
+\item A generated state label or generator key contains any species name
+(FEC, VC, PF6, FSI, TFSI, EC, DMC, or similar) after the descriptor-parsing
+stage.
+\item The audit cannot attribute the conductivity residual to one of
+\(c_i,\ Q_{ij},\ d/M,\ D^{\rm self},\ A/h\).
+\item The displacement scale check \(\|\Delta P_{ij,\ell}\|\le L_{\max}\)
+is not enforced and meter-scale displacements are accepted.
+\end{enumerate}
+
+\section{Validation rules for implementation}
+
+A numerical implementation must fail if:
+\[
+c_i\le0,
+\]
+\[
+K_{ij}<0,
+\]
+\[
+K_{ij}\ne K_{ji},
+\]
+\[
+\sum_jQ_{ij}\ne0,
+\]
+\[
+c_iQ_{ij}\ne c_jQ_{ji},
+\]
+\[
+d_{ji}\ne-d_{ij},
+\]
+\[
+M_{ji}\ne M_{ij},
+\]
+\[
+D_i^{\rm self}\not\succeq0,
+\]
+\[
+A\not\succeq0,
+\]
+or if
+\[
+\|\Delta P_{ij,\ell}\|>L_{\max}.
+\]
+
+The projected analytical estimator should consume numerical generator inputs
+built from the species library \(\mathcal L\) (Sections~\ref{sec:library}--%
+\ref{sec:mobility}), or equivalent primitive arrays. A property database row
+with only recipe composition \(r\) and empirical conductivity should not be
+converted into a fake generator: by the non-identifiability lemma
+(Section~\ref{sec:c2g}), \(r\) alone does not determine \(\sigma\). Standalone
+estimator code that imports composition/species utilities but still evaluates
+against recipe/composition prediction paths, or validators that call
+recipe/composition prediction paths directly, are descriptor-surrogate
+implementations, not the full projected analytical model defined in this
+document.
+
+\section{Final implementation formula}
+
+\[
+\boxed{
+\sigma_{\rm mS/cm}(x)
+=
+10\frac{F^2}{3RT}
+\Tr
+\left[
+\sum_i c_iD_i^{\rm self}
++
+\frac12\sum_{i,j}K_{ij}M_{ij}
+-
+C^Q
+-
+h^\top A^\#h
+\right].
+}
+\]
+
+Every symbol in this formula is computed by the explicit steps above, starting
+from the composition \(x=(T,\{C_a\},\{\phi_s\},\mathcal L)\) through the
+species library \(\mathcal L\) (Section~\ref{sec:library}), the force field
+and mobility tensor (Sections~\ref{sec:forcefield}--\ref{sec:mobility}), the
+generator (Section~\ref{sec:generator}), basins and mass balance
+(Sections~\ref{sec:basins}--\ref{sec:massbalance}), reactive fluxes and
+transition-path moments (Sections~\ref{sec:fluxes}--\ref{sec:tpmoments}),
+self-current (Section~\ref{sec:selfcurrent}), and the finite-state and
+continuous memory corrections (Sections~\ref{sec:finitestate}--\ref{sec:mori}).
+
+\end{document}

@@ -1,0 +1,20 @@
+schema: conductivity_mixture_closure_record_v1
+species:
+- EC
+- DMC
+- FEC
+- Li+
+- PF6-
+- FSI-
+dielectric:
+  mixing_rule: volume_fraction_linear_static_dielectric_with_salt_decrement
+  pure_dielectric_source: data.species_data epsilon_r
+viscosity:
+  mixing_rule: reciprocal_volume_fraction_plus_Jones_Dole_salt_terms
+  pure_viscosity_source: data.species_data viscosity_cP
+packing:
+  local_volume_source: species_record_site_volumes
+  invalid_state_rule: local_packing_fraction_must_remain_below_configured_phi_max
+atmosphere:
+  charge_sites_source: species_record_sites
+  screening_source: composition_ionic_strength_and_mixture_dielectric

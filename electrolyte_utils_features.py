@@ -245,8 +245,8 @@ def get_total_li_molarity(
 
     # 1. Explicit salts (already molarity)
     for name, molarity in recipe.get("salts", {}).items():
-        if get_species_property(name, "provides_ionic_conductivity"):
-            total_li += float(molarity)
+        required_species_property(name, "molecular_weight")
+        total_li += float(molarity)
 
     # 2. Ionic additives: wt_fraction -> molarity
     for name, wt_frac in recipe.get("additives", {}).items():
@@ -262,6 +262,13 @@ def get_total_li_molarity(
         total_li += molarity
 
     return float(total_li)
+
+
+def required_species_property(species_name: str, property_name: str):
+    property_value = get_species_property(species_name, property_name)
+    if property_value is None:
+        raise ValueError(f"missing species property {species_name}.{property_name}")
+    return property_value
 
 
 # ---------------------------------------------------------------------

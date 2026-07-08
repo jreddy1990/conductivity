@@ -1,0 +1,15 @@
+schema: conductivity_basis_definition_record_v1
+coordinates:
+- Li_anion_distance
+- Li_solvent_coordination
+- Li_ligand_coordination
+- Li_anion_coordination
+- anion_orientation
+- local_packing_fraction
+- local_ionic_strength
+- local_dielectric
+- local_viscosity
+- atmosphere_polarization
+- cage_coordinate
+- partner_residence_coordinate
+threshold_source: pair_pmf_or_rdf_minima; values must be stored before conductivity evaluation

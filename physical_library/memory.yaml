@@ -1,0 +1,11 @@
+schema: conductivity_memory_coordinate_record_v1
+families:
+- atmosphere_polarization
+- charge_density_relaxation
+- cage_backjump
+- partner_residence
+- ligand_shell_residence
+- anion_orientation
+- free_volume_stress
+- bounded_internal_polarization
+orthogonalization: subtract state-conditional mean before Mori matrix construction

@@ -1,0 +1,15 @@
+schema: conductivity_physical_pair_record_v1
+species_i: EC
+species_j: Li+
+source:
+  force_field: openff-2.2.0.offxml
+  lj_mixing_policy: Lorentz-Berthelot; sigma arithmetic, epsilon geometric
+lj_mixing_policy:
+  sigma: 0.5*(sigma_i+sigma_j)
+  epsilon: sqrt(epsilon_i*epsilon_j)
+coulomb_policy:
+  boundary: periodic conducting tin-foil
+  ewald_or_pppm_tolerance: 0.0001
+  electronic_screening: fixed AM1-BCC Sage charges; ECC charge scaling must be recorded as a separate
+    upstream transform
+site_pair_count: 10

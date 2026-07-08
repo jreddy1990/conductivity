@@ -1,0 +1,21 @@
+schema: conductivity_physical_library_manifest_v1
+force_field_source: openff-2.2.0.offxml
+species:
+- EC
+- DMC
+- FEC
+- Li+
+- PF6-
+- FSI-
+species_records:
+- species/EC.yaml
+- species/DMC.yaml
+- species/FEC.yaml
+- species/Liplus.yaml
+- species/PF6minus.yaml
+- species/FSIminus.yaml
+pair_records_glob: pairs/*.yaml
+mixture_record: mixture.yaml
+basis_record: basis.yaml
+transition_record: transitions.yaml
+memory_record: memory.yaml

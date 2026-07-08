@@ -1,254 +1,242 @@
-"""Validate projected analytical conductivity predictions against property DB rows."""
+"""Validate projected analytical conductivity on property DB projected inputs."""
 
 from __future__ import annotations
 
-import json
-
 import numpy as np
 
-from conductivity.electrolyte_utils_features import get_component_fractions
-from conductivity.projected_analytical_conductivity import (
-    compute_projected_analytical_conductivity_from_recipe,
-)
+from conductivity import projected_analytical_conductivity
 from data.electrolyte_property_db import DATA
-from species_fns import ADDITIVES, SALTS, SOLVENTS, get_species_property
-from utils.strict_validation import require_key, strict_mapping
+from utils.strict_validation import require_key, strict_mapping, strict_positive_float
+
+PROPERTY_DB_WORST_ROW_COUNT = 5  # Report the five largest residual rows.
 
 
-def main() -> None:
-    row_results = tuple(
-        _evaluate_property_db_row(row_index, row_mapping)
-        for row_index, row_mapping in enumerate(DATA)
-        if "conductivity_mS_cm" in strict_mapping(
-            require_key(row_mapping, "properties", f"DATA[{row_index}]"),
-            f"DATA[{row_index}].properties",
-        )
-    )
-    successful_results = tuple(
-        row_result
-        for row_result in row_results
-        if row_result["predicted_mS_cm"] is not None
-    )
-    failed_results = tuple(
-        row_result
-        for row_result in row_results
-        if row_result["predicted_mS_cm"] is None
-    )
-    print("projected_analytical_property_db_validation")
-    print("model=conductivity.projected_analytical_conductivity")
-    print(f"source_labeled_rows={len(row_results)}")
-    print(
-        "formulation_group_count="
-        f"{len({str(row_result['recipe_key']) for row_result in row_results})}"
-    )
-    print(f"evaluated_rows={len(successful_results)}")
-    print(f"failed_rows={len(failed_results)}")
-    if successful_results:
-        _print_metrics(successful_results, len(successful_results))
-    if failed_results:
-        print("failed_rows")
-        for row_result in failed_results:
-            print(
-                f"row_id={row_result['row_id']} "
-                f"failure={row_result['failure']}"
-            )
-
-
-def _evaluate_property_db_row(row_index: int, row_mapping):
-    row = strict_mapping(row_mapping, f"DATA[{row_index}]")
-    recipe = strict_mapping(
-        require_key(row, "recipe", f"DATA[{row_index}]"),
-        f"DATA[{row_index}].recipe",
-    )
+def _evaluate_property_db_row(row_index: int, row):
+    row_mapping = strict_mapping(row, f"DATA[{row_index}]")
     properties = strict_mapping(
-        require_key(row, "properties", f"DATA[{row_index}]"),
+        require_key(row_mapping, "properties", f"DATA[{row_index}]"),
         f"DATA[{row_index}].properties",
     )
-    empirical_mS_cm = float(
-        require_key(
-            properties,
-            "conductivity_mS_cm",
-            f"DATA[{row_index}].properties",
-        )
+    empirical_conductivity_mS_cm = strict_positive_float(
+        require_key(properties, "conductivity_mS_cm", f"DATA[{row_index}].properties"),
+        f"DATA[{row_index}].properties.conductivity_mS_cm",
     )
     try:
-        canonical_recipe = _canonical_projected_recipe_from_property_db_row(
-            recipe,
-            properties,
-        )
-        projected_result = compute_projected_analytical_conductivity_from_recipe(
-            canonical_recipe
-        )
+        projected_result = _evaluate_projected_property_payload(row_index, row_mapping)
     except Exception as exc:
         return {
             "row_id": row_index,
-            "recipe_key": json.dumps(recipe, sort_keys=True, separators=(",", ":")),
-            "empirical_mS_cm": empirical_mS_cm,
+            "empirical_mS_cm": empirical_conductivity_mS_cm,
             "predicted_mS_cm": None,
             "residual_mS_cm": None,
             "failure": str(exc),
         }
-    predicted_mS_cm = float(projected_result["sigma_mS_cm"])
+
+    predicted_conductivity_mS_cm = float(projected_result.sigma_mS_cm)
     return {
         "row_id": row_index,
-        "recipe_key": json.dumps(canonical_recipe, sort_keys=True, separators=(",", ":")),
-        "empirical_mS_cm": empirical_mS_cm,
-        "predicted_mS_cm": predicted_mS_cm,
-        "residual_mS_cm": predicted_mS_cm - empirical_mS_cm,
+        "empirical_mS_cm": empirical_conductivity_mS_cm,
+        "predicted_mS_cm": predicted_conductivity_mS_cm,
+        "residual_mS_cm": predicted_conductivity_mS_cm
+        - empirical_conductivity_mS_cm,
         "failure": None,
     }
 
 
-def _canonical_projected_recipe_from_property_db_row(recipe, properties):
-    raw_recipe = strict_mapping(recipe, "property_db.recipe")
-    raw_properties = strict_mapping(properties, "property_db.properties")
-    raw_solvents = strict_mapping(
-        require_key(raw_recipe, "solvents", "property_db.recipe"),
-        "property_db.recipe.solvents",
+def _evaluate_projected_property_payload(row_index: int, row):
+    properties = strict_mapping(
+        require_key(row, "properties", f"DATA[{row_index}]"),
+        f"DATA[{row_index}].properties",
     )
-    raw_salts = strict_mapping(
-        require_key(raw_recipe, "salts", "property_db.recipe"),
-        "property_db.recipe.salts",
-    )
-    raw_additives = strict_mapping(
-        require_key(raw_recipe, "additives", "property_db.recipe"),
-        "property_db.recipe.additives",
-    )
-    solvent_fractions: dict[str, float] = {}
-    salt_molarities: dict[str, float] = {}
-    additive_fractions: dict[str, float] = {}
-    for species_name, raw_fraction in raw_solvents.items():
-        fraction = float(raw_fraction)
-        if species_name in SOLVENTS:
-            solvent_fractions[str(species_name)] = fraction
-        elif species_name in ADDITIVES:
-            additive_fractions[str(species_name)] = (
-                additive_fractions[str(species_name)] + fraction
-                if str(species_name) in additive_fractions
-                else fraction
-            )
-        else:
-            raise ValueError(f"property DB solvent species {species_name} is not registered")
-    for species_name, raw_molarity in raw_salts.items():
-        molarity = float(raw_molarity)
-        if species_name in SALTS:
-            salt_molarities[str(species_name)] = molarity
-        elif species_name in ADDITIVES and _species_is_projected_ionic_source(
-            str(species_name)
-        ):
-            density_g_ml = _property_db_density_g_ml(raw_properties, raw_recipe)
-            additive_fraction = _molarity_to_weight_fraction(
-                str(species_name),
-                molarity,
-                density_g_ml,
-            )
-            additive_fractions[str(species_name)] = (
-                additive_fractions[str(species_name)] + additive_fraction
-                if str(species_name) in additive_fractions
-                else additive_fraction
-            )
-        else:
-            raise ValueError(f"property DB salt species {species_name} is not registered")
-    for species_name, raw_fraction in raw_additives.items():
-        fraction = float(raw_fraction)
-        if species_name in ADDITIVES:
-            additive_fractions[str(species_name)] = (
-                additive_fractions[str(species_name)] + fraction
-                if str(species_name) in additive_fractions
-                else fraction
-            )
-        else:
-            raise ValueError(
-                f"property DB additive species {species_name} is not registered"
-            )
-    solvent_total = float(sum(solvent_fractions.values()))
-    if solvent_total <= 0.0:
-        raise ValueError("property DB recipe has no positive solvent fraction")
-    normalized_solvents = {
-        species_name: fraction / solvent_total
-        for species_name, fraction in solvent_fractions.items()
-    }
-    return {
-        "solvents": normalized_solvents,
-        "salts": salt_molarities,
-        "additives": additive_fractions,
-    }
-
-
-def _property_db_density_g_ml(properties, recipe) -> float:
-    if "density" in properties:
-        return float(properties["density"])
-    component_fractions = get_component_fractions(dict(recipe))
-    if not component_fractions:
-        raise ValueError("property DB recipe has no liquid components for density")
-    inverse_density = 0.0
-    for species_name, fraction in component_fractions.items():
-        if _species_is_projected_ionic_source(str(species_name)):
-            continue
-        density = get_species_property(str(species_name), "density_g_ml")
-        if density is None:
-            raise ValueError(f"species {species_name} missing density_g_ml")
-        inverse_density += float(fraction) / float(density)
-    if inverse_density <= 0.0:
-        raise ValueError("property DB density estimate denominator is non-positive")
-    return 1.0 / inverse_density
-
-
-def _molarity_to_weight_fraction(
-    species_name: str,
-    molarity_mol_l: float,
-    density_g_ml: float,
-) -> float:
-    molecular_weight_g_mol = get_species_property(species_name, "molecular_weight")
-    if molecular_weight_g_mol is None:
-        raise ValueError(f"species {species_name} missing molecular_weight")
-    return float(molarity_mol_l) * float(molecular_weight_g_mol) / (
-        float(density_g_ml) * 1000.0
-    )
-
-
-def _species_is_projected_ionic_source(species_name: str) -> bool:
-    configured_value = get_species_property(species_name, "provides_ionic_conductivity")
-    if configured_value is not None:
-        if not isinstance(configured_value, bool):
-            raise ValueError(
-                f"{species_name}.provides_ionic_conductivity must be boolean"
-            )
-        return configured_value
-    return (
-        get_species_property(species_name, "Lambda_0") is not None
-        and get_species_property(species_name, "anion_charge") is not None
-    )
-
-
-def _print_metrics(successful_results: tuple[dict, ...], worst_row_count: int) -> None:
-    empirical = np.asarray(
-        [float(row_result["empirical_mS_cm"]) for row_result in successful_results],
-        dtype=float,
-    )
-    predicted = np.asarray(
-        [float(row_result["predicted_mS_cm"]) for row_result in successful_results],
-        dtype=float,
-    )
-    residual = predicted - empirical
-    if len(empirical) > 1 and np.std(empirical) > 0.0 and np.std(predicted) > 0.0:
-        pearson_r = float(np.corrcoef(empirical, predicted)[0, 1])
-    else:
-        pearson_r = 0.0
-    print(f"mae_mS_cm={float(np.mean(np.abs(residual))):.9g}")
-    print(f"rmse_mS_cm={float(np.sqrt(np.mean(residual * residual))):.9g}")
-    print(f"bias_mS_cm={float(np.mean(residual)):.9g}")
-    print(f"pearson_r={pearson_r:.9g}")
-    print(f"maximum_abs_residual_mS_cm={float(np.max(np.abs(residual))):.9g}")
-    print("worst_rows")
-    for residual_index in np.argsort(-np.abs(residual))[:worst_row_count]:
-        row_result = successful_results[int(residual_index)]
-        print(
-            f"row_id={row_result['row_id']} "
-            f"empirical_mS_cm={float(row_result['empirical_mS_cm']):.9g} "
-            f"predicted_mS_cm={float(row_result['predicted_mS_cm']):.9g} "
-            f"residual_mS_cm={float(row_result['residual_mS_cm']):.9g}"
+    if "projected_primitives" in properties:
+        primitive_inputs = strict_mapping(
+            properties["projected_primitives"],
+            f"DATA[{row_index}].properties.projected_primitives",
         )
+        return projected_analytical_conductivity.compute_projected_analytical_conductivity_from_primitives(
+            require_key(
+                primitive_inputs,
+                "state_concentrations_mol_m3",
+                f"DATA[{row_index}].properties.projected_primitives",
+            ),
+            require_key(
+                primitive_inputs,
+                "symmetric_capacity_fluxes_K_ij_mol_m3_s",
+                f"DATA[{row_index}].properties.projected_primitives",
+            ),
+            require_key(
+                primitive_inputs,
+                "transition_first_moments_d_ij_m",
+                f"DATA[{row_index}].properties.projected_primitives",
+            ),
+            require_key(
+                primitive_inputs,
+                "transition_second_moments_M_ij_m2",
+                f"DATA[{row_index}].properties.projected_primitives",
+            ),
+            require_key(
+                primitive_inputs,
+                "self_current_tensors_D_self_i_m2_s",
+                f"DATA[{row_index}].properties.projected_primitives",
+            ),
+            require_key(
+                primitive_inputs,
+                "mori_memory_matrix_A",
+                f"DATA[{row_index}].properties.projected_primitives",
+            ),
+            require_key(
+                primitive_inputs,
+                "mori_current_coupling_matrix_h",
+                f"DATA[{row_index}].properties.projected_primitives",
+            ),
+            require_key(
+                primitive_inputs,
+                "temperature_K",
+                f"DATA[{row_index}].properties.projected_primitives",
+            ),
+            require_key(
+                primitive_inputs,
+                "volume_m3",
+                f"DATA[{row_index}].properties.projected_primitives",
+            ),
+        )
+    if "projected_generator_inputs" in properties:
+        generator_inputs = strict_mapping(
+            properties["projected_generator_inputs"],
+            f"DATA[{row_index}].properties.projected_generator_inputs",
+        )
+        context = f"DATA[{row_index}].properties.projected_generator_inputs"
+        return projected_analytical_conductivity.compute_projected_analytical_conductivity(
+            require_key(generator_inputs, "potential_energy_J_mol", context),
+            require_key(generator_inputs, "mobility_tensor_m2_s", context),
+            require_key(generator_inputs, "charge_polarization_gradient", context),
+            require_key(generator_inputs, "memory_coordinate_gradient", context),
+            require_key(generator_inputs, "basin_quadrature_points", context),
+            require_key(generator_inputs, "basin_quadrature_weights", context),
+            require_key(generator_inputs, "transition_pair_indices", context),
+            require_key(generator_inputs, "transition_quadrature_points", context),
+            require_key(generator_inputs, "transition_quadrature_weights", context),
+            require_key(generator_inputs, "transition_committor_gradients", context),
+            require_key(generator_inputs, "transition_surface_state_indices", context),
+            require_key(generator_inputs, "transition_path_displacements_m", context),
+            require_key(generator_inputs, "transition_path_weights", context),
+            require_key(
+                generator_inputs,
+                "total_component_concentrations_mol_m3",
+                context,
+            ),
+            require_key(generator_inputs, "basin_stoichiometry", context),
+            require_key(generator_inputs, "temperature_K", context),
+            require_key(generator_inputs, "volume_m3", context),
+            require_key(generator_inputs, "self_current_coordinate_projectors", context),
+        )
+    raise ValueError(
+        f"DATA[{row_index}] is missing projected_primitives or "
+        "projected_generator_inputs; recipe-only conductivity validation requires a "
+        "populated full ConductivityPhysicalLibrary"
+    )
+
+
+def _labeled_rows() -> list[tuple[int, dict]]:
+    labeled_rows = []
+    for row_index, row in enumerate(DATA):
+        row_mapping = strict_mapping(row, f"DATA[{row_index}]")
+        properties = strict_mapping(
+            require_key(row_mapping, "properties", f"DATA[{row_index}]"),
+            f"DATA[{row_index}].properties",
+        )
+        if "conductivity_mS_cm" in properties:
+            labeled_rows.append((row_index, row_mapping))
+    return labeled_rows
+
+
+def _formulation_key(row) -> tuple:
+    recipe = strict_mapping(require_key(row, "recipe", "row"), "row.recipe")
+    return tuple(
+        (
+            phase_name,
+            tuple(
+                sorted(
+                    strict_mapping(phase_mapping, f"row.recipe.{phase_name}").items()
+                )
+            ),
+        )
+        for phase_name, phase_mapping in sorted(recipe.items())
+    )
+
+
+def _print_successful_predictions(successful_results: list[dict]) -> None:
+    print("projected_analytical_property_db_predictions")
+    for result in successful_results:
+        print(
+            "row_id={row_id} empirical_mS_cm={empirical:.9g} "
+            "predicted_mS_cm={predicted:.9g} residual_mS_cm={residual:.9g}".format(
+                row_id=result["row_id"],
+                empirical=result["empirical_mS_cm"],
+                predicted=result["predicted_mS_cm"],
+                residual=result["residual_mS_cm"],
+            )
+        )
+
+
+def _print_metrics(row_results: list[dict], labeled_rows: list[tuple[int, dict]]) -> None:
+    successful_results = [row for row in row_results if row["failure"] is None]
+    failed_results = [row for row in row_results if row["failure"] is not None]
+    formulation_keys = {_formulation_key(row) for _, row in labeled_rows}
+    print(f"source_labeled_rows={len(labeled_rows)}")
+    print(f"formulation_group_count={len(formulation_keys)}")
+    print(f"evaluated_rows={len(successful_results)}")
+    print(f"failed_rows={len(failed_results)}")
+    if successful_results:
+        _print_successful_predictions(successful_results)
+        empirical = np.asarray(
+            [row["empirical_mS_cm"] for row in successful_results],
+            dtype=float,
+        )
+        predicted = np.asarray(
+            [row["predicted_mS_cm"] for row in successful_results],
+            dtype=float,
+        )
+        residual = predicted - empirical
+        print(f"mae_mS_cm={float(np.mean(np.abs(residual))):.9g}")
+        print(f"rmse_mS_cm={float(np.sqrt(np.mean(residual**2))):.9g}")
+        print(f"bias_mS_cm={float(np.mean(residual)):.9g}")
+        if len(successful_results) > 1:
+            pearson = float(np.corrcoef(empirical, predicted)[0, 1])
+            print(f"pearson_r={pearson:.9g}")
+        print(f"maximum_abs_residual_mS_cm={float(np.max(np.abs(residual))):.9g}")
+        print("worst_rows")
+        worst_indices = np.argsort(np.abs(residual))[::-1][
+            :PROPERTY_DB_WORST_ROW_COUNT
+        ]
+        for result_index in worst_indices:
+            row = successful_results[int(result_index)]
+            print(
+                "row_id={row_id} empirical_mS_cm={empirical:.9g} "
+                "predicted_mS_cm={predicted:.9g} residual_mS_cm={residual:.9g}".format(
+                    row_id=row["row_id"],
+                    empirical=row["empirical_mS_cm"],
+                    predicted=row["predicted_mS_cm"],
+                    residual=row["residual_mS_cm"],
+                )
+            )
+    if failed_results:
+        print("failed_row_details")
+        for row in failed_results:
+            print(f"row_id={row['row_id']} failure={row['failure']}")
+
+
+def validate_projected_analytical_property_db() -> list[dict]:
+    labeled_rows = _labeled_rows()
+    row_results = [
+        _evaluate_property_db_row(row_index, row) for row_index, row in labeled_rows
+    ]
+    _print_metrics(row_results, labeled_rows)
+    return row_results
+
+
+def main() -> None:
+    validate_projected_analytical_property_db()
 
 
 if __name__ == "__main__":

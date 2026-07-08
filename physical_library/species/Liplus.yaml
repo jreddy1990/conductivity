@@ -1,0 +1,47 @@
+schema: conductivity_physical_species_record_v1
+name: Li+
+role: cation
+source:
+  smiles: '[Li+]'
+  force_field: openff-2.2.0.offxml
+  partial_charge_method: formal_charge
+  metadata_source: data.species_data.SALTS[LiPF6]
+formal_charge_e: 1.0
+molecular_weight_kg_mol: 0.006941200000000001
+density_kg_m3: 6268.364892575225
+partial_molar_volume_m3_mol: 1.1073382164177676e-06
+sites:
+- site_id: 0
+  element: Li
+  atomic_number: 3
+  mass_kg: 1.152613376908392e-26
+  steric_radius_m: 9.131711860938478e-11
+  hydrodynamic_radius_m: 9.131711860938478e-11
+  volume_m3: 3.189665989383466e-30
+  lj_sigma_m: 1.8263423721876955e-10
+  lj_epsilon_J: 1.9446321676479713e-22
+  charge_number: 1.0
+  charge_cloud_radius_m: 9.131711860938478e-11
+  born_radius_m: 9.131711860938478e-11
+  polarizability_SI: 0.0
+  donor_flag: 0
+  acceptor_flag: 0
+  hba_count_contribution: 0
+  hbd_count_contribution: 0
+  parameter_ids:
+    vdw: n27
+    vdw_smirks: '[#3+1:1]'
+  derived_radius_source: one_half_openff_sage_lj_sigma
+bonds: []
+angles: []
+torsions: []
+constraints: []
+reference_conformer_coordinates_m:
+- - 0.0
+  - 0.0
+  - 0.0
+coordinate_map:
+  type: site_cartesian_coordinates
+  dimension: 3
+  unwrapping: molecule-contiguous periodic image tracking
+dielectric_constant: 5.5

@@ -1,0 +1,2042 @@
+Below are **only sections (2)–(11)**, written as constructive model definitions and numerical algorithms. No contracts, ledgers, certificates, or validation policy. This fills in the missing composition-to-generator part: species library → state basis → mobility/covariance → transitions → committor/Doob path moments → atmosphere/high-concentration/additive physics. It uses the same primitive heads already required by the conductivity-effect checklist: (c_i), (K_{ij}/Q_{ij}), (d_{ij}/M_{ij}), (D_i/R_i), and (A,h). 
+
+---
+
+```latex
+\section{2. Complete species-library schema}
+
+The electrolyte composition is
+\[
+x=(T,\{C_a\}_{a\in\mathcal C},\{\phi_s\}_{s\in\mathcal S},\mathcal L).
+\]
+
+Here \(T\) is temperature, \(C_a\) are conserved analytical component concentrations,
+\(\phi_s\) are liquid fractions, and \(\mathcal L\) is the physical species library.
+The library is
+\[
+\mathcal L=
+\left(
+\{\mathcal T_s\}_{s},
+\{\mathcal Q_s\}_{s},
+\{\mathcal G_s\}_{s},
+\{\Theta_{st}\}_{s,t},
+\mathcal M,
+\mathcal B,
+\mathcal R,
+\mathcal \Psi
+\right).
+\]
+
+For every species \(s\), the topology record is
+\[
+\mathcal T_s
+=
+(\mathcal I_s,\mathcal E_s^{\rm bond},\mathcal E_s^{\rm angle},
+\mathcal E_s^{\rm torsion},\mathcal C_s^{\rm constraint}),
+\]
+where
+\[
+\mathcal I_s=\{1,\ldots,n_s\}
+\]
+is the site set.
+
+For each site \(u\in\mathcal I_s\), define
+\[
+m_{su}>0,
+\quad
+r_{su}^{\rm atom}>0,
+\quad
+a_{su}^{\rm hyd}>0,
+\quad
+v_{su}>0,
+\quad
+\sigma_{su}>0,
+\quad
+\epsilon_{su}\ge0,
+\quad
+z_{su}\in\mathbb R,
+\quad
+\alpha_{su}\ge0.
+\]
+
+Meanings:
+\[
+m_{su}=\text{mass},
+\]
+\[
+r_{su}^{\rm atom}=\text{steric radius},
+\]
+\[
+a_{su}^{\rm hyd}=\text{hydrodynamic radius},
+\]
+\[
+v_{su}=\text{site volume},
+\]
+\[
+\sigma_{su},\epsilon_{su}=\text{Lennard--Jones parameters},
+\]
+\[
+z_{su}=\text{formal or partial charge number},
+\]
+\[
+\alpha_{su}=\text{polarizability}.
+\]
+
+The molecular charge-site model is
+\[
+\mathcal Q_s=\{(u,z_{su},r_{su}^{\rm charge},a_{su}^{\rm cloud})\}_{u\in\mathcal I_s},
+\]
+where \(a_{su}^{\rm cloud}\) is the finite charge-cloud radius.
+
+The molecular geometry-feature record is
+\[
+\mathcal G_s=
+(
+V_s,\,
+A_s^{\rm SASA},\,
+a_s^{\rm hyd},\,
+a_s^{\rm Born},\,
+a_s^{\rm cloud},\,
+\ell_s^{\rm asym},\,
+n_s^{\rm donor},\,
+n_s^{\rm acceptor},\,
+n_s^{\rm HBA},\,
+n_s^{\rm HBD},\,
+\{g_{s\ell}^{\rm coord}\}_{\ell}
+).
+\]
+
+Here
+\[
+V_s=\text{molecular volume},
+\]
+\[
+A_s^{\rm SASA}=\text{solvent-accessible surface area},
+\]
+\[
+a_s^{\rm hyd}=\text{hydrodynamic radius},
+\]
+\[
+a_s^{\rm Born}=\text{Born cavity radius},
+\]
+\[
+a_s^{\rm cloud}=\text{charge-cloud radius},
+\]
+\[
+\ell_s^{\rm asym}=\text{ligand-field/shape asymmetry},
+\]
+\[
+n_s^{\rm donor},n_s^{\rm acceptor},n_s^{\rm HBA},n_s^{\rm HBD}
+=\text{coordination and H-bond descriptors},
+\]
+\[
+g_{s\ell}^{\rm coord}
+=\text{site-specific coordination free energy for ligand class }\ell.
+\]
+
+For every species pair \((s,t)\), define the interaction record
+\[
+\Theta_{st}
+=
+(
+\Theta_{st}^{\rm LJ},
+\Theta_{st}^{\rm Coul},
+\Theta_{st}^{\rm Born},
+\Theta_{st}^{\rm coord},
+\Theta_{st}^{\rm PMF},
+\Theta_{st}^{\rm mobility}
+).
+\]
+
+Short-range mixing:
+\[
+\sigma_{uv}^{st}
+=
+\frac{\sigma_{su}+\sigma_{tv}}{2},
+\qquad
+\epsilon_{uv}^{st}
+=
+\sqrt{\epsilon_{su}\epsilon_{tv}}.
+\]
+
+Coulomb convention:
+\[
+U_{\rm Coul}
+=
+N_A
+\frac{1}{4\pi\epsilon_0\epsilon_\infty}
+\left(
+U_{\rm real}+U_{\rm reciprocal}+U_{\rm self}+U_{\rm surface}
+\right),
+\]
+with Ewald parameter \(\alpha_{\rm Ewald}\), real-space cutoff \(r_{\rm real}\),
+reciprocal cutoff \(k_{\max}\), and boundary convention fixed by \(\Theta_{st}^{\rm Coul}\).
+
+Born/desolvation term for bringing charge site \(u\) into environment \(e\):
+\[
+\Delta G_{su}^{\rm Born}(e)
+=
+-\frac{N_A e^2 z_{su}^2}{8\pi\epsilon_0 a_{su}^{\rm Born}}
+\left(
+1-\frac{1}{\epsilon_e}
+\right).
+\]
+
+Pair desolvation penalty:
+\[
+\Delta G_{st}^{\rm desolv}
+=
+\sum_{u\in s}\sum_{v\in t}
+\omega_{uv}^{\rm contact}
+\left[
+\Delta G_{su}^{\rm Born}(e_{\rm paired})
++
+\Delta G_{tv}^{\rm Born}(e_{\rm paired})
+-
+\Delta G_{su}^{\rm Born}(e_{\rm bulk})
+-
+\Delta G_{tv}^{\rm Born}(e_{\rm bulk})
+\right].
+\]
+
+Coordination energy:
+\[
+U_{\rm coord}(q)
+=
+N_A
+\sum_{a,L}
+\Delta g_{aL}^{\rm coord}\,
+n_{aL}(q),
+\]
+where
+\[
+n_{aL}(q)=\sum_{b\in L}s_{aL}(r_{ab}),
+\]
+\[
+s_{aL}(r)=\frac{1}{1+(r/r_{aL}^{0})^{p_{aL}}}.
+\]
+
+The mobility library \(\mathcal M\) defines a resistance contribution for each physical source:
+\[
+R_x(q)
+=
+R_{\rm Stokes}
++
+R_{\rm hydro}
++
+R_{\rm shape}
++
+R_{\rm free\ volume}
++
+R_{\rm charge\ cloud}
++
+R_{\rm atmosphere}
++
+R_{\rm cage}
++
+R_{\rm constraint}.
+\]
+
+The diffusion tensor is
+\[
+D_x(q)=k_BT\,R_x(q)^\#.
+\]
+
+The basin library \(\mathcal B\) defines coordinate functions and thresholds for
+free, SSIP, additive-separated SSIP, CIP, aggregate, ligand-shell, bridge,
+orientation, cage, atmosphere, and local-environment basins.
+
+The transition library \(\mathcal R\) defines allowed transition coordinates
+\[
+\xi_{ij}(q),
+\]
+transition domains
+\[
+\Omega_{ij},
+\]
+transition boundaries
+\[
+\partial A_i,\partial A_j,
+\]
+and committor boundary conditions.
+
+The memory library \(\mathcal \Psi\) defines continuous slow variables
+\[
+\psi_\alpha(q)
+\]
+for atmosphere, cage, partner residence, ligand residence, anion orientation,
+charge density, and local free-volume/stress relaxation.
+```
+
+---
+
+```latex
+\section{3. Deterministic basis-generation algorithm}
+
+Define a feature map
+\[
+\mathcal F(q)=
+\left(
+f_{\rm pair}(q),
+f_{\rm LiShell}(q),
+f_{\rm ligand}(q),
+f_{\rm anion}(q),
+f_{\rm orient}(q),
+f_{\rm cluster}(q),
+f_{\rm env}(q),
+f_{\rm atm}(q)
+\right).
+\]
+
+Each component is computed from physical coordinates, not species names.
+
+\subsection{Pair basin}
+
+For Li center \(\ell\) and anion center \(a\),
+\[
+r_{\ell a}(q)=|r_\ell-r_a|.
+\]
+
+Define thresholds
+\[
+r_{\rm CIP}<r_{\rm SSIP}<r_{\rm free}.
+\]
+
+Then
+\[
+f_{\rm pair}(q)=
+\begin{cases}
+{\rm CIP}, & r_{\ell a}<r_{\rm CIP},\\
+{\rm SSIP}, & r_{\rm CIP}\le r_{\ell a}<r_{\rm SSIP},\\
+{\rm free}, & r_{\ell a}\ge r_{\rm free},\\
+{\rm additive\_separated\_SSIP}, &
+r_{\rm CIP}\le r_{\ell a}<r_{\rm SSIP}
+\text{ and } n_{\ell L}\ge n_L^{\rm cut}.
+\end{cases}
+\]
+
+\subsection{Li solvation shell}
+
+For ligand class \(L\),
+\[
+n_{\ell L}(q)=\sum_{b\in L}s_{\ell L}(r_{\ell b}).
+\]
+
+Let
+\[
+n_{\ell{\rm solv}}=\sum_{L\in{\rm solvent}}n_{\ell L},
+\qquad
+n_{\ell{\rm add}}=\sum_{L\in{\rm neutral\ additive}}n_{\ell L},
+\qquad
+n_{\ell{\rm anion}}=\sum_{a\in{\rm anion}}s_{\ell a}(r_{\ell a}).
+\]
+
+Then
+\[
+f_{\rm LiShell}(q)=
+\begin{cases}
+{\rm solvent\_only}, & n_{\ell{\rm add}}<n_{\rm add}^{\rm cut}
+\text{ and }n_{\ell{\rm anion}}<n_{\rm anion}^{\rm cut},\\
+{\rm neutral\_ligand\_bound}, & n_{\ell{\rm add}}\ge n_{\rm add}^{\rm cut},\\
+{\rm anion\_coordinated}, & n_{\ell{\rm anion}}\ge n_{\rm anion}^{\rm cut},\\
+{\rm overcrowded}, & n_{\ell{\rm solv}}+n_{\ell{\rm add}}+n_{\ell{\rm anion}}
+>n_{\rm shell}^{\max}.
+\end{cases}
+\]
+
+\subsection{Neutral ligand state}
+
+Let \(L\) be a neutral coordinating molecule class. Then
+\[
+f_{\rm ligand}(q)=
+\begin{cases}
+{\rm none}, & n_{\ell L}<n_L^{\rm cut},\\
+{\rm monodentate\_bound}, & n_{\ell L}\ge n_L^{\rm cut}
+\text{ and }m_L^{\rm dent}=1,\\
+{\rm multidentate\_bound}, & n_{\ell L}\ge n_L^{\rm cut}
+\text{ and }m_L^{\rm dent}>1,\\
+{\rm ligand\_bridge}, &
+n_{\ell_1 L}\ge n_L^{\rm cut}
+\text{ and }n_{\ell_2 L}\ge n_L^{\rm cut}.
+\end{cases}
+\]
+
+\subsection{Anion feature bin}
+
+For anion \(a\), define descriptors
+\[
+a_a^{\rm hyd},\quad a_a^{\rm cloud},\quad \ell_a^{\rm asym},\quad m_a^{\rm dent}.
+\]
+
+Then
+\[
+f_{\rm anion}(a)=
+\left(
+b_{\rm hyd}(a_a^{\rm hyd}),
+b_{\rm cloud}(a_a^{\rm cloud}),
+b_{\rm asym}(\ell_a^{\rm asym}),
+b_{\rm dent}(m_a^{\rm dent})
+\right).
+\]
+
+Example binning:
+\[
+b_{\rm hyd}(a)=
+\begin{cases}
+{\rm compact}, & a<a_{\rm hyd}^{(1)},\\
+{\rm medium}, & a_{\rm hyd}^{(1)}\le a<a_{\rm hyd}^{(2)},\\
+{\rm bulky}, & a\ge a_{\rm hyd}^{(2)}.
+\end{cases}
+\]
+
+\[
+b_{\rm cloud}(a)=
+\begin{cases}
+{\rm localized}, & a<a_{\rm cloud}^{(1)},\\
+{\rm delocalized}, & a\ge a_{\rm cloud}^{(1)}.
+\end{cases}
+\]
+
+\[
+b_{\rm dent}(m)=
+\begin{cases}
+{\rm monodentate}, & m=1,\\
+{\rm multidentate}, & m>1.
+\end{cases}
+\]
+
+\subsection{Anion orientation}
+
+Let \(u_a(q)\) be the principal axis of the anion and
+\[
+\hat r_{\ell a}=\frac{r_a-r_\ell}{|r_a-r_\ell|}.
+\]
+Define
+\[
+\omega_a(q)=u_a(q)\cdot \hat r_{\ell a}.
+\]
+
+Then
+\[
+f_{\rm orient}(q)=
+\begin{cases}
+{\rm radial}, & \omega_a>\omega_+,\\
+{\rm tangential}, & |\omega_a|\le\omega_0,\\
+{\rm bridging}, & \omega_a<-\omega_-,\\
+{\rm free\_rotating}, & \tau_{\rm orient}<\tau_{\rm orient}^{\rm cut}.
+\end{cases}
+\]
+
+\subsection{Cluster state}
+
+Construct a graph
+\[
+G(q)=(V,E(q)),
+\]
+where vertices are charged centers and
+\[
+(a,b)\in E(q)
+\iff
+r_{ab}<r_{\rm pair}^{\rm cut}.
+\]
+
+Connected components define clusters. For cluster \(C\):
+\[
+N_{\rm Li}(C)=\sum_{v\in C}\mathbf 1_{\{v={\rm Li}\}},
+\]
+\[
+N_A(C)=\sum_{v\in C}\mathbf 1_{\{v={\rm anion}\}},
+\]
+\[
+z_C=\sum_{v\in C}z_v.
+\]
+
+Then
+\[
+f_{\rm cluster}(C)=
+\left(N_{\rm Li}(C),N_A(C),z_C,\tau_C,\text{topology}(C)\right).
+\]
+
+Cluster labels include
+\[
+{\rm Li^+},\quad
+{\rm A^-},\quad
+{\rm LiA},\quad
+{\rm Li_2A^+},\quad
+{\rm LiA_2^-},\quad
+{\rm Li_2A_2},\quad
+{\rm higher\_cluster},\quad
+{\rm bridge\_network}.
+\]
+
+\subsection{Local environment}
+
+Define local packing
+\[
+\varphi(q)=\sum_b v_b W(|r_b-r_0|),
+\]
+local ionic strength
+\[
+I(q)=\frac12\sum_i z_i^2 c_i^{\rm loc}(q),
+\]
+local dielectric
+\[
+\epsilon_{\rm loc}(q)=\sum_s \phi_s^{\rm loc}(q)\epsilon_s,
+\]
+and local viscosity
+\[
+\eta_{\rm loc}(q)=\eta_{\rm bulk}\,
+f_{\rm salt}(I(q))f_{\rm free\ volume}(\varphi(q))f_{\rm additive}(q).
+\]
+
+Then
+\[
+f_{\rm env}(q)=
+\left(
+b_\varphi(\varphi),
+b_I(I),
+b_\epsilon(\epsilon_{\rm loc}),
+b_\eta(\eta_{\rm loc})
+\right).
+\]
+
+\subsection{Joint sparse state}
+
+The full projected state key is
+\[
+\alpha(q)=
+\left[
+f_{\rm pair},
+f_{\rm LiShell},
+f_{\rm ligand},
+f_{\rm anion},
+f_{\rm orient},
+f_{\rm cluster},
+f_{\rm env},
+f_{\rm atm}
+\right].
+\]
+
+The basin is
+\[
+A_\alpha=\{q:\alpha(q)=\alpha\}.
+\]
+
+Instantiate \(A_\alpha\) only if
+\[
+Z_\alpha=
+\int_{A_\alpha}e^{-U(q)/(RT)}\,dq>Z_{\min}
+\]
+and the stoichiometry is feasible:
+\[
+\nu_{\alpha,a}\le N_a
+\qquad
+\forall a.
+\]
+
+Thus the basis is sparse:
+\[
+\mathcal A=\{A_\alpha:Z_\alpha>Z_{\min}\}.
+\]
+```
+
+This directly instantiates the states the checklist says are missing: SSIP/CIP/aggregate populations, ligand-conditioned Li solvation shells, additive-bound Li states, anion coordination/orientation states, and high-viscosity/low-dielectric regimes. The source material explicitly requires shared Li, SSIP/CIP, Li-additive, aggregate motifs, and name-blind site-measure state generation. 
+
+---
+
+```latex
+\section{4. Physical state classification and DC transport projector}
+
+For each basin \(A_\alpha\), define the charged centers
+\[
+\mathcal C_\alpha=\{p=1,\ldots,m_\alpha\}.
+\]
+
+Each center has
+\[
+z_{\alpha p}\in\mathbb R,
+\quad
+r_{\alpha p}\in\mathbb R^3,
+\quad
+a_{\alpha p}^{\rm hyd},
+\quad
+a_{\alpha p}^{\rm cloud},
+\quad
+S_{\alpha p}^{\rm shape}.
+\]
+
+Let
+\[
+z_\alpha=(z_{\alpha1},\ldots,z_{\alpha m_\alpha})^\top.
+\]
+
+Define the coordinate-space projector
+\[
+\Pi_\alpha(q)\in\mathbb R^{d\times d}
+\]
+that selects unbounded DC charge-transport directions.
+
+\subsection{Free ion}
+
+For free ion \(p\),
+\[
+\Pi_\alpha=\Pi_{\rm trans}(p),
+\]
+where \(\Pi_{\rm trans}(p)\) projects onto the three unwrapped translational coordinates of \(p\).
+
+\subsection{Charged cluster COM}
+
+For a charged cluster with net charge
+\[
+z_{\rm net,\alpha}=\sum_p z_{\alpha p}\ne0,
+\]
+the cluster COM coordinate is
+\[
+R_{\rm COM,\alpha}=
+\frac{\sum_p m_{\alpha p}r_{\alpha p}}
+{\sum_p m_{\alpha p}}.
+\]
+
+The COM projector is
+\[
+\Pi_\alpha=\Pi_{\rm COM,\alpha}
+\]
+only if the cluster translation is unbounded.
+
+\subsection{Neutral cluster COM}
+
+If
+\[
+z_{\rm net,\alpha}=0
+\]
+and all charged centers move as a rigid co-moving neutral cluster, then
+\[
+G_P\Pi_{\rm COM,\alpha}=0.
+\]
+Thus the neutral COM contributes no DC self-current.
+
+\subsection{Bound internal polarization}
+
+For a bounded internal coordinate \(\xi_{\rm int}\),
+\[
+\Pi_\alpha\xi_{\rm int}=0.
+\]
+Bound internal polarization contributes to \(A,h\), not \(D_\alpha^{\rm self}\).
+
+\subsection{Associated charge-identity diffusion}
+
+If a bound/associated state permits unbounded charge identity transfer,
+define a charge-identity coordinate \(y_a\). Then
+\[
+\Pi_\alpha=\Pi_{\rm id,a}
+\]
+only along \(y_a\).
+
+The associated identity diffusivity is
+\[
+D_{{\rm id},a}
+=
+\frac{1}{6}
+k_{{\rm switch},a}
+p_{{\rm switch},a}
+\mathbb E[\ell_{{\rm switch},a}^{2}].
+\]
+
+Here
+\[
+k_{{\rm switch},a}
+\]
+is the validated switching rate,
+\[
+p_{{\rm switch},a}
+\]
+is the probability that the charge identity changes partner rather than returning,
+and
+\[
+\ell_{{\rm switch},a}
+\]
+is the unwrapped charge-identity displacement.
+
+If \(k_{\rm switch}\), \(p_{\rm switch}\), or \(\ell_{\rm switch}\) is unavailable,
+\[
+D_{{\rm id},a}=0.
+\]
+
+\subsection{State self-current}
+
+The within-state tensor is
+\[
+D_\alpha^{\rm self}
+=
+\frac{1}{c_\alpha}
+\int_{A_\alpha}
+G_P(q)\Pi_\alpha(q)D_x(q)\Pi_\alpha(q)^\top G_P(q)^\top
+\rho(dq).
+\]
+
+For center covariance representation, define
+\[
+D_\alpha^{\rm centers}\in\mathbb R^{m_\alpha\times m_\alpha}.
+\]
+
+Then
+\[
+D_Q(\alpha)=z_\alpha^\top D_\alpha^{\rm centers}z_\alpha.
+\]
+
+For Li--anion:
+\[
+D_Q
+=
+D_{\rm Li}
++
+D_{\rm A}
+-
+2D_{\rm Li,A}.
+\]
+
+If
+\[
+D_{\rm Li,A}<0,
+\]
+then
+\[
+-2D_{\rm Li,A}>0,
+\]
+so anti-correlated Li--anion motion increases conductivity.
+```
+
+This is the non-negotiable fix for the recurring neutral-pair/SSIP issue: the model must use state-resolved charged-center tensors and not collapse multi-charge motifs to scalar net charge. That requirement appears explicitly in the finite-generator plan and the effect checklist.  
+
+---
+
+```latex
+\section{5. Complete transition-family enumeration}
+
+Every transition is an ordered edge
+\[
+e=(i,j,\kappa)
+\]
+from basin \(A_i\) to basin \(A_j\), with transition family \(\kappa\).
+
+Each edge has
+\[
+K_{ij}^{(\kappa)}=K_{ji}^{(\kappa)}\ge0,
+\]
+\[
+Q_{ij}^{(\kappa)}=\frac{K_{ij}^{(\kappa)}}{c_i},
+\]
+\[
+d_{ji}^{(\kappa)}=-d_{ij}^{(\kappa)},
+\]
+\[
+M_{ji}^{(\kappa)}=M_{ij}^{(\kappa)}.
+\]
+
+The total flux is
+\[
+K_{ij}=\sum_\kappa K_{ij}^{(\kappa)}.
+\]
+
+The total generator is
+\[
+Q_{ij}=\frac{K_{ij}}{c_i}.
+\]
+
+\subsection{Free \(\leftrightarrow\) SSIP}
+
+Reaction coordinate:
+\[
+\xi_{\rm free,SSIP}=r_{\rm LiA}.
+\]
+
+Basins:
+\[
+A_{\rm free}=\{r_{\rm LiA}\ge r_{\rm SSIP}\},
+\]
+\[
+A_{\rm SSIP}=\{r_{\rm CIP}\le r_{\rm LiA}<r_{\rm SSIP}\}.
+\]
+
+Transition moment:
+\[
+\Delta P=P(q_{\rm SSIP})-P(q_{\rm free}).
+\]
+
+If the transition only changes association label without unwrapped charge motion:
+\[
+d=0,\qquad M=0.
+\]
+
+If the transition includes a structural approach/separation hop:
+\[
+d=\mathbb E[\Delta P],
+\qquad
+M=\mathbb E[\Delta P\Delta P^\top].
+\]
+
+\subsection{SSIP \(\leftrightarrow\) CIP}
+
+Reaction coordinate:
+\[
+\xi_{\rm SSIP,CIP}=r_{\rm LiA}.
+\]
+
+Basins:
+\[
+A_{\rm CIP}=\{r_{\rm LiA}<r_{\rm CIP}\}.
+\]
+
+Pure conversion:
+\[
+d=0,\qquad M=0.
+\]
+
+Charge-carrying structural conversion:
+\[
+d,M
+\]
+must be computed from transition-path \(\Delta P\) samples.
+
+\subsection{Free/SSIP/CIP \(\leftrightarrow\) aggregate}
+
+Cluster graph transition:
+\[
+G(q)\to G'(q)
+\]
+with changed connected component size.
+
+Coordinates:
+\[
+\xi_{\rm agg}=
+\left(
+r_{\rm LiA_1},\ldots,r_{\rm LiA_k},
+N_{\rm cluster},
+z_{\rm cluster}
+\right).
+\]
+
+Edges:
+\[
+{\rm free}\leftrightarrow{\rm Li_2A^+},
+\quad
+{\rm free}\leftrightarrow{\rm LiA_2^-},
+\quad
+{\rm SSIP}\leftrightarrow{\rm Li_2A_2},
+\quad
+{\rm CIP}\leftrightarrow{\rm bridge}.
+\]
+
+Pure cluster relabeling:
+\[
+d=0,\quad M=0.
+\]
+
+Cluster-mediated charge transfer:
+\[
+d,M
+\]
+from physical charge-displacement samples only.
+
+\subsection{Li \(\leftrightarrow\) Li--ligand}
+
+Reaction coordinate:
+\[
+\xi_{\rm Li,L}=n_{\rm LiL}.
+\]
+
+Basins:
+\[
+A_{\rm Li}=\{n_{\rm LiL}<n_L^{\rm cut}\},
+\]
+\[
+A_{\rm LiL}=\{n_{\rm LiL}\ge n_L^{\rm cut}\}.
+\]
+
+Pure ligand binding:
+\[
+d=0,\quad M=0.
+\]
+
+If ligand exchange produces unbounded Li shell hopping:
+\[
+d,M
+\]
+from \(\Delta P\) samples.
+
+\subsection{Li--anion \(\leftrightarrow\) Li--ligand--anion}
+
+Reaction coordinate:
+\[
+\xi_{\rm ternary}=(r_{\rm LiA},n_{\rm LiL}).
+\]
+
+Basins:
+\[
+A_{\rm LiA}
+=
+\{r_{\rm LiA}<r_{\rm SSIP},\,n_{\rm LiL}<n_L^{\rm cut}\},
+\]
+\[
+A_{\rm LiL\cdots A}
+=
+\{r_{\rm CIP}\le r_{\rm LiA}<r_{\rm SSIP},\,n_{\rm LiL}\ge n_L^{\rm cut}\}.
+\]
+
+This transition changes:
+\[
+c_i,\quad K_{ij},\quad D_{\rm Li,A|i},\quad A,h.
+\]
+
+\subsection{Ordinary SSIP \(\leftrightarrow\) additive-separated SSIP}
+
+Reaction coordinate:
+\[
+\xi_{\rm addSSIP}=(r_{\rm LiA},n_{\rm LiL},\chi_L),
+\]
+where \(\chi_L\) identifies ligand insertion between Li and anion.
+
+Pure insertion:
+\[
+d=0,\quad M=0.
+\]
+
+If insertion triggers partner switch:
+\[
+d,M
+\]
+from \(\Delta P\).
+
+\subsection{Partner switch}
+
+Old partner \(a\), new partner \(b\):
+\[
+{\rm Li}\cdots a \to {\rm Li}\cdots b.
+\]
+
+Reaction coordinate:
+\[
+\xi_{\rm switch}=r_{\rm Li,a}-r_{\rm Li,b}.
+\]
+
+Charge displacement:
+\[
+\Delta P=P(q_{\rm after})-P(q_{\rm before}).
+\]
+
+This edge always requires:
+\[
+K>0,\quad d\ne0\text{ or }M\ne0
+\]
+only if the transition changes unwrapped charge identity.
+
+\subsection{Identity diffusion}
+
+For charge identity coordinate \(y\):
+\[
+y\to y+\ell.
+\]
+
+Moments:
+\[
+d=\mathbb E[\ell],
+\qquad
+M=\mathbb E[\ell\ell^\top].
+\]
+
+\subsection{Structural hop}
+
+A structural hop is legal only when a physical displacement coordinate exists:
+\[
+\Delta P=P(q_{\rm end})-P(q_{\rm start}).
+\]
+
+Then:
+\[
+d=\mathbb E[\Delta P],
+\qquad
+M=\mathbb E[\Delta P\Delta P^\top].
+\]
+
+\subsection{Cage capture/release}
+
+Cage state:
+\[
+A_{\rm cage}
+=
+\{|\psi_{\rm cage}|>\psi_{\rm cage}^{\rm cut}\}.
+\]
+
+Capture/release without charge displacement:
+\[
+d=0,\quad M=0.
+\]
+
+Backjump memory enters through either finite-state \(C^Q\) or Mori \(A,h\).
+
+\subsection{Atmosphere capture/release}
+
+If atmosphere is represented discretely:
+\[
+A_{\rm atm,k}=\{p_{\rm atm}\in[p_k,p_{k+1})\}.
+\]
+
+Pure atmosphere relaxation:
+\[
+d=0,\quad M=0.
+\]
+
+Current coupling enters through Mori memory:
+\[
+A_{\alpha\gamma},\quad h_{\alpha a}.
+\]
+```
+
+---
+
+```latex
+\section{6. Committor PDE numerical policy}
+
+For each edge \(i\leftrightarrow j\), define transition domain
+\[
+\Omega_{ij}=\Omega\setminus(A_i\cup A_j).
+\]
+
+The committor solves
+\[
+Lq_{ij}=0
+\quad\text{in }\Omega_{ij},
+\]
+\[
+q_{ij}=0\quad\text{on }\partial A_i,
+\qquad
+q_{ij}=1\quad\text{on }\partial A_j.
+\]
+
+\subsection{Finite-element discretization}
+
+Construct a mesh
+\[
+\mathcal T_{ij}^{(r)}
+\]
+on \(\Omega_{ij}\), where \(r\) is refinement level.
+
+Use continuous piecewise-linear basis functions
+\[
+\{\varphi_m\}_{m=1}^{M_r}.
+\]
+
+Write
+\[
+q_{ij}^{(r)}(q)
+=
+q_D(q)+\sum_{m=1}^{M_r}u_m\varphi_m(q),
+\]
+where \(q_D\) enforces Dirichlet values.
+
+Stiffness matrix:
+\[
+S_{mn}^{(r)}
+=
+\int_{\Omega_{ij}}
+\nabla\varphi_m^\top D(q)\nabla\varphi_n\,\rho(dq).
+\]
+
+Right-hand side:
+\[
+f_m^{(r)}
+=
+-
+\int_{\Omega_{ij}}
+\nabla\varphi_m^\top D(q)\nabla q_D\,\rho(dq).
+\]
+
+Solve:
+\[
+S^{(r)}u^{(r)}=f^{(r)}.
+\]
+
+Use conjugate gradient if \(S^{(r)}\) is symmetric positive definite. Use
+MINRES if constraints produce semidefinite blocks. Precondition with incomplete
+Cholesky or algebraic multigrid.
+
+\subsection{Capacity computation}
+
+Compute
+\[
+K_{ij}^{(r)}
+=
+\int_{\Omega_{ij}}
+\nabla q_{ij}^{(r)\top}D(q)\nabla q_{ij}^{(r)}\,\rho(dq).
+\]
+
+\subsection{Adaptive refinement}
+
+Refine elements with largest local energy residual
+\[
+\eta_E
+=
+\int_E
+\nabla q_{ij}^{(r)\top}D\nabla q_{ij}^{(r)}\,\rho(dq).
+\]
+
+Refine the smallest set of elements \(\mathcal R\) satisfying
+\[
+\sum_{E\in\mathcal R}\eta_E
+\ge
+\theta_{\rm refine}\sum_E\eta_E,
+\]
+with
+\[
+0.3\le\theta_{\rm refine}\le0.7.
+\]
+
+Re-solve until
+\[
+\frac{|K_{ij}^{(r+1)}-K_{ij}^{(r)}|}
+{\max(K_{ij}^{(r)},K_{\min})}
+<
+\tau_K.
+\]
+
+Default:
+\[
+\tau_K=10^{-3},
+\qquad
+K_{\min}=10^{-30}\ \mathrm{mol\,m^{-3}\,s^{-1}}.
+\]
+
+\subsection{Disconnected domains}
+
+If \(\Omega_{ij}\) has disconnected components \(\Omega_{ij}^{(m)}\), solve
+on each component. If a component touches both boundaries, include it. If it
+touches only one boundary, it contributes zero flux.
+
+Thus:
+\[
+K_{ij}=\sum_mK_{ij}^{(m)}.
+\]
+
+\subsection{Tiny populations}
+
+If
+\[
+c_i<c_{\min}
+\]
+or
+\[
+c_j<c_{\min},
+\]
+remove the edge from the active generator and merge the basin or mark it inactive.
+Default:
+\[
+c_{\min}=10^{-18}\ \mathrm{mol\,m^{-3}}.
+\]
+```
+
+---
+
+```latex
+\section{7. Doob-conditioned transition-path moment solver}
+
+For each edge \(i\to j\), use the converged committor \(q_{ij}\).
+
+Original overdamped drift:
+\[
+b(q)=
+\nabla\cdot D(q)
+-
+\frac{1}{RT}D(q)\nabla U(q).
+\]
+
+Doob-conditioned drift:
+\[
+b^{(ij)}(q)
+=
+b(q)
++
+2D(q)\nabla\log q_{ij}(q).
+\]
+
+Regularize:
+\[
+\nabla\log q_{ij}
+=
+\frac{\nabla q_{ij}}{\max(q_{ij},q_{\min})}.
+\]
+
+Default:
+\[
+q_{\min}=10^{-8}.
+\]
+
+\subsection{Exit-surface sampling}
+
+Exit density:
+\[
+p_{ij}^{\rm exit}(q)
+=
+\frac{
+\rho(q)\,n_{ij}(q)^\top D(q)\nabla q_{ij}(q)
+}{
+K_{ij}
+}.
+\]
+
+Sample exit points by weighted surface quadrature:
+\[
+\Pr(q=q_\ell^\Sigma)
+=
+\frac{
+w_\ell^\Sigma\rho(q_\ell^\Sigma)n^\top D(q_\ell^\Sigma)\nabla q_{ij}(q_\ell^\Sigma)
+}{
+\sum_m
+w_m^\Sigma\rho(q_m^\Sigma)n^\top D(q_m^\Sigma)\nabla q_{ij}(q_m^\Sigma)
+}.
+\]
+
+\subsection{Time-step rule}
+
+At point \(q\), choose
+\[
+\Delta t(q)
+=
+\min\left[
+\Delta t_{\max},
+\gamma_t
+\frac{\ell_{\rm mesh}(q)^2}{\lambda_{\max}(D(q))},
+\gamma_b
+\frac{\ell_{\rm mesh}(q)}{\|b^{(ij)}(q)\|}
+\right].
+\]
+
+Defaults:
+\[
+\gamma_t=10^{-2},
+\qquad
+\gamma_b=10^{-1}.
+\]
+
+\subsection{Euler--Maruyama propagation}
+
+At step \(n\):
+\[
+q_{n+1}
+=
+q_n
++
+b^{(ij)}(q_n)\Delta t_n
++
+L_D(q_n)\sqrt{2\Delta t_n}\,\eta_n,
+\]
+where
+\[
+D(q_n)=L_D(q_n)L_D(q_n)^\top,
+\]
+and
+\[
+\eta_n\sim\mathcal N(0,I).
+\]
+
+Stop at first hit:
+\[
+\tau_j=\inf\{t:q_t\in A_j\}.
+\]
+
+If a step crosses the boundary, linearly interpolate:
+\[
+q_{\rm hit}=q_n+\theta(q_{n+1}-q_n),
+\]
+where \(\theta\in[0,1]\) solves the boundary equation.
+
+\subsection{Path charge displacement}
+
+For each path:
+\[
+\Delta P_\ell=P(q_{\rm hit})-P(q_0).
+\]
+
+Reject path if
+\[
+\|\Delta P_\ell\|>L_{\max}.
+\]
+
+Default:
+\[
+L_{\max}=10^{-8}\ \mathrm m.
+\]
+
+\subsection{Moment estimates}
+
+After \(N\) accepted paths:
+\[
+d_{ij}^{(N)}
+=
+\frac{1}{N}\sum_{\ell=1}^N\Delta P_\ell,
+\]
+\[
+M_{ij}^{(N)}
+=
+\frac{1}{N}\sum_{\ell=1}^N\Delta P_\ell\Delta P_\ell^\top.
+\]
+
+Block convergence: split paths into \(B\) blocks. Compute block means
+\[
+d_{ij}^{[b]},\quad M_{ij}^{[b]}.
+\]
+
+Stop when
+\[
+\frac{\operatorname{SE}(d_{ij})}{\max(\|d_{ij}\|,d_{\min})}<\tau_d
+\]
+and
+\[
+\frac{\operatorname{SE}(M_{ij})}{\max(\|M_{ij}\|_F,M_{\min})}<\tau_M.
+\]
+
+Defaults:
+\[
+\tau_d=0.05,
+\qquad
+\tau_M=0.05.
+\]
+```
+
+---
+
+```latex
+\section{8. State-local mobility and charged-center covariance construction}
+
+For each state \(\alpha\), define centers
+\[
+p=1,\ldots,m_\alpha.
+\]
+
+Each center has charge \(z_{\alpha p}\), position \(r_{\alpha p}\), hydrodynamic
+radius \(a_{\alpha p}^{\rm hyd}\), charge-cloud radius \(a_{\alpha p}^{\rm cloud}\),
+shape tensor \(S_{\alpha p}\), and relative position
+\[
+\rho_{\alpha p}=r_{\alpha p}-R_\alpha^{\rm ref}.
+\]
+
+Construct total resistance:
+\[
+R_\alpha
+=
+R_\alpha^{\rm Stokes}
++
+R_\alpha^{\rm hydro}
++
+R_\alpha^{\rm shape}
++
+R_\alpha^{\rm free\ volume}
++
+R_\alpha^{\rm charge\ cloud}
++
+R_\alpha^{\rm atmosphere}
++
+R_\alpha^{\rm constraint}
++
+R_\alpha^{\rm cage}.
+\]
+
+\subsection{Stokes resistance}
+
+For center \(p\):
+\[
+\zeta_{\alpha p}=6\pi\eta_\alpha a_{\alpha p}^{\rm hyd}.
+\]
+
+Then
+\[
+R_{\alpha,pp}^{\rm Stokes}=\zeta_{\alpha p}I_3.
+\]
+
+\subsection{Shape resistance}
+
+Let \(S_{\alpha p}\) have eigenvalues \(s_1,s_2,s_3\). Define
+\[
+R_{\alpha p}^{\rm shape}
+=
+\zeta_{\alpha p}
+\left[
+I_3+\lambda_{\rm shape}(S_{\alpha p}-I_3)
+\right].
+\]
+
+For scalar shape factor:
+\[
+R_{\alpha p}^{\rm shape}
+=
+\zeta_{\alpha p}\,
+\chi_{\alpha p}^{\rm shape} I_3,
+\]
+\[
+\chi_{\alpha p}^{\rm shape}
+=
+\left(1+\ell_{\alpha p}^{\rm asym}\right)^{\gamma_{\rm shape}}.
+\]
+
+\subsection{Free-volume resistance}
+
+Local packing:
+\[
+\varphi_\alpha=\mathbb E[\varphi(q)\mid A_\alpha].
+\]
+
+Free-volume factor:
+\[
+\chi_\alpha^{\rm fv}
+=
+\left(1-\frac{\varphi_\alpha}{\varphi_{\max}}\right)^{-\gamma_{\rm fv}}.
+\]
+
+Then
+\[
+R_\alpha^{\rm free\ volume}
+=
+(\chi_\alpha^{\rm fv}-1)R_\alpha^{\rm Stokes}.
+\]
+
+\subsection{Charge-cloud resistance}
+
+For center \(p\):
+\[
+\rho_{\alpha p}^{\rm charge}
+=
+\frac{|z_{\alpha p}|}{(a_{\alpha p}^{\rm cloud})^3}.
+\]
+
+Charge-cloud resistance:
+\[
+R_{\alpha p}^{\rm cloud}
+=
+\lambda_{\rm cloud}
+\left(\rho_{\alpha p}^{\rm charge}\right)^{\gamma_{\rm cloud}}
+F_{\rm screen}(\kappa a_{\alpha p}^{\rm cloud})
+I_3.
+\]
+
+Screening form factor:
+\[
+F_{\rm screen}(x)=\frac{x^2}{1+x^2}.
+\]
+
+\subsection{Constraint resistance}
+
+For constraint mode \(m\):
+\[
+R_{\alpha}^{\rm constraint,m}
+=
+k_BT
+\frac{\tau_{\alpha m}}{\ell_{\alpha m}^2}
+s_{\alpha m}s_{\alpha m}^\top.
+\]
+
+Here \(s_{\alpha m}\) is the relative-motion direction, \(\tau_{\alpha m}\)
+is the residence time, and \(\ell_{\alpha m}\) is the constraint length.
+
+\[
+R_{\alpha}^{\rm constraint}=\sum_mR_{\alpha}^{\rm constraint,m}.
+\]
+
+\subsection{Cage resistance}
+
+For cage coordinate direction \(s_{\rm cage}\):
+\[
+R_{\alpha}^{\rm cage}
+=
+k_BT
+\frac{\tau_{\rm cage,\alpha}}{\ell_{\rm cage,\alpha}^2}
+s_{\rm cage}s_{\rm cage}^\top.
+\]
+
+\subsection{Mobility and charge covariance}
+
+The mobility is
+\[
+D_\alpha=k_BT\,R_\alpha^\#.
+\]
+
+Let
+\[
+Z_\alpha
+\]
+be the matrix mapping center velocities to charge displacement:
+\[
+\dot P=Z_\alpha v.
+\]
+
+Then
+\[
+D_\alpha^{Q}
+=
+Z_\alpha D_\alpha Z_\alpha^\top.
+\]
+
+For one Cartesian axis:
+\[
+D_Q(\alpha)=z_\alpha^\top D_\alpha^{\rm centers}z_\alpha.
+\]
+
+This is the state-local self-current tensor:
+\[
+D_\alpha^{\rm self}=D_\alpha^Q
+\]
+projected onto unbounded coordinates.
+```
+
+---
+
+```latex
+\section{9. Ion-atmosphere operator}
+
+The atmosphere operator is a resistance matrix projected into state charge geometry.
+
+\subsection{Screening}
+
+Ionic strength:
+\[
+I=\frac12\sum_s z_s^2 c_s.
+\]
+
+Inverse Debye length:
+\[
+\kappa^2
+=
+\frac{F^2}{\epsilon_0\epsilon_r RT}
+\sum_s z_s^2 c_s.
+\]
+
+Debye length:
+\[
+\lambda_D=\kappa^{-1}.
+\]
+
+\subsection{Bulk charge-mode response}
+
+For wavevector \(k\), define charge-density form factor:
+\[
+\rho_z(k;q)=\sum_p z_p e^{ik\cdot r_p}.
+\]
+
+Gradient:
+\[
+g_k(q)=\nabla_q\rho_z(k;q).
+\]
+
+Define the bulk PNP/Stokes resistance response:
+\[
+\mathcal R_{\rm bulk}(k)
+=
+\mathcal R_{\rm ep}(k)+\mathcal R_{\rm rel}(k).
+\]
+
+Electrophoretic part:
+\[
+\mathcal R_{\rm ep}(k)
+=
+\Gamma_{\rm ep}
+\frac{k^2}{(k^2+\kappa^2)^2}
+\eta.
+\]
+
+Relaxation part:
+\[
+\mathcal R_{\rm rel}(k)
+=
+\Gamma_{\rm rel}
+\frac{\kappa^2}{(k^2+\kappa^2)^2}
+\frac{1}{D_{\rm amb}k^2+\tau_{\rm chem}^{-1}}.
+\]
+
+Ambipolar diffusivity:
+\[
+D_{\rm amb}
+=
+\frac{\sum_s z_s^2c_sD_s}{\sum_s z_s^2c_s}.
+\]
+
+\subsection{State charge-geometry form factor}
+
+For state \(\alpha\), define
+\[
+F_\alpha(k)
+=
+\sum_{p\in\alpha} z_{\alpha p}
+e^{ik\cdot \rho_{\alpha p}}
+\exp\left[-\frac12k^2(a_{\alpha p}^{\rm cloud})^2\right].
+\]
+
+Then the state atmosphere resistance is
+\[
+R_\alpha^{\rm atmosphere}
+=
+\sum_{k\in\mathcal K}
+|F_\alpha(k)|^2
+\mathcal R_{\rm bulk}(k)
+\,G_{\alpha k}G_{\alpha k}^\top.
+\]
+
+Here \(G_{\alpha k}\) maps the state center coordinate velocities into the
+charge-density mode \(k\).
+
+\subsection{Neutral-pair cancellation}
+
+For a co-located neutral pair:
+\[
+z_1=+1,\quad z_2=-1,\quad \rho_1=\rho_2.
+\]
+
+Then
+\[
+F_\alpha(k)=e^{ik\cdot\rho_1}-e^{ik\cdot\rho_1}=0.
+\]
+
+Thus
+\[
+R_\alpha^{\rm atmosphere}=0
+\]
+for the neutral charge-neutral translation mode.
+
+\subsection{Separated-pair interpolation}
+
+For a Li--anion pair separated by \(r\):
+\[
+F_\alpha(k)=e^{ik\cdot r_{\rm Li}}-e^{ik\cdot r_{\rm A}}.
+\]
+
+At small \(kr\):
+\[
+|F_\alpha(k)|^2\approx (k\cdot r)^2.
+\]
+
+At large \(kr\), angular average gives
+\[
+\langle |F_\alpha(k)|^2\rangle\to2.
+\]
+
+Therefore:
+\[
+R_{\rm atmosphere}^{\rm SSIP/CIP}(r)
+\]
+interpolates between neutral cancellation and independent-ion resistance.
+
+\subsection{Debye--Falkenhagen diagnostic timescale}
+
+Atmosphere relaxation time:
+\[
+\tau_{\rm atm}=\frac{1}{D_{\rm amb}\kappa^2}.
+\]
+
+State lifetime:
+\[
+\tau_\alpha.
+\]
+
+Diagnostic gate:
+\[
+g_\alpha^{\rm diag}
+=
+\frac{\tau_\alpha}{\tau_\alpha+\tau_{\rm atm}}.
+\]
+
+This gate is diagnostic unless explicitly included in \(R_{\rm rel}\). If used:
+\[
+R_{\alpha}^{\rm rel,eff}
+=
+g_\alpha R_{\alpha}^{\rm rel}.
+\]
+
+It must not multiply final \(\sigma\).
+```
+
+This matches the uploaded plan: atmosphere resistance must be a finite-size nonideal carrier matrix response projected into state-local charge geometry, not a scalar trace multiplier; neutral pairs cancel, SSIP/contact pairs interpolate by Li–anion separation, and the Debye–Falkenhagen gate is diagnostic until geometry invariants pass. 
+
+---
+
+```latex
+\section{10. High-concentration closure}
+
+High concentration modifies \(U\), \(D\), \(K\), and \(A,h\). It does not modify
+the final conductivity formula.
+
+\subsection{Finite occupied volume}
+
+Each species \(s\) has molecular volume \(V_s\). Local occupied volume fraction:
+\[
+\varphi(q)=\sum_s V_s c_s^{\rm loc}(q).
+\]
+
+Packing free energy:
+\[
+U_{\rm pack}(q)
+=
+RT
+\int
+\frac{\varphi(r)(4-3\varphi(r))}
+{(1-\varphi(r))^2}
+\,dr.
+\]
+
+If
+\[
+\varphi(r)\ge\varphi_{\max}
+\]
+for any quadrature point, the state has infinite free energy:
+\[
+U_{\rm pack}=+\infty.
+\]
+
+\subsection{Activity correction}
+
+Debye--Huckel activity:
+\[
+\ln\gamma_i^{\rm DH}
+=
+-\frac{A_\gamma z_i^2\sqrt I}{1+B_\gamma a_i\sqrt I}.
+\]
+
+Hard-sphere activity:
+\[
+\ln\gamma_i^{\rm HS}
+=
+\frac{\partial}{\partial n_i}
+\left[
+\frac{\varphi(4-3\varphi)}{(1-\varphi)^2}
+\right].
+\]
+
+Total activity contribution:
+\[
+U_{\rm act}
+=
+RT\sum_i n_i
+\left(
+\ln\gamma_i^{\rm DH}
++
+\ln\gamma_i^{\rm HS}
+\right).
+\]
+
+\subsection{Dielectric decrement}
+
+Effective dielectric:
+\[
+\epsilon_r(c)
+=
+\epsilon_r^{0}
+-
+\sum_s a_s^{\epsilon}c_s
+-
+b_\epsilon I.
+\]
+
+Require
+\[
+\epsilon_r(c)\ge\epsilon_{\min}.
+\]
+
+This affects:
+\[
+U_{\rm Coul},\quad U_{\rm Born},\quad \kappa,\quad R_{\rm atmosphere}.
+\]
+
+\subsection{Jones--Dole viscosity}
+
+Bulk viscosity:
+\[
+\eta(c)
+=
+\eta_0
+\left[
+1+
+\sum_s A_s^{\eta}\sqrt{c_s}
++
+\sum_s B_s^{\eta}c_s
++
+\sum_{s,t}C_{st}^{\eta}c_sc_t
+\right].
+\]
+
+Local microviscosity:
+\[
+\eta_{\rm loc}(q)
+=
+\eta(c)
+\left(1-\frac{\varphi(q)}{\varphi_{\max}}\right)^{-\gamma_{\rm fv}}
+\left[
+1+
+\sum_L a_L^{\eta}n_L(q)
+\right].
+\]
+
+This enters:
+\[
+R_{\rm Stokes},\quad R_{\rm hydro},\quad K_{ij},\quad A.
+\]
+
+\subsection{Aggregate saturation}
+
+For cluster \(C\) with stoichiometry \(\nu_C\), free energy:
+\[
+G_C
+=
+G_C^{0}
++
+G_C^{\rm Coul}
++
+G_C^{\rm desolv}
++
+G_C^{\rm coord}
++
+G_C^{\rm steric}
++
+G_C^{\rm entropy}
++
+G_C^{\rm activity}.
+\]
+
+Cluster entropy penalty:
+\[
+G_C^{\rm entropy}
+=
+RT\left[
+\ln(n_C!)
++
+\gamma_{\rm rot}\ln\Omega_C^{-1}
+\right].
+\]
+
+Steric penalty:
+\[
+G_C^{\rm steric}
+=
+RT
+\left(\frac{V_C}{V_{\rm void}}\right)^{\gamma_{\rm steric}}.
+\]
+
+Mass action:
+\[
+c_C
+=
+C^\circ
+\exp[-G_C/(RT)]
+\prod_a
+\left(\frac{c_a}{C^\circ}\right)^{\nu_{C,a}}.
+\]
+
+At high concentration, aggregates reduce free-ion \(c_i\), alter \(D_i^{\rm self}\),
+and create aggregate transition edges \(K_{ij}\).
+```
+
+---
+
+```latex
+\section{11. Additive and neutral-ligand handling}
+
+Additives enter only as neutral ligand feature classes after species parsing.
+
+For neutral ligand \(L\), define feature vector
+\[
+\ell_L=
+(
+n_L^{\rm donor},
+n_L^{\rm acceptor},
+n_L^{\rm HBA},
+n_L^{\rm HBD},
+\alpha_L,
+V_L,
+a_L^{\rm hyd},
+g_{\rm LiL}^{\rm coord},
+\chi_L^{\rm visc},
+m_L^{\rm dent}
+).
+\]
+
+No equation below depends on the string name of the molecule.
+
+\subsection{Li--ligand coordination}
+
+Coordination number:
+\[
+n_{\rm Li,L}(q)=\sum_{b\in L}s_{\rm Li,L}(r_{\rm Li,b}).
+\]
+
+Li--ligand basin:
+\[
+A_{\rm LiL}=\{q:n_{\rm Li,L}\ge n_L^{\rm cut}\}.
+\]
+
+Coordination free energy:
+\[
+U_{\rm LiL}(q)
+=
+N_A\Delta g_{\rm LiL}^{\rm coord}
+n_{\rm Li,L}(q).
+\]
+
+\subsection{Ligand competition with anion}
+
+Li--anion coordination number:
+\[
+n_{\rm Li,A}(q)=\sum_{a\in A}s_{\rm Li,A}(r_{\rm Li,a}).
+\]
+
+Competition energy:
+\[
+U_{\rm comp}(q)
+=
+\frac12 k_{\rm comp}
+\left[
+n_{\rm Li,L}(q)+n_{\rm Li,A}(q)-n_{\rm shell}^{\rm target}
+\right]^2.
+\]
+
+This shifts:
+\[
+c_{\rm free},
+\quad
+c_{\rm SSIP},
+\quad
+c_{\rm CIP},
+\quad
+c_{\rm LiL},
+\quad
+c_{\rm LiL\cdots A}.
+\]
+
+\subsection{Li--ligand--anion ternary state}
+
+Define:
+\[
+A_{\rm LiL\cdots A}
+=
+\{
+q:
+n_{\rm Li,L}\ge n_L^{\rm cut},
+\,
+r_{\rm CIP}\le r_{\rm LiA}<r_{\rm SSIP}
+\}.
+\]
+
+This state is distinct from:
+\[
+A_{\rm LiL}+A_{\rm free\ anion}.
+\]
+
+Its population is
+\[
+c_{\rm LiL\cdots A}
+=
+\int_{A_{\rm LiL\cdots A}}\rho(dq).
+\]
+
+\subsection{Additive-separated SSIP}
+
+Define insertion coordinate
+\[
+\chi_{L{\rm sep}}(q)
+=
+\mathbf 1\{
+L\text{ lies in the Li--anion corridor}
+\}.
+\]
+
+The additive-separated SSIP basin is
+\[
+A_{\rm addSSIP}
+=
+A_{\rm SSIP}\cap\{\chi_{L{\rm sep}}=1\}.
+\]
+
+\subsection{Ligand-induced Li--anion covariance}
+
+For state \(\alpha=A_{\rm addSSIP}\) or \(A_{\rm LiL\cdots A}\), define
+\[
+D_{\rm Li,A|\alpha}
+=
+\mathbb E[
+v_{\rm Li}\cdot v_A
+\mid A_\alpha
+].
+\]
+
+The state charge mobility is
+\[
+D_Q(\alpha)
+=
+D_{\rm Li|\alpha}
++
+D_{A|\alpha}
+-
+2D_{\rm Li,A|\alpha}.
+\]
+
+Ligand insertion may make
+\[
+D_{\rm Li,A|\alpha}<0,
+\]
+which increases \(D_Q\) and therefore conductivity.
+
+\subsection{Additive microviscosity}
+
+Local viscosity factor:
+\[
+f_L^\eta(q)
+=
+1+a_L^\eta n_{\rm Li,L}(q)+b_L^\eta \phi_L.
+\]
+
+Then
+\[
+\eta_{\rm loc}(q)=\eta_{\rm base}(q)f_L^\eta(q).
+\]
+
+This modifies:
+\[
+D_x(q),
+\quad
+K_{ij},
+\quad
+A_{\alpha\gamma}.
+\]
+
+\subsection{Ligand-shell residence memory}
+
+Define memory coordinate:
+\[
+\psi_L(q)=n_{\rm Li,L}(q)-\mathbb E[n_{\rm Li,L}\mid A_{s(q)}].
+\]
+
+It enters:
+\[
+A_{\alpha\gamma}
+=
+\int
+\nabla\psi_\alpha^\top D\nabla\psi_\gamma\,\rho(dq),
+\]
+\[
+h_{\alpha a}
+=
+\int
+\nabla\psi_\alpha^\top D\nabla P_a\,\rho(dq).
+\]
+
+\subsection{Ligand bridge}
+
+For two Li centers \(\ell_1,\ell_2\):
+\[
+A_{\rm bridge}
+=
+\{q:n_{\ell_1,L}\ge n_L^{\rm cut},\ n_{\ell_2,L}\ge n_L^{\rm cut}\}.
+\]
+
+Bridge states contribute through:
+\[
+c_i,\quad K_{ij},\quad D_i^{\rm self},\quad A,h.
+\]
+```
+
+This resolves the FEC/VC issue in the only first-principles-compatible way: neutral additives are ligand feature classes; the required FEC/bulky-anion behavior is the conditional Li–anion covariance (D_{\rm Li,A|\alpha}) in ligand-conditioned SSIP/CIP/additive-separated states, not a molecule-name branch. The uploaded checklist explicitly says additive-separated SSIP must be representable, species names may only be registry lookup labels, and the Li–anion covariance must change under ligand shell + bulky/delocalized anion conditions. 
+

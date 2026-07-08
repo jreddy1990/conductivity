@@ -1,0 +1,16 @@
+schema: conductivity_transition_definition_record_v1
+families:
+- free_to_SSIP
+- SSIP_to_CIP
+- pair_to_aggregate
+- Li_to_Li_ligand
+- LiA_to_Li_ligand_anion
+- SSIP_to_additive_separated_SSIP
+- partner_switch
+- identity_diffusion
+- structural_hop
+- bridge_network_formation_breakup
+- cage_capture_release
+- atmosphere_capture_release
+numerical_method: committor finite-element capacity solve plus deterministic Doob-conditioned endpoint
+  moment boundary-value solves
