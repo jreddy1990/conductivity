@@ -18,7 +18,7 @@ transition_records:
   free_to_SSIP:
     reaction_coordinate: Li_anion_distance
     gradient_policy: pair_distance_gradient
-    moment_policy: conditioned_endpoint_bvp
+    moment_policy: isotropic_endpoint_bvp
     displacement_policy: charge_polarization_endpoint_moment
     barrier_J_mol: 6000.0
     rate_bounds_s_inv:
@@ -27,7 +27,7 @@ transition_records:
   SSIP_to_CIP:
     reaction_coordinate: Li_anion_distance
     gradient_policy: pair_distance_gradient
-    moment_policy: conditioned_endpoint_bvp
+    moment_policy: isotropic_endpoint_bvp
     displacement_policy: charge_polarization_endpoint_moment
     barrier_J_mol: 8000.0
     rate_bounds_s_inv:
@@ -79,7 +79,7 @@ transition_records:
   partner_switch:
     reaction_coordinate: partner_residence_coordinate
     gradient_policy: partner_residence_gradient
-    moment_policy: identity_diffusion
+    moment_policy: isotropic_endpoint_bvp
     displacement_policy: unwrapped_identity_displacement
     endpoint_geometry:
       start:
@@ -147,7 +147,7 @@ transition_records:
       lower: 0.0
       upper: 1.0
     gradient_policy: cluster_coordinate_gradient
-    moment_policy: conditioned_endpoint_bvp
+    moment_policy: isotropic_endpoint_bvp
     displacement_policy: charge_polarization_endpoint_moment
     endpoint_geometry:
       start:
@@ -166,17 +166,8 @@ transition_records:
   cage_capture_release:
     reaction_coordinate: cage_coordinate
     gradient_policy: cage_coordinate_gradient
-    moment_policy: conditioned_endpoint_bvp
-    displacement_policy: charge_polarization_endpoint_moment
-    endpoint_geometry:
-      start:
-        cage_state: cage_released
-      end:
-        cage_state: cage_captured
-      displacement:
-        type: cage_backjump_transport
-        length_m: 2.5e-10
-        direction_policy: cage_axis
+    moment_policy: zero_motif_exchange
+    displacement_policy: zero
     barrier_J_mol: 12000.0
     attempt_frequency_s_inv: 1.0e13
     rate_bounds_s_inv:

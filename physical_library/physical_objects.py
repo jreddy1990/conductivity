@@ -69,6 +69,16 @@ class AtmosphereResistanceDiagnostics:
     debye_falkenhagen_time_s: float
 
 
+@dataclass(frozen=True)
+class ResistanceComponentDiagnostics:
+    stokes_trace_kg_s: float
+    free_volume_trace_kg_s: float
+    charge_cloud_trace_kg_s: float
+    shape_trace_kg_s: float
+    atmosphere_trace_kg_s: float
+    total_trace_kg_s: float
+
+
 def build_physical_objects(
     records: PhysicalLibraryRecords,
     configuration: SiteConfiguration,
@@ -573,7 +583,7 @@ def compute_mobility_tensor_m2_s(
     for site_index, site_record in enumerate(site_records):
         start = CARTESIAN_DIMENSION * site_index
         stop = start + CARTESIAN_DIMENSION
-        if float(site_record["charge_number"]) == 0.0:
+        if _site_formal_charge_number(records, configuration, site_index) == 0.0:
             mobility[start:stop, start:stop] = np.linalg.pinv(
                 resistance[start:stop, start:stop],
                 hermitian=True,
@@ -627,6 +637,8 @@ def compute_resistance_tensor_kg_s(
         drag_kg_s += _charge_cloud_drag_kg_s(
             mobility_record,
             site_record,
+            stokes_drag_kg_s,
+            _effective_charge_cloud_number(records, configuration, site_index),
             kappa_m_inv,
         )
         drag_kg_s += _shape_drag_kg_s(
@@ -650,6 +662,77 @@ def compute_resistance_tensor_kg_s(
     )
     resistance += atmosphere_diagnostics.atmosphere_resistance_tensor_kg_s
     return resistance
+
+
+def compute_resistance_component_diagnostics(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+    viscosity_Pa_s: float,
+    dielectric_constant: float,
+    ionic_strength_mol_m3: float,
+    temperature_K: float,
+    local_packing_fraction: float,
+) -> ResistanceComponentDiagnostics:
+    if viscosity_Pa_s <= 0.0:
+        raise ValueError("viscosity_Pa_s must be positive")
+    if temperature_K <= 0.0:
+        raise ValueError("temperature_K must be positive")
+    mobility_record = records.mixture_record["mobility"]
+    kappa_m_inv = _debye_kappa_m_inv(
+        dielectric_constant,
+        ionic_strength_mol_m3,
+        temperature_K,
+    )
+    stokes_trace_kg_s = 0.0
+    free_volume_trace_kg_s = 0.0
+    charge_cloud_trace_kg_s = 0.0
+    shape_trace_kg_s = 0.0
+    site_records = _configuration_site_records(records, configuration)
+    for site_index, site_record in enumerate(site_records):
+        stokes_drag_kg_s = _stokes_drag_kg_s(site_record, viscosity_Pa_s)
+        stokes_trace_kg_s += CARTESIAN_DIMENSION * stokes_drag_kg_s
+        free_volume_trace_kg_s += CARTESIAN_DIMENSION * _free_volume_drag_kg_s(
+            records,
+            stokes_drag_kg_s,
+            local_packing_fraction,
+        )
+        charge_cloud_trace_kg_s += CARTESIAN_DIMENSION * _charge_cloud_drag_kg_s(
+            mobility_record,
+            site_record,
+            stokes_drag_kg_s,
+            _effective_charge_cloud_number(records, configuration, site_index),
+            kappa_m_inv,
+        )
+        shape_trace_kg_s += CARTESIAN_DIMENSION * _shape_drag_kg_s(
+            records,
+            configuration,
+            site_index,
+            stokes_drag_kg_s,
+        )
+    atmosphere_diagnostics = compute_atmosphere_resistance_diagnostics(
+        records,
+        configuration,
+        dielectric_constant,
+        ionic_strength_mol_m3,
+        temperature_K,
+    )
+    atmosphere_trace_kg_s = float(
+        np.trace(atmosphere_diagnostics.atmosphere_resistance_tensor_kg_s)
+    )
+    return ResistanceComponentDiagnostics(
+        stokes_trace_kg_s=stokes_trace_kg_s,
+        free_volume_trace_kg_s=free_volume_trace_kg_s,
+        charge_cloud_trace_kg_s=charge_cloud_trace_kg_s,
+        shape_trace_kg_s=shape_trace_kg_s,
+        atmosphere_trace_kg_s=atmosphere_trace_kg_s,
+        total_trace_kg_s=(
+            stokes_trace_kg_s
+            + free_volume_trace_kg_s
+            + charge_cloud_trace_kg_s
+            + shape_trace_kg_s
+            + atmosphere_trace_kg_s
+        ),
+    )
 
 
 def compute_atmosphere_resistance_diagnostics(
@@ -859,12 +942,30 @@ def compute_charge_polarization_m(
     records: PhysicalLibraryRecords,
     configuration: SiteConfiguration,
 ) -> Array:
+    """Return ionic charge polarization from formal molecule charge centers.
+
+    Partial atomic charges belong to U(q): Coulomb, Born, LJ/coordination, and
+    local structure.  Long-time ionic conductivity is driven by transported
+    formal charge centers.  Neutral molecules therefore contribute no net
+    polarization current even when their force-field sites carry nonzero
+    partial charges.
+    """
+
     polarization_m = np.zeros(CARTESIAN_DIMENSION, dtype=float)
     unwrapped_positions_m = np.asarray(configuration.unwrapped_positions_m, dtype=float)
-    site_records = _configuration_site_records(records, configuration)
-    for site_index in range(len(configuration.species_names)):
-        charge_number = float(site_records[site_index]["charge_number"])
-        polarization_m += charge_number * unwrapped_positions_m[site_index]
+    for molecule_key in _configuration_molecule_keys(configuration):
+        species_name, molecule_id = molecule_key
+        formal_charge_number = float(records.species_records[species_name]["formal_charge_e"])
+        if formal_charge_number == 0.0:
+            continue
+        charge_center_site_index = _charge_center_site_index_for_molecule(
+            records,
+            configuration,
+            species_name,
+            molecule_id,
+        )
+        charge_center_m = unwrapped_positions_m[charge_center_site_index]
+        polarization_m += formal_charge_number * charge_center_m
     return polarization_m
 
 
@@ -872,20 +973,73 @@ def compute_charge_polarization_gradient(
     records: PhysicalLibraryRecords,
     configuration: SiteConfiguration,
 ) -> Array:
+    """Return dP/dq for transported formal charge centers."""
+
     site_count = len(configuration.species_names)
     gradient = np.zeros(
         (CARTESIAN_DIMENSION, CARTESIAN_DIMENSION * site_count),
         dtype=float,
     )
-    site_records = _configuration_site_records(records, configuration)
-    for site_index in range(site_count):
-        charge_number = float(site_records[site_index]["charge_number"])
+    for molecule_key in _configuration_molecule_keys(configuration):
+        species_name, molecule_id = molecule_key
+        formal_charge_number = float(records.species_records[species_name]["formal_charge_e"])
+        if formal_charge_number == 0.0:
+            continue
+        charge_center_site_index = _charge_center_site_index_for_molecule(
+            records,
+            configuration,
+            species_name,
+            molecule_id,
+        )
         for cartesian_index in range(CARTESIAN_DIMENSION):
             gradient[
                 cartesian_index,
-                CARTESIAN_DIMENSION * site_index + cartesian_index,
-            ] = charge_number
+                CARTESIAN_DIMENSION * charge_center_site_index + cartesian_index,
+            ] = formal_charge_number
     return gradient
+
+
+def _configuration_molecule_keys(
+    configuration: SiteConfiguration,
+) -> tuple[tuple[str, int], ...]:
+    molecule_keys = []
+    for site_index, species_name in enumerate(configuration.species_names):
+        molecule_keys.append((species_name, int(configuration.molecule_ids[site_index])))
+    return tuple(dict.fromkeys(molecule_keys))
+
+
+def _site_indices_for_molecule(
+    configuration: SiteConfiguration,
+    species_name: str,
+    molecule_id: int,
+) -> tuple[int, ...]:
+    return tuple(
+        site_index
+        for site_index, current_species_name in enumerate(configuration.species_names)
+        if current_species_name == species_name
+        and int(configuration.molecule_ids[site_index]) == molecule_id
+    )
+
+
+def _charge_center_site_index_for_molecule(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+    species_name: str,
+    molecule_id: int,
+) -> int:
+    site_indices = _site_indices_for_molecule(configuration, species_name, molecule_id)
+    if not site_indices:
+        raise ValueError("charge center needs at least one site")
+    absolute_partial_charge_numbers = np.asarray(
+        [
+            abs(float(_site_record(records, configuration, site_index)["charge_number"]))
+            for site_index in site_indices
+        ],
+        dtype=float,
+    )
+    if float(np.max(absolute_partial_charge_numbers)) == 0.0:
+        raise ValueError("formally charged molecule has no charged force-field site")
+    return int(site_indices[int(np.argmax(absolute_partial_charge_numbers))])
 
 
 def assign_pair_basin(
@@ -1057,22 +1211,69 @@ def _free_volume_drag_kg_s(
 def _charge_cloud_drag_kg_s(
     mobility_record: dict,
     site_record: dict,
+    stokes_drag_kg_s: float,
+    effective_charge_number: float,
     kappa_m_inv: float,
 ) -> float:
-    charge_number = abs(float(site_record["charge_number"]))
+    charge_number = abs(effective_charge_number)
+    if charge_number == 0.0:
+        return 0.0
+    if stokes_drag_kg_s <= 0.0:
+        raise ValueError("stokes_drag_kg_s must be positive")
     cloud_radius_m = float(site_record["charge_cloud_radius_m"])
     if cloud_radius_m <= 0.0:
         raise ValueError("charge_cloud_radius_m must be positive")
-    charge_density_m3 = charge_number / (cloud_radius_m * cloud_radius_m * cloud_radius_m)
     screen_argument = kappa_m_inv * cloud_radius_m
+    exponent = float(mobility_record["charge_cloud_exponent"])
+    if exponent <= 0.0:
+        raise ValueError("charge_cloud_exponent must be positive")
     screen_factor = screen_argument * screen_argument / (
         UNITY + screen_argument * screen_argument
     )
     return (
         float(mobility_record["charge_cloud_lambda_kg_m4_s"])
-        * charge_density_m3 ** float(mobility_record["charge_cloud_exponent"])
+        * charge_number**exponent
+        / (cloud_radius_m * cloud_radius_m * cloud_radius_m)
         * screen_factor
     )
+
+
+def _site_formal_charge_number(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+    site_index: int,
+) -> float:
+    species_name = configuration.species_names[site_index]
+    return float(records.species_records[species_name]["formal_charge_e"])
+
+
+def _effective_charge_cloud_number(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+    site_index: int,
+) -> float:
+    species_name = configuration.species_names[site_index]
+    species_record = records.species_records[species_name]
+    formal_charge_number = float(species_record["formal_charge_e"])
+    if formal_charge_number == 0.0:
+        return 0.0
+    molecule_site_indices = _site_indices_for_molecule(
+        configuration,
+        species_name,
+        int(configuration.molecule_ids[site_index]),
+    )
+    absolute_partial_charges = np.asarray(
+        [
+            abs(float(_site_record(records, configuration, molecule_site_index)["charge_number"]))
+            for molecule_site_index in molecule_site_indices
+        ],
+        dtype=float,
+    )
+    partial_charge_total = float(np.sum(absolute_partial_charges))
+    if partial_charge_total == 0.0:
+        raise ValueError("formally charged molecule has no charged force-field sites")
+    site_partial_charge = abs(float(_site_record(records, configuration, site_index)["charge_number"]))
+    return abs(formal_charge_number) * site_partial_charge / partial_charge_total
 
 
 def _shape_drag_kg_s(
@@ -1124,11 +1325,26 @@ def _molecular_shape_asymmetry(
     positions = np.asarray(configuration.positions_m[site_indices], dtype=float)
     centered_positions = positions - np.mean(positions, axis=0)
     covariance = centered_positions.T @ centered_positions / float(len(site_indices))
+    steric_radii_m = np.asarray(
+        [
+            float(_site_record(records, configuration, current_index)["steric_radius_m"])
+            for current_index in site_indices
+        ],
+        dtype=float,
+    )
+    if np.any(steric_radii_m <= 0.0):
+        raise ValueError("steric_radius_m must be positive")
+    mean_steric_variance_m2 = float(np.mean(steric_radii_m * steric_radii_m))
+    covariance += (
+        mean_steric_variance_m2
+        / float(CARTESIAN_DIMENSION)
+        * np.eye(CARTESIAN_DIMENSION, dtype=float)
+    )
     eigenvalues = np.linalg.eigvalsh(covariance)
-    positive_eigenvalues = eigenvalues[eigenvalues > ZERO_DISTANCE_TOLERANCE_M]
+    positive_eigenvalues = eigenvalues[eigenvalues > ZERO_DISTANCE_TOLERANCE_M**2]
     if positive_eigenvalues.size < 2:
         return 0.0
-    return float(np.max(positive_eigenvalues) / np.min(positive_eigenvalues) - UNITY)
+    return float(math.sqrt(np.max(positive_eigenvalues) / np.min(positive_eigenvalues)) - UNITY)
 
 
 def _same_molecule(

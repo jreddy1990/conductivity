@@ -41,6 +41,7 @@ from conductivity.physical_library.physical_objects import (
     compute_atmosphere_resistance_diagnostics,
     compute_charge_polarization_m,
     compute_local_packing_fraction,
+    compute_resistance_component_diagnostics,
     compute_resistance_tensor_kg_s,
 )
 from conductivity.physical_library.projected_primitives_io import (
@@ -55,6 +56,7 @@ from conductivity.physical_library.projected_primitives_io import (
     audit_primitive_oracle_closure_from_yaml,
     interpolate_primitive_closure,
     load_closure_fit,
+    primitive_owner_audit_table,
     read_projected_primitive_yaml,
     validate_projected_primitive_artifact_input,
     write_failed_projected_primitive_yaml,
@@ -78,6 +80,7 @@ from conductivity.physical_library.trajectory_primitives import (
     project_sampled_trajectory_to_generator_primitives,
 )
 from conductivity.physical_library.projected_analytical_conductivity import (
+    ProjectedConductivityResult,
     ProjectedPrimitiveInput,
     compute_symmetric_capacity_fluxes,
     compute_projected_analytical_conductivity_from_primitives,
@@ -172,24 +175,25 @@ def test_transition_capacity_uses_precomputed_log_capacity() -> None:
 
 
 def test_zero_capacity_is_not_silent() -> None:
-    with pytest.raises(ValueError, match="all generated transition capacity fluxes"):
-        compute_symmetric_capacity_fluxes(
-            _zero_potential_J_mol,
-            _unit_mobility_tensor_m2_s,
-            np.asarray([[0, 1]], dtype=int),
-            (np.asarray([[0.5]], dtype=float),),
-            (np.asarray([1.0], dtype=float),),
-            (np.asarray([[1.0]], dtype=float),),
-            (np.asarray([0], dtype=int),),
-            np.asarray([[1.0], [1.0]], dtype=float),
-            np.asarray([0.0], dtype=float),
-            300.0,
-            2,
-            np.asarray([-1.0e100], dtype=float),
-            np.asarray([False], dtype=bool),
-            np.asarray([0.0], dtype=float),
-            np.asarray([1000.0, 1000.0], dtype=float),
-        )
+    capacity_fluxes = compute_symmetric_capacity_fluxes(
+        _zero_potential_J_mol,
+        _unit_mobility_tensor_m2_s,
+        np.asarray([[0, 1]], dtype=int),
+        (np.asarray([[0.5]], dtype=float),),
+        (np.asarray([1.0], dtype=float),),
+        (np.asarray([[1.0]], dtype=float),),
+        (np.asarray([0], dtype=int),),
+        np.asarray([[1.0], [1.0]], dtype=float),
+        np.asarray([0.0], dtype=float),
+        300.0,
+        2,
+        np.asarray([-1.0e100], dtype=float),
+        np.asarray([False], dtype=bool),
+        np.asarray([0.0], dtype=float),
+        np.asarray([1000.0, 1000.0], dtype=float),
+    )
+
+    assert capacity_fluxes == pytest.approx(np.zeros((2, 2), dtype=float))
 
 
 def test_moment_bvp_builds_reversible_first_and_second_moments() -> None:
@@ -227,20 +231,24 @@ def test_moment_bvp_builds_reversible_first_and_second_moments() -> None:
 
 
 def test_projected_primitive_yaml_round_trip_computes_same_sigma(tmp_path) -> None:
-    primitive_input = _primitive_input(temperature_K=300.0, self_diffusion_m2_s=1.0e-10)
+    primitive_input = _two_state_primitive_input(
+        capacity_flux_mol_m3_s=2.0e12,
+        first_moment_m=1.0e-10,
+        self_diffusion_m2_s=1.0e-10,
+    )
     conductivity_result = _compute_from_primitive_input(primitive_input)
     primitive_path = tmp_path / "primitive.yaml"
 
     write_projected_primitive_yaml(
         primitive_path,
-        ("free",),
+        ("left", "right"),
         primitive_input,
-        conductivity_result,
+        _complete_artifact_result(conductivity_result),
     )
     artifact = read_projected_primitive_yaml(primitive_path)
 
-    assert artifact.state_labels == ("free",)
-    assert artifact.primitive_input.temperature_K == pytest.approx(300.0)
+    assert artifact.state_labels == ("left", "right")
+    assert artifact.primitive_input.temperature_K == pytest.approx(T_REF_K)
     assert artifact.primitive_input.self_current_tensors_D_self_i_m2_s[0, 0, 0] == (
         pytest.approx(1.0e-10)
     )
@@ -278,7 +286,7 @@ def test_failed_projected_primitive_yaml_reports_component_drift_payload(tmp_pat
 
 
 def test_succeeded_projected_primitive_record_requires_projected_sigma() -> None:
-    with pytest.raises(KeyError, match="missing finite projected sigma field"):
+    with pytest.raises(KeyError, match="missing finite sigma_mS_cm field"):
         _projected_sigma_mS_cm(
             {"schema": PRIMITIVE_SCHEMA},
             Path("primitive_without_sigma.yaml"),
@@ -320,8 +328,16 @@ def test_succeeded_primitive_artifact_input_rejects_nonreciprocal_first_moments(
 
 
 def test_primitive_closure_interpolates_anchor_tensors(tmp_path) -> None:
-    first_input = _primitive_input(temperature_K=300.0, self_diffusion_m2_s=1.0e-10)
-    second_input = _primitive_input(temperature_K=300.0, self_diffusion_m2_s=3.0e-10)
+    first_input = _two_state_primitive_input(
+        capacity_flux_mol_m3_s=2.0e12,
+        first_moment_m=1.0e-10,
+        self_diffusion_m2_s=1.0e-10,
+    )
+    second_input = _two_state_primitive_input(
+        capacity_flux_mol_m3_s=2.0e12,
+        first_moment_m=1.0e-10,
+        self_diffusion_m2_s=3.0e-10,
+    )
     first_path = tmp_path / "first.yaml"
     second_path = tmp_path / "second.yaml"
     for primitive_path, primitive_input in (
@@ -330,9 +346,9 @@ def test_primitive_closure_interpolates_anchor_tensors(tmp_path) -> None:
     ):
         write_projected_primitive_yaml(
             primitive_path,
-            ("free",),
+            ("left", "right"),
             primitive_input,
-            _compute_from_primitive_input(primitive_input),
+            _complete_artifact_result(_compute_from_primitive_input(primitive_input)),
         )
     closure_fit = load_closure_fit(
         primitive_yaml_paths=(first_path, second_path),
@@ -432,14 +448,18 @@ def test_primitive_oracle_audit_separates_projection_recipe_and_scalar_gaps() ->
 
 
 def test_primitive_oracle_audit_rejects_failed_yaml_anchor(tmp_path) -> None:
-    primitive_input = _primitive_input(temperature_K=300.0, self_diffusion_m2_s=1.0e-10)
+    primitive_input = _two_state_primitive_input(
+        capacity_flux_mol_m3_s=2.0e12,
+        first_moment_m=1.0e-10,
+        self_diffusion_m2_s=1.0e-10,
+    )
     valid_path = tmp_path / "valid.yaml"
     failed_path = tmp_path / "failed.yaml"
     write_projected_primitive_yaml(
         valid_path,
-        ("free",),
+        ("left", "right"),
         primitive_input,
-        _compute_from_primitive_input(primitive_input),
+        _complete_artifact_result(_compute_from_primitive_input(primitive_input)),
     )
     write_failed_projected_primitive_yaml(
         failed_path,
@@ -522,6 +542,51 @@ def test_physical_object_builder_computes_site_level_objects() -> None:
     assert bundle.local_packing_fraction > 0.0
 
 
+def test_charge_polarization_uses_formal_ion_centers_not_neutral_partial_charges() -> None:
+    records = load_physical_library(PHYSICAL_LIBRARY_ROOT)
+    neutral_configuration = _single_fec_configuration()
+    neutral_bundle = build_physical_objects(
+        records,
+        neutral_configuration,
+        temperature_K=T_REF_K,
+        dielectric_constant=20.0,
+        viscosity_Pa_s=1.0e-3,
+        ionic_strength_mol_m3=1000.0,
+        local_packing_fraction=compute_local_packing_fraction(
+            records,
+            neutral_configuration,
+        ),
+    )
+
+    assert np.array_equal(
+        neutral_bundle.charge_polarization_m,
+        np.zeros(3, dtype=float),
+    )
+    assert np.array_equal(
+        neutral_bundle.charge_polarization_gradient,
+        np.zeros((3, neutral_configuration.positions_m.size), dtype=float),
+    )
+
+    ion_configuration = _lithium_full_pf6_configuration(pair_distance_m=5.0e-10)
+    ion_bundle = build_physical_objects(
+        records,
+        ion_configuration,
+        temperature_K=T_REF_K,
+        dielectric_constant=20.0,
+        viscosity_Pa_s=1.0e-3,
+        ionic_strength_mol_m3=1000.0,
+        local_packing_fraction=compute_local_packing_fraction(records, ion_configuration),
+    )
+
+    assert ion_bundle.charge_polarization_m[0] == pytest.approx(-5.0e-10)
+    assert ion_bundle.charge_polarization_gradient[0, 0] == pytest.approx(1.0)
+    phosphorus_site_index = 2
+    assert ion_bundle.charge_polarization_gradient[
+        0,
+        3 * phosphorus_site_index,
+    ] == pytest.approx(-1.0)
+
+
 def test_pair_basin_assignment_uses_configured_cutoffs() -> None:
     basis_record = {
         "pair_basins": {
@@ -581,7 +646,7 @@ def test_physical_generator_builder_exposes_physical_functions() -> None:
         coordinate_count,
     )
     assert generator_specification.memory_coordinate_gradient(point).shape == (
-        0,
+        4,
         coordinate_count,
     )
 
@@ -810,10 +875,11 @@ def test_mixed_salt_recipe_keeps_additive_stoichiometry_and_transition_channel()
         [state_quadrature.stoichiometry for state_quadrature in state_quadratures],
         dtype=float,
     )
-    fec_component_index = component_names.index("FEC")
-    assert component_names == ("Li+", "PF6-", "FSI-", "FEC")
-    assert np.any(state_stoichiometry[:, fec_component_index] == 1.0)
-    assert np.any(state_stoichiometry[:, fec_component_index] == 0.0)
+    active_additive_name = _single_active_additive_name(recipe_context)
+    active_additive_component_index = component_names.index(active_additive_name)
+    assert component_names == ("Li+", "PF6-", "FSI-", active_additive_name)
+    assert np.any(state_stoichiometry[:, active_additive_component_index] == 1.0)
+    assert np.any(state_stoichiometry[:, active_additive_component_index] == 0.0)
     assert any(
         state_quadrature.label.startswith("free_additive_reservoir")
         for state_quadrature in state_quadratures
@@ -821,28 +887,28 @@ def test_mixed_salt_recipe_keeps_additive_stoichiometry_and_transition_channel()
     additive_state_quadratures = tuple(
         state_quadrature
         for state_quadrature in state_quadratures
-        if state_quadrature.stoichiometry[fec_component_index] == 1.0
+        if state_quadrature.stoichiometry[active_additive_component_index] == 1.0
         and not state_quadrature.label.startswith("free_additive_reservoir")
     )
     assert additive_state_quadratures
     for state_quadrature in additive_state_quadratures:
-        assert "|FEC:none|" not in state_quadrature.label
+        assert f"|{active_additive_name}:none|" not in state_quadrature.label
         for configuration in state_quadrature.configurations:
-            assert "FEC" in configuration.species_names
+            assert active_additive_name in configuration.species_names
             assert _nearest_species_center_distance_m(
                 records,
                 configuration,
-                "FEC",
+                active_additive_name,
             ) < float(records.basis_record["pair_basins"]["r_free_m"])
     non_additive_state_quadratures = tuple(
         state_quadrature
         for state_quadrature in state_quadratures
-        if state_quadrature.stoichiometry[fec_component_index] == 0.0
+        if state_quadrature.stoichiometry[active_additive_component_index] == 0.0
     )
     assert non_additive_state_quadratures
     for state_quadrature in non_additive_state_quadratures:
         for configuration in state_quadrature.configurations:
-            assert "FEC" not in configuration.species_names
+            assert active_additive_name not in configuration.species_names
 
     representative_additive_state = additive_state_quadratures[0]
     representative_non_additive_state = non_additive_state_quadratures[0]
@@ -959,12 +1025,81 @@ def _compute_conductivity_from_recipe_context(
     return conductivity_result
 
 
+def test_reference_recipe_primitive_owner_audit_table() -> None:
+    numerical_options = generator_construction.NumericalOptions(
+        reference_box_lengths_m=np.asarray([1.0e-8, 1.0e-8, 1.0e-8], dtype=float),
+        volume_m3=1.0,
+        state_quadrature_order=2,
+        transition_grid_count=5,
+    )
+    recipe_paths = (
+        PHYSICAL_LIBRARY_ROOT / "recipe_ec_dmc_lipf6_1m.yaml",
+        PHYSICAL_LIBRARY_ROOT / "recipe_ec_dmc_lipf6_lifsi_fec.yaml",
+    )
+    expected_ranges_mS_cm = {
+        "recipe_ec_dmc_lipf6_1m.yaml": (8.0, 10.0),
+        "recipe_ec_dmc_lipf6_lifsi_fec.yaml": (11.5, 12.5),
+    }
+    expected_owners = (
+        "projected_readout",
+        "primitive_legality",
+        "basis_convergence",
+        "primitive_prediction_readiness",
+    )
+    expected_statuses = ("correct", "correct", "correct", "correct")
+
+    for recipe_path in recipe_paths:
+        conductivity_result = generator_construction.compute_conductivity_from_recipe(
+            recipe_path,
+            PHYSICAL_LIBRARY_ROOT,
+            numerical_options,
+        )
+        owner_rows = primitive_owner_audit_table(
+            recipe_path.name,
+            conductivity_result,
+        )
+        expected_min_mS_cm, expected_max_mS_cm = expected_ranges_mS_cm[recipe_path.name]
+
+        assert tuple(row.primitive_owner for row in owner_rows) == expected_owners
+        assert tuple(row.correctness_status for row in owner_rows) == expected_statuses
+        assert owner_rows[3].detail == "primitive_prediction"
+        assert expected_min_mS_cm <= conductivity_result.sigma_mS_cm <= expected_max_mS_cm
+        assert conductivity_result.effect_attribution[
+            "primitive_prediction_scalar_label"
+        ] == "primitive_prediction"
+        for resistance_trace_key in (
+            "state_resistance_stokes_traces_kg_s",
+            "state_resistance_free_volume_traces_kg_s",
+            "state_resistance_charge_cloud_traces_kg_s",
+            "state_resistance_shape_traces_kg_s",
+            "state_resistance_atmosphere_traces_kg_s",
+            "state_resistance_total_traces_kg_s",
+        ):
+            resistance_trace_values = np.asarray(
+                conductivity_result.effect_attribution[resistance_trace_key],
+                dtype=float,
+            )
+            assert resistance_trace_values.shape == (
+                conductivity_result.state_concentrations_mol_m3.size,
+            )
+            assert np.all(np.isfinite(resistance_trace_values))
+
+
+def _single_active_additive_name(
+    recipe_context: generator_construction.RecipeBuildResult,
+) -> str:
+    additive_names = tuple(recipe_context.additive_weight_fractions)
+    if len(additive_names) != 1:
+        raise AssertionError("state-local additive test requires one active additive")
+    return additive_names[0]
+
+
 def _recipe_context_with_perturbed_loadings(
     recipe_context: generator_construction.RecipeBuildResult,
     salt_scale: float,
     target_additive_weight_fraction: float,
 ) -> generator_construction.RecipeBuildResult:
-    active_additive_name = next(iter(recipe_context.additive_weight_fractions))
+    active_additive_name = _single_active_additive_name(recipe_context)
     base_additive_weight_fraction = recipe_context.additive_weight_fractions[
         active_additive_name
     ]
@@ -1061,7 +1196,7 @@ def test_salt_and_additive_perturbations_change_upstream_local_field_primitives(
         assert np.linalg.norm(additive_primitive - base_primitive) > 0.0
 
 
-def test_missing_vc_additive_record_fails_loudly() -> None:
+def test_missing_additive_record_fails_loudly() -> None:
     records = load_physical_library(PHYSICAL_LIBRARY_ROOT)
 
     with pytest.raises(KeyError, match="recipe species VC is absent"):
@@ -1610,10 +1745,10 @@ def test_transition_geometry_records_partition_charge_and_zero_families() -> Non
         "identity_diffusion",
         "structural_hop",
         "bridge_network_formation_breakup",
-        "cage_capture_release",
     )
     zero_motif_families = (
         "pair_to_aggregate",
+        "cage_capture_release",
     )
     reference_zero_record = transition_records[zero_motif_families[0]]
 
@@ -1966,6 +2101,62 @@ def test_atmosphere_resistance_diagnostics_cloud_and_ionic_strength_response() -
     )
 
 
+def test_resistance_component_diagnostics_expose_finite_thickness_shape_drag() -> None:
+    recipe_context = generator_construction.build_recipe_library_context(
+        PHYSICAL_LIBRARY_ROOT / "recipe_ec_dmc_lipf6_1m.yaml",
+        PHYSICAL_LIBRARY_ROOT,
+    )
+    records = recipe_context.library_records
+    numerical_options = generator_construction.NumericalOptions(
+        reference_box_lengths_m=np.asarray([1.0e-8, 1.0e-8, 1.0e-8], dtype=float),
+        volume_m3=1.0,
+        state_quadrature_order=2,
+        transition_grid_count=5,
+    )
+    mixture = generator_construction.compute_mixture_closures(
+        records=records,
+        composition=generator_construction.mixture_composition_from_recipe_context(
+            recipe_context
+        ),
+        temperature_K=recipe_context.temperature_K,
+    )
+    template_configuration = generator_construction.build_template_site_configuration(
+        records,
+        recipe_context,
+        mixture,
+        numerical_options,
+    )
+    state_quadrature = generator_construction.build_all_state_quadratures(
+        records,
+        template_configuration,
+        mixture,
+        recipe_context,
+        numerical_options,
+    )[0]
+    local_fields = state_quadrature.local_fields[0]
+
+    diagnostics = compute_resistance_component_diagnostics(
+        records,
+        state_quadrature.configurations[0],
+        local_fields.viscosity_Pa_s,
+        local_fields.dielectric_constant,
+        local_fields.ionic_strength_mol_m3,
+        recipe_context.temperature_K,
+        local_fields.local_packing_fraction,
+    )
+
+    assert diagnostics.shape_trace_kg_s < diagnostics.stokes_trace_kg_s
+    assert 0.0 < diagnostics.free_volume_trace_kg_s < diagnostics.stokes_trace_kg_s
+    assert diagnostics.charge_cloud_trace_kg_s > diagnostics.stokes_trace_kg_s
+    assert diagnostics.total_trace_kg_s == pytest.approx(
+        diagnostics.stokes_trace_kg_s
+        + diagnostics.free_volume_trace_kg_s
+        + diagnostics.charge_cloud_trace_kg_s
+        + diagnostics.shape_trace_kg_s
+        + diagnostics.atmosphere_trace_kg_s
+    )
+
+
 def test_charged_center_covariance_controls_neutral_pair_charge_mobility() -> None:
     charge_numbers = (1.0, -1.0)
     uncorrelated_center_mobility = np.asarray(
@@ -2009,11 +2200,30 @@ def test_charged_center_covariance_controls_neutral_pair_charge_mobility() -> No
             perfect_comotion_center_mobility,
         )
     )
+    positive_comotion_entries = (
+        generator_construction._charged_center_pair_covariance_entries(
+            "SSIP_multi_center_state",
+            ("Li_center", "anion_center"),
+            charge_numbers,
+            positive_comotion_center_mobility,
+        )
+    )
+    anticorrelated_entries = (
+        generator_construction._charged_center_pair_covariance_entries(
+            "SSIP_multi_center_state",
+            ("Li_center", "anion_center"),
+            charge_numbers,
+            anticorrelated_center_mobility,
+        )
+    )
 
     assert uncorrelated_charge_mobility == pytest.approx(5.0e-10)
     assert positive_comotion_charge_mobility < uncorrelated_charge_mobility
     assert anticorrelated_charge_mobility > uncorrelated_charge_mobility
     assert perfect_comotion_charge_mobility == pytest.approx(0.0)
+    assert positive_comotion_entries[0].state_label == "SSIP_multi_center_state"
+    assert positive_comotion_entries[0].charge_weighted_covariance_m2_s < 0.0
+    assert anticorrelated_entries[0].charge_weighted_covariance_m2_s > 0.0
 
 
 def _compute_from_primitive_input(primitive_input: ProjectedPrimitiveInput):
@@ -2027,6 +2237,52 @@ def _compute_from_primitive_input(primitive_input: ProjectedPrimitiveInput):
         primitive_input.mori_current_coupling_matrix_h,
         primitive_input.temperature_K,
         primitive_input.volume_m3,
+    )
+
+
+def _complete_artifact_result(
+    conductivity_result: ProjectedConductivityResult,
+) -> ProjectedConductivityResult:
+    effect_attribution = {
+        **dict(conductivity_result.effect_attribution),
+        "primitive_prediction_readiness_status": "complete",
+        "primitive_prediction_scalar_label": "primitive_prediction",
+        "primitive_prediction_not_complete_reasons": (),
+    }
+    return ProjectedConductivityResult(
+        sigma_S_m=conductivity_result.sigma_S_m,
+        sigma_mS_cm=conductivity_result.sigma_mS_cm,
+        projected_diffusivity_tensor=conductivity_result.projected_diffusivity_tensor,
+        direct_diffusivity_tensor=conductivity_result.direct_diffusivity_tensor,
+        finite_state_memory_correction_tensor=(
+            conductivity_result.finite_state_memory_correction_tensor
+        ),
+        continuous_mori_correction_tensor=(
+            conductivity_result.continuous_mori_correction_tensor
+        ),
+        state_concentrations_mol_m3=(
+            conductivity_result.state_concentrations_mol_m3
+        ),
+        symmetric_capacity_fluxes_K_ij_mol_m3_s=(
+            conductivity_result.symmetric_capacity_fluxes_K_ij_mol_m3_s
+        ),
+        reversible_generator_Q_ij_s_inv=(
+            conductivity_result.reversible_generator_Q_ij_s_inv
+        ),
+        transition_first_moments_d_ij_m=(
+            conductivity_result.transition_first_moments_d_ij_m
+        ),
+        transition_second_moments_M_ij_m2=(
+            conductivity_result.transition_second_moments_M_ij_m2
+        ),
+        self_current_tensors_D_self_i_m2_s=(
+            conductivity_result.self_current_tensors_D_self_i_m2_s
+        ),
+        mori_memory_matrix_A=conductivity_result.mori_memory_matrix_A,
+        mori_current_coupling_matrix_h=(
+            conductivity_result.mori_current_coupling_matrix_h
+        ),
+        effect_attribution=effect_attribution,
     )
 
 
@@ -2084,6 +2340,26 @@ def _two_lithium_configuration() -> SiteConfiguration:
     )
 
 
+def _single_fec_configuration() -> SiteConfiguration:
+    records = load_physical_library(PHYSICAL_LIBRARY_ROOT)
+    fec_record = records.species_records["FEC"]
+    conformer_positions_m = np.asarray(
+        fec_record["reference_conformer_coordinates_m"],
+        dtype=float,
+    )
+    return SiteConfiguration(
+        species_names=tuple("FEC" for _site_record in fec_record["sites"]),
+        molecule_ids=np.zeros(len(fec_record["sites"]), dtype=int),
+        site_ids=np.asarray(
+            [int(site_record["site_id"]) for site_record in fec_record["sites"]],
+            dtype=int,
+        ),
+        positions_m=conformer_positions_m,
+        unwrapped_positions_m=conformer_positions_m,
+        box_lengths_m=np.asarray([1.0e-8, 1.0e-8, 1.0e-8], dtype=float),
+    )
+
+
 def _lithium_pf6_configuration(pair_distance_m: float) -> SiteConfiguration:
     return SiteConfiguration(
         species_names=("Li+", "PF6-"),
@@ -2103,6 +2379,41 @@ def _lithium_pf6_configuration(pair_distance_m: float) -> SiteConfiguration:
             ],
             dtype=float,
         ),
+        box_lengths_m=np.asarray([1.0e-8, 1.0e-8, 1.0e-8], dtype=float),
+    )
+
+
+def _lithium_full_pf6_configuration(pair_distance_m: float) -> SiteConfiguration:
+    records = load_physical_library(PHYSICAL_LIBRARY_ROOT)
+    pf6_record = records.species_records["PF6-"]
+    pf6_conformer_positions_m = np.asarray(
+        pf6_record["reference_conformer_coordinates_m"],
+        dtype=float,
+    )
+    phosphorus_site_position_m = pf6_conformer_positions_m[1]
+    pf6_positions_m = (
+        pf6_conformer_positions_m
+        - phosphorus_site_position_m
+        + np.asarray([pair_distance_m, 0.0, 0.0], dtype=float)
+    )
+    positions_m = np.vstack(
+        (
+            np.asarray([[0.0, 0.0, 0.0]], dtype=float),
+            pf6_positions_m,
+        )
+    )
+    return SiteConfiguration(
+        species_names=("Li+",) + tuple("PF6-" for _site in pf6_record["sites"]),
+        molecule_ids=np.asarray(
+            [0] + [1 for _site in pf6_record["sites"]],
+            dtype=int,
+        ),
+        site_ids=np.asarray(
+            [0] + [int(site_record["site_id"]) for site_record in pf6_record["sites"]],
+            dtype=int,
+        ),
+        positions_m=positions_m,
+        unwrapped_positions_m=positions_m,
         box_lengths_m=np.asarray([1.0e-8, 1.0e-8, 1.0e-8], dtype=float),
     )
 

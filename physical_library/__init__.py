@@ -41,6 +41,7 @@ from conductivity.physical_library.physical_objects import (
 from conductivity.physical_library.projected_primitives_io import (
     PrimitiveExternalScalarInput,
     PrimitiveOracleAuditReport,
+    PrimitiveOwnerAuditRow,
     PrimitiveScalarEstimateNotProvided,
     PrimitiveScalarEstimateValue,
     PrimitiveScalarGapNotComputed,
@@ -50,6 +51,7 @@ from conductivity.physical_library.projected_primitives_io import (
     audit_primitive_oracle_closure,
     audit_primitive_oracle_closure_from_yaml,
     compute_conductivity_from_primitive_yaml,
+    primitive_owner_audit_table,
     read_projected_primitive_yaml,
     write_projected_primitive_yaml,
 )
@@ -73,6 +75,7 @@ __all__ = [
     "PhysicalTransitionQuadrature",
     "PrimitiveExternalScalarInput",
     "PrimitiveOracleAuditReport",
+    "PrimitiveOwnerAuditRow",
     "PrimitiveScalarEstimateNotProvided",
     "PrimitiveScalarEstimateValue",
     "PrimitiveScalarGapNotComputed",
@@ -99,6 +102,7 @@ __all__ = [
     "compute_mixture_closures",
     "load_physical_library",
     "load_required_species_records",
+    "primitive_owner_audit_table",
     "read_projected_primitive_yaml",
     "validate_physical_library_records",
     "write_projected_primitive_yaml",

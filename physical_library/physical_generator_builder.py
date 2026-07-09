@@ -497,26 +497,71 @@ def _physical_memory_gradient_function(
         cache_key = _generator_point_cache_key(generator_point)
         if cache_key not in point_registry:
             raise ValueError("generator point is not registered to a physical configuration")
-        configuration, _local_fields = point_registry[cache_key]
+        configuration, local_fields = point_registry[cache_key]
+        generator_dimension = np.asarray(generator_point, dtype=float).size
         if not _configuration_has_role(build_input.records, configuration, "cation"):
             return np.zeros(
                 (
-                    len(build_input.memory_coordinate_gradient_functions),
-                    np.asarray(generator_point, dtype=float).size,
+                    len(build_input.memory_coordinate_gradient_functions)
+                    + LOCAL_FIELD_VECTOR_LENGTH,
+                    generator_dimension,
                 ),
                 dtype=float,
             )
         gradients = []
         for gradient_function in build_input.memory_coordinate_gradient_functions:
             gradients.append(np.asarray(gradient_function(configuration), dtype=float))
-        if not gradients:
-            return np.zeros((0, np.asarray(generator_point, dtype=float).size), dtype=float)
-        return _extend_gradient_to_dimension(
-            np.vstack(tuple(gradients)),
-            np.asarray(generator_point, dtype=float).size,
+        gradients.append(
+            _local_field_memory_gradients(
+                generator_point,
+                configuration,
+                local_fields,
+            )
+        )
+        return np.vstack(
+            tuple(
+                _extend_gradient_to_dimension(
+                    np.atleast_2d(gradient),
+                    generator_dimension,
+                )
+                for gradient in gradients
+            )
         )
 
     return memory_coordinate_gradient
+
+
+def _local_field_memory_gradients(
+    generator_point: Array,
+    configuration: SiteConfiguration,
+    local_fields: PhysicalLocalFields,
+) -> Array:
+    point = np.asarray(generator_point, dtype=float)
+    local_field_start_index = len(configuration.species_names) * CARTESIAN_DIMENSION
+    local_field_stop_index = local_field_start_index + LOCAL_FIELD_VECTOR_LENGTH
+    if point.size < local_field_stop_index:
+        raise ValueError("generator point is shorter than local-field coordinate block")
+    validate_local_fields(local_fields, "generator_point.local_field_memory")
+    local_field_values = np.asarray(
+        [
+            local_fields.dielectric_constant,
+            local_fields.viscosity_Pa_s,
+            local_fields.ionic_strength_mol_m3,
+            local_fields.local_packing_fraction,
+        ],
+        dtype=float,
+    )
+    gradients = np.zeros((LOCAL_FIELD_VECTOR_LENGTH, point.size), dtype=float)
+    for local_field_index, local_field_value in enumerate(local_field_values):
+        coordinate_index = local_field_start_index + local_field_index
+        if local_field_index == 2 and local_field_value == 0.0:
+            gradients[local_field_index, coordinate_index] = 0.0
+            continue
+        if local_field_index == 3:
+            gradients[local_field_index, coordinate_index] = 1.0
+            continue
+        gradients[local_field_index, coordinate_index] = 1.0 / float(local_field_value)
+    return gradients
 
 
 def _configuration_has_role(

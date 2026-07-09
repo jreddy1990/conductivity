@@ -24,6 +24,7 @@ from conductivity.physical_library.mixture_closures import compute_mixture_closu
 from conductivity.physical_library.physical_objects import PairBasin, SiteConfiguration
 from conductivity.physical_library.projected_primitives_io import (
     PRIMITIVE_SCHEMA,
+    _projected_readout_status_from_result,
     write_failed_projected_primitive_yaml,
 )
 from conductivity.physical_library.trajectory_primitives import (
@@ -306,8 +307,10 @@ def extract_projected_primitives_from_lammps_dump(
         temperature_K=float(composition_record["temperature_K"]),
         volume_m3=PROJECTED_REFERENCE_VOLUME_M3,
     )
-    artifact["projected_readout_status"] = "succeeded"
-    artifact["projected_analytical_sigma_mS_cm"] = float(projected_result.sigma_mS_cm)
+    artifact["projected_readout_status"] = _projected_readout_status_from_result(
+        projected_result
+    )
+    artifact["sigma_mS_cm"] = float(projected_result.sigma_mS_cm)
     output_yaml_path.parent.mkdir(parents=True, exist_ok=True)
     output_yaml_path.write_text(yaml.safe_dump(artifact, sort_keys=False))
     return artifact

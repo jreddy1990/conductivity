@@ -18,6 +18,7 @@ from conductivity.physical_library.projected_analytical_conductivity import (
     validate_reversible_generator,
 )
 from conductivity.physical_library.trajectory_primitives import (
+    FiniteProcessComponentDriftResidual,
     diagnose_finite_process_legality,
 )
 
@@ -31,6 +32,17 @@ VALID_PROJECTED_READOUT_STATUSES = (
     PROJECTED_READOUT_DIRECT_ONLY,
     PROJECTED_READOUT_FAILED,
 )
+PRIMITIVE_AUDIT_STATUS_CORRECT = "correct"
+PRIMITIVE_AUDIT_STATUS_BLOCKED = "blocked"
+PRIMITIVE_OWNER_PROJECTED_READOUT = "projected_readout"
+PRIMITIVE_OWNER_LEGALITY = "primitive_legality"
+PRIMITIVE_OWNER_BASIS_CONVERGENCE = "basis_convergence"
+PRIMITIVE_OWNER_PREDICTION_READINESS = "primitive_prediction_readiness"
+FINITE_PROCESS_READOUT_PROJECTED = "projected"
+BASIS_REFINEMENT_CONVERGED = "converged"
+PRIMITIVE_PREDICTION_COMPLETE = "complete"
+PRIMITIVE_PREDICTION_SCALAR_LABEL = "primitive_prediction"
+FINITE_PROCESS_LEGAL_DETAIL = "finite_process_legal"
 
 
 @dataclass(frozen=True)
@@ -38,6 +50,14 @@ class ProjectedPrimitiveArtifact:
     schema: str
     state_labels: tuple[str, ...]
     primitive_input: ProjectedPrimitiveInput
+
+
+@dataclass(frozen=True)
+class PrimitiveOwnerAuditRow:
+    recipe_label: str
+    primitive_owner: str
+    correctness_status: str
+    detail: str
 
 
 def read_projected_primitive_yaml(path: Path) -> ProjectedPrimitiveArtifact:
@@ -58,7 +78,10 @@ def read_projected_primitive_yaml(path: Path) -> ProjectedPrimitiveArtifact:
     if projected_readout_status == PROJECTED_READOUT_FAILED:
         failure_reason = str(record["failure_reason"])
         diagnostics = record["diagnostics"]
-        component_drift_residuals = diagnostics["component_drift_residuals"]
+        component_drift_residuals = _required_component_drift_residual_records(
+            diagnostics,
+            "component_drift_residuals",
+        )
         raise ValueError(
             "projected primitive artifact is invalid for readout: "
             f"{projected_readout_status}; failure_reason={failure_reason}; "
@@ -69,6 +92,15 @@ def read_projected_primitive_yaml(path: Path) -> ProjectedPrimitiveArtifact:
         direct_only_reasons = diagnostics["direct_only_reasons"]
         if not direct_only_reasons:
             raise ValueError("direct_only artifact requires direct_only_reasons")
+        _required_component_drift_residual_records(
+            diagnostics,
+            "component_drift_residuals",
+        )
+        raise ValueError(
+            "projected primitive artifact is not a full prediction: "
+            f"{projected_readout_status}; direct_only_reasons={direct_only_reasons}"
+        )
+    _validate_succeeded_artifact_diagnostics(record, path)
     _projected_sigma_mS_cm(record, path)
     state_labels = tuple(str(label) for label in record["state_labels"])
     primitives = record["primitives"]
@@ -140,7 +172,7 @@ def validate_projected_primitive_artifact_input(
         reversible_generator_Q_ij_s_inv,
         state_concentrations_mol_m3,
     )
-    diagnose_finite_process_legality(
+    finite_process_legality = diagnose_finite_process_legality(
         tuple(
             f"state_{state_index}"
             for state_index in range(state_concentrations_mol_m3.size)
@@ -156,6 +188,9 @@ def validate_projected_primitive_artifact_input(
             ),
             dtype=int,
         ),
+    )
+    _raise_for_component_drift_residuals(
+        finite_process_legality.component_drift_residuals
     )
     compute_finite_state_memory_correction(
         state_concentrations_mol_m3,
@@ -214,29 +249,45 @@ def write_projected_primitive_yaml(
         "sigma_mS_cm": float(conductivity_result.sigma_mS_cm),
         "sigma_S_m": float(conductivity_result.sigma_S_m),
     }
+    record["diagnostics"] = _primitive_artifact_diagnostics(
+        tuple(str(label) for label in state_labels),
+        primitive_input,
+    )
     if record["projected_readout_status"] == PROJECTED_READOUT_DIRECT_ONLY:
-        record["diagnostics"] = {
-            "direct_only_reasons": tuple(
-                conductivity_result.effect_attribution[
-                    "finite_process_not_complete_reasons"
-                ]
-            ),
-            "active_transition_capacity_flux_count": int(
-                conductivity_result.effect_attribution[
-                    "active_transition_capacity_flux_count"
-                ]
-            ),
-            "active_transition_first_moment_count": int(
-                conductivity_result.effect_attribution[
-                    "active_transition_first_moment_count"
-                ]
-            ),
-            "active_transition_second_moment_count": int(
-                conductivity_result.effect_attribution[
-                    "active_transition_second_moment_count"
-                ]
-            ),
-        }
+        record["diagnostics"].update(
+            {
+                "direct_only_reasons": tuple(
+                    conductivity_result.effect_attribution[
+                        "primitive_prediction_not_complete_reasons"
+                    ]
+                ),
+                "primitive_prediction_readiness_status": str(
+                    conductivity_result.effect_attribution[
+                        "primitive_prediction_readiness_status"
+                    ]
+                ),
+                "primitive_prediction_scalar_label": str(
+                    conductivity_result.effect_attribution[
+                        "primitive_prediction_scalar_label"
+                    ]
+                ),
+                "active_transition_capacity_flux_count": int(
+                    conductivity_result.effect_attribution[
+                        "active_transition_capacity_flux_count"
+                    ]
+                ),
+                "active_transition_first_moment_count": int(
+                    conductivity_result.effect_attribution[
+                        "active_transition_first_moment_count"
+                    ]
+                ),
+                "active_transition_second_moment_count": int(
+                    conductivity_result.effect_attribution[
+                        "active_transition_second_moment_count"
+                    ]
+                ),
+            }
+        )
     path.write_text(yaml.safe_dump(record, sort_keys=False))
 
 
@@ -280,6 +331,183 @@ def compute_conductivity_from_primitive_yaml(path: Path) -> ProjectedConductivit
         primitive_input.temperature_K,
         primitive_input.volume_m3,
     )
+
+
+def primitive_owner_audit_table(
+    recipe_label: str,
+    conductivity_result: ProjectedConductivityResult,
+) -> tuple[PrimitiveOwnerAuditRow, ...]:
+    """Report primitive correctness ownership for recipe prediction readiness."""
+
+    effect_attribution = conductivity_result.effect_attribution
+    projected_readout_status = str(effect_attribution["finite_process_readout_status"])
+    primitive_prediction_status = str(
+        effect_attribution["primitive_prediction_readiness_status"]
+    )
+    basis_convergence_status = str(
+        effect_attribution["basis_refinement_convergence_status"]
+    )
+    finite_process_reasons = tuple(
+        str(reason) for reason in effect_attribution["finite_process_not_complete_reasons"]
+    )
+    primitive_prediction_reasons = tuple(
+        str(reason)
+        for reason in effect_attribution["primitive_prediction_not_complete_reasons"]
+    )
+    projected_readout_correctness = _primitive_audit_status_for_expected_value(
+        projected_readout_status,
+        FINITE_PROCESS_READOUT_PROJECTED,
+    )
+    projected_readout_detail = projected_readout_status
+    if finite_process_reasons:
+        projected_readout_correctness = PRIMITIVE_AUDIT_STATUS_BLOCKED
+        projected_readout_detail = ",".join(finite_process_reasons)
+    basis_status = _primitive_audit_status_for_expected_value(
+        basis_convergence_status,
+        BASIS_REFINEMENT_CONVERGED,
+    )
+    primitive_prediction_detail = ",".join(primitive_prediction_reasons)
+    if primitive_prediction_status == PRIMITIVE_PREDICTION_COMPLETE:
+        primitive_prediction_detail = PRIMITIVE_PREDICTION_SCALAR_LABEL
+    return (
+        PrimitiveOwnerAuditRow(
+            recipe_label=recipe_label,
+            primitive_owner=PRIMITIVE_OWNER_PROJECTED_READOUT,
+            correctness_status=projected_readout_correctness,
+            detail=projected_readout_detail,
+        ),
+        PrimitiveOwnerAuditRow(
+            recipe_label=recipe_label,
+            primitive_owner=PRIMITIVE_OWNER_LEGALITY,
+            correctness_status=PRIMITIVE_AUDIT_STATUS_CORRECT,
+            detail=FINITE_PROCESS_LEGAL_DETAIL,
+        ),
+        PrimitiveOwnerAuditRow(
+            recipe_label=recipe_label,
+            primitive_owner=PRIMITIVE_OWNER_BASIS_CONVERGENCE,
+            correctness_status=basis_status,
+            detail=basis_convergence_status,
+        ),
+        PrimitiveOwnerAuditRow(
+            recipe_label=recipe_label,
+            primitive_owner=PRIMITIVE_OWNER_PREDICTION_READINESS,
+            correctness_status=_primitive_audit_status_for_expected_value(
+                primitive_prediction_status,
+                PRIMITIVE_PREDICTION_COMPLETE,
+            ),
+            detail=primitive_prediction_detail,
+        ),
+    )
+
+
+def _primitive_artifact_diagnostics(
+    state_labels: tuple[str, ...],
+    primitive_input: ProjectedPrimitiveInput,
+) -> dict:
+    (
+        state_concentrations_mol_m3,
+        symmetric_capacity_fluxes_K_ij_mol_m3_s,
+        transition_first_moments_d_ij_m,
+        transition_second_moments_M_ij_m2,
+        _self_current_tensors_D_self_i_m2_s,
+        _mori_memory_matrix_A,
+        _mori_current_coupling_matrix_h,
+    ) = validate_primitive_input(primitive_input)
+    finite_process_legality = diagnose_finite_process_legality(
+        state_labels,
+        state_concentrations_mol_m3,
+        symmetric_capacity_fluxes_K_ij_mol_m3_s,
+        transition_first_moments_d_ij_m,
+        transition_second_moments_M_ij_m2,
+        np.zeros(
+            (
+                state_concentrations_mol_m3.size,
+                state_concentrations_mol_m3.size,
+            ),
+            dtype=int,
+        ),
+    )
+    return {
+        "component_drift_residuals": _component_drift_residual_records(
+            finite_process_legality.component_drift_residuals
+        ),
+        "finite_process_legality": {
+            "maximum_detailed_balance_residual_mol_m3_s": float(
+                finite_process_legality.maximum_detailed_balance_residual_mol_m3_s
+            ),
+            "component_drift_residuals": _component_drift_residual_records(
+                finite_process_legality.component_drift_residuals
+            ),
+        },
+    }
+
+
+def _component_drift_residual_records(
+    component_drift_residuals: tuple[FiniteProcessComponentDriftResidual, ...],
+) -> list[dict]:
+    records: list[dict] = []
+    for component_drift_residual in component_drift_residuals:
+        records.append(
+            {
+                "component_id": int(component_drift_residual.component_id),
+                "state_labels": list(component_drift_residual.state_labels),
+                "state_concentrations_mol_m3": list(
+                    component_drift_residual.state_concentrations_mol_m3
+                ),
+                "exit_rates_s_inv": list(component_drift_residual.exit_rates_s_inv),
+                "concentration_sum_mol_m3": float(
+                    component_drift_residual.concentration_sum_mol_m3
+                ),
+                "weighted_drift_mol_m2_s": list(
+                    component_drift_residual.weighted_drift_mol_m2_s
+                ),
+                "weighted_drift_norm_mol_m2_s": float(
+                    component_drift_residual.weighted_drift_norm_mol_m2_s
+                ),
+                "weighted_absolute_drift_scale_mol_m2_s": float(
+                    component_drift_residual.weighted_absolute_drift_scale_mol_m2_s
+                ),
+                "top_edge_contributions": [
+                    {
+                        "component_id": int(edge_contribution.component_id),
+                        "from_state_label": edge_contribution.from_state_label,
+                        "to_state_label": edge_contribution.to_state_label,
+                        "contribution_mol_m2_s": list(
+                            edge_contribution.contribution_mol_m2_s
+                        ),
+                        "contribution_norm_mol_m2_s": float(
+                            edge_contribution.contribution_norm_mol_m2_s
+                        ),
+                        "capacity_flux_mol_m3_s": float(
+                            edge_contribution.capacity_flux_mol_m3_s
+                        ),
+                        "first_moment_norm_m": float(
+                            edge_contribution.first_moment_norm_m
+                        ),
+                        "forward_sample_count": int(
+                            edge_contribution.forward_sample_count
+                        ),
+                        "reverse_sample_count": int(
+                            edge_contribution.reverse_sample_count
+                        ),
+                        "missing_reverse_event_candidate": bool(
+                            edge_contribution.missing_reverse_event_candidate
+                        ),
+                    }
+                    for edge_contribution in component_drift_residual.top_edge_contributions
+                ],
+            }
+        )
+    return records
+
+
+def _primitive_audit_status_for_expected_value(
+    observed_value: str,
+    expected_value: str,
+) -> str:
+    if observed_value == expected_value:
+        return PRIMITIVE_AUDIT_STATUS_CORRECT
+    return PRIMITIVE_AUDIT_STATUS_BLOCKED
 
 
 @dataclass(frozen=True)
@@ -802,6 +1030,74 @@ def _array(value, label: str) -> Array:
     return result
 
 
+def _validate_succeeded_artifact_diagnostics(record: dict, path: Path) -> None:
+    diagnostics = record["diagnostics"]
+    component_drift_residuals = _required_component_drift_residual_records(
+        diagnostics,
+        "component_drift_residuals",
+    )
+    finite_process_legality = diagnostics["finite_process_legality"]
+    if not isinstance(finite_process_legality, dict):
+        raise TypeError(f"{path} diagnostics finite_process_legality must be a mapping")
+    _required_component_drift_residual_records(
+        finite_process_legality,
+        "component_drift_residuals",
+    )
+    detailed_balance_residual = float(
+        finite_process_legality["maximum_detailed_balance_residual_mol_m3_s"]
+    )
+    if not np.isfinite(detailed_balance_residual):
+        raise ValueError(
+            f"{path} finite_process_legality maximum detailed-balance residual "
+            "must be finite"
+        )
+    for component_drift_residual in component_drift_residuals:
+        weighted_drift_norm = float(
+            component_drift_residual["weighted_drift_norm_mol_m2_s"]
+        )
+        if not np.isfinite(weighted_drift_norm):
+            raise ValueError(f"{path} component drift residual norm must be finite")
+
+
+def _required_component_drift_residual_records(
+    diagnostics: dict,
+    field_name: str,
+) -> list:
+    if not isinstance(diagnostics, dict):
+        raise TypeError("artifact diagnostics must be a mapping")
+    component_drift_residuals = diagnostics[field_name]
+    if not isinstance(component_drift_residuals, list):
+        raise TypeError(f"diagnostics {field_name} must be a list")
+    if not component_drift_residuals:
+        raise ValueError(f"diagnostics {field_name} must not be empty")
+    for component_drift_residual in component_drift_residuals:
+        if not isinstance(component_drift_residual, dict):
+            raise TypeError(f"diagnostics {field_name} entries must be mappings")
+        int(component_drift_residual["component_id"])
+        float(component_drift_residual["weighted_drift_norm_mol_m2_s"])
+        component_drift_residual["top_edge_contributions"]
+    return component_drift_residuals
+
+
+def _raise_for_component_drift_residuals(
+    component_drift_residuals: tuple[FiniteProcessComponentDriftResidual, ...],
+) -> None:
+    for component_drift_residual in component_drift_residuals:
+        weighted_drift_norm = float(
+            component_drift_residual.weighted_drift_norm_mol_m2_s
+        )
+        weighted_absolute_scale = float(
+            component_drift_residual.weighted_absolute_drift_scale_mol_m2_s
+        )
+        tolerance = max(1.0e-30, np.finfo(float).eps * weighted_absolute_scale)
+        if weighted_drift_norm > tolerance:
+            raise ValueError(
+                "finite-state drift is not solvable on a generator component; "
+                f"component_id={component_drift_residual.component_id}; "
+                f"weighted_drift_norm_mol_m2_s={weighted_drift_norm}"
+            )
+
+
 def _projected_sigma_mS_cm(record: dict, path: Path) -> float:
     sigma_field = _projected_sigma_field(record)
     projected_sigma_mS_cm = float(record[sigma_field])
@@ -813,12 +1109,7 @@ def _projected_sigma_mS_cm(record: dict, path: Path) -> float:
 def _projected_sigma_field(record: dict) -> str:
     if "sigma_mS_cm" in record:
         return "sigma_mS_cm"
-    if "projected_analytical_sigma_mS_cm" in record:
-        return "projected_analytical_sigma_mS_cm"
-    raise KeyError(
-        "projected primitive artifact missing finite projected sigma field "
-        "sigma_mS_cm or projected_analytical_sigma_mS_cm"
-    )
+    raise KeyError("projected primitive artifact missing finite sigma_mS_cm field")
 
 
 def _projected_readout_status_from_result(
@@ -827,12 +1118,20 @@ def _projected_readout_status_from_result(
     effect_attribution = conductivity_result.effect_attribution
     if "finite_process_readout_status" not in effect_attribution:
         raise KeyError("conductivity result missing finite_process_readout_status")
-    status = str(effect_attribution["finite_process_readout_status"])
-    if status == "projected":
+    if "primitive_prediction_readiness_status" not in effect_attribution:
+        raise KeyError(
+            "conductivity result missing primitive_prediction_readiness_status"
+        )
+    readiness_status = str(
+        effect_attribution["primitive_prediction_readiness_status"]
+    )
+    if readiness_status == "complete":
         return PROJECTED_READOUT_SUCCEEDED
-    if status == PROJECTED_READOUT_DIRECT_ONLY:
+    if readiness_status == "incomplete":
         return PROJECTED_READOUT_DIRECT_ONLY
-    raise ValueError(f"unsupported finite_process_readout_status: {status}")
+    raise ValueError(
+        f"unsupported primitive_prediction_readiness_status: {readiness_status}"
+    )
 
 
 def _finite_vector(array: Array, label: str) -> Array:

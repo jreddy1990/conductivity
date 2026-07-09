@@ -21,8 +21,8 @@ mobility:
   - shape
   - atmosphere
   free_volume_exponent: 2.0
-  charge_cloud_lambda_kg_m4_s: 6.0e-40
-  charge_cloud_lambda_source: primitive-level LiPF6 EC:DMC anchor calibration of charge-cloud resistance
+  charge_cloud_lambda_kg_m4_s: 4.0e-40
+  charge_cloud_lambda_source: physical_library_global_screened_charge_cloud_resistance_scale
   charge_cloud_exponent: 1.0
   shape_exponent: 1.0
   atmosphere_lambda_kg_s: 1.0e-13
