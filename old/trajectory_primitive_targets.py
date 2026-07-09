@@ -19,7 +19,7 @@ from typing import Mapping, Sequence
 import numpy as np
 
 from constants import N_A
-from conductivity.finite_markov_additive_green_kubo import (
+from conductivity.old.finite_markov_additive_green_kubo import (
     MarkovAdditiveConductivityInput,
     MarkovAdditiveConductivityResult,
     MarkovAdditiveEvent,

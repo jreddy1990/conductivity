@@ -55,6 +55,20 @@ class PhysicalObjectBundle:
     local_packing_fraction: float
 
 
+@dataclass(frozen=True)
+class AtmosphereResistanceDiagnostics:
+    atmosphere_resistance_tensor_kg_s: Array
+    electrophoretic_resistance_tensor_kg_s: Array
+    relaxation_resistance_tensor_kg_s: Array
+    cation_diagonal_resistance_trace_kg_s: float
+    anion_diagonal_resistance_trace_kg_s: float
+    cation_anion_cross_resistance_trace_kg_s: float
+    mean_charge_cloud_form_factor: float
+    mean_state_geometry_form_factor: float
+    minimum_separation_over_debye_length: float
+    debye_falkenhagen_time_s: float
+
+
 def build_physical_objects(
     records: PhysicalLibraryRecords,
     configuration: SiteConfiguration,
@@ -627,13 +641,218 @@ def compute_resistance_tensor_kg_s(
             CARTESIAN_DIMENSION,
             dtype=float,
         )
-    resistance += _state_geometry_atmosphere_resistance_tensor_kg_s(
-        mobility_record,
+    atmosphere_diagnostics = compute_atmosphere_resistance_diagnostics(
+        records,
+        configuration,
+        dielectric_constant,
+        ionic_strength_mol_m3,
+        temperature_K,
+    )
+    resistance += atmosphere_diagnostics.atmosphere_resistance_tensor_kg_s
+    return resistance
+
+
+def compute_atmosphere_resistance_diagnostics(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+    dielectric_constant: float,
+    ionic_strength_mol_m3: float,
+    temperature_K: float,
+) -> AtmosphereResistanceDiagnostics:
+    validate_site_configuration(configuration)
+    if temperature_K <= 0.0:
+        raise ValueError("temperature_K must be positive")
+    if dielectric_constant <= 0.0:
+        raise ValueError("dielectric_constant must be positive")
+    if ionic_strength_mol_m3 < 0.0:
+        raise ValueError("ionic_strength_mol_m3 must be nonnegative")
+    mobility_record = records.mixture_record["mobility"]
+    site_records = _configuration_site_records(records, configuration)
+    kappa_m_inv = _debye_kappa_m_inv(
+        dielectric_constant,
+        ionic_strength_mol_m3,
+        temperature_K,
+    )
+    site_count = len(configuration.species_names)
+    matrix_shape = (CARTESIAN_DIMENSION * site_count, CARTESIAN_DIMENSION * site_count)
+    zero_tensor = np.zeros(matrix_shape, dtype=float)
+    atmosphere_lambda_kg_s = float(mobility_record["atmosphere_lambda_kg_s"])
+    if atmosphere_lambda_kg_s == 0.0 or kappa_m_inv == 0.0:
+        return AtmosphereResistanceDiagnostics(
+            atmosphere_resistance_tensor_kg_s=zero_tensor,
+            electrophoretic_resistance_tensor_kg_s=zero_tensor.copy(),
+            relaxation_resistance_tensor_kg_s=zero_tensor.copy(),
+            cation_diagonal_resistance_trace_kg_s=0.0,
+            anion_diagonal_resistance_trace_kg_s=0.0,
+            cation_anion_cross_resistance_trace_kg_s=0.0,
+            mean_charge_cloud_form_factor=0.0,
+            mean_state_geometry_form_factor=0.0,
+            minimum_separation_over_debye_length=math.inf,
+            debye_falkenhagen_time_s=0.0,
+        )
+    positions_m = np.asarray(configuration.positions_m, dtype=float)
+    charged_site_indices = tuple(
+        site_index
+        for site_index, site_record in enumerate(site_records)
+        if float(site_record["charge_number"]) != 0.0
+    )
+    if not charged_site_indices:
+        return AtmosphereResistanceDiagnostics(
+            atmosphere_resistance_tensor_kg_s=zero_tensor,
+            electrophoretic_resistance_tensor_kg_s=zero_tensor.copy(),
+            relaxation_resistance_tensor_kg_s=zero_tensor.copy(),
+            cation_diagonal_resistance_trace_kg_s=0.0,
+            anion_diagonal_resistance_trace_kg_s=0.0,
+            cation_anion_cross_resistance_trace_kg_s=0.0,
+            mean_charge_cloud_form_factor=0.0,
+            mean_state_geometry_form_factor=0.0,
+            minimum_separation_over_debye_length=math.inf,
+            debye_falkenhagen_time_s=0.0,
+        )
+    charged_index_array = np.asarray(charged_site_indices, dtype=int)
+    charged_positions_m = positions_m[charged_index_array]
+    charged_displacements_m = (
+        charged_positions_m[None, :, :] - charged_positions_m[:, None, :]
+    )
+    box_lengths_m = np.asarray(configuration.box_lengths_m, dtype=float)
+    charged_displacements_m = charged_displacements_m - box_lengths_m * np.rint(
+        charged_displacements_m / box_lengths_m
+    )
+    charged_distances_m = np.linalg.norm(charged_displacements_m, axis=2)
+    charge_numbers = np.asarray(
+        [float(site_records[site_index]["charge_number"]) for site_index in charged_site_indices],
+        dtype=float,
+    )
+    cloud_radii_m = np.asarray(
+        [
+            float(site_records[site_index]["charge_cloud_radius_m"])
+            for site_index in charged_site_indices
+        ],
+        dtype=float,
+    )
+    cloud_factor_matrix = np.exp(
+        -HARMONIC_PREFRACTOR
+        * kappa_m_inv
+        * kappa_m_inv
+        * (
+            cloud_radii_m[:, None] * cloud_radii_m[:, None]
+            + cloud_radii_m[None, :] * cloud_radii_m[None, :]
+        )
+    )
+    screen_arguments = kappa_m_inv * cloud_radii_m
+    screen_activation = screen_arguments * screen_arguments / (
+        UNITY + screen_arguments * screen_arguments
+    )
+    atmosphere_activation_matrix = np.sqrt(
+        screen_activation[:, None] * screen_activation[None, :]
+    )
+    geometry_factor_matrix = np.exp(
+        -charged_distances_m
+        * charged_distances_m
+        * kappa_m_inv
+        * kappa_m_inv
+    )
+    resistance_factor_matrix = (
+        atmosphere_lambda_kg_s
+        * charge_numbers[:, None]
+        * charge_numbers[None, :]
+        * atmosphere_activation_matrix
+        * cloud_factor_matrix
+        * geometry_factor_matrix
+    )
+    total_tensor = np.zeros(matrix_shape, dtype=float)
+    electrophoretic_tensor = np.zeros(matrix_shape, dtype=float)
+    relaxation_tensor = np.zeros(matrix_shape, dtype=float)
+    for cartesian_axis in range(CARTESIAN_DIMENSION):
+        coordinate_indices = charged_index_array * CARTESIAN_DIMENSION + cartesian_axis
+        total_tensor[np.ix_(coordinate_indices, coordinate_indices)] += (
+            resistance_factor_matrix
+        )
+        electrophoretic_tensor[np.ix_(coordinate_indices, coordinate_indices)] += (
+            np.diag(np.diag(resistance_factor_matrix))
+        )
+        relaxation_tensor[np.ix_(coordinate_indices, coordinate_indices)] += (
+            resistance_factor_matrix - np.diag(np.diag(resistance_factor_matrix))
+        )
+    cation_coordinate_indices = _charged_role_coordinate_indices(
+        records,
         configuration,
         site_records,
-        kappa_m_inv,
+        "cation",
     )
-    return resistance
+    anion_coordinate_indices = _charged_role_coordinate_indices(
+        records,
+        configuration,
+        site_records,
+        "anion",
+    )
+    cation_anion_cross_trace = 0.0
+    if cation_coordinate_indices.size > 0 and anion_coordinate_indices.size > 0:
+        cation_anion_cross_trace = float(
+            np.sum(total_tensor[np.ix_(cation_coordinate_indices, anion_coordinate_indices)])
+        )
+    nonself_mask = ~np.eye(charged_distances_m.shape[0], dtype=bool)
+    finite_nonself_distances_m = charged_distances_m[nonself_mask]
+    if finite_nonself_distances_m.size == 0:
+        minimum_separation_over_debye_length = math.inf
+    else:
+        minimum_separation_over_debye_length = float(
+            np.min(finite_nonself_distances_m) * kappa_m_inv
+        )
+    return AtmosphereResistanceDiagnostics(
+        atmosphere_resistance_tensor_kg_s=total_tensor,
+        electrophoretic_resistance_tensor_kg_s=electrophoretic_tensor,
+        relaxation_resistance_tensor_kg_s=relaxation_tensor,
+        cation_diagonal_resistance_trace_kg_s=float(
+            np.trace(total_tensor[np.ix_(cation_coordinate_indices, cation_coordinate_indices)])
+        )
+        if cation_coordinate_indices.size > 0
+        else 0.0,
+        anion_diagonal_resistance_trace_kg_s=float(
+            np.trace(total_tensor[np.ix_(anion_coordinate_indices, anion_coordinate_indices)])
+        )
+        if anion_coordinate_indices.size > 0
+        else 0.0,
+        cation_anion_cross_resistance_trace_kg_s=cation_anion_cross_trace,
+        mean_charge_cloud_form_factor=float(np.mean(cloud_factor_matrix)),
+        mean_state_geometry_form_factor=float(np.mean(geometry_factor_matrix)),
+        minimum_separation_over_debye_length=minimum_separation_over_debye_length,
+        debye_falkenhagen_time_s=_debye_falkenhagen_time_s(
+            kappa_m_inv,
+            temperature_K,
+            atmosphere_lambda_kg_s,
+        ),
+    )
+
+
+def _charged_role_coordinate_indices(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+    site_records: tuple[dict, ...],
+    role: str,
+) -> Array:
+    coordinate_indices: list[int] = []
+    for site_index, site_record in enumerate(site_records):
+        if float(site_record["charge_number"]) == 0.0:
+            continue
+        species_name = configuration.species_names[site_index]
+        species_role = str(records.species_records[species_name]["role"])
+        if species_role != role:
+            continue
+        start = CARTESIAN_DIMENSION * site_index
+        coordinate_indices.extend(range(start, start + CARTESIAN_DIMENSION))
+    return np.asarray(coordinate_indices, dtype=int)
+
+
+def _debye_falkenhagen_time_s(
+    kappa_m_inv: float,
+    temperature_K: float,
+    atmosphere_lambda_kg_s: float,
+) -> float:
+    if kappa_m_inv == 0.0 or atmosphere_lambda_kg_s == 0.0:
+        return 0.0
+    atmosphere_diffusivity_m2_s = K_B * temperature_K / atmosphere_lambda_kg_s
+    return 1.0 / (atmosphere_diffusivity_m2_s * kappa_m_inv * kappa_m_inv)
 
 
 def compute_charge_polarization_m(
@@ -761,6 +980,8 @@ def _coordination_number(
     ligand_roles = tuple(str(ligand_role) for ligand_role in switch_record["ligand_roles"])
     switch_radius_m = float(switch_record["r0_m"])
     exponent = float(switch_record["exponent"])
+    if not _has_role(records, configuration, center_role):
+        return 0.0
     center_index = _first_role_index(records, configuration, center_role)
     coordination_number = 0.0
     for site_index, species_name in enumerate(configuration.species_names):
@@ -863,97 +1084,6 @@ def _shape_drag_kg_s(
     asymmetry = _molecular_shape_asymmetry(records, configuration, site_index)
     exponent = float(records.mixture_record["mobility"]["shape_exponent"])
     return stokes_drag_kg_s * ((UNITY + asymmetry) ** exponent - UNITY)
-
-
-def _state_geometry_atmosphere_resistance_tensor_kg_s(
-    mobility_record: dict,
-    configuration: SiteConfiguration,
-    site_records: tuple[dict, ...],
-    kappa_m_inv: float,
-) -> Array:
-    site_count = len(configuration.species_names)
-    resistance = np.zeros(
-        (CARTESIAN_DIMENSION * site_count, CARTESIAN_DIMENSION * site_count),
-        dtype=float,
-    )
-    atmosphere_lambda_kg_s = float(mobility_record["atmosphere_lambda_kg_s"])
-    if atmosphere_lambda_kg_s == 0.0 or kappa_m_inv == 0.0:
-        return resistance
-    positions_m = np.asarray(configuration.positions_m, dtype=float)
-    charged_site_indices = tuple(
-        site_index
-        for site_index, site_record in enumerate(site_records)
-        if float(site_record["charge_number"]) != 0.0
-    )
-    if not charged_site_indices:
-        return resistance
-    charged_positions_m = positions_m[np.asarray(charged_site_indices, dtype=int)]
-    charged_displacements_m = (
-        charged_positions_m[None, :, :] - charged_positions_m[:, None, :]
-    )
-    box_lengths_m = np.asarray(configuration.box_lengths_m, dtype=float)
-    charged_displacements_m = charged_displacements_m - box_lengths_m * np.rint(
-        charged_displacements_m / box_lengths_m
-    )
-    charged_distances_m = np.linalg.norm(charged_displacements_m, axis=2)
-    charge_numbers = np.asarray(
-        [float(site_records[site_index]["charge_number"]) for site_index in charged_site_indices],
-        dtype=float,
-    )
-    cloud_radii_m = np.asarray(
-        [
-            float(site_records[site_index]["charge_cloud_radius_m"])
-            for site_index in charged_site_indices
-        ],
-        dtype=float,
-    )
-    cloud_factor_matrix = np.exp(
-        -HARMONIC_PREFRACTOR
-        * kappa_m_inv
-        * kappa_m_inv
-        * (
-            cloud_radii_m[:, None] * cloud_radii_m[:, None]
-            + cloud_radii_m[None, :] * cloud_radii_m[None, :]
-        )
-    )
-    separation_factor_matrix = np.exp(
-        -charged_distances_m
-        * charged_distances_m
-        * kappa_m_inv
-        * kappa_m_inv
-    )
-    resistance_factor_matrix = (
-        atmosphere_lambda_kg_s
-        * charge_numbers[:, None]
-        * charge_numbers[None, :]
-        * cloud_factor_matrix
-        * separation_factor_matrix
-    )
-    charged_site_index_array = np.asarray(charged_site_indices, dtype=int)
-    for cartesian_axis in range(CARTESIAN_DIMENSION):
-        coordinate_indices = charged_site_index_array * CARTESIAN_DIMENSION + cartesian_axis
-        resistance[np.ix_(coordinate_indices, coordinate_indices)] += (
-            resistance_factor_matrix
-        )
-    return resistance
-
-
-def _charge_cloud_atmosphere_factor(
-    first_site_record: dict,
-    second_site_record: dict,
-    kappa_m_inv: float,
-) -> float:
-    first_cloud_radius_m = float(first_site_record["charge_cloud_radius_m"])
-    second_cloud_radius_m = float(second_site_record["charge_cloud_radius_m"])
-    return math.exp(
-        -HARMONIC_PREFRACTOR
-        * kappa_m_inv
-        * kappa_m_inv
-        * (
-            first_cloud_radius_m * first_cloud_radius_m
-            + second_cloud_radius_m * second_cloud_radius_m
-        )
-    )
 
 
 def _debye_kappa_m_inv(

@@ -1,170 +1,153 @@
+from constants import T_REF_K
 import numpy as np
 import pytest
 
-from constants import T_REF_K
-from conductivity.analytical_conductivity_model import (
-    PROJECTION_CLASS_SELF_CURRENT_CARRIER,
-    OverdampedSmoluchowskiGeneratorInput,
-    ProjectedBasisAssignment,
-    ProjectedBasisFunctionDefinition,
-    compare_recipe_sigma_to_trajectory_projection,
-    compute_first_principles_conductivity_from_overdamped_generator,
+from conductivity.physical_library.projected_primitives_io import (
+    PrimitiveExternalScalarInput,
+    PrimitiveScalarEstimateNotProvided,
+    PrimitiveScalarEstimateValue,
+    PrimitiveScalarGapNotComputed,
+    PrimitiveScalarGapValue,
+    audit_primitive_oracle_closure,
 )
-from conductivity.fm_md.atomistic_io import MolecularTrajectory
+from conductivity.physical_library.projected_analytical_conductivity import (
+    ProjectedPrimitiveInput,
+)
 
 
-class ZeroPotentialModel:
-    def potential_energy_J(self, positions_m: np.ndarray) -> float:
-        return float(np.sum(positions_m * 0.0))
+def test_projection_closure_audit_separates_gk_eh_and_recipe_gaps() -> None:
+    trajectory_primitives = _two_state_primitives(
+        capacity_flux_mol_m3_s=2.0e12,
+        first_moment_m=1.0e-10,
+        self_diffusion_m2_s=1.0e-10,
+    )
+    projected_primitives = _two_state_primitives(
+        capacity_flux_mol_m3_s=3.0e12,
+        first_moment_m=1.0e-10,
+        self_diffusion_m2_s=1.0e-10,
+    )
+    recipe_primitives = _two_state_primitives(
+        capacity_flux_mol_m3_s=3.0e12,
+        first_moment_m=2.0e-10,
+        self_diffusion_m2_s=4.0e-10,
+    )
 
-    def forces_N(self, positions_m: np.ndarray) -> np.ndarray:
-        return np.zeros_like(positions_m, dtype=float)
-
-
-class ChargeSignBasisAssigner:
-    def assign_basis(self, trajectory: MolecularTrajectory) -> ProjectedBasisAssignment:
-        state_index_by_molecule = np.where(
-            np.asarray(trajectory.formal_charges, dtype=float) > 0.0,
-            0,
-            1,
-        )
-        state_index_by_frame_and_molecule = np.repeat(
-            state_index_by_molecule[np.newaxis, :],
-            int(trajectory.com_positions.shape[0]),
-            axis=0,
-        )
-        return ProjectedBasisAssignment(
-            basis_functions=(
-                ProjectedBasisFunctionDefinition(
-                    state_label="free_ion_center:positive",
-                    projection_class=PROJECTION_CLASS_SELF_CURRENT_CARRIER,
-                ),
-                ProjectedBasisFunctionDefinition(
-                    state_label="free_ion_center:negative",
-                    projection_class=PROJECTION_CLASS_SELF_CURRENT_CARRIER,
-                ),
-            ),
-            state_index_by_frame_and_molecule=state_index_by_frame_and_molecule,
-        )
-
-
-def test_sampled_generator_projection_has_non_vacuous_gk_closure_tolerance():
-    projection_tolerance_mS_cm = 5.0e-2
-    projected_model = compute_first_principles_conductivity_from_overdamped_generator(
-        generator_input=OverdampedSmoluchowskiGeneratorInput(
-            configuration_space="overdamped_two_ion_periodic_configuration_space",
-            equilibrium_measure="boltzmann_measure_for_zero_test_potential",
-            reversible_generator="overdamped_smoluchowski_langevin_generator",
-            charge_polarization_observable="P=sum_a z_a R_a",
-            potential_model=ZeroPotentialModel(),
-            initial_positions_m=np.asarray(
-                (
-                    (0.0, 0.0, 0.0),
-                    (2.0e-10, 0.0, 0.0),
-                ),
-                dtype=float,
-            ),
-            molecule_species_indices=np.asarray((0, 1), dtype=int),
-            formal_charge_numbers=np.asarray((1.0, -1.0), dtype=float),
-            box_lengths_m=np.asarray((2.0e-9, 2.0e-9, 2.0e-9), dtype=float),
-            diffusion_coefficients_m2_s=np.asarray((1.0e-11, 1.0e-11), dtype=float),
-            temperature_K=T_REF_K,
-            dt_s=1.0e-12,
-            frame_count=8,
-            rng_seed=7,
+    report = audit_primitive_oracle_closure(
+        trajectory_primitives,
+        projected_primitives,
+        recipe_primitives,
+        PrimitiveExternalScalarInput(
+            green_kubo=PrimitiveScalarEstimateValue(sigma_mS_cm=4.0),
+            einstein_helfand=PrimitiveScalarEstimateValue(sigma_mS_cm=4.1),
         ),
-        basis_assigner=ChargeSignBasisAssigner(),
-        green_kubo_integration_stop_index=4,
-        einstein_helfand_fit_start_index=0,
-        einstein_helfand_fit_stop_index=8,
-        target_absolute_error_mS_cm=projection_tolerance_mS_cm,
-    )
-    acceptance_test = projected_model.projection_acceptance_test
-
-    assert acceptance_test.raw_green_kubo_sigma_mS_cm > 0.0
-    assert acceptance_test.raw_einstein_helfand_sigma_mS_cm > 0.0
-    assert acceptance_test.projected_sigma_mS_cm > 0.0
-    assert acceptance_test.maximum_acceptance_gap_mS_cm < projection_tolerance_mS_cm
-    assert acceptance_test.passed
-
-
-def test_recipe_gap_is_separate_from_projected_gk_closure_gap():
-    projection_tolerance_mS_cm = 5.0e-2
-    projected_model = compute_first_principles_conductivity_from_overdamped_generator(
-        generator_input=OverdampedSmoluchowskiGeneratorInput(
-            configuration_space="overdamped_two_ion_periodic_configuration_space",
-            equilibrium_measure="boltzmann_measure_for_zero_test_potential",
-            reversible_generator="overdamped_smoluchowski_langevin_generator",
-            charge_polarization_observable="P=sum_a z_a R_a",
-            potential_model=ZeroPotentialModel(),
-            initial_positions_m=np.asarray(
-                (
-                    (0.0, 0.0, 0.0),
-                    (2.0e-10, 0.0, 0.0),
-                ),
-                dtype=float,
-            ),
-            molecule_species_indices=np.asarray((0, 1), dtype=int),
-            formal_charge_numbers=np.asarray((1.0, -1.0), dtype=float),
-            box_lengths_m=np.asarray((2.0e-9, 2.0e-9, 2.0e-9), dtype=float),
-            diffusion_coefficients_m2_s=np.asarray((1.0e-11, 1.0e-11), dtype=float),
-            temperature_K=T_REF_K,
-            dt_s=1.0e-12,
-            frame_count=8,
-            rng_seed=7,
+        PrimitiveExternalScalarInput(
+            green_kubo=PrimitiveScalarEstimateValue(sigma_mS_cm=4.05),
+            einstein_helfand=PrimitiveScalarEstimateValue(sigma_mS_cm=4.15),
         ),
-        basis_assigner=ChargeSignBasisAssigner(),
-        green_kubo_integration_stop_index=4,
-        einstein_helfand_fit_start_index=0,
-        einstein_helfand_fit_stop_index=8,
-        target_absolute_error_mS_cm=projection_tolerance_mS_cm,
-    )
-    recipe_generated_sigma_mS_cm = (
-        projected_model.projection_acceptance_test.projected_sigma_mS_cm + 0.25
-    )
-
-    gap_audit = compare_recipe_sigma_to_trajectory_projection(
-        projected_model,
-        recipe_generated_sigma_mS_cm,
-    )
-
-    assert gap_audit.green_kubo_projection_gap_mS_cm < projection_tolerance_mS_cm
-    assert gap_audit.einstein_helfand_projection_gap_mS_cm < projection_tolerance_mS_cm
-    assert np.isclose(gap_audit.recipe_projection_gap_mS_cm, 0.25)
-    assert gap_audit.recipe_generated_sigma_mS_cm == recipe_generated_sigma_mS_cm
-
-
-def test_first_principles_projection_fails_loudly_when_closure_gap_exceeds_target():
-    with pytest.raises(
-        ValueError,
-        match="first-principles projected conductivity closure failed",
-    ):
-        compute_first_principles_conductivity_from_overdamped_generator(
-            generator_input=OverdampedSmoluchowskiGeneratorInput(
-                configuration_space="overdamped_two_ion_periodic_configuration_space",
-                equilibrium_measure="boltzmann_measure_for_zero_test_potential",
-                reversible_generator="overdamped_smoluchowski_langevin_generator",
-                charge_polarization_observable="P=sum_a z_a R_a",
-                potential_model=ZeroPotentialModel(),
-                initial_positions_m=np.asarray(
-                    (
-                        (0.0, 0.0, 0.0),
-                        (2.0e-10, 0.0, 0.0),
-                    ),
-                    dtype=float,
-                ),
-                molecule_species_indices=np.asarray((0, 1), dtype=int),
-                formal_charge_numbers=np.asarray((1.0, -1.0), dtype=float),
-                box_lengths_m=np.asarray((2.0e-9, 2.0e-9, 2.0e-9), dtype=float),
-                diffusion_coefficients_m2_s=np.asarray((1.0e-11, 1.0e-11), dtype=float),
-                temperature_K=T_REF_K,
-                dt_s=1.0e-12,
-                frame_count=8,
-                rng_seed=7,
+        PrimitiveExternalScalarInput(
+            green_kubo=PrimitiveScalarEstimateValue(sigma_mS_cm=6.0),
+            einstein_helfand=PrimitiveScalarEstimateNotProvided(
+                scalar_name="einstein_helfand"
             ),
-            basis_assigner=ChargeSignBasisAssigner(),
-            green_kubo_integration_stop_index=4,
-            einstein_helfand_fit_start_index=0,
-            einstein_helfand_fit_stop_index=8,
-            target_absolute_error_mS_cm=np.finfo(float).tiny,
+        ),
+    )
+
+    assert report.projection_gap.K_gap_mol_m3_s > 0.0
+    assert report.projection_gap.d_gap_m == pytest.approx(0.0)
+    assert report.recipe_primitive_gap.K_gap_mol_m3_s == pytest.approx(0.0)
+    assert report.recipe_primitive_gap.d_gap_m > 0.0
+    assert report.recipe_primitive_gap.D_self_gap_m2_s > 0.0
+    assert isinstance(report.scalar_gap.green_kubo, PrimitiveScalarGapValue)
+    assert report.scalar_gap.green_kubo.gap_mS_cm == pytest.approx(2.0)
+    assert isinstance(report.scalar_gap.einstein_helfand, PrimitiveScalarGapNotComputed)
+
+
+def test_projection_closure_audit_fails_on_illegal_primitive_process() -> None:
+    illegal_recipe_primitives = _two_state_primitives(
+        capacity_flux_mol_m3_s=2.0e12,
+        first_moment_m=1.0e-10,
+        self_diffusion_m2_s=1.0e-10,
+    )
+    illegal_recipe_primitives = ProjectedPrimitiveInput(
+        state_concentrations_mol_m3=illegal_recipe_primitives.state_concentrations_mol_m3,
+        symmetric_capacity_fluxes_K_ij_mol_m3_s=(
+            illegal_recipe_primitives.symmetric_capacity_fluxes_K_ij_mol_m3_s
+        ),
+        transition_first_moments_d_ij_m=np.asarray(
+            [
+                [[0.0, 0.0, 0.0], [1.0e-10, 0.0, 0.0]],
+                [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            ],
+            dtype=float,
+        ),
+        transition_second_moments_M_ij_m2=(
+            illegal_recipe_primitives.transition_second_moments_M_ij_m2
+        ),
+        self_current_tensors_D_self_i_m2_s=(
+            illegal_recipe_primitives.self_current_tensors_D_self_i_m2_s
+        ),
+        mori_memory_matrix_A=illegal_recipe_primitives.mori_memory_matrix_A,
+        mori_current_coupling_matrix_h=(
+            illegal_recipe_primitives.mori_current_coupling_matrix_h
+        ),
+        temperature_K=illegal_recipe_primitives.temperature_K,
+        volume_m3=illegal_recipe_primitives.volume_m3,
+    )
+    scalar_input = PrimitiveExternalScalarInput(
+        green_kubo=PrimitiveScalarEstimateNotProvided(scalar_name="green_kubo"),
+        einstein_helfand=PrimitiveScalarEstimateNotProvided(
+            scalar_name="einstein_helfand"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="d_ji must equal -d_ij"):
+        audit_primitive_oracle_closure(
+            illegal_recipe_primitives,
+            illegal_recipe_primitives,
+            illegal_recipe_primitives,
+            scalar_input,
+            scalar_input,
+            scalar_input,
         )
+
+
+def _two_state_primitives(
+    capacity_flux_mol_m3_s: float,
+    first_moment_m: float,
+    self_diffusion_m2_s: float,
+) -> ProjectedPrimitiveInput:
+    return ProjectedPrimitiveInput(
+        state_concentrations_mol_m3=np.asarray([500.0, 500.0], dtype=float),
+        symmetric_capacity_fluxes_K_ij_mol_m3_s=np.asarray(
+            [[0.0, capacity_flux_mol_m3_s], [capacity_flux_mol_m3_s, 0.0]],
+            dtype=float,
+        ),
+        transition_first_moments_d_ij_m=np.asarray(
+            [
+                [[0.0, 0.0, 0.0], [first_moment_m, 0.0, 0.0]],
+                [[-first_moment_m, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            ],
+            dtype=float,
+        ),
+        transition_second_moments_M_ij_m2=np.asarray(
+            [
+                [
+                    np.zeros((3, 3), dtype=float),
+                    np.diag([first_moment_m * first_moment_m, 0.0, 0.0]),
+                ],
+                [
+                    np.diag([first_moment_m * first_moment_m, 0.0, 0.0]),
+                    np.zeros((3, 3), dtype=float),
+                ],
+            ],
+            dtype=float,
+        ),
+        self_current_tensors_D_self_i_m2_s=np.asarray(
+            [np.eye(3) * self_diffusion_m2_s, np.eye(3) * self_diffusion_m2_s],
+            dtype=float,
+        ),
+        mori_memory_matrix_A=np.zeros((0, 0), dtype=float),
+        mori_current_coupling_matrix_h=np.zeros((0, 3), dtype=float),
+        temperature_K=T_REF_K,
+        volume_m3=1.0,
+    )

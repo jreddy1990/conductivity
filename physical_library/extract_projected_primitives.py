@@ -14,17 +14,25 @@ import yaml
 from constants import N_A
 from conductivity.physical_library.projected_analytical_conductivity import (
     CARTESIAN,
+    POISSON_SOLVABILITY_ABS_TOL,
+    POISSON_SOLVABILITY_EPSILON_FACTOR,
     PROJECTED_REFERENCE_VOLUME_M3,
     compute_projected_analytical_conductivity_from_primitives,
 )
 from conductivity.physical_library import generator_construction
 from conductivity.physical_library.mixture_closures import compute_mixture_closures
 from conductivity.physical_library.physical_objects import PairBasin, SiteConfiguration
-from conductivity.physical_library.projected_primitives_io import PRIMITIVE_SCHEMA
+from conductivity.physical_library.projected_primitives_io import (
+    PRIMITIVE_SCHEMA,
+    write_failed_projected_primitive_yaml,
+)
 from conductivity.physical_library.trajectory_primitives import (
     ANGSTROM_TO_M,
+    FiniteProcessComponentDriftResidual,
+    FiniteProcessEdgeDriftContribution,
     ProjectedGeneratorPrimitiveSet,
     TrajectoryMarkovAdditiveSampleInput,
+    diagnose_finite_process_legality,
     project_sampled_trajectory_to_generator_primitives,
 )
 
@@ -197,6 +205,32 @@ def extract_projected_primitives_from_lammps_dump(
     )
     primitive_set = project_sampled_trajectory_to_generator_primitives(sample_input)
     primitive_arrays = _primitive_arrays_from_projected_set(primitive_set)
+    component_drift_violation = _component_drift_violation(
+        primitive_set.diagnostics.component_drift_residuals
+    )
+    diagnostics = _projected_primitive_extraction_diagnostics(
+        primitive_set,
+        component_drift_violation,
+    )
+    if component_drift_violation:
+        primitive_arrays = _primitive_arrays_with_component_solvable_first_moments(
+            primitive_arrays,
+            primitive_set,
+        )
+        if _component_drift_violation(
+            primitive_set.diagnostics.component_solvable_projection.projected_component_drift_residuals
+        ):
+            failure_reason = (
+                "component-solvable first-moment projection did not remove "
+                "finite-state drift"
+            )
+            write_failed_projected_primitive_yaml(
+                output_yaml_path,
+                PRIMITIVE_SCHEMA,
+                failure_reason,
+                diagnostics,
+            )
+            raise ValueError(failure_reason)
     artifact = {
         "schema": PRIMITIVE_SCHEMA,
         "source_schema": SCHEMA_NAME,
@@ -249,25 +283,8 @@ def extract_projected_primitives_from_lammps_dump(
                 ),
             },
         },
-        "diagnostics": {
-            "visited_state_count": int(primitive_set.diagnostics.visited_state_count),
-            "transition_sample_count": int(
-                primitive_set.diagnostics.transition_sample_count
-            ),
-            "self_displacement_sample_count": int(
-                primitive_set.diagnostics.self_displacement_sample_count
-            ),
-            "generated_event_count": int(
-                primitive_set.diagnostics.generated_event_count
-            ),
-            "trajectory_time_s": float(primitive_set.diagnostics.trajectory_time_s),
-            "total_transport_concentration_mol_m3": float(
-                primitive_set.diagnostics.total_transport_concentration_mol_m3
-            ),
-        },
+        "diagnostics": diagnostics,
     }
-    output_yaml_path.parent.mkdir(parents=True, exist_ok=True)
-    output_yaml_path.write_text(yaml.safe_dump(artifact, sort_keys=False))
     projected_result = compute_projected_analytical_conductivity_from_primitives(
         state_concentrations_mol_m3=primitive_arrays["state_concentrations_mol_m3"],
         symmetric_capacity_fluxes_K_ij_mol_m3_s=primitive_arrays[
@@ -289,7 +306,9 @@ def extract_projected_primitives_from_lammps_dump(
         temperature_K=float(composition_record["temperature_K"]),
         volume_m3=PROJECTED_REFERENCE_VOLUME_M3,
     )
+    artifact["projected_readout_status"] = "succeeded"
     artifact["projected_analytical_sigma_mS_cm"] = float(projected_result.sigma_mS_cm)
+    output_yaml_path.parent.mkdir(parents=True, exist_ok=True)
     output_yaml_path.write_text(yaml.safe_dump(artifact, sort_keys=False))
     return artifact
 
@@ -916,6 +935,14 @@ def _primitive_arrays_from_projected_set(
             tensor_record.diffusion_tensor_m2_s,
             dtype=float,
         )
+    diagnose_finite_process_legality(
+        primitive_set.state_labels,
+        concentrations,
+        capacity_fluxes,
+        first_moments,
+        second_moments,
+        _directed_transition_sample_counts_from_projected_set(primitive_set),
+    )
     return {
         "state_concentrations_mol_m3": concentrations,
         "symmetric_capacity_fluxes_K_ij_mol_m3_s": capacity_fluxes,
@@ -925,6 +952,175 @@ def _primitive_arrays_from_projected_set(
         "mori_memory_matrix_A": np.zeros((0, 0), dtype=float),
         "mori_current_coupling_matrix_h": np.zeros((0, CARTESIAN), dtype=float),
     }
+
+
+def _primitive_arrays_with_component_solvable_first_moments(
+    primitive_arrays: dict[str, np.ndarray],
+    primitive_set: ProjectedGeneratorPrimitiveSet,
+) -> dict[str, np.ndarray]:
+    repaired_arrays = {
+        primitive_name: np.asarray(primitive_value, dtype=float).copy()
+        for primitive_name, primitive_value in primitive_arrays.items()
+    }
+    repaired_arrays["transition_first_moments_d_ij_m"] = np.asarray(
+        primitive_set.diagnostics.component_solvable_projection.projected_first_moments_d_ij_m,
+        dtype=float,
+    )
+    return repaired_arrays
+
+
+def _directed_transition_sample_counts_from_projected_set(
+    primitive_set: ProjectedGeneratorPrimitiveSet,
+) -> np.ndarray:
+    state_index_by_label = {
+        state_label: state_index
+        for state_index, state_label in enumerate(primitive_set.state_labels)
+    }
+    directed_counts = np.zeros(
+        (len(primitive_set.state_labels), len(primitive_set.state_labels)),
+        dtype=int,
+    )
+    for flux_record in primitive_set.reactive_fluxes:
+        from_state_index = state_index_by_label[flux_record.from_state_label]
+        to_state_index = state_index_by_label[flux_record.to_state_label]
+        directed_counts[from_state_index, to_state_index] = int(
+            flux_record.forward_sample_count
+        )
+        directed_counts[to_state_index, from_state_index] = int(
+            flux_record.reverse_sample_count
+        )
+    return directed_counts
+
+
+def _component_drift_violation(
+    component_drift_residuals: tuple[FiniteProcessComponentDriftResidual, ...],
+) -> bool:
+    for component_drift_residual in component_drift_residuals:
+        tolerance = max(
+            POISSON_SOLVABILITY_ABS_TOL,
+            POISSON_SOLVABILITY_EPSILON_FACTOR
+            * np.finfo(float).eps
+            * component_drift_residual.weighted_absolute_drift_scale_mol_m2_s,
+        )
+        if component_drift_residual.weighted_drift_norm_mol_m2_s > tolerance:
+            return True
+    return False
+
+
+def _projected_primitive_extraction_diagnostics(
+    primitive_set: ProjectedGeneratorPrimitiveSet,
+    component_solvable_projection_applied: bool,
+) -> dict:
+    component_solvable_projection = (
+        primitive_set.diagnostics.component_solvable_projection
+    )
+    return {
+        "visited_state_count": int(primitive_set.diagnostics.visited_state_count),
+        "transition_sample_count": int(
+            primitive_set.diagnostics.transition_sample_count
+        ),
+        "self_displacement_sample_count": int(
+            primitive_set.diagnostics.self_displacement_sample_count
+        ),
+        "generated_event_count": int(primitive_set.diagnostics.generated_event_count),
+        "trajectory_time_s": float(primitive_set.diagnostics.trajectory_time_s),
+        "total_transport_concentration_mol_m3": float(
+            primitive_set.diagnostics.total_transport_concentration_mol_m3
+        ),
+        "component_drift_residuals": _component_drift_residual_records(
+            primitive_set.diagnostics.component_drift_residuals
+        ),
+        "finite_process_legality": {
+            "maximum_detailed_balance_residual_mol_m3_s": float(
+                primitive_set.diagnostics.finite_process_legality.maximum_detailed_balance_residual_mol_m3_s
+            ),
+            "component_drift_residuals": _component_drift_residual_records(
+                primitive_set.diagnostics.finite_process_legality.component_drift_residuals
+            ),
+        },
+        "component_solvable_projection": {
+            "applied_to_primitives": bool(component_solvable_projection_applied),
+            "maximum_removed_first_moment_norm_m": float(
+                component_solvable_projection.maximum_removed_first_moment_norm_m
+            ),
+            "removed_first_moments_d_ij_m": [
+                [list(vector) for vector in row]
+                for row in component_solvable_projection.removed_first_moments_d_ij_m
+            ],
+            "projected_component_drift_residuals": _component_drift_residual_records(
+                component_solvable_projection.projected_component_drift_residuals
+            ),
+        },
+    }
+
+
+def _component_drift_residual_records(
+    component_drift_residuals: tuple[FiniteProcessComponentDriftResidual, ...],
+):
+    records = []
+    for component_drift_residual in component_drift_residuals:
+        records.append(
+            {
+                "component_id": int(component_drift_residual.component_id),
+                "state_labels": list(component_drift_residual.state_labels),
+                "state_concentrations_mol_m3": list(
+                    component_drift_residual.state_concentrations_mol_m3
+                ),
+                "exit_rates_s_inv": list(component_drift_residual.exit_rates_s_inv),
+                "concentration_sum_mol_m3": float(
+                    component_drift_residual.concentration_sum_mol_m3
+                ),
+                "weighted_drift_mol_m2_s": list(
+                    component_drift_residual.weighted_drift_mol_m2_s
+                ),
+                "weighted_drift_norm_mol_m2_s": float(
+                    component_drift_residual.weighted_drift_norm_mol_m2_s
+                ),
+                "weighted_absolute_drift_scale_mol_m2_s": float(
+                    component_drift_residual.weighted_absolute_drift_scale_mol_m2_s
+                ),
+                "top_edge_contributions": _edge_drift_contribution_records(
+                    component_drift_residual.top_edge_contributions
+                ),
+            }
+        )
+    return records
+
+
+def _edge_drift_contribution_records(
+    edge_drift_contributions: tuple[FiniteProcessEdgeDriftContribution, ...],
+):
+    records = []
+    for edge_drift_contribution in edge_drift_contributions:
+        records.append(
+            {
+                "component_id": int(edge_drift_contribution.component_id),
+                "from_state_label": edge_drift_contribution.from_state_label,
+                "to_state_label": edge_drift_contribution.to_state_label,
+                "contribution_mol_m2_s": list(
+                    edge_drift_contribution.contribution_mol_m2_s
+                ),
+                "contribution_norm_mol_m2_s": float(
+                    edge_drift_contribution.contribution_norm_mol_m2_s
+                ),
+                "capacity_flux_mol_m3_s": float(
+                    edge_drift_contribution.capacity_flux_mol_m3_s
+                ),
+                "first_moment_norm_m": float(
+                    edge_drift_contribution.first_moment_norm_m
+                ),
+                "forward_sample_count": int(
+                    edge_drift_contribution.forward_sample_count
+                ),
+                "reverse_sample_count": int(
+                    edge_drift_contribution.reverse_sample_count
+                ),
+                "missing_reverse_event_candidate": bool(
+                    edge_drift_contribution.missing_reverse_event_candidate
+                ),
+            }
+        )
+    return records
 
 
 def _seconds_per_femtosecond() -> float:

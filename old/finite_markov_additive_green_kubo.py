@@ -9,7 +9,7 @@ from typing import Mapping, Sequence
 import numpy as np
 
 from constants import F, R, S_M_TO_MS_CM
-from conductivity.finite_mori_conductivity import (
+from conductivity.old.finite_mori_conductivity import (
     CARTESIAN_AXIS_COUNT,
     ProjectedMoriConductivityInput,
     ProjectedMoriConductivityResult,
@@ -466,10 +466,16 @@ def compute_markov_additive_event_family_attribution(
     return tuple(
         sorted(
             attributions,
-            key=lambda attribution: abs(attribution.marginal_net_sigma_mS_cm),
+            key=_absolute_marginal_net_sigma_mS_cm,
             reverse=True,
         )
     )
+
+
+def _absolute_marginal_net_sigma_mS_cm(
+    attribution: MarkovAdditiveEventFamilyAttribution,
+) -> float:
+    return abs(attribution.marginal_net_sigma_mS_cm)
 
 
 def _event_family_labels(

@@ -3,18 +3,17 @@
 from __future__ import annotations
 
 from constants import T_REF_K
-from conductivity.finite_markov_conductivity import (
-    ANION_DIAGONAL_RELAXATION_FORM_FACTOR_OFF,
-    ATMOSPHERE_BATH_BASIS_TOTAL_FORMAL,
-    RELAXATION_DYNAMIC_RESPONSE_OFF,
-)
-from conductivity.run_finite_markov_dataset_audit import TOP_REPORTED_ROWS
-from conductivity.projected_mori_property_db_audit import (
+from conductivity.old.projected_mori_property_db_audit import (
     ProjectedMoriPropertyDbAuditResult,
     ProjectedMoriPropertyDbRow,
     audit_projected_mori_conductivity_against_property_db,
 )
 from data.electrolyte_property_db import DATA
+
+ANION_DIAGONAL_RELAXATION_FORM_FACTOR_OFF = "off"
+ATMOSPHERE_BATH_BASIS_TOTAL_FORMAL = "total_formal"
+RELAXATION_DYNAMIC_RESPONSE_OFF = "off"
+TOP_REPORTED_ROWS = 5  # Audit display count: report the five largest residual rows.
 
 
 def main() -> None:
@@ -31,10 +30,14 @@ def main() -> None:
     print("worst_projected_mori_rows")
     for row in sorted(
         audit.rows,
-        key=lambda audit_row: abs(audit_row.residual_mS_cm),
+        key=_absolute_residual_mS_cm,
         reverse=True,
     )[:TOP_REPORTED_ROWS]:
         _print_row(row)
+
+
+def _absolute_residual_mS_cm(row: ProjectedMoriPropertyDbRow) -> float:
+    return abs(row.residual_mS_cm)
 
 
 def _print_summary(audit: ProjectedMoriPropertyDbAuditResult) -> None:

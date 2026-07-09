@@ -59,6 +59,8 @@ class PhysicalTransitionQuadrature:
     first_displacement_moment_m: Array
     second_displacement_moment_m2: Array
     log_capacity_integral: float
+    uses_residence_rate_constant: bool
+    residence_rate_constant_s_inv: float
 
 
 @dataclass(frozen=True)
@@ -78,33 +80,41 @@ def build_reduced_generator_specification_from_physical_objects(
 ) -> ReducedGeneratorSpecification:
     """Convert physical-library quadrature into deterministic generator functions."""
 
-    validate_site_configuration_family(
-        build_input.template_configuration,
-        _all_configurations(build_input.state_quadratures, build_input.transition_quadratures),
+    common_coordinate_count = _common_generator_coordinate_count(
+        build_input.state_quadratures,
+        build_input.transition_quadratures,
     )
     state_quadratures = tuple(
         _build_reduced_state_quadrature(
-            build_input.template_configuration,
             state_quadrature,
+            common_coordinate_count,
         )
         for state_quadrature in build_input.state_quadratures
     )
     transition_quadratures = tuple(
         _build_reduced_transition_quadrature(
-            build_input.template_configuration,
             transition_quadrature,
             build_input.records,
+            common_coordinate_count,
         )
         for transition_quadrature in build_input.transition_quadratures
     )
-    physical_object_at_point = _physical_object_function(build_input)
+    point_registry = _generator_point_registry(
+        build_input.state_quadratures,
+        build_input.transition_quadratures,
+        common_coordinate_count,
+    )
+    physical_object_at_point = _physical_object_function(build_input, point_registry)
     return ReducedGeneratorSpecification(
         potential_energy_J_mol=_physical_potential_function(physical_object_at_point),
         mobility_tensor_m2_s=_physical_mobility_function(physical_object_at_point),
         charge_polarization_gradient=_physical_polarization_gradient_function(
             physical_object_at_point
         ),
-        memory_coordinate_gradient=_physical_memory_gradient_function(build_input),
+        memory_coordinate_gradient=_physical_memory_gradient_function(
+            build_input,
+            point_registry,
+        ),
         state_quadratures=state_quadratures,
         transition_quadratures=transition_quadratures,
         total_component_concentrations_mol_m3=np.asarray(
@@ -197,8 +207,8 @@ def _all_configurations(
 
 
 def _build_reduced_state_quadrature(
-    template_configuration: SiteConfiguration,
     state_quadrature: PhysicalStateQuadrature,
+    common_coordinate_count: int,
 ) -> ReducedStateQuadrature:
     validate_local_field_count(
         state_quadrature.local_fields,
@@ -207,7 +217,10 @@ def _build_reduced_state_quadrature(
     )
     points = np.vstack(
         tuple(
-            flatten_configuration_with_local_fields(configuration, local_fields)
+            _pad_generator_point(
+                flatten_configuration_with_local_fields(configuration, local_fields),
+                common_coordinate_count,
+            )
             for configuration, local_fields in zip(
                 state_quadrature.configurations,
                 state_quadrature.local_fields,
@@ -215,28 +228,33 @@ def _build_reduced_state_quadrature(
             )
         )
     )
-    coordinate_count = (
-        len(template_configuration.species_names) * CARTESIAN_DIMENSION
-        + LOCAL_FIELD_VECTOR_LENGTH
-    )
     projector = np.asarray(state_quadrature.self_current_projector, dtype=float)
-    if projector.shape != (coordinate_count, coordinate_count):
+    physical_coordinate_count = int(projector.shape[0])
+    if projector.shape[0] != projector.shape[1]:
+        raise ValueError(f"{state_quadrature.label}.self_current_projector must be square")
+    if physical_coordinate_count > common_coordinate_count:
         raise ValueError(
             f"{state_quadrature.label}.self_current_projector must have "
-            f"shape ({coordinate_count}, {coordinate_count})"
+            f"at most {common_coordinate_count} coordinates"
         )
+    if not np.allclose(projector, np.eye(physical_coordinate_count, dtype=float)):
+        raise ValueError(
+            f"{state_quadrature.label}.self_current_projector must be identity "
+            "in the full-generator path"
+        )
+    padded_projector = np.eye(common_coordinate_count, dtype=float)
     return ReducedStateQuadrature(
         points=points,
         weights=np.asarray(state_quadrature.weights, dtype=float),
         stoichiometry=np.asarray(state_quadrature.stoichiometry, dtype=float),
-        self_current_projector=projector,
+        self_current_projector=padded_projector,
     )
 
 
 def _build_reduced_transition_quadrature(
-    template_configuration: SiteConfiguration,
     transition_quadrature: PhysicalTransitionQuadrature,
     records: PhysicalLibraryRecords,
+    common_coordinate_count: int,
 ) -> ReducedTransitionQuadrature:
     validate_local_field_count(
         transition_quadrature.local_fields,
@@ -245,7 +263,10 @@ def _build_reduced_transition_quadrature(
     )
     points = np.vstack(
         tuple(
-            flatten_configuration_with_local_fields(configuration, local_fields)
+            _pad_generator_point(
+                flatten_configuration_with_local_fields(configuration, local_fields),
+                common_coordinate_count,
+            )
             for configuration, local_fields in zip(
                 transition_quadrature.configurations,
                 transition_quadrature.local_fields,
@@ -255,7 +276,7 @@ def _build_reduced_transition_quadrature(
     )
     committor_gradients = _extend_position_gradients_to_generator_points(
         transition_quadrature.committor_gradients,
-        points.shape[1],
+        common_coordinate_count,
     )
     return ReducedTransitionQuadrature(
         from_state_index=transition_quadrature.from_state_index,
@@ -282,6 +303,12 @@ def _build_reduced_transition_quadrature(
             dtype=float,
         ),
         log_capacity_integral=float(transition_quadrature.log_capacity_integral),
+        uses_residence_rate_constant=bool(
+            transition_quadrature.uses_residence_rate_constant
+        ),
+        residence_rate_constant_s_inv=float(
+            transition_quadrature.residence_rate_constant_s_inv
+        ),
     )
 
 
@@ -300,24 +327,116 @@ def _path_displacements_m(
     return np.asarray(displacements, dtype=float)
 
 
+def _common_generator_coordinate_count(
+    state_quadratures: tuple[PhysicalStateQuadrature, ...],
+    transition_quadratures: tuple[PhysicalTransitionQuadrature, ...],
+) -> int:
+    coordinate_counts = tuple(
+        flatten_configuration_with_local_fields(configuration, local_fields).size
+        for state_quadrature in state_quadratures
+        for configuration, local_fields in zip(
+            state_quadrature.configurations,
+            state_quadrature.local_fields,
+            strict=True,
+        )
+    ) + tuple(
+        flatten_configuration_with_local_fields(configuration, local_fields).size
+        for transition_quadrature in transition_quadratures
+        for configuration, local_fields in zip(
+            transition_quadrature.configurations,
+            transition_quadrature.local_fields,
+            strict=True,
+        )
+    )
+    if not coordinate_counts:
+        raise ValueError("physical generator build has no quadrature points")
+    return int(max(coordinate_counts))
+
+
+def _pad_generator_point(generator_point: Array, common_coordinate_count: int) -> Array:
+    point = np.asarray(generator_point, dtype=float)
+    if point.ndim != 1:
+        raise ValueError("generator point must be one-dimensional")
+    if point.size > common_coordinate_count:
+        raise ValueError("generator point exceeds common coordinate dimension")
+    if point.size == common_coordinate_count:
+        return point
+    padded_point = np.zeros(common_coordinate_count, dtype=float)
+    padded_point[: point.size] = point
+    return padded_point
+
+
+def _generator_point_registry(
+    state_quadratures: tuple[PhysicalStateQuadrature, ...],
+    transition_quadratures: tuple[PhysicalTransitionQuadrature, ...],
+    common_coordinate_count: int,
+) -> dict[tuple[float, ...], tuple[SiteConfiguration, PhysicalLocalFields]]:
+    registry: dict[tuple[float, ...], tuple[SiteConfiguration, PhysicalLocalFields]] = {}
+    for state_quadrature in state_quadratures:
+        _register_configuration_points(
+            registry,
+            state_quadrature.configurations,
+            state_quadrature.local_fields,
+            common_coordinate_count,
+        )
+    for transition_quadrature in transition_quadratures:
+        _register_configuration_points(
+            registry,
+            transition_quadrature.configurations,
+            transition_quadrature.local_fields,
+            common_coordinate_count,
+        )
+    return registry
+
+
+def _register_configuration_points(
+    registry: dict[tuple[float, ...], tuple[SiteConfiguration, PhysicalLocalFields]],
+    configurations: tuple[SiteConfiguration, ...],
+    local_fields: tuple[PhysicalLocalFields, ...],
+    common_coordinate_count: int,
+) -> None:
+    validate_local_field_count(local_fields, len(configurations), "registered_points")
+    for configuration, local_fields_at_configuration in zip(
+        configurations,
+        local_fields,
+        strict=True,
+    ):
+        generator_point = flatten_configuration_with_local_fields(
+            configuration,
+            local_fields_at_configuration,
+        )
+        padded_generator_point = _pad_generator_point(
+            generator_point,
+            common_coordinate_count,
+        )
+        registry[_generator_point_cache_key(padded_generator_point)] = (
+            configuration,
+            local_fields_at_configuration,
+        )
+
+
+def _generator_point_cache_key(generator_point: Array) -> tuple[float, ...]:
+    return tuple(
+        np.round(
+            np.asarray(generator_point, dtype=float),
+            CACHE_KEY_DECIMAL_PLACES,
+        )
+    )
+
+
 def _physical_object_function(
     build_input: PhysicalGeneratorBuildInput,
+    point_registry: dict[tuple[float, ...], tuple[SiteConfiguration, PhysicalLocalFields]],
 ) -> Callable[[Array], PhysicalObjectBundle]:
     physical_object_cache: dict[tuple[float, ...], PhysicalObjectBundle] = {}
 
     def physical_object_at_point(generator_point: Array) -> PhysicalObjectBundle:
-        cache_key = tuple(
-            np.round(
-                np.asarray(generator_point, dtype=float),
-                CACHE_KEY_DECIMAL_PLACES,
-            )
-        )
+        cache_key = _generator_point_cache_key(generator_point)
         if cache_key in physical_object_cache:
             return physical_object_cache[cache_key]
-        configuration, local_fields = configuration_and_local_fields_from_generator_point(
-            build_input.template_configuration,
-            generator_point,
-        )
+        if cache_key not in point_registry:
+            raise ValueError("generator point is not registered to a physical configuration")
+        configuration, local_fields = point_registry[cache_key]
         physical_object = build_physical_objects(
             build_input.records,
             configuration,
@@ -347,7 +466,10 @@ def _physical_mobility_function(
 ) -> Callable[[Array], Array]:
     def mobility_tensor_m2_s(generator_point: Array) -> Array:
         physical_mobility = physical_object_at_point(generator_point).mobility_tensor_m2_s
-        return _extend_square_matrix_to_generator_point(physical_mobility)
+        return _extend_square_matrix_to_dimension(
+            physical_mobility,
+            np.asarray(generator_point, dtype=float).size,
+        )
 
     return mobility_tensor_m2_s
 
@@ -359,31 +481,53 @@ def _physical_polarization_gradient_function(
         physical_gradient = physical_object_at_point(
             generator_point
         ).charge_polarization_gradient
-        return _extend_gradient_to_generator_point(physical_gradient)
+        return _extend_gradient_to_dimension(
+            physical_gradient,
+            np.asarray(generator_point, dtype=float).size,
+        )
 
     return charge_polarization_gradient
 
 
 def _physical_memory_gradient_function(
     build_input: PhysicalGeneratorBuildInput,
+    point_registry: dict[tuple[float, ...], tuple[SiteConfiguration, PhysicalLocalFields]],
 ) -> Callable[[Array], Array]:
     def memory_coordinate_gradient(generator_point: Array) -> Array:
-        configuration, _local_fields = configuration_and_local_fields_from_generator_point(
-            build_input.template_configuration,
-            generator_point,
-        )
+        cache_key = _generator_point_cache_key(generator_point)
+        if cache_key not in point_registry:
+            raise ValueError("generator point is not registered to a physical configuration")
+        configuration, _local_fields = point_registry[cache_key]
+        if not _configuration_has_role(build_input.records, configuration, "cation"):
+            return np.zeros(
+                (
+                    len(build_input.memory_coordinate_gradient_functions),
+                    np.asarray(generator_point, dtype=float).size,
+                ),
+                dtype=float,
+            )
         gradients = []
         for gradient_function in build_input.memory_coordinate_gradient_functions:
             gradients.append(np.asarray(gradient_function(configuration), dtype=float))
         if not gradients:
-            coordinate_count = (
-                len(configuration.species_names) * CARTESIAN_DIMENSION
-                + LOCAL_FIELD_VECTOR_LENGTH
-            )
-            return np.zeros((0, coordinate_count), dtype=float)
-        return _extend_gradient_to_generator_point(np.vstack(tuple(gradients)))
+            return np.zeros((0, np.asarray(generator_point, dtype=float).size), dtype=float)
+        return _extend_gradient_to_dimension(
+            np.vstack(tuple(gradients)),
+            np.asarray(generator_point, dtype=float).size,
+        )
 
     return memory_coordinate_gradient
+
+
+def _configuration_has_role(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+    role: str,
+) -> bool:
+    return any(
+        records.species_records[species_name]["role"] == role
+        for species_name in configuration.species_names
+    )
 
 
 def validate_local_field_count(
@@ -408,21 +552,28 @@ def validate_local_fields(local_fields: PhysicalLocalFields, label: str) -> None
         raise ValueError(f"{label}.local_packing_fraction must be nonnegative")
 
 
-def _extend_square_matrix_to_generator_point(physical_matrix: Array) -> Array:
+def _extend_square_matrix_to_dimension(
+    physical_matrix: Array,
+    target_dimension: int,
+) -> Array:
     matrix = np.asarray(physical_matrix, dtype=float)
-    generator_dimension = matrix.shape[0] + LOCAL_FIELD_VECTOR_LENGTH
-    extended = np.zeros((generator_dimension, generator_dimension), dtype=float)
+    if matrix.shape[0] > target_dimension or matrix.shape[1] > target_dimension:
+        raise ValueError("physical matrix exceeds target generator dimension")
+    extended = np.zeros((target_dimension, target_dimension), dtype=float)
     extended[: matrix.shape[0], : matrix.shape[1]] = matrix
     return extended
 
 
-def _extend_gradient_to_generator_point(physical_gradient: Array) -> Array:
+def _extend_gradient_to_dimension(
+    physical_gradient: Array,
+    target_dimension: int,
+) -> Array:
     gradient = np.asarray(physical_gradient, dtype=float)
-    local_field_columns = np.zeros(
-        (gradient.shape[0], LOCAL_FIELD_VECTOR_LENGTH),
-        dtype=float,
-    )
-    return np.hstack((gradient, local_field_columns))
+    if gradient.shape[1] > target_dimension:
+        raise ValueError("physical gradient exceeds target generator dimension")
+    extended = np.zeros((gradient.shape[0], target_dimension), dtype=float)
+    extended[:, : gradient.shape[1]] = gradient
+    return extended
 
 
 def _extend_position_gradients_to_generator_points(
@@ -432,10 +583,8 @@ def _extend_position_gradients_to_generator_points(
     gradient_array = np.asarray(gradients, dtype=float)
     if gradient_array.shape[1] == generator_dimension:
         return gradient_array
-    if gradient_array.shape[1] + LOCAL_FIELD_VECTOR_LENGTH != generator_dimension:
-        raise ValueError("committor gradient dimension is incompatible with generator points")
-    local_field_columns = np.zeros(
-        (gradient_array.shape[0], LOCAL_FIELD_VECTOR_LENGTH),
-        dtype=float,
-    )
-    return np.hstack((gradient_array, local_field_columns))
+    if gradient_array.shape[1] > generator_dimension:
+        raise ValueError("committor gradient dimension exceeds generator points")
+    extended = np.zeros((gradient_array.shape[0], generator_dimension), dtype=float)
+    extended[:, : gradient_array.shape[1]] = gradient_array
+    return extended

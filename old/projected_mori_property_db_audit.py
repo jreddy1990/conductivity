@@ -4,16 +4,17 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Sequence
 
 import numpy as np
 
-from conductivity.finite_markov_conductivity import evaluate_finite_markov_conductivity
-from conductivity.finite_markov_dataset_audit import (
-    _require_entry,
-    canonicalize_empirical_recipe,
-)
-from utils.strict_validation import require_float
+from conductivity.physical_library.library_io import load_physical_library
+from data.species_data import SALTS
+from utils.strict_validation import require_float, require_key, strict_mapping
+
+
+PHYSICAL_LIBRARY_ROOT = Path("conductivity/physical_library")
 
 
 @dataclass(frozen=True)
@@ -64,61 +65,58 @@ def audit_projected_mori_conductivity_against_property_db(
         raise ValueError(f"temperature_K must be positive and finite, got {temperature_K}")
 
     rows: list[ProjectedMoriPropertyDbRow] = []
-    failures: list[ProjectedMoriPropertyDbFailure] = []
     labeled_rows = 0
 
     for row_id, entry in enumerate(entries):
-        entry_sections = _require_entry(entry, row_id)
+        entry_sections = _require_projected_mori_entry(entry, row_id)
         properties = entry_sections["properties"]
         if "conductivity_mS_cm" not in properties:
             continue
         labeled_rows += 1
-        try:
-            empirical_sigma_mS_cm = require_float(
-                properties,
-                "conductivity_mS_cm",
-                f"DATA[{row_id}].properties",
+        empirical_sigma_mS_cm = require_float(
+            properties,
+            "conductivity_mS_cm",
+            f"DATA[{row_id}].properties",
+        )
+        _require_projected_physical_library_payload(row_id, properties)
+        recipe = strict_mapping(entry_sections["recipe"], f"DATA[{row_id}].recipe")
+        _require_active_recipe_species_records(row_id, recipe)
+        from conductivity.old.finite_markov_conductivity import (
+            evaluate_finite_markov_conductivity,
+        )
+
+        finite_result = evaluate_finite_markov_conductivity(
+            recipe,
+            temperature_K,
+            atmosphere_bath_basis,
+            relaxation_dynamic_response,
+            anion_diagonal_relaxation_form_factor,
+        )
+        projected_mori_result = finite_result.projected_mori_conductivity
+        energy_eigenvalues = projected_mori_result.energy_eigenvalues
+        if not energy_eigenvalues:
+            raise ValueError("projected Mori result has no energy eigenvalues")
+        projected_mori_sigma_mS_cm = projected_mori_result.sigma_mS_cm
+        rows.append(
+            ProjectedMoriPropertyDbRow(
+                row_id=row_id,
+                empirical_sigma_mS_cm=empirical_sigma_mS_cm,
+                projected_mori_sigma_mS_cm=projected_mori_sigma_mS_cm,
+                residual_mS_cm=projected_mori_sigma_mS_cm - empirical_sigma_mS_cm,
+                projected_mori_sigma_S_m=projected_mori_result.sigma_S_m,
+                axis_conductivity_S_m=projected_mori_result.axis_conductivity_S_m,
+                quadratic_form_by_axis=projected_mori_result.quadratic_form_by_axis,
+                projected_basis_dimension=len(energy_eigenvalues),
+                energy_min_eigenvalue=float(min(energy_eigenvalues)),
+                energy_max_eigenvalue=float(max(energy_eigenvalues)),
             )
-            canonicalization = canonicalize_empirical_recipe(entry_sections["recipe"])
-            finite_result = evaluate_finite_markov_conductivity(
-                canonicalization.recipe,
-                temperature_K,
-                atmosphere_bath_basis,
-                relaxation_dynamic_response,
-                anion_diagonal_relaxation_form_factor,
-            )
-            projected_mori_result = finite_result.projected_mori_conductivity
-            energy_eigenvalues = projected_mori_result.energy_eigenvalues
-            if not energy_eigenvalues:
-                raise ValueError("projected Mori result has no energy eigenvalues")
-            projected_mori_sigma_mS_cm = projected_mori_result.sigma_mS_cm
-            rows.append(
-                ProjectedMoriPropertyDbRow(
-                    row_id=row_id,
-                    empirical_sigma_mS_cm=empirical_sigma_mS_cm,
-                    projected_mori_sigma_mS_cm=projected_mori_sigma_mS_cm,
-                    residual_mS_cm=projected_mori_sigma_mS_cm - empirical_sigma_mS_cm,
-                    projected_mori_sigma_S_m=projected_mori_result.sigma_S_m,
-                    axis_conductivity_S_m=projected_mori_result.axis_conductivity_S_m,
-                    quadratic_form_by_axis=projected_mori_result.quadratic_form_by_axis,
-                    projected_basis_dimension=len(energy_eigenvalues),
-                    energy_min_eigenvalue=float(min(energy_eigenvalues)),
-                    energy_max_eigenvalue=float(max(energy_eigenvalues)),
-                )
-            )
-        except (KeyError, TypeError, ValueError) as exc:
-            failures.append(
-                ProjectedMoriPropertyDbFailure(
-                    row_id=row_id,
-                    error=str(exc),
-                )
-            )
+        )
 
     metrics = _projected_mori_property_db_metrics(rows)
     return ProjectedMoriPropertyDbAuditResult(
         labeled_rows=labeled_rows,
         evaluated_rows=len(rows),
-        failed_rows=len(failures),
+        failed_rows=0,
         mae_mS_cm=metrics["mae_mS_cm"],
         rmse_mS_cm=metrics["rmse_mS_cm"],
         bias_mS_cm=metrics["bias_mS_cm"],
@@ -126,8 +124,107 @@ def audit_projected_mori_conductivity_against_property_db(
         r2=metrics["r2"],
         pearson_r=metrics["pearson_r"],
         rows=tuple(rows),
-        failures=tuple(failures),
+        failures=(),
     )
+
+
+def _require_projected_mori_entry(entry, row_id: int) -> dict[str, dict]:
+    entry_mapping = strict_mapping(entry, f"DATA[{row_id}]")
+    recipe = strict_mapping(
+        require_key(entry_mapping, "recipe", f"DATA[{row_id}]"),
+        f"DATA[{row_id}].recipe",
+    )
+    properties = strict_mapping(
+        require_key(entry_mapping, "properties", f"DATA[{row_id}]"),
+        f"DATA[{row_id}].properties",
+    )
+    return {"recipe": recipe, "properties": properties}
+
+
+def _require_projected_physical_library_payload(row_id: int, properties) -> None:
+    properties_mapping = strict_mapping(properties, f"DATA[{row_id}].properties")
+    if "projected_primitives" in properties_mapping:
+        strict_mapping(
+            properties_mapping["projected_primitives"],
+            f"DATA[{row_id}].properties.projected_primitives",
+        )
+        return
+    if "projected_generator_inputs" in properties_mapping:
+        strict_mapping(
+            properties_mapping["projected_generator_inputs"],
+            f"DATA[{row_id}].properties.projected_generator_inputs",
+        )
+        return
+    raise ValueError(
+        f"DATA[{row_id}] is missing projected_primitives or "
+        "projected_generator_inputs; recipe-only conductivity validation requires a "
+        "populated full ConductivityPhysicalLibrary"
+    )
+
+
+def _require_active_recipe_species_records(
+    row_id: int,
+    recipe: dict[str, dict[str, float]],
+) -> None:
+    records = load_physical_library(PHYSICAL_LIBRARY_ROOT)
+    missing_species_names = _missing_active_recipe_species_names(
+        recipe,
+        records.species_records,
+    )
+    if missing_species_names:
+        raise KeyError(
+            f"DATA[{row_id}] active recipe species missing from physical library: "
+            f"{missing_species_names}"
+        )
+
+
+def _missing_active_recipe_species_names(
+    recipe: dict[str, dict[str, float]],
+    species_records: dict,
+) -> tuple[str, ...]:
+    active_species_names = _active_recipe_species_names(recipe)
+    return tuple(
+        species_name
+        for species_name in active_species_names
+        if species_name not in species_records
+    )
+
+
+def _active_recipe_species_names(recipe: dict[str, dict[str, float]]) -> tuple[str, ...]:
+    active_species_names: list[str] = []
+    for section_name in ("solvents", "salts", "additives"):
+        section = strict_mapping(
+            require_key(recipe, section_name, "canonical_recipe"),
+            f"canonical_recipe.{section_name}",
+        )
+        for species_name, loading in section.items():
+            loading_value = float(loading)
+            if not math.isfinite(loading_value):
+                raise ValueError(
+                    f"canonical_recipe.{section_name}.{species_name} must be finite"
+                )
+            if loading_value > 0.0:
+                active_species_names.extend(
+                    _physical_library_species_names_for_recipe_loading(
+                        section_name,
+                        str(species_name),
+                    )
+                )
+    return tuple(sorted(set(active_species_names)))
+
+
+def _physical_library_species_names_for_recipe_loading(
+    section_name: str,
+    species_name: str,
+) -> tuple[str, ...]:
+    if section_name != "salts":
+        return (species_name,)
+    if species_name not in SALTS:
+        return (species_name,)
+    salt_record = strict_mapping(SALTS[species_name], f"SALTS.{species_name}")
+    cation_name = str(require_key(salt_record, "cation", f"SALTS.{species_name}"))
+    anion_name = str(require_key(salt_record, "anion", f"SALTS.{species_name}"))
+    return (f"{cation_name}+", anion_name)
 
 
 def _projected_mori_property_db_metrics(

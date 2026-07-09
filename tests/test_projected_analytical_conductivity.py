@@ -8,7 +8,11 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+import conductivity.old.projected_mori_property_db_audit as projected_mori_audit
 from conductivity.physical_library import projected_analytical_conductivity as model
+from conductivity.old.projected_mori_property_db_audit import (
+    audit_projected_mori_conductivity_against_property_db,
+)
 from constants import F, R, T_REF_K
 
 
@@ -214,6 +218,13 @@ def test_free_brownian_charge_density_memory_does_not_cancel_ne() -> None:
         expected_projected_diffusivity_density,
     )
     assert np.allclose(result.continuous_mori_correction_tensor, np.zeros((3, 3)))
+    assert result.effect_attribution[
+        "mori_filter_accepted_candidate_indices"
+    ].size == 0
+    assert np.array_equal(
+        result.effect_attribution["mori_filter_rejected_candidate_indices"],
+        np.asarray([0], dtype=int),
+    )
     assert result.sigma_S_m == pytest.approx(expected_sigma_S_m)
 
 
@@ -654,7 +665,7 @@ def test_basis_refinement_adds_missing_current_coordinate() -> None:
             dtype=float,
         ),
         temperature_K=300.0,
-        residual_score_tolerance=0.1,
+        residual_score_tolerance=0.001,
         conductivity_change_tolerance_S_m=1.0e-30,
         max_added_coordinates=1,
     )
@@ -663,9 +674,140 @@ def test_basis_refinement_adds_missing_current_coordinate() -> None:
         refinement_result["selected_candidate_indices"],
         np.asarray([0], dtype=int),
     )
+    assert refinement_result["convergence_status"] == "basis_residual_above_tolerance"
+    assert refinement_result["hard_convergence_failure"]
+    assert refinement_result["final_maximum_residual_score"] == pytest.approx(0.01)
+    assert refinement_result["final_conductivity_change_abs_S_m"] > 0.0
+    assert np.allclose(
+        refinement_result["final_mori_memory_matrix_A"],
+        np.asarray([[2.0]], dtype=float),
+    )
+    assert np.allclose(
+        refinement_result["final_mori_current_coupling_matrix_h"],
+        np.asarray([[1.0, 0.0, 0.0]], dtype=float),
+    )
     conductivity_history = refinement_result["conductivity_history_S_m"]
     assert conductivity_history.size == 2
     assert conductivity_history[-1] < conductivity_history[0]
+
+
+def test_basis_refinement_converges_with_residual_and_conductivity_diagnostics() -> None:
+    refinement_result = model.refine_mori_basis_by_projected_residual(
+        direct_diffusivity_tensor=np.diag([1.0, 1.0, 0.0]),
+        initial_mori_memory_matrix_A=np.zeros((0, 0), dtype=float),
+        initial_mori_current_coupling_matrix_h=np.zeros((0, 3), dtype=float),
+        candidate_self_energies_A_gg=np.asarray([2.0], dtype=float),
+        candidate_cross_energies_A_gPhi=np.zeros((1, 0), dtype=float),
+        candidate_cross_energy_matrix=np.asarray([[2.0]], dtype=float),
+        candidate_current_couplings_h_g=np.asarray([[1.0, 0.0, 0.0]], dtype=float),
+        temperature_K=300.0,
+        residual_score_tolerance=0.1,
+        conductivity_change_tolerance_S_m=1.0e9,
+        max_added_coordinates=1,
+    )
+
+    assert refinement_result["convergence_status"] == "converged"
+    assert not refinement_result["hard_convergence_failure"]
+    assert np.array_equal(
+        refinement_result["selected_candidate_indices"],
+        np.asarray([0], dtype=int),
+    )
+    assert refinement_result["maximum_residual_score_history"][0] == pytest.approx(0.5)
+    assert refinement_result["maximum_residual_score_history"][-1] == pytest.approx(0.0)
+    assert refinement_result["conductivity_change_history_abs_S_m"].size == 1
+
+
+def test_basis_refinement_rejects_duplicate_null_and_current_spanning_candidates() -> None:
+    refinement_result = model.refine_mori_basis_by_projected_residual(
+        direct_diffusivity_tensor=np.diag([1.0, 1.0, 0.0]),
+        initial_mori_memory_matrix_A=np.asarray([[1.0]], dtype=float),
+        initial_mori_current_coupling_matrix_h=np.asarray(
+            [[0.0, 1.0, 0.0]],
+            dtype=float,
+        ),
+        candidate_self_energies_A_gg=np.asarray([1.0, 0.0, 1.0], dtype=float),
+        candidate_cross_energies_A_gPhi=np.asarray(
+            [
+                [1.0],
+                [0.0],
+                [0.0],
+            ],
+            dtype=float,
+        ),
+        candidate_cross_energy_matrix=np.asarray(
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=float,
+        ),
+        candidate_current_couplings_h_g=np.asarray(
+            [
+                [0.0, 1.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+            ],
+            dtype=float,
+        ),
+        temperature_K=300.0,
+        residual_score_tolerance=1.0e-12,
+        conductivity_change_tolerance_S_m=1.0e-30,
+        max_added_coordinates=3,
+    )
+
+    assert np.array_equal(
+        refinement_result["selected_candidate_indices"],
+        np.asarray([], dtype=int),
+    )
+    assert np.array_equal(
+        refinement_result["discarded_candidate_indices"],
+        np.asarray([0], dtype=int),
+    )
+    assert np.array_equal(
+        refinement_result["rejected_null_energy_candidate_indices"],
+        np.asarray([1], dtype=int),
+    )
+    assert np.array_equal(
+        refinement_result["rejected_current_spanning_candidate_indices"],
+        np.asarray([2], dtype=int),
+    )
+
+
+def test_basis_refinement_marks_hard_status_when_add_budget_exhausts() -> None:
+    refinement_result = model.refine_mori_basis_by_projected_residual(
+        direct_diffusivity_tensor=np.diag([1.0, 1.0, 0.0]),
+        initial_mori_memory_matrix_A=np.zeros((0, 0), dtype=float),
+        initial_mori_current_coupling_matrix_h=np.zeros((0, 3), dtype=float),
+        candidate_self_energies_A_gg=np.asarray([4.0, 4.0], dtype=float),
+        candidate_cross_energies_A_gPhi=np.zeros((2, 0), dtype=float),
+        candidate_cross_energy_matrix=np.asarray(
+            [
+                [4.0, 0.0],
+                [0.0, 4.0],
+            ],
+            dtype=float,
+        ),
+        candidate_current_couplings_h_g=np.asarray(
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+            ],
+            dtype=float,
+        ),
+        temperature_K=300.0,
+        residual_score_tolerance=0.2,
+        conductivity_change_tolerance_S_m=1.0e9,
+        max_added_coordinates=1,
+    )
+
+    assert np.array_equal(
+        refinement_result["selected_candidate_indices"],
+        np.asarray([0], dtype=int),
+    )
+    assert refinement_result["convergence_status"] == "basis_residual_above_tolerance"
+    assert refinement_result["hard_convergence_failure"]
+    assert refinement_result["final_maximum_residual_score"] == pytest.approx(0.25)
 
 
 def test_composition_only_conductivity_fails_without_full_physical_library() -> None:
@@ -711,6 +853,43 @@ def test_property_db_validator_evaluates_all_labeled_compositions() -> None:
 
     assert "source_labeled_rows=102" in completed.stdout
     assert "evaluated_rows=0" in completed.stdout
-    assert "failed_rows=102" in completed.stdout
-    assert "missing executable physical generator inputs" in completed.stdout
-    assert "mae_mS_cm=" not in completed.stdout
+
+
+def test_projected_mori_property_db_audit_rejects_recipe_only_row() -> None:
+    recipe_only_row = {
+        "recipe": {
+            "solvents": {"EC": 0.3, "DMC": 0.7},
+            "salts": {"LiPF6": 1.0},
+            "additives": {},
+        },
+        "properties": {"conductivity_mS_cm": 10.0},
+    }
+
+    with pytest.raises(
+        ValueError,
+        match="recipe-only conductivity validation requires",
+    ):
+        audit_projected_mori_conductivity_against_property_db(
+            (recipe_only_row,),
+            T_REF_K,
+            "basis",
+            "relaxation",
+            "anion",
+        )
+
+
+def test_projected_mori_audit_requires_active_mixed_recipe_species_records() -> None:
+    missing_species_names = projected_mori_audit._missing_active_recipe_species_names(
+        {
+            "solvents": {"EC": 0.3, "DMC": 0.7},
+            "salts": {"LiPF6": 0.2, "LiFSI": 0.8},
+            "additives": {"FEC": 0.05},
+        },
+        {
+            "EC": {},
+            "DMC": {},
+            "Li+": {},
+        },
+    )
+
+    assert missing_species_names == ("FEC", "FSI-", "PF6-")

@@ -36,6 +36,8 @@ class ReducedTransitionQuadrature:
     first_displacement_moment_m: Array
     second_displacement_moment_m2: Array
     log_capacity_integral: float
+    uses_residence_rate_constant: bool
+    residence_rate_constant_s_inv: float
 
 
 @dataclass(frozen=True)
@@ -88,6 +90,8 @@ def build_projected_generator_input(
     transition_path_displacements = []
     transition_path_weights = []
     transition_log_capacity_integrals = []
+    transition_uses_residence_rate_constants = []
+    transition_residence_rate_constants = []
     transition_first_moments = np.zeros((state_count, state_count, CARTESIAN), dtype=float)
     transition_second_moments = np.zeros(
         (state_count, state_count, CARTESIAN, CARTESIAN),
@@ -179,6 +183,12 @@ def build_projected_generator_input(
         transition_path_displacements.append(displacements)
         transition_path_weights.append(path_weights)
         transition_log_capacity_integrals.append(float(transition_quadrature.log_capacity_integral))
+        transition_uses_residence_rate_constants.append(
+            bool(transition_quadrature.uses_residence_rate_constant)
+        )
+        transition_residence_rate_constants.append(
+            float(transition_quadrature.residence_rate_constant_s_inv)
+        )
 
     if transition_pair_indices:
         transition_pair_index_array = np.asarray(transition_pair_indices, dtype=int)
@@ -205,6 +215,14 @@ def build_projected_generator_input(
         transition_path_weights=tuple(transition_path_weights),
         transition_log_capacity_integrals=np.asarray(
             transition_log_capacity_integrals,
+            dtype=float,
+        ),
+        transition_uses_residence_rate_constants=np.asarray(
+            transition_uses_residence_rate_constants,
+            dtype=bool,
+        ),
+        transition_residence_rate_constants_s_inv=np.asarray(
+            transition_residence_rate_constants,
             dtype=float,
         ),
         transition_first_moments_d_ij_m=transition_first_moments,
