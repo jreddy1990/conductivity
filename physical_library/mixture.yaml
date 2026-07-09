@@ -6,15 +6,40 @@ species:
 - Li+
 - PF6-
 - FSI-
+reference_density_kg_m3: 1193.521476171035
 dielectric:
   mixing_rule: volume_fraction_linear_static_dielectric_with_salt_decrement
   pure_dielectric_source: data.species_data epsilon_r
 viscosity:
   mixing_rule: reciprocal_volume_fraction_plus_Jones_Dole_salt_terms
   pure_viscosity_source: data.species_data viscosity_cP
+mobility:
+  resistance_terms:
+  - Stokes
+  - free_volume
+  - charge_cloud
+  - shape
+  - atmosphere
+  free_volume_exponent: 2.0
+  charge_cloud_lambda_kg_m4_s: 6.0e-40
+  charge_cloud_lambda_source: primitive-level LiPF6 EC:DMC anchor calibration of charge-cloud resistance
+  charge_cloud_exponent: 1.0
+  shape_exponent: 1.0
+  atmosphere_lambda_kg_s: 1.0e-13
 packing:
   local_volume_source: species_record_site_volumes
   invalid_state_rule: local_packing_fraction_must_remain_below_configured_phi_max
+  phi_max: 0.64
+  phi_max_source: random_close_packing_reference_for_site_volume_free_volume_closure
 atmosphere:
   charge_sites_source: species_record_sites
   screening_source: composition_ionic_strength_and_mixture_dielectric
+local_fields:
+  dielectric_decrement_per_mol_m3: 2.0e-3
+  jones_dole_A_sqrt_m3_mol: 3.0e-3
+  jones_dole_B_m3_mol: 1.0e-5
+  additive_microviscosity_coefficients:
+    FEC: 1.0
+  local_ionic_strength_packing_coupling: 1.0
+  local_ionic_strength_kernel_width_m: 1.0e-9
+  packing_viscosity_exponent: 2.0

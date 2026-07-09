@@ -9,9 +9,11 @@ Entry: python -m conductivity.validate_on_traj_fsi
 """
 
 import os
+
 os.environ["JAX_PLATFORMS"] = "cpu"
 
 import sys
+
 sys.path.insert(0, "/Users/jreddy/electrolyte_formation_sim")
 import control_framework.jax_m4_tuning  # noqa
 
@@ -20,7 +22,6 @@ import pickle
 import subprocess
 import time
 from enum import IntEnum
-from pathlib import Path
 
 import numpy as np
 import jax
@@ -30,12 +31,21 @@ from jax import random, vmap
 from constants import K_B, E_CHARGE, S_M_TO_MS_CM
 
 from conductivity.flow_matching_conductivity import (
-    K_SPECTRUM, ODE_STEPS, LabeledRow, SigmaMethod,
+    K_SPECTRUM,
+    ODE_STEPS,
+    LabeledRow,
+    SigmaMethod,
 )
-from conductivity.fm_train_fast import (
-    DATA_DIR, build_smiles_cache, row_to_arrays, stack_batch,
-    composition_encoder_arrays, target_spectrum_arrays, green_kubo_arrays,
-    integrate_fm_ode_arrays, RowArrays,
+from conductivity.fm_md.fm_train_fast import (
+    DATA_DIR,
+    build_smiles_cache,
+    row_to_arrays,
+    stack_batch,
+    composition_encoder_arrays,
+    target_spectrum_arrays,
+    green_kubo_arrays,
+    integrate_fm_ode_arrays,
+    RowArrays,
 )
 
 
@@ -60,8 +70,12 @@ class Element(IntEnum):
 
 _SYMBOL_TO_ELEMENT = {e.name: e for e in Element}
 _ATOMIC_MASS = {
-    Element.H: 1.008,   Element.Li: 6.94,   Element.C: 12.011,
-    Element.N: 14.007,  Element.O: 15.999,  Element.F: 18.998,
+    Element.H: 1.008,
+    Element.Li: 6.94,
+    Element.C: 12.011,
+    Element.N: 14.007,
+    Element.O: 15.999,
+    Element.F: 18.998,
     Element.S: 32.06,
 }
 
@@ -70,10 +84,10 @@ _ATOMIC_MASS = {
 # Constants
 # =============================================================================
 TRAJ_PATH = DATA_DIR / "trajectories" / "traj_FSI.tar.gz"
-N_FRAMES_TO_READ = 50000           # Explicit constant: ~75 ps at 1.5 fs/frame
-N_ATOMS_PER_FRAME = 8010           # Explicit constant: 52 LiFSI + 149 EC + 400 EMC
-DT_FS = 1.5                        # Explicit constant: trajectory frame stride
-TEMPERATURE_K = 333.0              # Explicit constant: simulation T per Zenodo
+N_FRAMES_TO_READ = 50000  # Explicit constant: ~75 ps at 1.5 fs/frame
+N_ATOMS_PER_FRAME = 8010  # Explicit constant: 52 LiFSI + 149 EC + 400 EMC
+DT_FS = 1.5  # Explicit constant: trajectory frame stride
+TEMPERATURE_K = 333.0  # Explicit constant: simulation T per Zenodo
 
 N_LIFSI_MOLECULES = 52
 N_EC_MOLECULES = 149
@@ -108,7 +122,9 @@ def read_frame0(tar_path):
     """Return positions (N, 3), element_ids (N int array of Element values), box (Å), time (fs)."""
     proc = subprocess.Popen(
         ["tar", "-xzOf", str(tar_path), "traj_FSI.xyz"],
-        stdout=subprocess.PIPE, bufsize=STREAM_BUFFER_BYTES, text=True,
+        stdout=subprocess.PIPE,
+        bufsize=STREAM_BUFFER_BYTES,
+        text=True,
     )
     header = proc.stdout.readline().split()
     n_atoms = int(header[0])
@@ -147,7 +163,10 @@ def identify_fsi_molecules(positions, element_ids, box):
 
     used = set()
     expected_composition = {
-        Element.N: 1, Element.S: 2, Element.O: 4, Element.F: 2,
+        Element.N: 1,
+        Element.S: 2,
+        Element.O: 4,
+        Element.F: 2,
     }
 
     def neighbors_within(seed_pos, cand_pos, cand_global, cutoff):
@@ -168,11 +187,14 @@ def identify_fsi_molecules(positions, element_ids, box):
         group = {n_global}
         used.add(n_global)
         s_neighbors = neighbors_within(
-            positions[n_global], positions[s_indices],
-            s_indices, INTRA_FSI_BOND_CUTOFF_ANG,
+            positions[n_global],
+            positions[s_indices],
+            s_indices,
+            INTRA_FSI_BOND_CUTOFF_ANG,
         )
         for g in s_neighbors:
-            group.add(g); used.add(g)
+            group.add(g)
+            used.add(g)
         s_in_group = [g for g in group if Element(int(element_ids[g])) == Element.S]
         for sg in s_in_group:
             of_nbrs = neighbors_within(
@@ -182,7 +204,8 @@ def identify_fsi_molecules(positions, element_ids, box):
                 INTRA_FSI_BOND_CUTOFF_ANG,
             )
             for g in of_nbrs:
-                group.add(g); used.add(g)
+                group.add(g)
+                used.add(g)
         if len(group) != 9:
             raise RuntimeError(
                 f"FSI around N atom {n_global} has {len(group)} members, expected 9. "
@@ -214,7 +237,9 @@ def identify_fsi_molecules(positions, element_ids, box):
 # =============================================================================
 
 
-def stream_li_and_fsi_com(tar_path, n_frames, n_atoms, li_indices, fsi_groups, element_ids):
+def stream_li_and_fsi_com(
+    tar_path, n_frames, n_atoms, li_indices, fsi_groups, element_ids
+):
     """Stream every frame; emit Li and FSI-COM position arrays.
 
     Returns:
@@ -224,14 +249,16 @@ def stream_li_and_fsi_com(tar_path, n_frames, n_atoms, li_indices, fsi_groups, e
       times_fs:      (n_frames,)
     """
     fsi_atom_indices = np.array([g for grp in fsi_groups for g in grp], dtype=np.int64)
-    fsi_atom_masses = np.array([
-        _ATOMIC_MASS[Element(int(element_ids[g]))] for g in fsi_atom_indices
-    ])
+    fsi_atom_masses = np.array(
+        [_ATOMIC_MASS[Element(int(element_ids[g]))] for g in fsi_atom_indices]
+    )
     fsi_group_size = 9
-    fsi_total_masses = np.array([
-        sum(_ATOMIC_MASS[Element(int(element_ids[g]))] for g in grp)
-        for grp in fsi_groups
-    ])
+    fsi_total_masses = np.array(
+        [
+            sum(_ATOMIC_MASS[Element(int(element_ids[g]))] for g in grp)
+            for grp in fsi_groups
+        ]
+    )
     fsi_atom_weights = (
         fsi_atom_masses.reshape(N_LIFSI_MOLECULES, fsi_group_size)
         / fsi_total_masses[:, None]
@@ -246,7 +273,9 @@ def stream_li_and_fsi_com(tar_path, n_frames, n_atoms, li_indices, fsi_groups, e
 
     proc = subprocess.Popen(
         ["tar", "-xzOf", str(tar_path), "traj_FSI.xyz"],
-        stdout=subprocess.PIPE, bufsize=STREAM_BUFFER_BYTES, text=True,
+        stdout=subprocess.PIPE,
+        bufsize=STREAM_BUFFER_BYTES,
+        text=True,
     )
 
     li_pos = np.zeros((n_frames, N_LIFSI_MOLECULES, 3))
@@ -259,8 +288,10 @@ def stream_li_and_fsi_com(tar_path, n_frames, n_atoms, li_indices, fsi_groups, e
         line = proc.stdout.readline()
         if not line:
             n_frames = f
-            li_pos = li_pos[:f]; fsi_atom_pos = fsi_atom_pos[:f]
-            box_lengths = box_lengths[:f]; times_fs = times_fs[:f]
+            li_pos = li_pos[:f]
+            fsi_atom_pos = fsi_atom_pos[:f]
+            box_lengths = box_lengths[:f]
+            times_fs = times_fs[:f]
             break
         header = line.split()
         box_lengths[f] = float(header[1])
@@ -278,9 +309,11 @@ def stream_li_and_fsi_com(tar_path, n_frames, n_atoms, li_indices, fsi_groups, e
         if (f + 1) % LOG_INTERVAL_FRAMES == 0:
             elapsed = time.time() - t_start
             rate = (f + 1) / elapsed if elapsed > 0 else 0
-            logger.info("frame %d / %d (%.0f frames/s, %.1fs)",
-                        f + 1, n_frames, rate, elapsed)
-    proc.terminate(); proc.wait()
+            logger.info(
+                "frame %d / %d (%.0f frames/s, %.1fs)", f + 1, n_frames, rate, elapsed
+            )
+    proc.terminate()
+    proc.wait()
 
     # PBC unfold within each FSI molecule before COM. N atom (index 0) is the
     # reference; other atoms are shifted by minimum-image displacement from N
@@ -288,9 +321,9 @@ def stream_li_and_fsi_com(tar_path, n_frames, n_atoms, li_indices, fsi_groups, e
     # a periodic boundary. Without this, the naive mass-weighted average puts
     # the COM near the box center and the COM "moves" wildly when the molecule
     # rotates across the boundary.
-    n_ref = fsi_atom_pos[:, :, 0:1, :]                  # (T, 52, 1, 3): N atom
-    delta = fsi_atom_pos - n_ref                        # (T, 52, 9, 3)
-    box_T = box_lengths[:, None, None, None]            # (T, 1, 1, 1)
+    n_ref = fsi_atom_pos[:, :, 0:1, :]  # (T, 52, 1, 3): N atom
+    delta = fsi_atom_pos - n_ref  # (T, 52, 9, 3)
+    box_T = box_lengths[:, None, None, None]  # (T, 1, 1, 1)
     delta_min_image = delta - box_T * np.round(delta / box_T)
     fsi_atom_unfolded = n_ref + delta_min_image
     fsi_com_pos = np.einsum("tmag,ma->tmg", fsi_atom_unfolded, fsi_atom_weights)
@@ -312,7 +345,9 @@ def unwrap_positions(positions, box_lengths):
     return out
 
 
-def compute_sigma_einstein_helfand(li_pos_unwrap, fsi_com_unwrap, box_lengths, times_fs):
+def compute_sigma_einstein_helfand(
+    li_pos_unwrap, fsi_com_unwrap, box_lengths, times_fs
+):
     n_frames = len(times_fs)
     li_sum = li_pos_unwrap.sum(axis=1)
     fsi_sum = fsi_com_unwrap.sum(axis=1)
@@ -328,7 +363,7 @@ def compute_sigma_einstein_helfand(li_pos_unwrap, fsi_com_unwrap, box_lengths, t
         origin_stride = max(1, (n_frames - lag_frames) // 200)
         origins = np.arange(0, n_frames - lag_frames, origin_stride)
         disps = R_charge[origins + lag_frames] - R_charge[origins]
-        msd[i] = float(np.mean(np.sum(disps ** 2, axis=-1)))
+        msd[i] = float(np.mean(np.sum(disps**2, axis=-1)))
 
     valid = np.isfinite(msd)
     t_ps = msd_lags_fs[valid] / 1000.0
@@ -339,15 +374,17 @@ def compute_sigma_einstein_helfand(li_pos_unwrap, fsi_com_unwrap, box_lengths, t
     slope_ang2_per_ps, _ = np.polyfit(t_ps[fit_mask], msd_v[fit_mask], 1)
 
     # Unit conversions: Angstrom -> meter, picosecond -> second
-    ANG_TO_M = 1e-10                   # Definitional: 1 Å = 1e-10 m
-    ANG2_PER_PS_TO_M2_PER_S = 1e-8     # Derived: (Å→m)² × (1/ps → 1/s) = 1e-20 × 1e12 = 1e-8
-    EINSTEIN_HELFAND_DIM_FACTOR = 6    # Explicit constant: factor "6" in σ = e²/(6VkT)·d⟨|ΔR|²⟩/dt: 3 spatial dimensions × factor of 2 (one-sided slope vs two-sided ⟨ΔR²⟩)
+    ANG_TO_M = 1e-10  # Definitional: 1 Å = 1e-10 m
+    ANG2_PER_PS_TO_M2_PER_S = (
+        1e-8  # Derived: (Å→m)² × (1/ps → 1/s) = 1e-20 × 1e12 = 1e-8
+    )
+    EINSTEIN_HELFAND_DIM_FACTOR = 6  # Explicit constant: factor "6" in σ = e²/(6VkT)·d⟨|ΔR|²⟩/dt: 3 spatial dimensions × factor of 2 (one-sided slope vs two-sided ⟨ΔR²⟩)
     avg_box = float(np.mean(box_lengths))
     volume_m3 = (avg_box * ANG_TO_M) ** 3
     kT_J = K_B * TEMPERATURE_K
     slope_m2_per_s = slope_ang2_per_ps * ANG2_PER_PS_TO_M2_PER_S
-    sigma_S_per_m = E_CHARGE ** 2 * slope_m2_per_s / (
-        EINSTEIN_HELFAND_DIM_FACTOR * volume_m3 * kT_J
+    sigma_S_per_m = (
+        E_CHARGE**2 * slope_m2_per_s / (EINSTEIN_HELFAND_DIM_FACTOR * volume_m3 * kT_J)
     )
     return sigma_S_per_m * S_M_TO_MS_CM, slope_ang2_per_ps, msd_lags_fs, msd
 
@@ -387,10 +424,14 @@ def predict_from_model(temperature_K):
     data = [row_to_arrays(row, cache)]
     batch = stack_batch(data, norm)
     rows_view = RowArrays(
-        atom_features=batch.atom_features, bond_features=batch.bond_features,
-        bond_src=batch.bond_src, bond_dst=batch.bond_dst,
-        atom_masks=batch.atom_masks, bond_masks=batch.bond_masks,
-        mole_fractions=batch.mole_fractions, species_mask=batch.species_masks,
+        atom_features=batch.atom_features,
+        bond_features=batch.bond_features,
+        bond_src=batch.bond_src,
+        bond_dst=batch.bond_dst,
+        atom_masks=batch.atom_masks,
+        bond_masks=batch.bond_masks,
+        mole_fractions=batch.mole_fractions,
+        species_mask=batch.species_masks,
         temperature=batch.temperatures,
     )
 
@@ -398,14 +439,17 @@ def predict_from_model(temperature_K):
         z = composition_encoder_arrays(params["mol_gnn"], params["attn"], row_in, norm)
         xi = target_spectrum_arrays(params["fm"], z)
         return green_kubo_arrays(xi, params["fm"]["log_sigma_offset"])
+
     log_sigma_det = float(vmap(det_pred)(rows_view)[0])
 
     single_row = jax.tree_util.tree_map(lambda x: x[0], rows_view)
+
     def fm_pred(row_in, key):
         z = composition_encoder_arrays(params["mol_gnn"], params["attn"], row_in, norm)
         xi_0 = random.normal(key, (2 * K_SPECTRUM,))
         xi_1 = integrate_fm_ode_arrays(params["fm"], xi_0, z, ODE_STEPS)
         return green_kubo_arrays(xi_1, params["fm"]["log_sigma_offset"])
+
     sample_keys = random.split(random.PRNGKey(0), N_FM_SAMPLES_AT_INFERENCE)
     samples = vmap(fm_pred, in_axes=(None, 0))(single_row, sample_keys)
     return log_sigma_det, float(jnp.mean(samples)), float(jnp.std(samples))
@@ -424,23 +468,34 @@ def main():
     logger.info("STEP 1: Inspect frame 0, identify FSI molecules")
     logger.info("=" * 70)
     positions0, element_ids0, box0, t0 = read_frame0(TRAJ_PATH)
-    logger.info("Frame 0: %d atoms, box=%.2f A, t=%.1f fs",
-                len(element_ids0), box0, t0)
+    logger.info("Frame 0: %d atoms, box=%.2f A, t=%.1f fs", len(element_ids0), box0, t0)
     li_idx, fsi_groups = identify_fsi_molecules(positions0, element_ids0, box0)
     elem_names_first_fsi = [Element(int(element_ids0[g])).name for g in fsi_groups[0]]
-    logger.info("Identified %d Li atoms and %d FSI- molecules; first FSI elements: %s",
-                len(li_idx), len(fsi_groups), elem_names_first_fsi)
+    logger.info(
+        "Identified %d Li atoms and %d FSI- molecules; first FSI elements: %s",
+        len(li_idx),
+        len(fsi_groups),
+        elem_names_first_fsi,
+    )
 
     logger.info("=" * 70)
-    logger.info("STEP 2: Stream %d frames, compute Li and FSI-COM positions",
-                N_FRAMES_TO_READ)
+    logger.info(
+        "STEP 2: Stream %d frames, compute Li and FSI-COM positions", N_FRAMES_TO_READ
+    )
     logger.info("=" * 70)
     li_pos, fsi_com_pos, box_lengths, times_fs = stream_li_and_fsi_com(
-        TRAJ_PATH, N_FRAMES_TO_READ, N_ATOMS_PER_FRAME,
-        li_idx, fsi_groups, element_ids0,
+        TRAJ_PATH,
+        N_FRAMES_TO_READ,
+        N_ATOMS_PER_FRAME,
+        li_idx,
+        fsi_groups,
+        element_ids0,
     )
-    logger.info("Loaded %d frames; span %.1f ps",
-                len(times_fs), (times_fs[-1] - times_fs[0]) / 1000)
+    logger.info(
+        "Loaded %d frames; span %.1f ps",
+        len(times_fs),
+        (times_fs[-1] - times_fs[0]) / 1000,
+    )
 
     logger.info("=" * 70)
     logger.info("STEP 3: Diagnose wrapping then compute Einstein-Helfand sigma")
@@ -449,14 +504,22 @@ def main():
     li_min = float(li_pos.min())
     li_max = float(li_pos.max())
     box_mean = float(np.mean(box_lengths))
-    logger.info("Li position range across frames: [%.2f, %.2f] A;  mean box %.2f A",
-                li_min, li_max, box_mean)
+    logger.info(
+        "Li position range across frames: [%.2f, %.2f] A;  mean box %.2f A",
+        li_min,
+        li_max,
+        box_mean,
+    )
     # Wrapped positions live in approximately [-L/2, +3L/2]; unwrapped ones drift far past these bounds.
     WRAP_LO_FRAC = -0.5
     WRAP_HI_FRAC = 1.5
-    is_wrapped = (li_min >= box_mean * WRAP_LO_FRAC) and (li_max <= box_mean * WRAP_HI_FRAC)
-    logger.info("Positions appear %s",
-                "WRAPPED (will unwrap)" if is_wrapped else "ALREADY UNWRAPPED (skip unwrap)")
+    is_wrapped = (li_min >= box_mean * WRAP_LO_FRAC) and (
+        li_max <= box_mean * WRAP_HI_FRAC
+    )
+    logger.info(
+        "Positions appear %s",
+        "WRAPPED (will unwrap)" if is_wrapped else "ALREADY UNWRAPPED (skip unwrap)",
+    )
     if is_wrapped:
         li_proc = unwrap_positions(li_pos, box_lengths)
         fsi_proc = unwrap_positions(fsi_com_pos, box_lengths)
@@ -464,10 +527,17 @@ def main():
         li_proc = li_pos
         fsi_proc = fsi_com_pos
     sigma_traj, slope, lags_fs, msd = compute_sigma_einstein_helfand(
-        li_proc, fsi_proc, box_lengths, times_fs,
+        li_proc,
+        fsi_proc,
+        box_lengths,
+        times_fs,
     )
-    logger.info("MSD slope (charge displacement) = %.4f A^2/ps in [%g, %g] ps",
-                slope, FIT_WINDOW_PS_START, FIT_WINDOW_PS_END)
+    logger.info(
+        "MSD slope (charge displacement) = %.4f A^2/ps in [%g, %g] ps",
+        slope,
+        FIT_WINDOW_PS_START,
+        FIT_WINDOW_PS_END,
+    )
     logger.info("Trajectory-derived sigma (Einstein-Helfand): %.3f mS/cm", sigma_traj)
 
     logger.info("=" * 70)
@@ -477,15 +547,20 @@ def main():
     sigma_det = float(np.exp(log_det))
     sigma_fm = float(np.exp(log_fm_mean))
     logger.info("Model deterministic:  %.3f mS/cm", sigma_det)
-    logger.info("Model FM-sampled:     %.3f mS/cm (factor x%.2f over %d samples)",
-                sigma_fm, float(np.exp(log_fm_std)), N_FM_SAMPLES_AT_INFERENCE)
+    logger.info(
+        "Model FM-sampled:     %.3f mS/cm (factor x%.2f over %d samples)",
+        sigma_fm,
+        float(np.exp(log_fm_std)),
+        N_FM_SAMPLES_AT_INFERENCE,
+    )
 
     logger.info("=" * 70)
     logger.info("STEP 5: Comparison vs literature")
     logger.info("=" * 70)
     logger.info("Composition: 1 m LiFSI in EC:EMC 3:7 at %g K", TEMPERATURE_K)
-    logger.info("Literature range: %g - %g mS/cm",
-                LIT_SIGMA_MIN_MSCM, LIT_SIGMA_MAX_MSCM)
+    logger.info(
+        "Literature range: %g - %g mS/cm", LIT_SIGMA_MIN_MSCM, LIT_SIGMA_MAX_MSCM
+    )
     logger.info("Trajectory (Einstein-Helfand): %.3f mS/cm", sigma_traj)
     logger.info("Model deterministic:           %.3f mS/cm", sigma_det)
     logger.info("Model FM-sampled mean:         %.3f mS/cm", sigma_fm)

@@ -3,11 +3,12 @@ from __future__ import annotations
 import inspect
 import subprocess
 import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
 
-from conductivity import projected_analytical_conductivity as model
+from conductivity.physical_library import projected_analytical_conductivity as model
 from constants import F, R, T_REF_K
 
 
@@ -54,6 +55,55 @@ def _two_state_generator_inputs() -> dict:
             np.eye(1, dtype=float),
         ),
     }
+
+
+def _one_state_generator_inputs() -> dict:
+    return {
+        "basin_quadrature_points": (np.asarray([[0.0]], dtype=float),),
+        "basin_quadrature_weights": (np.asarray([1.0], dtype=float),),
+        "transition_pair_indices": np.zeros((0, 2), dtype=int),
+        "transition_quadrature_points": (),
+        "transition_quadrature_weights": (),
+        "transition_committor_gradients": (),
+        "transition_surface_state_indices": (),
+        "transition_path_displacements_m": (),
+        "transition_path_weights": (),
+        "total_component_concentrations_mol_m3": np.asarray([1.0], dtype=float),
+        "basin_stoichiometry": np.asarray([[1.0]], dtype=float),
+        "self_current_coordinate_projectors": (np.eye(1, dtype=float),),
+    }
+
+
+def _current_spanning_memory_gradient(point: np.ndarray) -> np.ndarray:
+    return np.asarray([[1.0]], dtype=float)
+
+
+def _duplicate_memory_gradient(point: np.ndarray) -> np.ndarray:
+    return np.asarray([[1.0], [2.0]], dtype=float)
+
+
+def _orthogonal_memory_gradient(point: np.ndarray) -> np.ndarray:
+    return np.asarray([[0.0, 1.0]], dtype=float)
+
+
+def _two_coordinate_charge_gradient(point: np.ndarray) -> np.ndarray:
+    return np.asarray([[1.0, 0.0], [0.0, 0.0], [0.0, 0.0]], dtype=float)
+
+
+def _offdiagonal_mobility_tensor_m2_s(point: np.ndarray) -> np.ndarray:
+    return np.asarray([[0.0, 1.0], [1.0, 0.0]], dtype=float)
+
+
+def _null_energy_memory_gradient(point: np.ndarray) -> np.ndarray:
+    return np.asarray([[1.0, 0.0]], dtype=float)
+
+
+def _offdiagonal_charge_gradient(point: np.ndarray) -> np.ndarray:
+    return np.asarray([[0.0, 1.0], [0.0, 0.0], [0.0, 0.0]], dtype=float)
+
+
+def _odd_charge_density_memory_gradient(point: np.ndarray) -> np.ndarray:
+    return np.asarray([[float(point[0])]], dtype=float)
 
 
 def test_projected_module_contains_no_descriptor_or_recipe_closure() -> None:
@@ -134,6 +184,141 @@ def test_density_weights_reproduce_basin_concentrations() -> None:
     assert np.isclose(float(np.sum(concentrations)), 9.0)
 
 
+def test_free_brownian_charge_density_memory_does_not_cancel_ne() -> None:
+    inputs = _one_state_generator_inputs()
+    result = model.compute_projected_analytical_conductivity(
+        _zero_potential_J_mol,
+        _unit_mobility_tensor_m2_s,
+        _single_axis_charge_gradient,
+        _current_spanning_memory_gradient,
+        inputs["basin_quadrature_points"],
+        inputs["basin_quadrature_weights"],
+        inputs["transition_pair_indices"],
+        inputs["transition_quadrature_points"],
+        inputs["transition_quadrature_weights"],
+        inputs["transition_committor_gradients"],
+        inputs["transition_surface_state_indices"],
+        inputs["transition_path_displacements_m"],
+        inputs["transition_path_weights"],
+        inputs["total_component_concentrations_mol_m3"],
+        inputs["basin_stoichiometry"],
+        300.0,
+        1.0,
+        inputs["self_current_coordinate_projectors"],
+    )
+
+    expected_projected_diffusivity_density = np.diag([1.0, 0.0, 0.0])
+    expected_sigma_S_m = F * F / (R * 300.0) * (1.0 / 3.0)
+    assert np.allclose(
+        result.projected_diffusivity_tensor,
+        expected_projected_diffusivity_density,
+    )
+    assert np.allclose(result.continuous_mori_correction_tensor, np.zeros((3, 3)))
+    assert result.sigma_S_m == pytest.approx(expected_sigma_S_m)
+
+
+def test_duplicate_memory_coordinate_discarded() -> None:
+    filtered = model.filter_memory_basis_by_dirichlet_residual(
+        _duplicate_memory_gradient,
+        _unit_mobility_tensor_m2_s,
+        _zero_charge_gradient,
+        (np.asarray([[0.0]], dtype=float),),
+        (np.asarray([1.0], dtype=float),),
+        np.eye(3, dtype=float),
+        model.MEMORY_NULLSPACE_RELATIVE_TOL,
+        model.MEMORY_NULLSPACE_RELATIVE_TOL,
+        model.PROJECTED_DIFFUSIVITY_PSD_RELATIVE_TOL,
+    )
+
+    assert np.array_equal(filtered.accepted_candidate_indices, np.asarray([0]))
+    assert np.array_equal(filtered.discarded_candidate_indices, np.asarray([1]))
+    assert filtered.rejected_candidate_indices.size == 0
+
+
+def test_current_spanning_memory_rejected_before_readout() -> None:
+    filtered = model.filter_memory_basis_by_dirichlet_residual(
+        _current_spanning_memory_gradient,
+        _unit_mobility_tensor_m2_s,
+        _single_axis_charge_gradient,
+        (np.asarray([[0.0]], dtype=float),),
+        (np.asarray([1.0], dtype=float),),
+        np.diag([1.0, 0.0, 0.0]),
+        model.MEMORY_NULLSPACE_RELATIVE_TOL,
+        model.MEMORY_NULLSPACE_RELATIVE_TOL,
+        model.PROJECTED_DIFFUSIVITY_PSD_RELATIVE_TOL,
+    )
+
+    assert filtered.accepted_candidate_indices.size == 0
+    assert np.array_equal(filtered.rejected_candidate_indices, np.asarray([0]))
+    assert filtered.mori_memory_matrix_A.shape == (0, 0)
+    assert filtered.mori_current_coupling_matrix_h.shape == (0, 3)
+
+
+def test_incremental_memory_filter_preserves_psd_remaining_tensor() -> None:
+    filtered = model.filter_memory_basis_by_dirichlet_residual(
+        _orthogonal_memory_gradient,
+        _unit_mobility_tensor_m2_s,
+        _two_coordinate_charge_gradient,
+        (np.asarray([[0.0, 0.0]], dtype=float),),
+        (np.asarray([1.0], dtype=float),),
+        np.diag([1.0, 1.0, 0.0]),
+        model.MEMORY_NULLSPACE_RELATIVE_TOL,
+        model.MEMORY_NULLSPACE_RELATIVE_TOL,
+        model.PROJECTED_DIFFUSIVITY_PSD_RELATIVE_TOL,
+    )
+
+    assert np.array_equal(filtered.accepted_candidate_indices, np.asarray([0]))
+    correction = model.compute_continuous_mori_correction(
+        filtered.mori_memory_matrix_A,
+        filtered.mori_current_coupling_matrix_h,
+    )
+    remaining = np.diag([1.0, 1.0, 0.0]) - correction
+    assert np.min(np.linalg.eigvalsh(remaining)) >= -1.0e-12
+
+
+def test_null_current_memory_fails_in_dirichlet_filter() -> None:
+    with pytest.raises(ValueError, match="zero residual Dirichlet energy"):
+        model.filter_memory_basis_by_dirichlet_residual(
+            _null_energy_memory_gradient,
+            _offdiagonal_mobility_tensor_m2_s,
+            _offdiagonal_charge_gradient,
+            (np.asarray([[0.0, 0.0]], dtype=float),),
+            (np.asarray([1.0], dtype=float),),
+            np.diag([1.0, 0.0, 0.0]),
+            model.MEMORY_NULLSPACE_RELATIVE_TOL,
+            model.MEMORY_NULLSPACE_RELATIVE_TOL,
+            model.PROJECTED_DIFFUSIVITY_PSD_RELATIVE_TOL,
+        )
+
+
+def test_default_mori_memory_inventory_excludes_current_spanning_density_modes() -> None:
+    memory_text = Path("conductivity/physical_library/memory.yaml").read_text()
+
+    assert "charge_density_relaxation" not in memory_text
+    assert "atmosphere_polarization" not in memory_text
+
+
+def test_charge_density_mode_requires_phase_symmetric_quadrature() -> None:
+    with pytest.raises(ValueError, match="aliases unbounded charge polarization"):
+        model.validate_charge_density_translation_symmetry(
+            _odd_charge_density_memory_gradient,
+            _unit_mobility_tensor_m2_s,
+            _single_axis_charge_gradient,
+            (np.asarray([[1.0]], dtype=float),),
+            (np.asarray([1.0], dtype=float),),
+            model.MEMORY_NULLSPACE_RELATIVE_TOL,
+        )
+
+    model.validate_charge_density_translation_symmetry(
+        _odd_charge_density_memory_gradient,
+        _unit_mobility_tensor_m2_s,
+        _single_axis_charge_gradient,
+        (np.asarray([[-1.0], [1.0]], dtype=float),),
+        (np.asarray([1.0, 1.0], dtype=float),),
+        model.MEMORY_NULLSPACE_RELATIVE_TOL,
+    )
+
+
 def test_generator_path_uses_mass_balance_density_weights_for_conductivity() -> None:
     inputs = _two_state_generator_inputs()
     result = model.compute_projected_analytical_conductivity(
@@ -164,6 +349,31 @@ def test_generator_path_uses_mass_balance_density_weights_for_conductivity() -> 
         expected_projected_diffusivity_density,
     )
     assert result.sigma_S_m == pytest.approx(expected_sigma_S_m)
+
+
+def test_full_generator_rejects_nonidentity_self_current_projector() -> None:
+    inputs = _one_state_generator_inputs()
+    with pytest.raises(ValueError, match="requires identity"):
+        model.compute_projected_analytical_conductivity(
+            _zero_potential_J_mol,
+            _unit_mobility_tensor_m2_s,
+            _single_axis_charge_gradient,
+            _empty_memory_gradient,
+            inputs["basin_quadrature_points"],
+            inputs["basin_quadrature_weights"],
+            inputs["transition_pair_indices"],
+            inputs["transition_quadrature_points"],
+            inputs["transition_quadrature_weights"],
+            inputs["transition_committor_gradients"],
+            inputs["transition_surface_state_indices"],
+            inputs["transition_path_displacements_m"],
+            inputs["transition_path_weights"],
+            inputs["total_component_concentrations_mol_m3"],
+            inputs["basin_stoichiometry"],
+            300.0,
+            1.0,
+            (np.zeros((1, 1), dtype=float),),
+        )
 
 
 def test_zero_charge_gradient_produces_zero_conductivity() -> None:
@@ -231,6 +441,100 @@ def test_poisson_memory_corrector_subtracts_correlated_jump_drift() -> None:
     assert result.direct_diffusivity_tensor[0, 0] > 0.0
     assert result.finite_state_memory_correction_tensor[0, 0] > 0.0
     assert result.projected_diffusivity_tensor[0, 0] == pytest.approx(0.0)
+
+
+def test_three_state_transition_chain_has_nonzero_finite_state_drift() -> None:
+    concentrations = np.ones(3, dtype=float)
+    capacity_fluxes = np.asarray(
+        [
+            [0.0, 1.0, 0.0],
+            [1.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0],
+        ],
+        dtype=float,
+    )
+    transition_length_m = 1.0e-9
+    first_moments = np.asarray(
+        [
+            [
+                [0.0, 0.0, 0.0],
+                [transition_length_m, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+            ],
+            [
+                [-transition_length_m, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+                [transition_length_m, 0.0, 0.0],
+            ],
+            [
+                [0.0, 0.0, 0.0],
+                [-transition_length_m, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+            ],
+        ],
+        dtype=float,
+    )
+    transition_second_moment = np.diag(
+        [transition_length_m * transition_length_m, 0.0, 0.0]
+    )
+    zero_second_moment = np.zeros((3, 3), dtype=float)
+    second_moments = np.asarray(
+        [
+            [
+                zero_second_moment,
+                transition_second_moment,
+                zero_second_moment,
+            ],
+            [
+                transition_second_moment,
+                zero_second_moment,
+                transition_second_moment,
+            ],
+            [
+                zero_second_moment,
+                transition_second_moment,
+                zero_second_moment,
+            ],
+        ],
+        dtype=float,
+    )
+    self_current = np.zeros((3, 3, 3), dtype=float)
+
+    result = model.compute_projected_analytical_conductivity_from_primitives(
+        concentrations,
+        capacity_fluxes,
+        first_moments,
+        second_moments,
+        self_current,
+        np.zeros((0, 0), dtype=float),
+        np.zeros((0, 3), dtype=float),
+        300.0,
+    )
+
+    state_drift = np.einsum(
+        "ij,ija->ia",
+        result.reversible_generator_Q_ij_s_inv,
+        result.transition_first_moments_d_ij_m,
+    )
+    assert np.any(state_drift != 0.0)
+    assert result.finite_state_memory_correction_tensor[0, 0] > 0.0
+
+
+def test_weighted_poisson_accepts_roundoff_scale_solvable_drift() -> None:
+    generator = np.asarray(
+        [
+            [-1.0, 1.0],
+            [1.0, -1.0],
+        ],
+        dtype=float,
+    )
+    concentrations = np.asarray([1.0e6, 1.0e6], dtype=float)
+    drift = np.asarray([1.0e-4, -1.0e-4 + 1.0e-20], dtype=float)
+
+    solution = model.solve_weighted_poisson(generator, concentrations, drift)
+
+    assert np.all(np.isfinite(solution))
+    assert concentrations @ solution == pytest.approx(0.0)
 
 
 def test_mori_null_current_mode_fails_loudly() -> None:
@@ -328,6 +632,42 @@ def test_primitive_ownership_scores_assign_largest_response() -> None:
     assert scores["largest_primitive_index"] == pytest.approx(3.0)
 
 
+def test_basis_refinement_adds_missing_current_coordinate() -> None:
+    refinement_result = model.refine_mori_basis_by_projected_residual(
+        direct_diffusivity_tensor=np.diag([1.0, 0.0, 0.0]),
+        initial_mori_memory_matrix_A=np.zeros((0, 0), dtype=float),
+        initial_mori_current_coupling_matrix_h=np.zeros((0, 3), dtype=float),
+        candidate_self_energies_A_gg=np.asarray([2.0, 1.0], dtype=float),
+        candidate_cross_energies_A_gPhi=np.zeros((2, 0), dtype=float),
+        candidate_cross_energy_matrix=np.asarray(
+            [
+                [2.0, 0.0],
+                [0.0, 1.0],
+            ],
+            dtype=float,
+        ),
+        candidate_current_couplings_h_g=np.asarray(
+            [
+                [1.0, 0.0, 0.0],
+                [0.1, 0.0, 0.0],
+            ],
+            dtype=float,
+        ),
+        temperature_K=300.0,
+        residual_score_tolerance=0.1,
+        conductivity_change_tolerance_S_m=1.0e-30,
+        max_added_coordinates=1,
+    )
+
+    assert np.array_equal(
+        refinement_result["selected_candidate_indices"],
+        np.asarray([0], dtype=int),
+    )
+    conductivity_history = refinement_result["conductivity_history_S_m"]
+    assert conductivity_history.size == 2
+    assert conductivity_history[-1] < conductivity_history[0]
+
+
 def test_composition_only_conductivity_fails_without_full_physical_library() -> None:
     recipe = {
         "solvents": {"EC": 0.3, "DMC": 0.7},
@@ -361,7 +701,8 @@ def test_property_db_validator_evaluates_all_labeled_compositions() -> None:
         [
             sys.executable,
             "-m",
-            "conductivity.validate_projected_analytical_property_db",
+            "conductivity.physical_library.library_io",
+            "validate-property-db",
         ],
         check=True,
         capture_output=True,
@@ -371,5 +712,5 @@ def test_property_db_validator_evaluates_all_labeled_compositions() -> None:
     assert "source_labeled_rows=102" in completed.stdout
     assert "evaluated_rows=0" in completed.stdout
     assert "failed_rows=102" in completed.stdout
-    assert "populated full ConductivityPhysicalLibrary" in completed.stdout
+    assert "missing executable physical generator inputs" in completed.stdout
     assert "mae_mS_cm=" not in completed.stdout

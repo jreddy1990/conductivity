@@ -1,0 +1,441 @@
+"""Build reduced-generator inputs from site-level physical configurations."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Callable
+
+import numpy as np
+
+from conductivity.physical_library.physical_objects import (
+    CARTESIAN_DIMENSION,
+    PhysicalObjectBundle,
+    SiteConfiguration,
+    build_physical_objects,
+    compute_charge_polarization_m,
+)
+from conductivity.physical_library.reduced_generator import (
+    ReducedGeneratorSpecification,
+    ReducedStateQuadrature,
+    ReducedTransitionQuadrature,
+)
+from conductivity.physical_library.library_io import PhysicalLibraryRecords
+
+Array = np.ndarray
+LOCAL_FIELD_VECTOR_LENGTH = 4
+CACHE_KEY_DECIMAL_PLACES = np.finfo(float).precision
+
+
+@dataclass(frozen=True)
+class PhysicalLocalFields:
+    dielectric_constant: float
+    viscosity_Pa_s: float
+    ionic_strength_mol_m3: float
+    local_packing_fraction: float
+
+
+@dataclass(frozen=True)
+class PhysicalStateQuadrature:
+    label: str
+    configurations: tuple[SiteConfiguration, ...]
+    local_fields: tuple[PhysicalLocalFields, ...]
+    weights: Array
+    stoichiometry: Array
+    self_current_projector: Array
+
+
+@dataclass(frozen=True)
+class PhysicalTransitionQuadrature:
+    from_state_index: int
+    to_state_index: int
+    configurations: tuple[SiteConfiguration, ...]
+    local_fields: tuple[PhysicalLocalFields, ...]
+    weights: Array
+    committor_gradients: Array
+    surface_state_indices: Array
+    path_start_configurations: tuple[SiteConfiguration, ...]
+    path_end_configurations: tuple[SiteConfiguration, ...]
+    path_weights: Array
+    first_displacement_moment_m: Array
+    second_displacement_moment_m2: Array
+    log_capacity_integral: float
+
+
+@dataclass(frozen=True)
+class PhysicalGeneratorBuildInput:
+    records: PhysicalLibraryRecords
+    template_configuration: SiteConfiguration
+    state_quadratures: tuple[PhysicalStateQuadrature, ...]
+    transition_quadratures: tuple[PhysicalTransitionQuadrature, ...]
+    memory_coordinate_gradient_functions: tuple[Callable[[SiteConfiguration], Array], ...]
+    total_component_concentrations_mol_m3: Array
+    temperature_K: float
+    volume_m3: float
+
+
+def build_reduced_generator_specification_from_physical_objects(
+    build_input: PhysicalGeneratorBuildInput,
+) -> ReducedGeneratorSpecification:
+    """Convert physical-library quadrature into deterministic generator functions."""
+
+    validate_site_configuration_family(
+        build_input.template_configuration,
+        _all_configurations(build_input.state_quadratures, build_input.transition_quadratures),
+    )
+    state_quadratures = tuple(
+        _build_reduced_state_quadrature(
+            build_input.template_configuration,
+            state_quadrature,
+        )
+        for state_quadrature in build_input.state_quadratures
+    )
+    transition_quadratures = tuple(
+        _build_reduced_transition_quadrature(
+            build_input.template_configuration,
+            transition_quadrature,
+            build_input.records,
+        )
+        for transition_quadrature in build_input.transition_quadratures
+    )
+    physical_object_at_point = _physical_object_function(build_input)
+    return ReducedGeneratorSpecification(
+        potential_energy_J_mol=_physical_potential_function(physical_object_at_point),
+        mobility_tensor_m2_s=_physical_mobility_function(physical_object_at_point),
+        charge_polarization_gradient=_physical_polarization_gradient_function(
+            physical_object_at_point
+        ),
+        memory_coordinate_gradient=_physical_memory_gradient_function(build_input),
+        state_quadratures=state_quadratures,
+        transition_quadratures=transition_quadratures,
+        total_component_concentrations_mol_m3=np.asarray(
+            build_input.total_component_concentrations_mol_m3,
+            dtype=float,
+        ),
+        temperature_K=build_input.temperature_K,
+        volume_m3=build_input.volume_m3,
+    )
+
+
+def flatten_configuration_positions_m(configuration: SiteConfiguration) -> Array:
+    positions_m = np.asarray(configuration.positions_m, dtype=float)
+    return positions_m.reshape(positions_m.size)
+
+
+def flatten_configuration_with_local_fields(
+    configuration: SiteConfiguration,
+    local_fields: PhysicalLocalFields,
+) -> Array:
+    local_field_values = np.asarray(
+        [
+            local_fields.dielectric_constant,
+            local_fields.viscosity_Pa_s,
+            local_fields.ionic_strength_mol_m3,
+            local_fields.local_packing_fraction,
+        ],
+        dtype=float,
+    )
+    return np.concatenate((flatten_configuration_positions_m(configuration), local_field_values))
+
+
+def configuration_and_local_fields_from_generator_point(
+    template_configuration: SiteConfiguration,
+    generator_point: Array,
+) -> tuple[SiteConfiguration, PhysicalLocalFields]:
+    point = np.asarray(generator_point, dtype=float)
+    site_count = len(template_configuration.species_names)
+    position_size = site_count * CARTESIAN_DIMENSION
+    expected_size = position_size + LOCAL_FIELD_VECTOR_LENGTH
+    if point.shape != (expected_size,):
+        raise ValueError(f"generator point must have shape ({expected_size},)")
+    positions_m = point[:position_size].reshape((site_count, CARTESIAN_DIMENSION))
+    local_field_values = point[position_size:]
+    local_fields = PhysicalLocalFields(
+        dielectric_constant=float(local_field_values[0]),
+        viscosity_Pa_s=float(local_field_values[1]),
+        ionic_strength_mol_m3=float(local_field_values[2]),
+        local_packing_fraction=float(local_field_values[3]),
+    )
+    validate_local_fields(local_fields, "generator_point.local_fields")
+    configuration = SiteConfiguration(
+        species_names=template_configuration.species_names,
+        molecule_ids=np.asarray(template_configuration.molecule_ids, dtype=int),
+        site_ids=np.asarray(template_configuration.site_ids, dtype=int),
+        positions_m=positions_m,
+        unwrapped_positions_m=positions_m,
+        box_lengths_m=np.asarray(template_configuration.box_lengths_m, dtype=float),
+    )
+    return configuration, local_fields
+
+
+def validate_site_configuration_family(
+    template_configuration: SiteConfiguration,
+    configurations: tuple[SiteConfiguration, ...],
+) -> None:
+    for configuration_index, configuration in enumerate(configurations):
+        if configuration.species_names != template_configuration.species_names:
+            raise ValueError(f"configuration[{configuration_index}] species_names mismatch")
+        if not np.array_equal(configuration.molecule_ids, template_configuration.molecule_ids):
+            raise ValueError(f"configuration[{configuration_index}] molecule_ids mismatch")
+        if not np.array_equal(configuration.site_ids, template_configuration.site_ids):
+            raise ValueError(f"configuration[{configuration_index}] site_ids mismatch")
+        if not np.allclose(configuration.box_lengths_m, template_configuration.box_lengths_m):
+            raise ValueError(f"configuration[{configuration_index}] box_lengths_m mismatch")
+
+
+def _all_configurations(
+    state_quadratures: tuple[PhysicalStateQuadrature, ...],
+    transition_quadratures: tuple[PhysicalTransitionQuadrature, ...],
+) -> tuple[SiteConfiguration, ...]:
+    configurations = []
+    for state_quadrature in state_quadratures:
+        configurations.extend(state_quadrature.configurations)
+    for transition_quadrature in transition_quadratures:
+        configurations.extend(transition_quadrature.configurations)
+        configurations.extend(transition_quadrature.path_start_configurations)
+        configurations.extend(transition_quadrature.path_end_configurations)
+    return tuple(configurations)
+
+
+def _build_reduced_state_quadrature(
+    template_configuration: SiteConfiguration,
+    state_quadrature: PhysicalStateQuadrature,
+) -> ReducedStateQuadrature:
+    validate_local_field_count(
+        state_quadrature.local_fields,
+        len(state_quadrature.configurations),
+        state_quadrature.label,
+    )
+    points = np.vstack(
+        tuple(
+            flatten_configuration_with_local_fields(configuration, local_fields)
+            for configuration, local_fields in zip(
+                state_quadrature.configurations,
+                state_quadrature.local_fields,
+                strict=True,
+            )
+        )
+    )
+    coordinate_count = (
+        len(template_configuration.species_names) * CARTESIAN_DIMENSION
+        + LOCAL_FIELD_VECTOR_LENGTH
+    )
+    projector = np.asarray(state_quadrature.self_current_projector, dtype=float)
+    if projector.shape != (coordinate_count, coordinate_count):
+        raise ValueError(
+            f"{state_quadrature.label}.self_current_projector must have "
+            f"shape ({coordinate_count}, {coordinate_count})"
+        )
+    return ReducedStateQuadrature(
+        points=points,
+        weights=np.asarray(state_quadrature.weights, dtype=float),
+        stoichiometry=np.asarray(state_quadrature.stoichiometry, dtype=float),
+        self_current_projector=projector,
+    )
+
+
+def _build_reduced_transition_quadrature(
+    template_configuration: SiteConfiguration,
+    transition_quadrature: PhysicalTransitionQuadrature,
+    records: PhysicalLibraryRecords,
+) -> ReducedTransitionQuadrature:
+    validate_local_field_count(
+        transition_quadrature.local_fields,
+        len(transition_quadrature.configurations),
+        "transition",
+    )
+    points = np.vstack(
+        tuple(
+            flatten_configuration_with_local_fields(configuration, local_fields)
+            for configuration, local_fields in zip(
+                transition_quadrature.configurations,
+                transition_quadrature.local_fields,
+                strict=True,
+            )
+        )
+    )
+    committor_gradients = _extend_position_gradients_to_generator_points(
+        transition_quadrature.committor_gradients,
+        points.shape[1],
+    )
+    return ReducedTransitionQuadrature(
+        from_state_index=transition_quadrature.from_state_index,
+        to_state_index=transition_quadrature.to_state_index,
+        points=points,
+        weights=np.asarray(transition_quadrature.weights, dtype=float),
+        committor_gradients=committor_gradients,
+        surface_state_indices=np.asarray(
+            transition_quadrature.surface_state_indices,
+            dtype=int,
+        ),
+        path_displacements_m=_path_displacements_m(
+            records,
+            transition_quadrature.path_start_configurations,
+            transition_quadrature.path_end_configurations,
+        ),
+        path_weights=np.asarray(transition_quadrature.path_weights, dtype=float),
+        first_displacement_moment_m=np.asarray(
+            transition_quadrature.first_displacement_moment_m,
+            dtype=float,
+        ),
+        second_displacement_moment_m2=np.asarray(
+            transition_quadrature.second_displacement_moment_m2,
+            dtype=float,
+        ),
+        log_capacity_integral=float(transition_quadrature.log_capacity_integral),
+    )
+
+
+def _path_displacements_m(
+    records: PhysicalLibraryRecords,
+    start_configurations: tuple[SiteConfiguration, ...],
+    end_configurations: tuple[SiteConfiguration, ...],
+) -> Array:
+    if len(start_configurations) != len(end_configurations):
+        raise ValueError("path_start_configurations and path_end_configurations mismatch")
+    displacements = []
+    for start_configuration, end_configuration in zip(start_configurations, end_configurations):
+        start_polarization = compute_charge_polarization_m(records, start_configuration)
+        end_polarization = compute_charge_polarization_m(records, end_configuration)
+        displacements.append(end_polarization - start_polarization)
+    return np.asarray(displacements, dtype=float)
+
+
+def _physical_object_function(
+    build_input: PhysicalGeneratorBuildInput,
+) -> Callable[[Array], PhysicalObjectBundle]:
+    physical_object_cache: dict[tuple[float, ...], PhysicalObjectBundle] = {}
+
+    def physical_object_at_point(generator_point: Array) -> PhysicalObjectBundle:
+        cache_key = tuple(
+            np.round(
+                np.asarray(generator_point, dtype=float),
+                CACHE_KEY_DECIMAL_PLACES,
+            )
+        )
+        if cache_key in physical_object_cache:
+            return physical_object_cache[cache_key]
+        configuration, local_fields = configuration_and_local_fields_from_generator_point(
+            build_input.template_configuration,
+            generator_point,
+        )
+        physical_object = build_physical_objects(
+            build_input.records,
+            configuration,
+            build_input.temperature_K,
+            local_fields.dielectric_constant,
+            local_fields.viscosity_Pa_s,
+            local_fields.ionic_strength_mol_m3,
+            local_fields.local_packing_fraction,
+        )
+        physical_object_cache[cache_key] = physical_object
+        return physical_object
+
+    return physical_object_at_point
+
+
+def _physical_potential_function(
+    physical_object_at_point: Callable[[Array], PhysicalObjectBundle],
+) -> Callable[[Array], float]:
+    def potential_energy_J_mol(generator_point: Array) -> float:
+        return physical_object_at_point(generator_point).potential_energy_J_mol
+
+    return potential_energy_J_mol
+
+
+def _physical_mobility_function(
+    physical_object_at_point: Callable[[Array], PhysicalObjectBundle],
+) -> Callable[[Array], Array]:
+    def mobility_tensor_m2_s(generator_point: Array) -> Array:
+        physical_mobility = physical_object_at_point(generator_point).mobility_tensor_m2_s
+        return _extend_square_matrix_to_generator_point(physical_mobility)
+
+    return mobility_tensor_m2_s
+
+
+def _physical_polarization_gradient_function(
+    physical_object_at_point: Callable[[Array], PhysicalObjectBundle],
+) -> Callable[[Array], Array]:
+    def charge_polarization_gradient(generator_point: Array) -> Array:
+        physical_gradient = physical_object_at_point(
+            generator_point
+        ).charge_polarization_gradient
+        return _extend_gradient_to_generator_point(physical_gradient)
+
+    return charge_polarization_gradient
+
+
+def _physical_memory_gradient_function(
+    build_input: PhysicalGeneratorBuildInput,
+) -> Callable[[Array], Array]:
+    def memory_coordinate_gradient(generator_point: Array) -> Array:
+        configuration, _local_fields = configuration_and_local_fields_from_generator_point(
+            build_input.template_configuration,
+            generator_point,
+        )
+        gradients = []
+        for gradient_function in build_input.memory_coordinate_gradient_functions:
+            gradients.append(np.asarray(gradient_function(configuration), dtype=float))
+        if not gradients:
+            coordinate_count = (
+                len(configuration.species_names) * CARTESIAN_DIMENSION
+                + LOCAL_FIELD_VECTOR_LENGTH
+            )
+            return np.zeros((0, coordinate_count), dtype=float)
+        return _extend_gradient_to_generator_point(np.vstack(tuple(gradients)))
+
+    return memory_coordinate_gradient
+
+
+def validate_local_field_count(
+    local_fields: tuple[PhysicalLocalFields, ...],
+    configuration_count: int,
+    label: str,
+) -> None:
+    if len(local_fields) != configuration_count:
+        raise ValueError(f"{label}.local_fields length must match configurations")
+    for local_field_index, local_fields_at_node in enumerate(local_fields):
+        validate_local_fields(local_fields_at_node, f"{label}.local_fields[{local_field_index}]")
+
+
+def validate_local_fields(local_fields: PhysicalLocalFields, label: str) -> None:
+    if local_fields.dielectric_constant <= 0.0:
+        raise ValueError(f"{label}.dielectric_constant must be positive")
+    if local_fields.viscosity_Pa_s <= 0.0:
+        raise ValueError(f"{label}.viscosity_Pa_s must be positive")
+    if local_fields.ionic_strength_mol_m3 < 0.0:
+        raise ValueError(f"{label}.ionic_strength_mol_m3 must be nonnegative")
+    if local_fields.local_packing_fraction < 0.0:
+        raise ValueError(f"{label}.local_packing_fraction must be nonnegative")
+
+
+def _extend_square_matrix_to_generator_point(physical_matrix: Array) -> Array:
+    matrix = np.asarray(physical_matrix, dtype=float)
+    generator_dimension = matrix.shape[0] + LOCAL_FIELD_VECTOR_LENGTH
+    extended = np.zeros((generator_dimension, generator_dimension), dtype=float)
+    extended[: matrix.shape[0], : matrix.shape[1]] = matrix
+    return extended
+
+
+def _extend_gradient_to_generator_point(physical_gradient: Array) -> Array:
+    gradient = np.asarray(physical_gradient, dtype=float)
+    local_field_columns = np.zeros(
+        (gradient.shape[0], LOCAL_FIELD_VECTOR_LENGTH),
+        dtype=float,
+    )
+    return np.hstack((gradient, local_field_columns))
+
+
+def _extend_position_gradients_to_generator_points(
+    gradients: Array,
+    generator_dimension: int,
+) -> Array:
+    gradient_array = np.asarray(gradients, dtype=float)
+    if gradient_array.shape[1] == generator_dimension:
+        return gradient_array
+    if gradient_array.shape[1] + LOCAL_FIELD_VECTOR_LENGTH != generator_dimension:
+        raise ValueError("committor gradient dimension is incompatible with generator points")
+    local_field_columns = np.zeros(
+        (gradient_array.shape[0], LOCAL_FIELD_VECTOR_LENGTH),
+        dtype=float,
+    )
+    return np.hstack((gradient_array, local_field_columns))

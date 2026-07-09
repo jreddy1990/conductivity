@@ -235,10 +235,7 @@ class ProjectedGeneratorPrimitiveSet:
     state_concentrations_mol_m3: Mapping[str, float]
     state_occupancy_fractions: Mapping[str, float]
     reactive_fluxes: tuple[ProjectedGeneratorReactiveFlux, ...]
-    conditional_displacement_moments: tuple[
-        ProjectedGeneratorConditionalMoment,
-        ...
-    ]
+    conditional_displacement_moments: tuple[ProjectedGeneratorConditionalMoment, ...]
     self_current_tensors: tuple[ProjectedGeneratorSelfCurrentTensor, ...]
     markov_input: MarkovAdditiveConductivityInput
     markov_conductivity_result: MarkovAdditiveConductivityResult
@@ -368,8 +365,8 @@ def build_trajectory_primitive_target_markov_input(
         total_concentration_mol_m3,
     )
 
-    pair_samples_by_state_pair: dict[tuple[int, int], list[np.ndarray]] = (
-        defaultdict(list)
+    pair_samples_by_state_pair: dict[tuple[int, int], list[np.ndarray]] = defaultdict(
+        list
     )
     self_samples_by_state: dict[int, list[np.ndarray]] = defaultdict(list)
     transition_sample_count = 0
@@ -394,14 +391,12 @@ def build_trajectory_primitive_target_markov_input(
             if from_state_index == lower_state_index
             else -charge_displacement_m
         )
-        pair_samples_by_state_pair[
-            (lower_state_index, upper_state_index)
-        ].append(canonical_displacement_m)
+        pair_samples_by_state_pair[(lower_state_index, upper_state_index)].append(
+            canonical_displacement_m
+        )
         transition_sample_count += 1
 
-    event_flux_mol_m3_s = total_concentration_mol_m3 / (
-        2.0 * step_count * dt_s
-    )
+    event_flux_mol_m3_s = total_concentration_mol_m3 / (2.0 * step_count * dt_s)
     events = _trajectory_events_from_samples(
         pair_samples_by_state_pair,
         self_samples_by_state,
@@ -491,8 +486,8 @@ def build_sampled_trajectory_markov_additive_input(
     all_state_observations = np.concatenate(
         (occupancy_state_indices, from_state_indices, to_state_indices),
     )
-    state_index_remap, remapped_labels, remapped_observations = (
-        _remap_visited_states(state_labels, all_state_observations)
+    state_index_remap, remapped_labels, remapped_observations = _remap_visited_states(
+        state_labels, all_state_observations
     )
     occupancy_count = int(occupancy_state_indices.shape[0])
     step_count = int(from_state_indices.shape[0])
@@ -507,8 +502,8 @@ def build_sampled_trajectory_markov_additive_input(
         len(remapped_labels),
         total_concentration_mol_m3,
     )
-    pair_samples_by_state_pair: dict[tuple[int, int], list[np.ndarray]] = (
-        defaultdict(list)
+    pair_samples_by_state_pair: dict[tuple[int, int], list[np.ndarray]] = defaultdict(
+        list
     )
     self_samples_by_state: dict[int, list[np.ndarray]] = defaultdict(list)
     transition_sample_count = 0
@@ -533,14 +528,12 @@ def build_sampled_trajectory_markov_additive_input(
             if from_state_index == lower_state_index
             else -charge_displacement_m
         )
-        pair_samples_by_state_pair[
-            (lower_state_index, upper_state_index)
-        ].append(canonical_displacement_m)
+        pair_samples_by_state_pair[(lower_state_index, upper_state_index)].append(
+            canonical_displacement_m
+        )
         transition_sample_count += 1
 
-    event_flux_mol_m3_s = total_concentration_mol_m3 / (
-        2.0 * step_count * dt_s
-    )
+    event_flux_mol_m3_s = total_concentration_mol_m3 / (2.0 * step_count * dt_s)
     events = _trajectory_events_from_samples(
         pair_samples_by_state_pair,
         self_samples_by_state,
@@ -550,8 +543,7 @@ def build_sampled_trajectory_markov_additive_input(
     )
     if not events:
         raise ValueError(
-            "sampled trajectory target produced no nonzero "
-            "Markov-additive events",
+            "sampled trajectory target produced no nonzero Markov-additive events",
         )
 
     diagnostics = TrajectoryPrimitiveTargetProcessDiagnostics(
@@ -597,9 +589,7 @@ def _projected_reactive_fluxes(
         if event.from_state_index == event.to_state_index:
             continue
         ordered_pair = (event.from_state_index, event.to_state_index)
-        event_flux = (
-            state_concentrations[event.from_state_index] * event.rate_s_inv
-        )
+        event_flux = state_concentrations[event.from_state_index] * event.rate_s_inv
         flux_by_ordered_pair[ordered_pair] += float(event_flux)
         rate_by_ordered_pair[ordered_pair] += float(event.rate_s_inv)
     reactive_fluxes: list[ProjectedGeneratorReactiveFlux] = []
@@ -730,7 +720,10 @@ def _projected_self_current_tensors(
         to_state_index = int(to_state_indices[sample_index])
         if from_state_index != to_state_index:
             continue
-        if float(np.linalg.norm(charge_displacement_m)) <= displacement_zero_tolerance_m:
+        if (
+            float(np.linalg.norm(charge_displacement_m))
+            <= displacement_zero_tolerance_m
+        ):
             continue
         self_samples_by_state[from_state_index].append(charge_displacement_m)
 
@@ -812,8 +805,7 @@ def compute_pf6_trajectory_primitive_targets(
         "internal_polarization_center:PF6-",
     )
     state_index_by_label = {
-        state_label: state_index
-        for state_index, state_label in enumerate(state_labels)
+        state_label: state_index for state_index, state_label in enumerate(state_labels)
     }
 
     frame_stream = iter(_stream_pf6_center_frames(validated_input))
@@ -962,10 +954,7 @@ def compute_pf6_trajectory_primitive_targets(
         sample_input,
         process_result,
         len(times_ps),
-        int(
-            validated_input.layout.li_atom_count
-            * LIPF6_CHARGED_CENTER_COUNT
-        ),
+        int(validated_input.layout.li_atom_count * LIPF6_CHARGED_CENTER_COUNT),
         validated_input.block_count,
         validated_input.frame_stride,
     )
@@ -1001,7 +990,9 @@ def _validated_pf6_target_input(
         raise ValueError("system_id must be nonempty")
     archive_path = Path(target_input.archive_path)
     if not archive_path.exists():
-        raise FileNotFoundError(f"PF6 trajectory archive does not exist: {archive_path}")
+        raise FileNotFoundError(
+            f"PF6 trajectory archive does not exist: {archive_path}"
+        )
     member_name = str(target_input.member_name)
     if not member_name:
         raise ValueError("member_name must be nonempty")
@@ -1141,8 +1132,7 @@ def _stream_pf6_center_frames(
                     skipped_line = trajectory_member.readline()
                     if not skipped_line:
                         raise ValueError(
-                            "PF6 trajectory ended inside raw frame "
-                            f"{raw_frame_index}",
+                            f"PF6 trajectory ended inside raw frame {raw_frame_index}",
                         )
             raw_frame_index += 1
     if not frames:
@@ -1191,12 +1181,9 @@ def _pf6_anion_center_A(
     p_position_A = pf6_positions_A[0]
     unfolded_positions_A = pf6_positions_A.copy()
     for atom_index in range(1, pf6_positions_A.shape[0]):
-        unfolded_positions_A[atom_index] = (
-            p_position_A
-            + _minimum_image_displacement_A(
-                pf6_positions_A[atom_index] - p_position_A,
-                box_length_A,
-            )
+        unfolded_positions_A[atom_index] = p_position_A + _minimum_image_displacement_A(
+            pf6_positions_A[atom_index] - p_position_A,
+            box_length_A,
         )
     atom_masses_g_mol = np.asarray(
         (
@@ -1499,9 +1486,7 @@ def _primitive_target_artifact_from_sample_input(
                 block_displacement_moment_standard_errors,
             )
         ),
-        markov_additive_sigma_mS_cm=(
-            process_result.conductivity_result.sigma_mS_cm
-        ),
+        markov_additive_sigma_mS_cm=(process_result.conductivity_result.sigma_mS_cm),
         markov_direct_sigma_mS_cm=(
             process_result.conductivity_result.direct_sigma_mS_cm
         ),
@@ -1577,14 +1562,10 @@ def _block_targets_from_sample_input(
                 sample_input.total_transport_concentration_mol_m3
             ),
             temperature_K=sample_input.temperature_K,
-            displacement_zero_tolerance_m=(
-                sample_input.displacement_zero_tolerance_m
-            ),
+            displacement_zero_tolerance_m=(sample_input.displacement_zero_tolerance_m),
         )
-        block_process_result = (
-            compute_sampled_trajectory_markov_additive_conductivity(
-                block_sample_input,
-            )
+        block_process_result = compute_sampled_trajectory_markov_additive_conductivity(
+            block_sample_input,
         )
         transition_rates = _transition_rate_targets(
             block_process_result.markov_input,
@@ -1990,8 +1971,7 @@ def _validated_charge_displacements(
     charge_displacements = np.asarray(charge_displacement_by_step_m, dtype=float)
     if charge_displacements.shape != (expected_step_count, 3):
         raise ValueError(
-            "charge_displacement_by_step_m must have shape "
-            f"({expected_step_count}, 3)",
+            f"charge_displacement_by_step_m must have shape ({expected_step_count}, 3)",
         )
     if not np.all(np.isfinite(charge_displacements)):
         raise ValueError("charge_displacement_by_step_m must be finite")
@@ -2012,10 +1992,7 @@ def _remap_visited_states(
         )
     }
     remapped_states = np.asarray(
-        tuple(
-            state_index_remap[int(state_index)]
-            for state_index in state_indices
-        ),
+        tuple(state_index_remap[int(state_index)] for state_index in state_indices),
         dtype=int,
     )
     remapped_labels = tuple(

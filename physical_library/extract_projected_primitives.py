@@ -12,12 +12,16 @@ import numpy as np
 import yaml
 
 from constants import N_A
-from conductivity.projected_analytical_conductivity import (
+from conductivity.physical_library.projected_analytical_conductivity import (
     CARTESIAN,
     PROJECTED_REFERENCE_VOLUME_M3,
     compute_projected_analytical_conductivity_from_primitives,
 )
-from conductivity.trajectory_primitive_targets import (
+from conductivity.physical_library import generator_construction
+from conductivity.physical_library.mixture_closures import compute_mixture_closures
+from conductivity.physical_library.physical_objects import PairBasin, SiteConfiguration
+from conductivity.physical_library.projected_primitives_io import PRIMITIVE_SCHEMA
+from conductivity.physical_library.trajectory_primitives import (
     ANGSTROM_TO_M,
     ProjectedGeneratorPrimitiveSet,
     TrajectoryMarkovAdditiveSampleInput,
@@ -95,6 +99,8 @@ def main() -> int:
     parser.add_argument("--trajectory", required=True, type=Path)
     parser.add_argument("--composition-json", required=True, type=Path)
     parser.add_argument("--copies-json", required=True, type=Path)
+    parser.add_argument("--recipe-yaml", required=True, type=Path)
+    parser.add_argument("--physical-library-root", required=True, type=Path)
     parser.add_argument("--dt-fs", required=True, type=float)
     parser.add_argument("--trajectory-dump-stride-steps", required=True, type=int)
     parser.add_argument("--output-yaml", required=True, type=Path)
@@ -104,6 +110,8 @@ def main() -> int:
         trajectory_path=args.trajectory,
         composition_json_path=args.composition_json,
         copies_json_path=args.copies_json,
+        recipe_yaml_path=args.recipe_yaml,
+        physical_library_root=args.physical_library_root,
         timestep_fs=float(args.dt_fs),
         trajectory_dump_stride_steps=int(args.trajectory_dump_stride_steps),
         output_yaml_path=args.output_yaml,
@@ -115,6 +123,8 @@ def extract_projected_primitives_from_lammps_dump(
     trajectory_path: Path,
     composition_json_path: Path,
     copies_json_path: Path,
+    recipe_yaml_path: Path,
+    physical_library_root: Path,
     timestep_fs: float,
     trajectory_dump_stride_steps: int,
     output_yaml_path: Path,
@@ -126,6 +136,18 @@ def extract_projected_primitives_from_lammps_dump(
 
     composition_record = _load_json_mapping(composition_json_path)
     copies_record = _load_json_mapping(copies_json_path)
+    recipe_context = generator_construction.build_recipe_library_context(
+        recipe_yaml_path,
+        physical_library_root,
+    )
+    records = recipe_context.library_records
+    mixture = compute_mixture_closures(
+        records=records,
+        composition=generator_construction.mixture_composition_from_recipe_context(
+            recipe_context
+        ),
+        temperature_K=recipe_context.temperature_K,
+    )
     species_ranges = _species_ranges_from_copies_record(copies_record)
     center_catalog = _charged_center_catalog_from_species_ranges(species_ranges)
     frames = tuple(_read_lammps_custom_dump(trajectory_path))
@@ -147,6 +169,8 @@ def extract_projected_primitives_from_lammps_dump(
         center_frames,
         center_catalog,
         thresholds,
+        records,
+        mixture,
     )
     charge_displacements_m = _charge_displacements_by_step_m(
         center_frames,
@@ -155,7 +179,9 @@ def extract_projected_primitives_from_lammps_dump(
     mean_volume_m3 = _mean_box_volume_m3(center_frames)
     sample_input = TrajectoryMarkovAdditiveSampleInput(
         state_labels=state_labels,
-        occupancy_state_index_by_observation=state_index_by_frame_and_center.reshape(-1),
+        occupancy_state_index_by_observation=state_index_by_frame_and_center.reshape(
+            -1
+        ),
         from_state_index_by_step=state_index_by_frame_and_center[:-1].reshape(-1),
         to_state_index_by_step=state_index_by_frame_and_center[1:].reshape(-1),
         charge_displacement_by_step_m=charge_displacements_m,
@@ -171,10 +197,79 @@ def extract_projected_primitives_from_lammps_dump(
     )
     primitive_set = project_sampled_trajectory_to_generator_primitives(sample_input)
     primitive_arrays = _primitive_arrays_from_projected_set(primitive_set)
+    artifact = {
+        "schema": PRIMITIVE_SCHEMA,
+        "source_schema": SCHEMA_NAME,
+        "state_labels": tuple(primitive_set.state_labels),
+        "temperature_K": float(composition_record["temperature_K"]),
+        "volume_m3": float(mean_volume_m3),
+        "primitives": {
+            "state_concentrations_mol_m3": np.asarray(
+                primitive_arrays["state_concentrations_mol_m3"],
+                dtype=float,
+            ).tolist(),
+            "symmetric_capacity_fluxes_K_ij_mol_m3_s": np.asarray(
+                primitive_arrays["symmetric_capacity_fluxes_K_ij_mol_m3_s"],
+                dtype=float,
+            ).tolist(),
+            "transition_first_moments_d_ij_m": np.asarray(
+                primitive_arrays["transition_first_moments_d_ij_m"],
+                dtype=float,
+            ).tolist(),
+            "transition_second_moments_M_ij_m2": np.asarray(
+                primitive_arrays["transition_second_moments_M_ij_m2"],
+                dtype=float,
+            ).tolist(),
+            "self_current_tensors_D_self_i_m2_s": np.asarray(
+                primitive_arrays["self_current_tensors_D_self_i_m2_s"],
+                dtype=float,
+            ).tolist(),
+            "mori_memory_matrix_A": np.asarray(
+                primitive_arrays["mori_memory_matrix_A"],
+                dtype=float,
+            ).tolist(),
+            "mori_current_coupling_matrix_h": np.asarray(
+                primitive_arrays["mori_current_coupling_matrix_h"],
+                dtype=float,
+            ).tolist(),
+        },
+        "source_metadata": {
+            "tag": composition_record["tag"],
+            "species_list": composition_record["species_list"],
+            "mole_fractions": composition_record["mole_fractions"],
+            "copies_per_species": copies_record["copies_per_species"],
+            "timestep_fs": float(timestep_fs),
+            "trajectory_dump_stride_steps": int(trajectory_dump_stride_steps),
+            "frame_count": int(len(frames)),
+            "mean_volume_m3": float(mean_volume_m3),
+            "association_thresholds_A": {
+                "contact_pair_max_distance_A": thresholds.contact_pair_max_distance_A,
+                "solvent_separated_pair_max_distance_A": (
+                    thresholds.solvent_separated_pair_max_distance_A
+                ),
+            },
+        },
+        "diagnostics": {
+            "visited_state_count": int(primitive_set.diagnostics.visited_state_count),
+            "transition_sample_count": int(
+                primitive_set.diagnostics.transition_sample_count
+            ),
+            "self_displacement_sample_count": int(
+                primitive_set.diagnostics.self_displacement_sample_count
+            ),
+            "generated_event_count": int(
+                primitive_set.diagnostics.generated_event_count
+            ),
+            "trajectory_time_s": float(primitive_set.diagnostics.trajectory_time_s),
+            "total_transport_concentration_mol_m3": float(
+                primitive_set.diagnostics.total_transport_concentration_mol_m3
+            ),
+        },
+    }
+    output_yaml_path.parent.mkdir(parents=True, exist_ok=True)
+    output_yaml_path.write_text(yaml.safe_dump(artifact, sort_keys=False))
     projected_result = compute_projected_analytical_conductivity_from_primitives(
-        state_concentrations_mol_m3=primitive_arrays[
-            "state_concentrations_mol_m3"
-        ],
+        state_concentrations_mol_m3=primitive_arrays["state_concentrations_mol_m3"],
         symmetric_capacity_fluxes_K_ij_mol_m3_s=primitive_arrays[
             "symmetric_capacity_fluxes_K_ij_mol_m3_s"
         ],
@@ -194,74 +289,7 @@ def extract_projected_primitives_from_lammps_dump(
         temperature_K=float(composition_record["temperature_K"]),
         volume_m3=PROJECTED_REFERENCE_VOLUME_M3,
     )
-    artifact = {
-        "schema": SCHEMA_NAME,
-        "tag": composition_record["tag"],
-        "species_list": composition_record["species_list"],
-        "mole_fractions": composition_record["mole_fractions"],
-        "copies_per_species": copies_record["copies_per_species"],
-        "temperature_K": float(composition_record["temperature_K"]),
-        "timestep_fs": float(timestep_fs),
-        "trajectory_dump_stride_steps": int(trajectory_dump_stride_steps),
-        "frame_count": int(len(frames)),
-        "mean_volume_m3": float(mean_volume_m3),
-        "association_thresholds_A": {
-            "contact_pair_max_distance_A": thresholds.contact_pair_max_distance_A,
-            "solvent_separated_pair_max_distance_A": (
-                thresholds.solvent_separated_pair_max_distance_A
-            ),
-        },
-        "state_labels": tuple(primitive_set.state_labels),
-        "state_concentrations_mol_m3": np.asarray(
-            primitive_arrays["state_concentrations_mol_m3"],
-            dtype=float,
-        ).tolist(),
-        "symmetric_capacity_fluxes_K_ij_mol_m3_s": np.asarray(
-            primitive_arrays["symmetric_capacity_fluxes_K_ij_mol_m3_s"],
-            dtype=float,
-        ).tolist(),
-        "transition_first_moments_d_ij_m": np.asarray(
-            primitive_arrays["transition_first_moments_d_ij_m"],
-            dtype=float,
-        ).tolist(),
-        "transition_second_moments_M_ij_m2": np.asarray(
-            primitive_arrays["transition_second_moments_M_ij_m2"],
-            dtype=float,
-        ).tolist(),
-        "self_current_tensors_D_self_i_m2_s": np.asarray(
-            primitive_arrays["self_current_tensors_D_self_i_m2_s"],
-            dtype=float,
-        ).tolist(),
-        "mori_memory_matrix_A": np.asarray(
-            primitive_arrays["mori_memory_matrix_A"],
-            dtype=float,
-        ).tolist(),
-        "mori_current_coupling_matrix_h": np.asarray(
-            primitive_arrays["mori_current_coupling_matrix_h"],
-            dtype=float,
-        ).tolist(),
-        "markov_additive_sigma_mS_cm": float(
-            primitive_set.markov_conductivity_result.sigma_mS_cm
-        ),
-        "projected_analytical_sigma_mS_cm": float(projected_result.sigma_mS_cm),
-        "diagnostics": {
-            "visited_state_count": int(primitive_set.diagnostics.visited_state_count),
-            "transition_sample_count": int(
-                primitive_set.diagnostics.transition_sample_count
-            ),
-            "self_displacement_sample_count": int(
-                primitive_set.diagnostics.self_displacement_sample_count
-            ),
-            "generated_event_count": int(
-                primitive_set.diagnostics.generated_event_count
-            ),
-            "trajectory_time_s": float(primitive_set.diagnostics.trajectory_time_s),
-            "total_transport_concentration_mol_m3": float(
-                primitive_set.diagnostics.total_transport_concentration_mol_m3
-            ),
-        },
-    }
-    output_yaml_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact["projected_analytical_sigma_mS_cm"] = float(projected_result.sigma_mS_cm)
     output_yaml_path.write_text(yaml.safe_dump(artifact, sort_keys=False))
     return artifact
 
@@ -477,9 +505,7 @@ def _association_thresholds_from_distances_A(
             "gaps; run longer or use a larger box"
         )
     largest_gap_indices = positive_gap_indices[
-        np.argsort(distance_gaps_A[positive_gap_indices])[
-            -MINIMUM_LOCAL_MINIMUM_COUNT:
-        ]
+        np.argsort(distance_gaps_A[positive_gap_indices])[-MINIMUM_LOCAL_MINIMUM_COUNT:]
     ]
     threshold_gap_indices = np.sort(largest_gap_indices)
     thresholds_A = (
@@ -496,11 +522,11 @@ def _assign_center_states(
     center_frames: tuple[ChargedCenterFrame, ...],
     center_catalog: ChargedCenterCatalog,
     thresholds: AssociationThresholds,
+    records,
+    mixture,
 ) -> tuple[tuple[str, ...], np.ndarray]:
-    base_labels = _state_labels(center_catalog)
-    state_index_by_label = {
-        label: state_index for state_index, label in enumerate(base_labels)
-    }
+    state_labels: list[str] = []
+    state_index_by_label: dict[str, int] = {}
     state_indices = np.zeros(
         (len(center_frames), center_catalog.molecule_ids.size),
         dtype=int,
@@ -514,22 +540,217 @@ def _assign_center_states(
             anion_indices,
         )
         for local_cation_index, center_index in enumerate(cation_indices):
-            label = _state_label_for_counterion_distances(
+            nearest_anion_local_index = int(
+                np.argmin(pair_distances_A[local_cation_index])
+            )
+            nearest_anion_index = int(anion_indices[nearest_anion_local_index])
+            label = _active_sparse_state_label_for_center(
+                records=records,
+                mixture=mixture,
+                center_frame=center_frame,
+                center_catalog=center_catalog,
+                center_index=int(center_index),
+                counterion_index=nearest_anion_index,
                 distances_A=pair_distances_A[local_cation_index],
                 thresholds=thresholds,
-                species_label=center_catalog.species_labels[center_index],
-                role=center_catalog.roles[center_index],
             )
-            state_indices[frame_index, center_index] = state_index_by_label[label]
+            state_indices[frame_index, center_index] = _state_index_for_label(
+                label,
+                state_labels,
+                state_index_by_label,
+            )
         for local_anion_index, center_index in enumerate(anion_indices):
-            label = _state_label_for_counterion_distances(
+            nearest_cation_local_index = int(
+                np.argmin(pair_distances_A[:, local_anion_index])
+            )
+            nearest_cation_index = int(cation_indices[nearest_cation_local_index])
+            label = _active_sparse_state_label_for_center(
+                records=records,
+                mixture=mixture,
+                center_frame=center_frame,
+                center_catalog=center_catalog,
+                center_index=int(center_index),
+                counterion_index=nearest_cation_index,
                 distances_A=pair_distances_A[:, local_anion_index],
                 thresholds=thresholds,
-                species_label=center_catalog.species_labels[center_index],
-                role=center_catalog.roles[center_index],
             )
-            state_indices[frame_index, center_index] = state_index_by_label[label]
-    return base_labels, state_indices
+            state_indices[frame_index, center_index] = _state_index_for_label(
+                label,
+                state_labels,
+                state_index_by_label,
+            )
+    return tuple(state_labels), state_indices
+
+
+def _state_index_for_label(
+    state_label: str,
+    state_labels: list[str],
+    state_index_by_label: dict[str, int],
+) -> int:
+    if state_label not in state_index_by_label:
+        state_index_by_label[state_label] = len(state_labels)
+        state_labels.append(state_label)
+    return state_index_by_label[state_label]
+
+
+def _active_sparse_state_label_for_center(
+    records,
+    mixture,
+    center_frame: ChargedCenterFrame,
+    center_catalog: ChargedCenterCatalog,
+    center_index: int,
+    counterion_index: int,
+    distances_A: np.ndarray,
+    thresholds: AssociationThresholds,
+) -> str:
+    pair_label = _pair_label_for_counterion_distances(distances_A, thresholds)
+    if center_catalog.roles[center_index] == ROLE_ANION:
+        active_anion_name = center_catalog.species_labels[center_index]
+        cation_index = counterion_index
+        anion_index = center_index
+    elif center_catalog.roles[center_index] == ROLE_CATION:
+        active_anion_name = center_catalog.species_labels[counterion_index]
+        cation_index = center_index
+        anion_index = counterion_index
+    else:
+        raise ValueError(f"unsupported charged-center role {center_catalog.roles[center_index]}")
+    configuration = _two_center_site_configuration_from_frame(
+        center_frame,
+        center_catalog,
+        cation_index,
+        anion_index,
+    )
+    coordinate_values = _reduced_coordinate_values_from_center_observation(
+        records,
+        mixture,
+        configuration,
+        pair_label,
+        distances_A,
+        thresholds,
+    )
+    state_key = generator_construction.sparse_state_key_from_reduced_observation(
+        records=records,
+        configuration=configuration,
+        mixture=mixture,
+        pair_label=pair_label,
+        active_anion_component_name=active_anion_name,
+        coordinate_values=coordinate_values,
+    )
+    return "|".join(state_key)
+
+
+def _two_center_site_configuration_from_frame(
+    center_frame: ChargedCenterFrame,
+    center_catalog: ChargedCenterCatalog,
+    cation_index: int,
+    anion_index: int,
+) -> SiteConfiguration:
+    box_lengths_m = (
+        center_frame.box_bounds_A[:, BOX_BOUND_HIGH_COLUMN]
+        - center_frame.box_bounds_A[:, BOX_BOUND_LOW_COLUMN]
+    ) * ANGSTROM_TO_M
+    positions_m = np.asarray(
+        [
+            center_frame.wrapped_positions_A[cation_index] * ANGSTROM_TO_M,
+            center_frame.wrapped_positions_A[anion_index] * ANGSTROM_TO_M,
+        ],
+        dtype=float,
+    )
+    unwrapped_positions_m = np.asarray(
+        [
+            center_frame.positions_A[cation_index] * ANGSTROM_TO_M,
+            center_frame.positions_A[anion_index] * ANGSTROM_TO_M,
+        ],
+        dtype=float,
+    )
+    return SiteConfiguration(
+        species_names=(
+            center_catalog.species_labels[cation_index],
+            center_catalog.species_labels[anion_index],
+        ),
+        molecule_ids=np.asarray(
+            [
+                center_catalog.molecule_ids[cation_index],
+                center_catalog.molecule_ids[anion_index],
+            ],
+            dtype=int,
+        ),
+        site_ids=np.asarray([0, 0], dtype=int),
+        positions_m=positions_m,
+        unwrapped_positions_m=unwrapped_positions_m,
+        box_lengths_m=np.asarray(box_lengths_m, dtype=float),
+    )
+
+
+def _reduced_coordinate_values_from_center_observation(
+    records,
+    mixture,
+    configuration: SiteConfiguration,
+    pair_label: str,
+    distances_A: np.ndarray,
+    thresholds: AssociationThresholds,
+) -> dict[str, float]:
+    cation_position_m = configuration.positions_m[0]
+    anion_position_m = configuration.positions_m[1]
+    pair_distance_m = float(np.linalg.norm(anion_position_m - cation_position_m))
+    return {
+        generator_construction.ReducedCoordinate.LI_ANION_DISTANCE.value: pair_distance_m,
+        generator_construction.ReducedCoordinate.LI_SOLVENT_COORDINATION.value: 0.0,
+        generator_construction.ReducedCoordinate.LI_LIGAND_COORDINATION.value: 0.0,
+        generator_construction.ReducedCoordinate.LI_ANION_COORDINATION.value: (
+            0.0
+            if pair_label == PairBasin.FREE.value
+            else generator_construction._coordination_cutoff(records, "Li_anion")
+        ),
+        generator_construction.ReducedCoordinate.ANION_ORIENTATION.value: 0.0,
+        generator_construction.ReducedCoordinate.LOCAL_PACKING_FRACTION.value: 0.0,
+        generator_construction.ReducedCoordinate.LOCAL_IONIC_STRENGTH.value: (
+            mixture.ionic_strength_mol_m3
+        ),
+        generator_construction.ReducedCoordinate.LOCAL_DIELECTRIC.value: (
+            mixture.dielectric_constant
+        ),
+        generator_construction.ReducedCoordinate.LOCAL_VISCOSITY.value: (
+            mixture.viscosity_Pa_s
+        ),
+        generator_construction.ReducedCoordinate.ATMOSPHERE_POLARIZATION.value: 0.0,
+        generator_construction.ReducedCoordinate.CAGE_COORDINATE.value: 0.0,
+        generator_construction.ReducedCoordinate.PARTNER_RESIDENCE_COORDINATE.value: 0.0,
+        generator_construction.ReducedCoordinate.CLUSTER_COORDINATE.value: (
+            _cluster_coordinate_for_counterion_distances(distances_A, thresholds)
+        ),
+        generator_construction.ReducedCoordinate.IDENTITY_COORDINATE.value: 0.0,
+        generator_construction.ReducedCoordinate.STRUCTURAL_HOP_COORDINATE.value: 0.0,
+    }
+
+
+def _pair_label_for_counterion_distances(
+    distances_A: np.ndarray,
+    thresholds: AssociationThresholds,
+) -> str:
+    contact_count = int(
+        np.count_nonzero(distances_A < thresholds.contact_pair_max_distance_A)
+    )
+    nearest_distance_A = float(np.min(distances_A))
+    if contact_count > 0:
+        return PairBasin.CONTACT_ION_PAIR.value
+    if nearest_distance_A < thresholds.solvent_separated_pair_max_distance_A:
+        return PairBasin.SOLVENT_SEPARATED_ION_PAIR.value
+    if nearest_distance_A >= thresholds.solvent_separated_pair_max_distance_A:
+        return PairBasin.FREE.value
+    raise RuntimeError("unreachable sparse-state pair classification")
+
+
+def _cluster_coordinate_for_counterion_distances(
+    distances_A: np.ndarray,
+    thresholds: AssociationThresholds,
+) -> float:
+    associated_count = int(
+        np.count_nonzero(distances_A < thresholds.solvent_separated_pair_max_distance_A)
+    )
+    if associated_count >= MINIMUM_COUNTERION_COUNT_FOR_AGGREGATE:
+        return 1.0
+    return 0.0
 
 
 def _state_labels(center_catalog: ChargedCenterCatalog) -> tuple[str, ...]:
@@ -587,8 +808,7 @@ def _cation_anion_distance_matrix_A(
     box_high_A = center_frame.box_bounds_A[:, BOX_BOUND_HIGH_COLUMN]
     box_lengths_A = box_high_A - box_low_A
     displacements_A = (
-        cation_positions_A[:, np.newaxis, :]
-        - anion_positions_A[np.newaxis, :, :]
+        cation_positions_A[:, np.newaxis, :] - anion_positions_A[np.newaxis, :, :]
     )
     displacements_A -= box_lengths_A * np.round(displacements_A / box_lengths_A)
     return np.linalg.norm(displacements_A, axis=2)

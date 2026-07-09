@@ -27,7 +27,7 @@ from conductivity.analytical_conductivity_model import (
     project_microscopic_generator,
 )
 from conductivity.fm_md.atomistic_io import MolecularTrajectory
-from conductivity.trajectory_primitive_targets import (
+from conductivity.old.trajectory_primitive_targets import (
     PF6AssociationCutoffs,
     PF6TrajectoryPrimitiveTargetInput,
     PF6ZenodoTrajectoryLayout,
@@ -61,9 +61,7 @@ def _synthetic_projected_transport_state(
     charge_cloud_radius_A = 2.5
     molecular_volume_A3 = 50.0
     ligand_field_asymmetry = 1.0
-    diffusion_m2_s = max(
-        center.diffusion_m2_s for center in charged_centers
-    )
+    diffusion_m2_s = max(center.diffusion_m2_s for center in charged_centers)
     return ProjectedTransportState(
         label=label,
         concentration_mol_m3=concentration_mol_m3,
@@ -211,14 +209,13 @@ def test_overdamped_generator_runs_full_first_principles_projection_pipeline():
         "free_ion_center:positive",
         "free_ion_center:negative",
     )
-    assert len(projected_model.projected_generator.primitive_set.self_current_tensors) == 2
+    assert (
+        len(projected_model.projected_generator.primitive_set.self_current_tensors) == 2
+    )
     assert acceptance_test.raw_green_kubo_sigma_mS_cm >= 0.0
     assert acceptance_test.raw_einstein_helfand_sigma_mS_cm >= 0.0
     assert acceptance_test.projected_sigma_mS_cm >= 0.0
-    assert (
-        acceptance_test.maximum_acceptance_gap_mS_cm
-        <= target_absolute_error_mS_cm
-    )
+    assert acceptance_test.maximum_acceptance_gap_mS_cm <= target_absolute_error_mS_cm
     assert acceptance_test.passed
 
 
@@ -314,11 +311,9 @@ def test_multicenter_state_charge_diffusivity_uses_center_covariance():
         partner_switch_time_s=2.0e-9,
     )
 
-    charge_diffusivity_m2_s = (
-        compute_projected_transport_state_charge_diffusivity_m2_s(
-            projected_state,
-            T_REF_K,
-        )
+    charge_diffusivity_m2_s = compute_projected_transport_state_charge_diffusivity_m2_s(
+        projected_state,
+        T_REF_K,
     )
 
     assert charge_diffusivity_m2_s == pytest.approx(4.0e-10)
@@ -746,8 +741,7 @@ def test_trajectory_target_process_keeps_self_displacement_as_direct_variance():
     assert diagnostics.self_displacement_sample_count == 2
     assert diagnostics.generated_event_count == 4
     assert all(
-        event.from_state_index == event.to_state_index
-        for event in markov_input.events
+        event.from_state_index == event.to_state_index for event in markov_input.events
     )
 
 
@@ -801,12 +795,8 @@ def test_projected_generator_primitives_include_c_k_m_and_self_current():
 
     primitive_set = project_sampled_trajectory_to_generator_primitives(sample_input)
 
-    assert primitive_set.state_concentrations_mol_m3[
-        "free_ion_center:Li+"
-    ] == 600.0
-    assert primitive_set.state_occupancy_fractions[
-        "contact_pair_center:Li+"
-    ] == 0.5
+    assert primitive_set.state_concentrations_mol_m3["free_ion_center:Li+"] == 600.0
+    assert primitive_set.state_occupancy_fractions["contact_pair_center:Li+"] == 0.5
     assert len(primitive_set.reactive_fluxes) == 1
     reactive_flux = primitive_set.reactive_fluxes[0]
     assert reactive_flux.from_state_label == "free_ion_center:Li+"

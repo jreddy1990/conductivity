@@ -1,7 +1,5 @@
 schema: conductivity_memory_coordinate_record_v1
 families:
-- atmosphere_polarization
-- charge_density_relaxation
 - cage_backjump
 - partner_residence
 - ligand_shell_residence

@@ -3881,8 +3881,44 @@ c_i,\quad K_{ij},\quad D_i^{\rm self},\quad A,\quad h.
 
 \section{Deterministic Analytical Closure}
 
-The production calculation uses a finite reduced generator. The reduced
-coordinate vector is
+The production model is not
+\[
+\text{recipe}\rightarrow \text{full MD trajectory}\rightarrow
+\text{GK integral}.
+\]
+The production calculation is
+\[
+\boxed{
+\text{recipe}+\mathcal L
+\rightarrow
+\text{finite reduced generator}
+\rightarrow
+(c,K,Q,d,M,D^{\rm self},A,h)
+\rightarrow
+\sigma .
+}
+\]
+The finite primitive chain is
+\[
+G_x=(\Omega_x,\mu_x,L_x,P_x)
+\rightarrow
+c_i,K_{ij},Q_{ij},d_{ij},M_{ij},D_i^{\rm self},A,h
+\rightarrow
+\text{projected GK/Mori conductivity}.
+\]
+Every physical contribution must enter through
+\[
+c_i,\quad K_{ij}/Q_{ij},\quad d_{ij}/M_{ij},\quad
+D_i/R_i,\quad A,h.
+\]
+A quantity that changes only the final scalar \(\sigma\) is not a modeled
+physics channel.
+
+Atomistic force fields, quantum calculations, and trajectories may determine
+or validate entries of \(\mathcal L\), reduced free-energy surfaces, mobility
+closures, basis thresholds, and primitive closure parameters. The conductivity
+calculation evaluated for a formulation is the deterministic reduced-generator
+calculation in this section. The reduced coordinate vector is
 \[
 y\in\R^m,
 \]
@@ -3915,6 +3951,346 @@ D:\nabla\nabla f
 \nabla\cdot D-\frac{1}{RT}D\nabla U
 \right]\cdot\nabla f .
 \]
+
+\subsection{Computational interface and closure ownership}
+
+The July 7, 2026 model requirement is that conductivity is not a function of
+recipe labels alone. The formulation must be paired with the physical
+parameter library and finite reduced-generator closures that determine
+\(U,D,P,A_i,\psi,\Sigma\), and \(\Delta P\). The computational signature is
+\[
+\begin{aligned}
+\sigma
+=
+{\cal C}_{\sigma}(&
+\text{recipe},
+\mathcal L_{\rm phys},
+\mathcal Y,
+\mathcal U,
+\mathcal D,
+\mathcal P,
+\mathcal B,
+\mathcal S,
+\mathcal R,
+\mathcal K,
+\mathcal M,
+\mathcal I,
+\Psi,
+\mathcal N),
+\end{aligned}
+\]
+where the arguments are the physical library, reduced-coordinate model,
+thermodynamic closure, mobility closure, polarization closure, basis closure,
+speciation closure, transition closure, committor or rate closure, moment
+closure, self-current closure, memory closure, and numerical closure. The only
+allowed computational route is
+\[
+(U,D,P,A_i,\psi)
+\rightarrow
+(c,K,Q,d,M,D^{\rm self},A,h)
+\rightarrow
+\sigma .
+\]
+The final readout is fixed:
+\[
+\sigma_{\mScm}
+=
+10\frac{F^2}{3RT}\tr\!\left[
+\sum_i c_iD_i^{\rm self}
++\frac12\sum_{i,j}K_{ij}M_{ij}
+-C^Q
+-h^\T A^\#h
+\right].
+\]
+
+\subsubsection{Physical library}
+
+\(\mathcal L_{\rm phys}\) maps species names and salt names to numerical
+physical records. Species records contain molecular weight, density, partial
+molar volume, net charge, and role. Site records contain site identifier, mass,
+steric radius, hydrodynamic radius, site volume, Lennard--Jones \(\sigma\) and
+\(\epsilon\), formal or partial charge, charge-cloud radius, Born radius,
+polarizability, donor and acceptor flags, and HBA/HBD count contributions.
+Topology records contain bonds, angles, torsions, constraints, rigid modes,
+and conformer or reference coordinates. Pair-interaction records contain
+cross Lennard--Jones parameters or mixing rules, Coulomb/Ewald convention,
+Born/desolvation occlusion weights, Li--solvent coordination parameters,
+Li--additive coordination parameters, Li--anion coordination parameters,
+solvation competition matrices, and cluster free-energy terms.
+
+Equivalently,
+\[
+\mathcal L_{\rm phys}
+=
+(\mathcal T_s,\mathcal Q_s,\Theta_{st},
+\mathcal B,\mathcal M,\mathcal R,\Psi),
+\]
+where \(\mathcal T_s\) is topology, \(\mathcal Q_s\) is the charge-site model,
+\(\Theta_{st}\) is pair interaction data, \(\mathcal B\) is basin data,
+\(\mathcal M\) is mobility data, \(\mathcal R\) is transition data, and
+\(\Psi\) is memory-coordinate data. This library supplies data for
+constructing \(U,D,P,A_i,\Sigma_{ij}\), and \(\psi_\alpha\); it is not a
+terminal fit table for conductivity.
+
+\subsubsection{Reduced-coordinate model}
+
+The reduced-coordinate model \(\mathcal Y\) fixes the finite vector
+\[
+\begin{aligned}
+y=&(r_{\rm LiA},s_{\rm pair},n_{\rm Li-solv},n_{\rm Li-lig},
+n_{\rm Li-anion},\chi_{\rm lig-sep},\omega_A,n_{\rm cluster},
+z_{\rm cluster},\\
+&\varphi_{\rm loc},I_{\rm loc},\epsilon_{\rm loc},\eta_{\rm loc},
+p_{\rm atm},s_{\rm cage},s_{\rm partner}).
+\end{aligned}
+\]
+For every coordinate \(y_k\), the model prescribes unit, domain, gradient,
+metric scale, mobility entry, and the terms of \(U,D,A_i\), and \(\psi\) that
+use it. The reduced calculation is performed on this finite coordinate space;
+atomistic force fields, quantum calculations, and trajectories populate or
+validate the functions on this space.
+
+\subsubsection{Thermodynamic closure}
+
+The thermodynamic closure \(\mathcal U\) returns the callable \(U(y)\). It
+provides the numerical pair PMF wells for free, SSIP, and CIP states, including
+\(r_{\rm CIP}^0,r_{\rm SSIP}^0,\Delta G_{\rm CIP},\Delta G_{\rm SSIP},
+k_{\rm CIP}\), and \(k_{\rm SSIP}\). It provides Li--solvent, Li--ligand, and
+Li--anion shell target occupancies and the solvation competition matrix. It
+provides Li--ligand binding, Li--ligand--anion ternary stabilization,
+additive-separated SSIP insertion, and ligand/anion shell competition. It
+provides free energies for \(\mathrm{LiA}\), \(\mathrm{Li_2A^+}\),
+\(\mathrm{LiA_2^-}\), \(\mathrm{Li_2A_2}\), higher aggregates, and bridge or
+network states, decomposed into Coulomb, desolvation, coordination, steric,
+entropy, and activity contributions. It also provides Born radii, local
+dielectric, desolvation occlusion, screened or Ewald-consistent Coulomb policy,
+packing/free-volume penalty with the hard invalid condition
+\(\varphi\ge\varphi_{\max}\), Debye--Huckel/hard-sphere activity, and
+dielectric decrement.
+
+Population parameters are obtained from restricted integrals:
+\[
+Z_i(\lambda)=
+\int_{A_i}\exp\!\left[-\frac{U(y)}{RT}
++\sum_a\nu_{i,a}\lambda_a\right]\dd y,
+\qquad
+c_i=C^\circ Z_i(\lambda^\star),
+\]
+where \(\lambda^\star\) solves shared component mass balance.
+
+\subsubsection{Mobility and polarization closures}
+
+The mobility closure \(\mathcal D\) constructs resistance first:
+\[
+R=
+R_{\rm Stokes}+R_{\rm hydro}+R_{\rm shape}+R_{\rm free\ volume}
++R_{\rm charge\ cloud}+R_{\rm atmosphere}+R_{\rm cage}
++R_{\rm constraint},
+\qquad
+D=k_BT\,R^\# .
+\]
+It supplies local viscosity, Jones--Dole salt correction, additive
+microviscosity, free-volume viscosity, hydrodynamic radii per site or transport
+center, hydrodynamic coupling policy, anion and cluster shape tensors,
+denticity/orientation factors, \(\varphi_{\max}\), \(\gamma_{\rm fv}\),
+charge-cloud radii and screening form factors, cage lengths and lifetimes,
+pair/ligand/aggregate residence lifetimes, and the ion-atmosphere matrix
+response. Atmosphere resistance is projected through state charge geometry:
+free ions receive monopolar response, while neutral and solvent-separated
+pairs receive geometry-dependent cancellation.
+
+The polarization closure \(\mathcal P\) supplies charge centers, charge numbers,
+state geometry, unwrapped displacement convention, and the reduced-coordinate
+map to charge-center displacement:
+\[
+P(y)=\sum_p z_pR_p^{\rm unwrap}(y),
+\qquad
+G_P(y)=\nabla_yP(y).
+\]
+For a multi-center state,
+\[
+D_Q(\alpha)=z_\alpha^\T D_\alpha^{\rm centers}z_\alpha.
+\]
+For a Li--anion state,
+\[
+D_Q=D_{\rm Li}+D_A-2D_{\rm Li,A}.
+\]
+A negative conditional covariance \(D_{\rm Li,A|\alpha}\) increases the charge
+mobility primitive for that state.
+
+\subsubsection{Basis and speciation closures}
+
+The basis closure \(\mathcal B\) prescribes thresholds and bins for pair
+basins, Li-shell states, ligand states, anion size/cloud/asymmetry/denticity,
+anion orientation, cluster charge and size, bridge/network states, and local
+packing, dielectric, viscosity, and ionic-strength environments. The sparse
+joint state is
+\[
+A_\alpha=
+A_{\rm pair}\cap A_{\rm shell}\cap A_{\rm ligand}\cap A_{\rm anion}
+\cap A_{\rm orient}\cap A_{\rm cluster}\cap A_{\rm env}.
+\]
+Only states satisfying \(Z_\alpha>Z_{\min}\) and feasible stoichiometry are
+retained.
+
+The speciation closure \(\mathcal S\) assigns stoichiometry to free Li, free
+anion, SSIP and CIP LiA, Li--ligand, Li--ligand--anion, additive-separated
+SSIP, \(\mathrm{Li_2A^+}\), \(\mathrm{LiA_2^-}\),
+\(\mathrm{Li_2A_2}\), higher aggregates, and bridge/network states. It solves
+one shared component balance:
+\[
+\sum_\alpha\nu_{\alpha,a}c_\alpha=C_a,
+\]
+with Newton residual and Jacobian
+\[
+r_a(\lambda)=\sum_\alpha\nu_{\alpha,a}c_\alpha(\lambda)-C_a,
+\qquad
+J_{ab}=\sum_\alpha\nu_{\alpha,a}\nu_{\alpha,b}c_\alpha .
+\]
+State concentrations are molar concentrations. Stationary probabilities are
+derived from those concentrations.
+
+\subsubsection{Transition, rate, and moment closures}
+
+The transition closure \(\mathcal R\) supplies edge list, transition family,
+reaction coordinate \(\xi_{ij}(y)\), transition domain \(\Omega_{ij}\),
+boundary surfaces \(\partial A_i,\partial A_j\), barrier or free-energy
+formula, committor/capacity solver data, and displacement policy. Required edge
+families are free \(\leftrightarrow\) SSIP, SSIP \(\leftrightarrow\) CIP,
+free/SSIP/CIP \(\leftrightarrow\) aggregate, Li \(\leftrightarrow\) Li--ligand,
+LiA \(\leftrightarrow\) Li--ligand--anion, SSIP \(\leftrightarrow\)
+additive-separated SSIP, partner switch, identity diffusion, structural hop,
+bridge/network formation and breakup, cage capture and release, and discrete
+atmosphere capture and release when represented.
+
+The committor or rate closure \(\mathcal K\) uses the strongest available
+closed form. For a one-dimensional coordinate,
+\[
+k_{i\to j}^{-1}
+=
+\int_{\xi_i}^{\xi_j}
+\frac{e^{F(\xi)/(RT)}}{D_\xi(\xi)}
+\left[
+\int_{\xi_L}^{\xi}e^{-F(\eta)/(RT)}\dd\eta
+\right]\dd\xi,
+\qquad
+K_{ij}=c_i k_{i\to j}=c_j k_{j\to i}.
+\]
+For a reduced PDE, it solves \(Lq_{ij}=0\) with \(q_{ij}=0\) on \(A_i\) and
+\(q_{ij}=1\) on \(A_j\), then computes
+\[
+K_{ij}
+=
+\int_{\Omega_{ij}}\nabla q_{ij}^\T D\nabla q_{ij}\rho\,\dd y.
+\]
+For Kramers/capacity asymptotics,
+\[
+k_{i\to j}
+=
+\frac{\omega_i\omega^\ddagger}{2\pi\zeta^\ddagger}
+\exp[-(F^\ddagger-F_i)/(RT)],
+\]
+and detailed balance is enforced by constructing \(K_{ij}\), not by fitting
+independent forward and reverse rates.
+
+The moment closure \(\mathcal M\) computes \(d_{ij}\) and \(M_{ij}\) from the
+zero-displacement rule, endpoint geometry, identity diffusion statistics, or
+the deterministic moment BVP:
+\[
+L^h u_a=0,\quad u_a|_{A_j}=P_a,
+\qquad
+L^h w_{ab}=0,\quad w_{ab}|_{A_j}=P_aP_b,
+\]
+\[
+L^hf=Lf+2D\nabla\log h\cdot\nabla f,\qquad h=q_{ij}.
+\]
+Surface moments are
+\[
+d_{ij,a}=\int_{\partial A_i}\eta_i(y)[u_a(y)-P_a(y)]\dd S,
+\]
+\[
+M_{ij,ab}
+=
+\int_{\partial A_i}\eta_i(y)
+[w_{ab}-P_au_b-P_bu_a+P_aP_b]\dd S.
+\]
+Pure motif exchange has \(d_{ij}=0\) and \(M_{ij}=0\). Nonzero displacement
+requires physical unwrapped charge displacement
+\(\Delta P=P(y_{\rm end})-P(y_{\rm start})\), with
+\(d_{ji}=-d_{ij}\) and \(M_{ji}=M_{ij}\).
+
+\subsubsection{Self-current, memory, and numerical closures}
+
+The self-current closure \(\mathcal I\) defines \(\Pi_i(y)\): free ions use an
+unbounded translation projector, charged clusters use the charged COM or
+internal unbounded coordinate projector, neutral co-moving clusters satisfy
+\(G_P\Pi_i=0\), bounded internal polarization uses \(\Pi_i=0\), and identity
+diffusion uses a projector only when identity coordinate and switching
+statistics are defined. It then computes
+\[
+D_i^{\rm self}
+=
+\frac1{c_i}
+\int_{A_i}G_P\Pi_iD\Pi_i^\T G_P^\T\rho\,\dd y.
+\]
+
+The memory closure \(\Psi\) defines charge-density/ion-atmosphere modes,
+solvent-cage/backjump coordinate, partner residence, ligand-shell residence,
+anion orientation/denticity, aggregate residence, local free-volume/stress, and
+bounded internal polarization coordinates. It state-orthogonalizes
+\[
+\psi_\alpha^\perp
+=
+\psi_\alpha-\mathbb E[\psi_\alpha\mid A_{s(y)}],
+\]
+and computes \(A_{\alpha\gamma}\), \(h_{\alpha a}\), and
+\(C^\psi=h^\T A^\#h\).
+
+The numerical closure \(\mathcal N\) fixes basin quadrature, transition-surface
+quadrature, memory quadrature, Newton tolerance, committor/PDE or 1D quadrature
+tolerance, \(K_{ij}\) convergence tolerance, moment-BVP tolerance, PSD
+tolerance, pseudoinverse tolerance, nullspace tolerance, and finite-basis
+refinement. Candidate memory or coordinate \(g\) is scored by
+\[
+\tilde h_g=h_g-A_{g\Phi}A_{\Phi\Phi}^\#h_\Phi,
+\qquad
+\tilde A_{gg}=A_{gg}-A_{g\Phi}A_{\Phi\Phi}^\#A_{\Phi g},
+\]
+\[
+S(g)=\frac{|\tilde h_g|^2}{\tilde A_{gg}}.
+\]
+Add the candidate with largest \(S(g)\), then stop when the maximum score and
+\(|\sigma_{n+1}-\sigma_n|\) are below tolerance.
+
+\subsubsection{Deterministic function body}
+
+The deterministic body is:
+\[
+\begin{array}{ll}
+1.&\text{Parse recipe into }C_a\text{ and }\phi_s.\\
+2.&\text{Build species and interaction feature records.}\\
+3.&\text{Build }y\text{ and coordinate domains.}\\
+4.&\text{Build }U(y).\\
+5.&\text{Build }R(y)\text{ and }D(y)=k_BT\,R(y)^\#.\\
+6.&\text{Build }P(y)\text{ and }G_P(y).\\
+7.&\text{Build sparse }A_i\text{ and }\nu_{i,a}.\\
+8.&\text{Solve mass balance for }c_i.\\
+9.&\text{Build transition edges.}\\
+10.&\text{Compute }K_{ij}\text{ by 1D integral, PDE, or capacity formula.}\\
+11.&\text{Compute }Q_{ij}=K_{ij}/c_i.\\
+12.&\text{Compute }d_{ij},M_{ij}.\\
+13.&\text{Compute }D_i^{\rm self}.\\
+14.&\text{Compute memory }A,h.\\
+15.&\text{Solve finite-state Poisson correction }C^Q.\\
+16.&\text{Compute }\sigma\text{ from the fixed readout.}
+\end{array}
+\]
+An input that does not feed
+\[
+c_i,\quad K_{ij}/Q_{ij},\quad d_{ij}/M_{ij},\quad
+D_i^{\rm self},\quad A,h
+\]
+is outside the conductivity function.
 
 \subsection{Reduced free energy}
 
@@ -4158,6 +4534,10 @@ Let \(h=q_{ij}\). The conditioned generator is
 \[
 L^h f=Lf+2D\nabla\log h\cdot\nabla f.
 \]
+The canonical production calculation for \(d_{ij}\) and \(M_{ij}\) is the
+boundary-value hierarchy below. Doob-conditioned sample paths estimate the same
+boundary-value objects and are used only as a numerical estimator when the
+deterministic solve is replaced by stochastic quadrature.
 Endpoint functions solve
 \[
 L^h u_a=0,\quad u_a=P_a\text{ on }\partial A_j,

@@ -12,4 +12,173 @@ coordinates:
 - atmosphere_polarization
 - cage_coordinate
 - partner_residence_coordinate
+- cluster_coordinate
+- identity_coordinate
+- structural_hop_coordinate
 threshold_source: pair_pmf_or_rdf_minima; values must be stored before conductivity evaluation
+pair_basins:
+  r_CIP_m: 3.0e-10
+  r_SSIP_m: 6.0e-10
+  r_free_m: 1.0e-9
+  source: curated carbonate Li-anion RDF/PMF first-minimum thresholds
+coordination_switches:
+  Li_solvent:
+    center_role: cation
+    ligand_roles:
+    - solvent
+    r0_m: 2.4e-10
+    exponent: 8
+    cutoff: 0.5
+    minimum_value: 1.0e-6
+    source: Li-carbonate first-shell oxygen coordination switch
+  Li_ligand:
+    center_role: cation
+    ligand_roles:
+    - additive
+    r0_m: 2.4e-10
+    exponent: 8
+    cutoff: 0.5
+    minimum_value: 1.0e-6
+    source: Li-additive first-shell coordination switch
+  Li_anion:
+    center_role: cation
+    ligand_roles:
+    - anion
+    r0_m: 3.0e-10
+    exponent: 8
+    cutoff: 0.5
+    minimum_value: 1.0e-6
+    source: Li-anion contact coordination switch
+orientation_bins:
+  radial_min: 0.5
+  tangential_abs_max: 0.25
+  bridging_max: -0.5
+  source: cosine-projection bins for anion orientation relative to Li-anion axis
+environment_bins:
+  packing_fraction:
+  - 0.25
+  - 0.45
+  ionic_strength_mol_m3:
+  - 500.0
+  - 1500.0
+  dielectric:
+  - 10.0
+  - 40.0
+  viscosity_Pa_s:
+  - 0.001
+  - 0.003
+  source: fixed low/medium/high electrolyte environment bins
+unit_interval_state_bins:
+- 0.3333333333333333
+- 0.6666666666666666
+coordination_high_bin_interior_fraction: 0.1
+active_state_axis_coordinates:
+- partner_residence_coordinate
+- identity_coordinate
+- structural_hop_coordinate
+- cluster_coordinate
+- cage_coordinate
+- atmosphere_polarization
+state_axis_generation: sparse_single_axis_plus_pair
+population_cutoff: 0.0
+finite_generator_log_partition_span: 100.0
+quadrature:
+  free_outer_distance_factor: 1.5
+coordinate_domains:
+  Li_solvent_coordination:
+    lower: 0.0
+    upper: 6.0
+    quadrature_order: 1
+    source: carbonate Li first-shell coordination support
+  Li_ligand_coordination:
+    lower: 0.0
+    upper: 2.0
+    quadrature_order: 1
+    source: neutral additive first-shell coordination support
+  Li_anion_coordination:
+    lower: 0.0
+    upper: 1.0
+    quadrature_order: 1
+    source: single nearest-anion coordination switch support
+  anion_orientation:
+    lower: -1.0
+    upper: 1.0
+    quadrature_order: 1
+    source: cosine orientation coordinate support
+  local_packing_fraction:
+    lower: 0.0
+    upper: 0.6
+    quadrature_order: 1
+    source: electrolyte occupied-volume support below packing hard wall
+  local_ionic_strength:
+    lower: 0.0
+    upper: 3000.0
+    quadrature_order: 1
+    source: carbonate electrolyte molar ionic-strength support
+  local_dielectric:
+    lower: 1.0
+    upper: 100.0
+    quadrature_order: 1
+    source: local relative dielectric support
+  local_viscosity:
+    lower: 0.0005
+    upper: 0.01
+    quadrature_order: 1
+    source: carbonate electrolyte local viscosity support
+  atmosphere_polarization:
+    lower: -1.0
+    upper: 1.0
+    quadrature_order: 1
+    source: reduced ion-atmosphere polarization support
+  cage_coordinate:
+    lower: -1.0
+    upper: 1.0
+    quadrature_order: 1
+    source: reduced cage/backjump coordinate support
+  partner_residence_coordinate:
+    lower: 0.0
+    upper: 1.0
+    quadrature_order: 1
+    source: partner residence switch support
+  cluster_coordinate:
+    lower: 0.0
+    upper: 1.0
+    quadrature_order: 1
+    source: aggregate and bridge graph progress coordinate support
+  identity_coordinate:
+    lower: 0.0
+    upper: 1.0
+    quadrature_order: 1
+    source: carrier identity displacement coordinate support
+  structural_hop_coordinate:
+    lower: 0.0
+    upper: 1.0
+    quadrature_order: 1
+    source: unwrapped structural-hop progress coordinate support
+anion_feature_bins:
+  charge_cloud_localized_threshold_m: 1.5e-10
+template_geometry:
+  anion_reference_offset_m: 6.0e-10
+  neutral_shell_spacing_m: 7.5e-10
+free_energy_terms:
+  coordination_J_mol:
+    Li_solvent: -12000.0
+    Li_ligand: -16000.0
+    Li_anion: -18000.0
+  solvation_competition:
+    targets:
+      Li_solvent: 4.0
+      Li_ligand: 0.0
+      Li_anion: 0.0
+    stiffness_J_mol:
+      Li_solvent: 2500.0
+      Li_ligand: 3000.0
+      Li_anion: 5000.0
+  pair_basin_J_mol:
+    CIP: -12000.0
+    SSIP: -6000.0
+    free: 0.0
+    transition: -1000.0
+  activity:
+    debye_huckel_A_sqrt_m3_mol: 1.0e-3
+    debye_huckel_B_sqrt_m3_mol_per_m: 1.0e-9

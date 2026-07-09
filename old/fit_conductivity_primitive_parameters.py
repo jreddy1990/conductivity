@@ -43,7 +43,7 @@ if TYPE_CHECKING:
         AnalyticalConductivityModelResult,
         MolecularElectrolyteRecipe,
     )
-    from conductivity.trajectory_primitive_targets import (
+    from conductivity.old.trajectory_primitive_targets import (
         TrajectoryBlockPrimitiveTarget,
         TrajectoryDisplacementMomentTarget,
         TrajectoryPrimitiveTargetArtifact,
@@ -164,22 +164,14 @@ PRIMITIVE_PARAMETER_FIT_CONFIG_KEY = "molecular_primitive_parameter_fit"
 TRAJECTORY_PRIMITIVE_CALIBRATION_ARTIFACT_TYPE = (
     "trajectory_primitive_calibration_target"
 )
-PRIMITIVE_FIT_PROGRESS_ARTIFACT_TYPE = (
-    "molecular_conductivity_primitive_fit_progress"
-)
+PRIMITIVE_FIT_PROGRESS_ARTIFACT_TYPE = "molecular_conductivity_primitive_fit_progress"
 TRAJECTORY_TARGET_LABEL_SEPARATOR = ":"
 TRAJECTORY_CONTACT_PAIR_ROLE = "contact_pair_center"
 CONTACT_PAIR_DESOLVATION_PARAMETER_NAME = "contact_pair_desolvation_offset_over_RT"
 TRAJECTORY_POPULATION_PARAMETER_UPDATES_BY_ROLE = {
-    TRAJECTORY_CONTACT_PAIR_ROLE: (
-        (CONTACT_PAIR_DESOLVATION_PARAMETER_NAME, -1.0),
-    ),
-    "solvent_separated_pair_center": (
-        ("solvent_separated_pair_logK_offset", 1.0),
-    ),
-    "internal_polarization_center": (
-        ("internal_polarization_projection_offset", 1.0),
-    ),
+    TRAJECTORY_CONTACT_PAIR_ROLE: ((CONTACT_PAIR_DESOLVATION_PARAMETER_NAME, -1.0),),
+    "solvent_separated_pair_center": (("solvent_separated_pair_logK_offset", 1.0),),
+    "internal_polarization_center": (("internal_polarization_projection_offset", 1.0),),
 }
 
 
@@ -320,8 +312,7 @@ class ConductivityPrimitiveParameterEvaluator(Protocol):
     def evaluate(
         self,
         primitive_parameters: ConductivityPrimitiveParameterSet,
-    ) -> PrimitiveFitDatasetEvaluation:
-        ...
+    ) -> PrimitiveFitDatasetEvaluation: ...
 
 
 class MolecularPropertyDbPrimitiveEvaluator:
@@ -409,12 +400,10 @@ class MolecularPropertyDbPrimitiveEvaluator:
                 1 for row in audit_result.rows if row.direct_capacity_failure
             ),
             corrector_too_strong_failure_count=sum(
-                1 for row in audit_result.rows
-                if row.corrector_too_strong_failure
+                1 for row in audit_result.rows if row.corrector_too_strong_failure
             ),
             corrector_too_weak_failure_count=sum(
-                1 for row in audit_result.rows
-                if row.corrector_too_weak_failure
+                1 for row in audit_result.rows if row.corrector_too_weak_failure
             ),
             trajectory_concentration_loss=trajectory_losses.concentration_loss,
             trajectory_transition_rate_loss=trajectory_losses.transition_rate_loss,
@@ -438,13 +427,9 @@ class MolecularPropertyDbPrimitiveEvaluator:
                 audit_result,
             ),
             failed_rows=audit_result.failed_rows,
-            maximum_mass_balance_residual=(
-                audit_result.maximum_mass_balance_residual
-            ),
+            maximum_mass_balance_residual=(audit_result.maximum_mass_balance_residual),
             maximum_row_sum_residual=audit_result.maximum_row_sum_residual,
-            maximum_stationary_residual=(
-                audit_result.maximum_stationary_residual
-            ),
+            maximum_stationary_residual=(audit_result.maximum_stationary_residual),
             maximum_detailed_balance_residual=(
                 audit_result.maximum_detailed_balance_residual
             ),
@@ -481,7 +466,7 @@ def _cluster_activation_penalty(
             audit_result.rows,
             key=_absolute_residual_sort_key,
             reverse=True,
-        )[:fit_options.residual_tail_count]
+        )[: fit_options.residual_tail_count]
     )
     penalty_terms: list[float] = []
     residual_threshold_mS_cm = fit_options.cluster_activation_residual_threshold_mS_cm
@@ -497,8 +482,7 @@ def _cluster_activation_penalty(
         if row_result.row_id not in case_by_row_id:
             raise ValueError(f"missing molecular case for row {row_result.row_id}")
         if (
-            row_result.charged_cluster_fraction
-            >= minimum_charged_cluster_fraction
+            row_result.charged_cluster_fraction >= minimum_charged_cluster_fraction
             and abs(row_result.charged_cluster_net_sigma_mS_cm)
             >= minimum_charged_cluster_net_sigma_mS_cm
         ):
@@ -521,10 +505,7 @@ def _cluster_activation_penalty(
             continue
         fraction_deficit = max(
             0.0,
-            (
-                minimum_charged_cluster_fraction
-                - row_result.charged_cluster_fraction
-            )
+            (minimum_charged_cluster_fraction - row_result.charged_cluster_fraction)
             / minimum_charged_cluster_fraction,
         )
         sigma_deficit = max(
@@ -537,10 +518,7 @@ def _cluster_activation_penalty(
         )
         penalty_terms.append(
             charged_cluster_sensitivity_weight
-            * (
-                fraction_deficit * fraction_deficit
-                + sigma_deficit * sigma_deficit
-            )
+            * (fraction_deficit * fraction_deficit + sigma_deficit * sigma_deficit)
         )
     return float(math.fsum(penalty_terms))
 
@@ -580,9 +558,7 @@ def _trajectory_primitive_loss_breakdown(
         if target_artifact.transition_rate_targets_validated:
             transition_rate_losses.append(
                 _uncertainty_normalized_mapping_loss(
-                    _transition_rate_targets_from_analytical_result(
-                        analytical_result
-                    ),
+                    _transition_rate_targets_from_analytical_result(analytical_result),
                     target_artifact.transition_rates_s_inv,
                     target_artifact.block_transition_rate_standard_errors_s_inv,
                     f"{trajectory_target.system_id}.transition_rates_s_inv",
@@ -677,7 +653,10 @@ def _transport_center_concentration_targets(
         cluster_template = cluster_template_by_label[
             transport_state.parent_cluster_label
         ]
-        for species_name, stoichiometric_count in cluster_template.stoichiometry.items():
+        for (
+            species_name,
+            stoichiometric_count,
+        ) in cluster_template.stoichiometry.items():
             _add_concentration_target(
                 concentration_by_target_label,
                 _transport_center_target_label(
@@ -758,8 +737,7 @@ def _displacement_moment_targets_from_analytical_result(
         to_target_label = target_label_by_state_index[event.to_state_index]
         transition_label = _transition_label(from_target_label, to_target_label)
         displacement_m2 = math.fsum(
-            component_m * component_m
-            for component_m in event.charge_displacement_m
+            component_m * component_m for component_m in event.charge_displacement_m
         )
         if transition_label not in weighted_displacement_m2_by_transition:
             weighted_displacement_m2_by_transition[transition_label] = 0.0
@@ -769,9 +747,10 @@ def _displacement_moment_targets_from_analytical_result(
         )
         rate_by_transition[transition_label] += event.rate_s_inv
     displacement_moments_m2: dict[str, float] = {}
-    for transition_label, weighted_displacement_m2 in (
-        weighted_displacement_m2_by_transition.items()
-    ):
+    for (
+        transition_label,
+        weighted_displacement_m2,
+    ) in weighted_displacement_m2_by_transition.items():
         transition_rate_s_inv = _positive_float(
             rate_by_transition[transition_label],
             f"{transition_label}.transition_rate_s_inv",
@@ -999,9 +978,10 @@ def initialize_topology_logk_offsets_from_trajectory_concentrations(
         concentration_floor_mol_m3 = _trajectory_concentration_floor_mol_m3(
             analytical_result,
         )
-        for target_label, target_concentration_mol_m3 in (
-            trajectory_target.primitive_target_artifact.state_concentrations_mol_m3.items()
-        ):
+        for (
+            target_label,
+            target_concentration_mol_m3,
+        ) in trajectory_target.primitive_target_artifact.state_concentrations_mol_m3.items():
             parsed_target_concentration_mol_m3 = _nonnegative_float(
                 target_concentration_mol_m3,
                 (
@@ -1026,17 +1006,17 @@ def initialize_topology_logk_offsets_from_trajectory_concentrations(
                     f"{trajectory_target.system_id}.state_concentrations_mol_m3",
                 ),
             )
-            log_concentration_ratio = (
-                math.log(parsed_target_concentration_mol_m3)
-                - math.log(predicted_concentration_mol_m3)
-            )
+            log_concentration_ratio = math.log(
+                parsed_target_concentration_mol_m3
+            ) - math.log(predicted_concentration_mol_m3)
             target_weight = max(
                 parsed_target_concentration_mol_m3,
                 concentration_floor_mol_m3,
             )
-            for parameter_name, update_sign in (
-                TRAJECTORY_POPULATION_PARAMETER_UPDATES_BY_ROLE[target_role]
-            ):
+            for (
+                parameter_name,
+                update_sign,
+            ) in TRAJECTORY_POPULATION_PARAMETER_UPDATES_BY_ROLE[target_role]:
                 if parameter_name == CONTACT_PAIR_DESOLVATION_PARAMETER_NAME:
                     continue
                 if parameter_name not in numerator_by_parameter_name:
@@ -1316,7 +1296,10 @@ def _solve_contact_pair_response_bracket(
     underprediction_point: _ContactPairReachabilityPoint,
     coordinate_tolerance: float,
 ) -> _ContactPairReachabilityPoint:
-    if not overprediction_point.coordinate_value < underprediction_point.coordinate_value:
+    if (
+        not overprediction_point.coordinate_value
+        < underprediction_point.coordinate_value
+    ):
         raise ValueError("contact-pair response bracket has inverted coordinates")
     if overprediction_point.log_concentration_residual < 0.0:
         raise ValueError("contact-pair response bracket missing overprediction side")
@@ -1353,9 +1336,7 @@ def _solve_contact_pair_response_bracket(
                 f"{probe.failure_reason}"
             )
         probe_point = _contact_pair_probe_point(probe)
-        best_point = _best_contact_pair_reachability_point(
-            (best_point, probe_point)
-        )
+        best_point = _best_contact_pair_reachability_point((best_point, probe_point))
         if 0.0 <= probe_point.log_concentration_residual:
             bracket_overprediction_point = probe_point
         else:
@@ -1450,9 +1431,10 @@ def _contact_pair_log_concentration_residual(
         concentration_floor_mol_m3 = _trajectory_concentration_floor_mol_m3(
             analytical_result,
         )
-        for target_label, target_concentration_mol_m3 in (
-            trajectory_target.primitive_target_artifact.state_concentrations_mol_m3.items()
-        ):
+        for (
+            target_label,
+            target_concentration_mol_m3,
+        ) in trajectory_target.primitive_target_artifact.state_concentrations_mol_m3.items():
             target_role, _target_species_name = _trajectory_target_label_parts(
                 target_label,
             )
@@ -1654,7 +1636,9 @@ def print_trajectory_topology_initialization_changes(
         if parameter_name not in baseline_mapping:
             raise ValueError(f"missing baseline primitive parameter {parameter_name}")
         if parameter_name not in initialized_mapping:
-            raise ValueError(f"missing initialized primitive parameter {parameter_name}")
+            raise ValueError(
+                f"missing initialized primitive parameter {parameter_name}"
+            )
         baseline_value = _finite_float(
             baseline_mapping[parameter_name],
             f"{parameter_name}.baseline",
@@ -1786,8 +1770,7 @@ def _mean_loss(
     if not losses:
         return 0.0
     return float(
-        math.fsum(_nonnegative_float(loss, context) for loss in losses)
-        / len(losses)
+        math.fsum(_nonnegative_float(loss, context) for loss in losses) / len(losses)
     )
 
 
@@ -1854,7 +1837,9 @@ def _parameter_is_consumed_by_any_perturbation(
     parameter_name: str,
     perturbation_scales: tuple[float, ...],
 ) -> bool:
-    from conductivity.molecular_property_db_audit import audit_molecular_property_db_cases
+    from conductivity.molecular_property_db_audit import (
+        audit_molecular_property_db_cases,
+    )
 
     baseline_parameter_value = getattr(primitive_parameters, parameter_name)
     for perturbation_scale in perturbation_scales:
@@ -1895,9 +1880,7 @@ def _primitive_parameter_perturbed_value(
     baseline_parameter_value: float,
     perturbation_scale: float,
 ) -> float:
-    transform_name = CONDUCTIVITY_PRIMITIVE_PARAMETER_TRANSFORM_BY_NAME[
-        parameter_name
-    ]
+    transform_name = CONDUCTIVITY_PRIMITIVE_PARAMETER_TRANSFORM_BY_NAME[parameter_name]
     if transform_name == PRIMITIVE_PARAMETER_TRANSFORM_LOG_POSITIVE:
         return baseline_parameter_value * perturbation_scale
     if transform_name == PRIMITIVE_PARAMETER_TRANSFORM_IDENTITY_SIGNED:
@@ -1974,18 +1957,12 @@ def _audit_comparison_values(
                 row_result.neutral_cluster_transport_mobility_density_mol_m_s,
             )
         )
-        transport_roles = tuple(
-            sorted(row_result.direct_sigma_by_transport_role_mS_cm)
-        )
+        transport_roles = tuple(sorted(row_result.direct_sigma_by_transport_role_mS_cm))
         for transport_role in transport_roles:
             values.extend(
                 (
-                    row_result.direct_sigma_by_transport_role_mS_cm[
-                        transport_role
-                    ],
-                    row_result.corrector_sigma_by_transport_role_mS_cm[
-                        transport_role
-                    ],
+                    row_result.direct_sigma_by_transport_role_mS_cm[transport_role],
+                    row_result.corrector_sigma_by_transport_role_mS_cm[transport_role],
                     row_result.net_sigma_by_transport_role_mS_cm[transport_role],
                 )
             )
@@ -2035,7 +2012,8 @@ def default_molecular_primitive_fit_configuration() -> tuple[
     )
     unknown_coordinate_bound_names = tuple(
         sorted(
-            parameter_name for parameter_name in coordinate_bounds_mapping
+            parameter_name
+            for parameter_name in coordinate_bounds_mapping
             if parameter_name not in CONDUCTIVITY_PRIMITIVE_PARAMETER_FIELD_NAMES
         )
     )
@@ -2379,9 +2357,7 @@ def _primitive_fit_coordinate_bound_from_config(
         )
     return PrimitiveParameterTransform(
         name=parameter_name,
-        transform=CONDUCTIVITY_PRIMITIVE_PARAMETER_TRANSFORM_BY_NAME[
-            parameter_name
-        ],
+        transform=CONDUCTIVITY_PRIMITIVE_PARAMETER_TRANSFORM_BY_NAME[parameter_name],
         lower=lower_value,
         upper=upper_value,
     )
@@ -2403,11 +2379,7 @@ def _required_string_tuple_allow_empty(
             raise ValueError(f"{value_context} must be a nonempty string")
         parsed_values.append(raw_value)
     duplicate_values = tuple(
-        sorted(
-            value
-            for value in set(parsed_values)
-            if parsed_values.count(value) > 1
-        )
+        sorted(value for value in set(parsed_values) if parsed_values.count(value) > 1)
     )
     if duplicate_values:
         raise ValueError(
@@ -2422,9 +2394,7 @@ def _primitive_bound_endpoint_from_config(
     endpoint_name: str,
 ) -> float:
     context = f"{parameter_name}.{endpoint_name}"
-    transform_name = CONDUCTIVITY_PRIMITIVE_PARAMETER_TRANSFORM_BY_NAME[
-        parameter_name
-    ]
+    transform_name = CONDUCTIVITY_PRIMITIVE_PARAMETER_TRANSFORM_BY_NAME[parameter_name]
     if transform_name == PRIMITIVE_PARAMETER_TRANSFORM_LOG_POSITIVE:
         return math.log(_positive_float(endpoint_value, context))
     if transform_name == PRIMITIVE_PARAMETER_TRANSFORM_IDENTITY_SIGNED:
@@ -2542,10 +2512,12 @@ def _write_fit_progress_status(
     current_best: PrimitiveFitCandidateResult,
     progress_payload: PrimitiveFitProgressPayload,
 ) -> None:
-    progress_path = Path(_nonempty_string(
-        options.progress_output_path,
-        "progress_output_path",
-    ))
+    progress_path = Path(
+        _nonempty_string(
+            options.progress_output_path,
+            "progress_output_path",
+        )
+    )
     progress_path.parent.mkdir(parents=True, exist_ok=True)
     status_mapping = {
         "artifact_type": PRIMITIVE_FIT_PROGRESS_ARTIFACT_TYPE,
@@ -2553,8 +2525,7 @@ def _write_fit_progress_status(
         "stage_detail": _nonempty_string(stage_detail, "fit_progress.stage_detail"),
         "candidate_count": len(candidate_results),
         "accepted_candidate_count": sum(
-            1 for candidate_result in candidate_results
-            if not candidate_result.rejected
+            1 for candidate_result in candidate_results if not candidate_result.rejected
         ),
         "current_best": _candidate_progress_mapping(
             current_best,
@@ -2599,9 +2570,7 @@ def _fit_progress_values_mapping(
                 progress_payload.regularization_reference_parameters,
             )
         ),
-        "latin_hypercube_sample_count": (
-            progress_payload.latin_hypercube_sample_count
-        ),
+        "latin_hypercube_sample_count": (progress_payload.latin_hypercube_sample_count),
         "coordinate_step_value": progress_payload.coordinate_step_value,
         "improved_this_round": progress_payload.improved_this_round,
         "powell_cached_candidate_count": (
@@ -2954,8 +2923,7 @@ def fit_conductivity_primitive_parameters(
     )
 
     accepted_candidate_count = sum(
-        1 for candidate_result in candidate_results
-        if not candidate_result.rejected
+        1 for candidate_result in candidate_results if not candidate_result.rejected
     )
     promotion_candidate = select_primitive_parameter_promotion_candidate(
         candidate_results,
@@ -2998,7 +2966,9 @@ def evaluate_primitive_parameter_candidate(
 ) -> PrimitiveFitCandidateResult:
     _validate_fit_options(options)
     validate_conductivity_primitive_parameters(base_parameters)
-    bounded_coordinate_values = _bounded_initial_coordinate_values(coordinate_values, ordered_bounds)
+    bounded_coordinate_values = _bounded_initial_coordinate_values(
+        coordinate_values, ordered_bounds
+    )
     if len(regularization_reference_coordinate_values) != len(ordered_bounds):
         raise ValueError(
             "regularization_reference_coordinate_values length must match coordinate bound count"
@@ -3065,11 +3035,15 @@ def evaluate_primitive_parameter_candidate(
     if len(corrector_sigmas) != len(empirical_sigmas):
         raise ValueError("corrector sigma tuple length must match sigma tuple length")
     if len(direct_capacity_gaps) != len(empirical_sigmas):
-        raise ValueError("direct capacity gap tuple length must match sigma tuple length")
+        raise ValueError(
+            "direct capacity gap tuple length must match sigma tuple length"
+        )
     if len(corrector_targets) != len(empirical_sigmas):
         raise ValueError("corrector target tuple length must match sigma tuple length")
     if len(corrector_residuals) != len(empirical_sigmas):
-        raise ValueError("corrector residual tuple length must match sigma tuple length")
+        raise ValueError(
+            "corrector residual tuple length must match sigma tuple length"
+        )
     _nonnegative_int(
         evaluation.direct_capacity_failure_count,
         "direct_capacity_failure_count",
@@ -3089,12 +3063,14 @@ def evaluate_primitive_parameter_candidate(
             predicted_sigmas,
         )
     )
-    rejection_reasons = list(_candidate_rejection_reasons(
-        evaluation,
-        predicted_sigmas,
-        ordered_bounds,
-        options,
-    ))
+    rejection_reasons = list(
+        _candidate_rejection_reasons(
+            evaluation,
+            predicted_sigmas,
+            ordered_bounds,
+            options,
+        )
+    )
     mae_mS_cm = _mean_absolute_residual(residuals)
     bias_mS_cm = float(math.fsum(residuals) / len(residuals))
     try:
@@ -3257,12 +3233,15 @@ def _run_powell_local_polish(
     )
 
     evaluation_cache: dict[tuple[float, ...], PrimitiveFitCandidateResult] = {}
+
     def _objective_for_coordinate_values(coordinate_value_array: np.ndarray) -> float:
         nonlocal current_best
         coordinate_values = tuple(
             float(coordinate_value) for coordinate_value in coordinate_value_array
         )
-        bounded_coordinate_values = _bounded_initial_coordinate_values(coordinate_values, ordered_bounds)
+        bounded_coordinate_values = _bounded_initial_coordinate_values(
+            coordinate_values, ordered_bounds
+        )
         if bounded_coordinate_values not in evaluation_cache:
             candidate_result = evaluate_primitive_parameter_candidate(
                 bounded_coordinate_values,
@@ -3328,13 +3307,13 @@ def _ordered_coordinate_bounds(
     coordinate_bounds: tuple[PrimitiveParameterTransform, ...],
 ) -> tuple[PrimitiveParameterTransform, ...]:
     if not coordinate_bounds:
-        raise ValueError("coordinate_bounds must contain at least one primitive parameter")
+        raise ValueError(
+            "coordinate_bounds must contain at least one primitive parameter"
+        )
     bound_by_parameter_name: dict[str, PrimitiveParameterTransform] = {}
     for coordinate_bound in coordinate_bounds:
         if coordinate_bound.name in bound_by_parameter_name:
-            raise ValueError(
-                f"duplicate coordinate bound for {coordinate_bound.name}"
-            )
+            raise ValueError(f"duplicate coordinate bound for {coordinate_bound.name}")
         _validate_coordinate_bound(coordinate_bound)
         bound_by_parameter_name[coordinate_bound.name] = coordinate_bound
     ordered_bounds: list[PrimitiveParameterTransform] = []
@@ -3358,11 +3337,14 @@ def _coordinate_bounds_for_parameter_names(
 ) -> tuple[PrimitiveParameterTransform, ...]:
     requested_parameter_names = set(parameter_names)
     selected_bounds = tuple(
-        coordinate_bound for coordinate_bound in coordinate_bounds
+        coordinate_bound
+        for coordinate_bound in coordinate_bounds
         if coordinate_bound.name in requested_parameter_names
     )
     if not selected_bounds:
-        raise ValueError("selected coordinate bounds must contain at least one parameter")
+        raise ValueError(
+            "selected coordinate bounds must contain at least one parameter"
+        )
     return selected_bounds
 
 
@@ -3436,7 +3418,7 @@ def fit_speciation_from_cluster_sensitivities(
             baseline_audit_result.rows,
             key=_absolute_residual_sort_key,
             reverse=True,
-        )[:fit_options.residual_tail_count]
+        )[: fit_options.residual_tail_count]
     )
 
     row_residuals: list[float] = []
@@ -3444,10 +3426,11 @@ def fit_speciation_from_cluster_sensitivities(
     sensitivity_entry_count = 0
     for row_result in selected_rows:
         if row_result.row_id not in case_by_row_id:
-            raise ValueError(f"missing molecular audit case for row {row_result.row_id}")
+            raise ValueError(
+                f"missing molecular audit case for row {row_result.row_id}"
+            )
         row_coefficients_by_parameter = {
-            parameter_name: 0.0
-            for parameter_name in sensitivity_parameter_names
+            parameter_name: 0.0 for parameter_name in sensitivity_parameter_names
         }
         stoichiometry_by_cluster_label = {
             cluster_diagnostic.cluster_label: cluster_diagnostic.stoichiometry
@@ -3474,9 +3457,7 @@ def fit_speciation_from_cluster_sensitivities(
                 )
                 sensitivity_entry_count += 1
             cluster_order = _cluster_order_from_stoichiometry(
-                stoichiometry_by_cluster_label[
-                    sensitivity_diagnostic.cluster_label
-                ],
+                stoichiometry_by_cluster_label[sensitivity_diagnostic.cluster_label],
                 sensitivity_diagnostic.cluster_label,
             )
             cluster_order_feature = max(0, cluster_order - 2)
@@ -3507,9 +3488,11 @@ def fit_speciation_from_cluster_sensitivities(
             row_sensitivity_vectors.append(row_sensitivity_vector)
 
     if not row_sensitivity_vectors:
-        candidate_coordinate_values = conductivity_primitive_parameter_coordinate_values_for_names(
-            baseline_parameters,
-            _ordered_bound_parameter_names(ordered_speciation_bounds),
+        candidate_coordinate_values = (
+            conductivity_primitive_parameter_coordinate_values_for_names(
+                baseline_parameters,
+                _ordered_bound_parameter_names(ordered_speciation_bounds),
+            )
         )
         regularization_reference_coordinate_values = (
             conductivity_primitive_parameter_coordinate_values_for_names(
@@ -3531,17 +3514,17 @@ def fit_speciation_from_cluster_sensitivities(
             sensitivity_entry_count=0,
         )
 
-    current_coordinate_values = conductivity_primitive_parameter_coordinate_values_for_names(
-        baseline_parameters,
-        sensitivity_parameter_names,
+    current_coordinate_values = (
+        conductivity_primitive_parameter_coordinate_values_for_names(
+            baseline_parameters,
+            sensitivity_parameter_names,
+        )
     )
     lower_coordinate_values = tuple(
-        coordinate_bound.lower
-        for coordinate_bound in sensitivity_coordinate_bounds
+        coordinate_bound.lower for coordinate_bound in sensitivity_coordinate_bounds
     )
     upper_coordinate_values = tuple(
-        coordinate_bound.upper
-        for coordinate_bound in sensitivity_coordinate_bounds
+        coordinate_bound.upper for coordinate_bound in sensitivity_coordinate_bounds
     )
     updated_coordinate_values = solve_bounded_huber_ridge_coordinate_values(
         residuals_mS_cm=tuple(row_residuals),
@@ -3560,9 +3543,11 @@ def fit_speciation_from_cluster_sensitivities(
     speciation_parameter_names = _ordered_bound_parameter_names(
         ordered_speciation_bounds
     )
-    candidate_coordinate_values = conductivity_primitive_parameter_coordinate_values_for_names(
-        sensitivity_parameters,
-        speciation_parameter_names,
+    candidate_coordinate_values = (
+        conductivity_primitive_parameter_coordinate_values_for_names(
+            sensitivity_parameters,
+            speciation_parameter_names,
+        )
     )
     regularization_reference_coordinate_values = (
         conductivity_primitive_parameter_coordinate_values_for_names(
@@ -3656,7 +3641,9 @@ def solve_bounded_huber_ridge_coordinate_values(
         dtype=float,
     )
     if sensitivity_matrix.shape != (len(residual_vector), parameter_count):
-        raise ValueError("sensitivity matrix shape must match residual and parameter counts")
+        raise ValueError(
+            "sensitivity matrix shape must match residual and parameter counts"
+        )
     huber_delta = _positive_float(huber_delta_mS_cm, "huber_delta_mS_cm")
     regularization_weight = _nonnegative_float(ridge_weight, "ridge_weight")
     abs_residuals = np.abs(residual_vector)
@@ -3664,9 +3651,7 @@ def solve_bounded_huber_ridge_coordinate_values(
     tail_mask = abs_residuals > huber_delta
     huber_weights[tail_mask] = huber_delta / abs_residuals[tail_mask]
     sqrt_huber_weights = np.sqrt(huber_weights)
-    weighted_sensitivity_matrix = (
-        sqrt_huber_weights[:, None] * sensitivity_matrix
-    )
+    weighted_sensitivity_matrix = sqrt_huber_weights[:, None] * sensitivity_matrix
     weighted_target_vector = -sqrt_huber_weights * residual_vector
     if regularization_weight > 0.0:
         weighted_sensitivity_matrix = np.vstack(
@@ -3686,7 +3671,9 @@ def solve_bounded_huber_ridge_coordinate_values(
         weighted_target_vector,
         rcond=None,
     )[0]
-    updated_coordinate_values = parsed_current_coordinate_values + coordinate_delta_values
+    updated_coordinate_values = (
+        parsed_current_coordinate_values + coordinate_delta_values
+    )
     bounded_coordinate_values = np.minimum(
         parsed_upper_coordinate_values,
         np.maximum(parsed_lower_coordinate_values, updated_coordinate_values),
@@ -3757,7 +3744,9 @@ def _validate_fit_options(options: PrimitiveFitOptions) -> None:
         options.empirical_sigma_floor_mS_cm,
         "empirical_sigma_floor_mS_cm",
     )
-    _nonnegative_float(options.coordinate_regularization_weight, "coordinate_regularization_weight")
+    _nonnegative_float(
+        options.coordinate_regularization_weight, "coordinate_regularization_weight"
+    )
     _nonnegative_float(
         options.residual_tail_loss_weight,
         "residual_tail_loss_weight",
@@ -3892,8 +3881,7 @@ def _validate_fit_options(options: PrimitiveFitOptions) -> None:
     )
     if relative_singular_value_threshold >= 1.0:
         raise ValueError(
-            "prediction_sensitivity_relative_singular_value_threshold "
-            "must be below 1"
+            "prediction_sensitivity_relative_singular_value_threshold must be below 1"
         )
     prediction_correlation_threshold = _positive_float(
         options.prediction_sensitivity_high_correlation_threshold,
@@ -3982,17 +3970,13 @@ def _latin_hypercube_coordinate_values(
     per_parameter_values: list[list[float]] = []
     for coordinate_bound in ordered_bounds:
         parameter_values: list[float] = []
-        coordinate_span = (
-            coordinate_bound.upper
-            - coordinate_bound.lower
-        )
+        coordinate_span = coordinate_bound.upper - coordinate_bound.lower
         for sample_index in range(sample_count):
             unit_interval_value = (
                 sample_index + random_number_generator.random()
             ) / sample_count
             parameter_values.append(
-                coordinate_bound.lower
-                + unit_interval_value * coordinate_span
+                coordinate_bound.lower + unit_interval_value * coordinate_span
             )
         random_number_generator.shuffle(parameter_values)
         per_parameter_values.append(parameter_values)
@@ -4032,15 +4016,15 @@ def _candidate_rejection_reasons(
     reasons: list[str] = []
     bounded_parameter_names = _ordered_bound_parameter_names(ordered_bounds)
     unconsumed_parameter_names = tuple(
-        parameter_name for parameter_name in bounded_parameter_names
+        parameter_name
+        for parameter_name in bounded_parameter_names
         if parameter_name not in evaluation.consumed_parameter_fields
     )
     if len(unconsumed_parameter_names) == len(bounded_parameter_names):
         reasons.append("no_consumed_primitive_parameters")
     elif unconsumed_parameter_names:
         reasons.append(
-            "unconsumed_fit_parameters:"
-            + ",".join(unconsumed_parameter_names)
+            "unconsumed_fit_parameters:" + ",".join(unconsumed_parameter_names)
         )
     if evaluation.failed_rows > options.maximum_failed_rows:
         reasons.append("failed_rows")
@@ -4204,25 +4188,27 @@ def _tail_huber_loss_mS_cm(
     residual_rankings: list[tuple[float, float, float]] = []
     for residual_mS_cm, residual_weight in zip(residuals_mS_cm, residual_weights):
         parsed_residual = _finite_float(residual_mS_cm, "residual_mS_cm")
-        residual_rankings.append((
-            abs(parsed_residual),
-            parsed_residual,
-            _positive_float(residual_weight, "residual_weight"),
-        ))
+        residual_rankings.append(
+            (
+                abs(parsed_residual),
+                parsed_residual,
+                _positive_float(residual_weight, "residual_weight"),
+            )
+        )
     residual_rankings.sort(reverse=True)
     tail_residuals_with_weights = tuple(
         (parsed_residual, parsed_weight)
-        for abs_residual, parsed_residual, parsed_weight in residual_rankings[:tail_count]
+        for abs_residual, parsed_residual, parsed_weight in residual_rankings[
+            :tail_count
+        ]
     )
     tail_weight_sum = math.fsum(
-        parsed_weight
-        for parsed_residual, parsed_weight in tail_residuals_with_weights
+        parsed_weight for parsed_residual, parsed_weight in tail_residuals_with_weights
     )
     _positive_float(tail_weight_sum, "tail_residual_weight_sum")
     return float(
         math.fsum(
-            parsed_weight
-            * _smooth_l1_loss_mS_cm(parsed_residual, huber_delta_mS_cm)
+            parsed_weight * _smooth_l1_loss_mS_cm(parsed_residual, huber_delta_mS_cm)
             for parsed_residual, parsed_weight in tail_residuals_with_weights
         )
         / tail_weight_sum
@@ -4324,7 +4310,10 @@ def _mean_absolute_residual(residuals_mS_cm: tuple[float, ...]) -> float:
     if not residuals_mS_cm:
         raise ValueError("residuals_mS_cm must be nonempty")
     return float(
-        math.fsum(abs(_finite_float(residual, "residual_mS_cm")) for residual in residuals_mS_cm)
+        math.fsum(
+            abs(_finite_float(residual, "residual_mS_cm"))
+            for residual in residuals_mS_cm
+        )
         / len(residuals_mS_cm)
     )
 
@@ -4465,7 +4454,8 @@ def _best_accepted_candidate(
     candidate_results: list[PrimitiveFitCandidateResult],
 ) -> PrimitiveFitCandidateResult:
     accepted_candidates = tuple(
-        candidate_result for candidate_result in candidate_results
+        candidate_result
+        for candidate_result in candidate_results
         if not candidate_result.rejected
     )
     if not accepted_candidates:
@@ -4507,7 +4497,8 @@ def select_primitive_parameter_promotion_candidate(
     if baseline_candidate.rejected:
         raise ValueError("baseline_candidate must satisfy physical invariants")
     accepted_candidates = tuple(
-        candidate_result for candidate_result in candidate_results
+        candidate_result
+        for candidate_result in candidate_results
         if not candidate_result.rejected
     )
     if not accepted_candidates:
@@ -4548,7 +4539,9 @@ def _promotion_candidate_sort_key(
     options: PrimitiveFitOptions,
 ) -> tuple[float, ...]:
     mae_improved = candidate_result.mae_mS_cm < baseline_candidate.mae_mS_cm
-    bias_improved = abs(candidate_result.bias_mS_cm) < abs(baseline_candidate.bias_mS_cm)
+    bias_improved = abs(candidate_result.bias_mS_cm) < abs(
+        baseline_candidate.bias_mS_cm
+    )
     pearson_improved = candidate_result.pearson_r > baseline_candidate.pearson_r
     baseline_improvement_deficit = float(
         (0 if mae_improved else 1)
@@ -4871,9 +4864,9 @@ def primitive_prediction_sensitivity_diagnostics(
             )
             continue
         if plus_trial.valid:
-            coordinate_delta = plus_coordinate_value - current_coordinate_values[
-                parameter_index
-            ]
+            coordinate_delta = (
+                plus_coordinate_value - current_coordinate_values[parameter_index]
+            )
             _positive_float(
                 coordinate_delta,
                 "prediction_sensitivity_forward_coordinate_delta",
@@ -4889,9 +4882,9 @@ def primitive_prediction_sensitivity_diagnostics(
             )
             continue
         if minus_trial.valid:
-            coordinate_delta = current_coordinate_values[
-                parameter_index
-            ] - minus_coordinate_value
+            coordinate_delta = (
+                current_coordinate_values[parameter_index] - minus_coordinate_value
+            )
             _positive_float(
                 coordinate_delta,
                 "prediction_sensitivity_backward_coordinate_delta",
@@ -4906,9 +4899,7 @@ def primitive_prediction_sensitivity_diagnostics(
                 )
             )
             continue
-        sensitivity_columns.append(
-            tuple(0.0 for _value in baseline_sensitivity_values)
-        )
+        sensitivity_columns.append(tuple(0.0 for _value in baseline_sensitivity_values))
     sensitivity_matrix = np.asarray(sensitivity_columns, dtype=float).T
     if not np.all(np.isfinite(sensitivity_matrix)):
         raise ValueError("prediction sensitivity matrix must be finite")
@@ -5288,7 +5279,9 @@ def _coordinate_bounds_for_identifiable_parameters(
         if coordinate_bound.name in identifiable_parameter_name_set
     )
     if not selected_coordinate_bounds:
-        raise ValueError("prediction sensitivity analysis found no identifiable parameters")
+        raise ValueError(
+            "prediction sensitivity analysis found no identifiable parameters"
+        )
     return selected_coordinate_bounds
 
 
@@ -5304,8 +5297,7 @@ def _coordinate_bounds_for_stage_and_full_identifiable_parameters(
         full_prediction_sensitivity_diagnostics.identifiable_parameter_names
     )
     selected_parameter_name_set = (
-        stage_identifiable_parameter_name_set
-        & full_identifiable_parameter_name_set
+        stage_identifiable_parameter_name_set & full_identifiable_parameter_name_set
     )
     selected_coordinate_bounds = tuple(
         coordinate_bound
@@ -5340,16 +5332,14 @@ def _high_correlation_pairs_from_scaled_matrix(
         "scaled_matrix_column_count",
     )
     if column_count != len(active_feature_names):
-        raise ValueError(
-            "scaled matrix columns must match active feature names"
-        )
+        raise ValueError("scaled matrix columns must match active feature names")
     if column_count < 2:
         return tuple()
     if not np.all(np.isfinite(scaled_active_matrix)):
         raise ValueError("scaled matrix must be finite")
-    correlation_matrix = (
-        scaled_active_matrix.T @ scaled_active_matrix
-    ) / float(row_count)
+    correlation_matrix = (scaled_active_matrix.T @ scaled_active_matrix) / float(
+        row_count
+    )
     if not np.all(np.isfinite(correlation_matrix)):
         raise ValueError("correlation matrix must be finite")
     high_correlation_pairs: list[tuple[str, str, float]] = []
@@ -5501,8 +5491,7 @@ def _primitive_driver_feature_row(
 def _loading_sum(loadings: Mapping[str, float]) -> float:
     return float(
         math.fsum(
-            _nonnegative_float(loading, "loading")
-            for loading in loadings.values()
+            _nonnegative_float(loading, "loading") for loading in loadings.values()
         )
     )
 
@@ -5605,10 +5594,7 @@ def primitive_parameter_promotion_rejection_reasons(
         reasons.append("mae_not_improved")
     if candidate_metrics.mae_mS_cm > options.promotion_maximum_mae_mS_cm:
         reasons.append("mae_target")
-    if (
-        abs(candidate_metrics.bias_mS_cm)
-        > options.promotion_maximum_abs_bias_mS_cm
-    ):
+    if abs(candidate_metrics.bias_mS_cm) > options.promotion_maximum_abs_bias_mS_cm:
         reasons.append("bias_target")
     if (
         candidate_metrics.worst_abs_residual_mS_cm
@@ -5760,7 +5746,9 @@ def load_primitive_parameters_from_promoted_candidate_artifact(
         raise ValueError("promoted primitive artifact missing promotion.accepted")
     promotion_accepted = promotion_mapping["accepted"]
     if not isinstance(promotion_accepted, bool):
-        raise TypeError("promoted primitive artifact promotion.accepted must be boolean")
+        raise TypeError(
+            "promoted primitive artifact promotion.accepted must be boolean"
+        )
     if not promotion_accepted:
         if "rejection_reasons" not in promotion_mapping:
             raise ValueError(
@@ -6057,8 +6045,7 @@ def _mean_row_value(values: tuple[float, ...], context: str) -> float:
     if not values:
         raise ValueError(f"{context} must contain at least one value")
     return float(
-        math.fsum(_finite_float(value, context) for value in values)
-        / len(values)
+        math.fsum(_finite_float(value, context) for value in values) / len(values)
     )
 
 
@@ -6173,8 +6160,7 @@ def _trajectory_total_ion_concentration_mol_m3(
 
     return _positive_float(
         math.fsum(
-            component.analytical_concentration_M
-            * STANDARD_STATE_CONCENTRATION_MOL_M3
+            component.analytical_concentration_M * STANDARD_STATE_CONCENTRATION_MOL_M3
             for component in analytical_result.speciation.components
         ),
         "trajectory_total_ion_concentration_mol_m3",
@@ -6205,9 +6191,8 @@ def _trajectory_cluster_thermodynamic_diagnostics(
             ]
         )
         cluster_ion_count = math.fsum(cluster_template.stoichiometry.values())
-        standard_free_energy_over_RT = (
-            cluster_template.standard_free_energy_J_mol
-            / (R * trajectory_target.recipe.temperature_K)
+        standard_free_energy_over_RT = cluster_template.standard_free_energy_J_mol / (
+            R * trajectory_target.recipe.temperature_K
         )
         diagnostics.append(
             MolecularClusterThermodynamicDiagnostic(
@@ -6232,9 +6217,7 @@ def _trajectory_cluster_thermodynamic_diagnostics(
                 coordination_J_mol=cluster_template.coordination_J_mol,
                 steric_J_mol=cluster_template.steric_J_mol,
                 entropy_J_mol=cluster_template.entropy_J_mol,
-                activity_reference_J_mol=(
-                    cluster_template.activity_reference_J_mol
-                ),
+                activity_reference_J_mol=(cluster_template.activity_reference_J_mol),
                 activity_correction_J_mol=cluster_activity_correction_J_mol(
                     analytical_result.speciation.components,
                     cluster_template,
@@ -6340,9 +6323,7 @@ def _validate_checkpoint_digest(
         raise TypeError(f"fit progress current_best.{key} must be a string")
     expected_digest_text = _nonempty_string(expected_digest, f"{key}.expected")
     if observed_digest_value != expected_digest_text:
-        raise ValueError(
-            f"fit progress current_best.{key} does not match current run"
-        )
+        raise ValueError(f"fit progress current_best.{key} does not match current run")
 
 
 def calibration_error_decomposition_report_mapping(
@@ -6612,9 +6593,7 @@ def _calibration_worst_row_mapping(
         "charged_cluster_corrector_sigma_mS_cm": (
             row_result.charged_cluster_corrector_sigma_mS_cm
         ),
-        "charged_cluster_net_sigma_mS_cm": (
-            row_result.charged_cluster_net_sigma_mS_cm
-        ),
+        "charged_cluster_net_sigma_mS_cm": (row_result.charged_cluster_net_sigma_mS_cm),
         "direct_sigma_by_transport_role_mS_cm": dict(
             row_result.direct_sigma_by_transport_role_mS_cm
         ),
@@ -6679,9 +6658,7 @@ def _cluster_thermodynamic_mapping(
         "coordination_J_mol": cluster_diagnostic.coordination_J_mol,
         "steric_J_mol": cluster_diagnostic.steric_J_mol,
         "entropy_J_mol": cluster_diagnostic.entropy_J_mol,
-        "activity_correction_J_mol": (
-            cluster_diagnostic.activity_correction_J_mol
-        ),
+        "activity_correction_J_mol": (cluster_diagnostic.activity_correction_J_mol),
         "hydrodynamic_radius_A": cluster_diagnostic.hydrodynamic_radius_A,
         "molecular_volume_A3": cluster_diagnostic.molecular_volume_A3,
     }
@@ -7054,7 +7031,7 @@ def _trajectory_primitive_target_artifact_from_mapping(
     target_mapping: dict,
     context: str,
 ) -> "TrajectoryPrimitiveTargetArtifact":
-    from conductivity.trajectory_primitive_targets import (
+    from conductivity.old.trajectory_primitive_targets import (
         TrajectoryPrimitiveTargetArtifact,
     )
 
@@ -7168,7 +7145,9 @@ def _trajectory_block_target_from_mapping(
     block_mapping: dict,
     context: str,
 ) -> "TrajectoryBlockPrimitiveTarget":
-    from conductivity.trajectory_primitive_targets import TrajectoryBlockPrimitiveTarget
+    from conductivity.old.trajectory_primitive_targets import (
+        TrajectoryBlockPrimitiveTarget,
+    )
 
     return TrajectoryBlockPrimitiveTarget(
         block_index=_required_json_nonnegative_int(
@@ -7238,7 +7217,7 @@ def _displacement_moment_targets_from_json_mapping(
     moment_mapping: dict,
     context: str,
 ) -> Mapping[str, "TrajectoryDisplacementMomentTarget"]:
-    from conductivity.trajectory_primitive_targets import (
+    from conductivity.old.trajectory_primitive_targets import (
         TrajectoryDisplacementMomentTarget,
     )
 
@@ -7319,7 +7298,9 @@ def _primitive_promotion_metrics_mapping(
             _nonempty_string(proof_status, "metrics.proof_status")
             for proof_status in metrics.proof_statuses
         ),
-        "failed_rows": int(_nonnegative_int(metrics.failed_rows, "metrics.failed_rows")),
+        "failed_rows": int(
+            _nonnegative_int(metrics.failed_rows, "metrics.failed_rows")
+        ),
         "trajectory_concentration_unreachable_target_count": int(
             _nonnegative_int(
                 metrics.trajectory_concentration_unreachable_target_count,
@@ -7451,10 +7432,7 @@ def _print_prediction_sensitivity_diagnostics(
 ) -> None:
     label_text = _nonempty_string(label, "prediction_sensitivity_label")
     _validate_fit_options(options)
-    print(
-        f"{label_text}_prediction_sensitivity_row_count="
-        f"{diagnostics.row_count}"
-    )
+    print(f"{label_text}_prediction_sensitivity_row_count={diagnostics.row_count}")
     print(
         f"{label_text}_prediction_sensitivity_parameter_count="
         f"{diagnostics.parameter_count}"
@@ -7488,12 +7466,12 @@ def _print_prediction_sensitivity_diagnostics(
         f"{label_text}_prediction_sensitivity_high_correlation_pair_count="
         f"{len(diagnostics.high_correlation_parameter_pairs)}"
     )
-    reported_pair_count = (
-        options.prediction_sensitivity_reported_correlation_pair_count
-    )
-    for first_name, second_name, correlation_value in (
-        diagnostics.high_correlation_parameter_pairs[:reported_pair_count]
-    ):
+    reported_pair_count = options.prediction_sensitivity_reported_correlation_pair_count
+    for (
+        first_name,
+        second_name,
+        correlation_value,
+    ) in diagnostics.high_correlation_parameter_pairs[:reported_pair_count]:
         print(
             f"{label_text}_prediction_sensitivity_high_correlation_pair "
             f"first={first_name} second={second_name} "
@@ -7615,7 +7593,9 @@ class SelectedRowPrimitiveEvaluator:
         if not selected_row_indices:
             raise ValueError("selected-row evaluator requires selected rows")
         if not consumed_parameter_fields:
-            raise ValueError("selected-row evaluator requires consumed parameter fields")
+            raise ValueError(
+                "selected-row evaluator requires consumed parameter fields"
+            )
         selected_cases = tuple(cases[row_index] for row_index in selected_row_indices)
         selected_audit_options = replace(
             audit_options,
@@ -7636,6 +7616,7 @@ class SelectedRowPrimitiveEvaluator:
     ) -> PrimitiveFitDatasetEvaluation:
         return self._selected_evaluator.evaluate(primitive_parameters)
 
+
 def _coordinate_bounds_for_parameter_names(
     coordinate_bounds: tuple[PrimitiveParameterTransform, ...],
     parameter_names: tuple[str, ...],
@@ -7647,7 +7628,9 @@ def _coordinate_bounds_for_parameter_names(
         if coordinate_bound.name in requested_parameter_names
     )
     if not selected_coordinate_bounds:
-        raise ValueError("selected coordinate bounds must contain at least one parameter")
+        raise ValueError(
+            "selected coordinate bounds must contain at least one parameter"
+        )
     return selected_coordinate_bounds
 
 
@@ -7759,12 +7742,14 @@ def fit_decomposed_conductivity_primitives() -> DecomposedFitResult:
         configured_parameters,
         audit_options,
     )
-    current_parameters = initialize_topology_logk_offsets_from_trajectory_concentrations(
-        configured_parameters,
-        trajectory_primitive_calibration_targets,
-        audit_options,
-        coordinate_bounds,
-        fit_options,
+    current_parameters = (
+        initialize_topology_logk_offsets_from_trajectory_concentrations(
+            configured_parameters,
+            trajectory_primitive_calibration_targets,
+            audit_options,
+            coordinate_bounds,
+            fit_options,
+        )
     )
     initialized_parameters = current_parameters
     baseline_audit_result = audit_molecular_property_db_cases(
@@ -8130,8 +8115,7 @@ def fit_onsager_operator_primitives(
         "tail_and_failure_rows",
     }:
         raise ValueError(
-            "calibration_subset_mode must be full_property_db or "
-            "tail_and_failure_rows"
+            "calibration_subset_mode must be full_property_db or tail_and_failure_rows"
         )
     audit_options = default_molecular_property_db_audit_options()
     fit_options, coordinate_bounds = default_molecular_primitive_fit_configuration()
@@ -8166,12 +8150,14 @@ def fit_onsager_operator_primitives(
         trajectory_primitive_calibration_targets,
     )
     configured_parameters = configured_conductivity_primitive_parameters()
-    initialized_parameters = initialize_topology_logk_offsets_from_trajectory_concentrations(
-        configured_parameters,
-        trajectory_primitive_calibration_targets,
-        audit_options,
-        coordinate_bounds,
-        fit_options,
+    initialized_parameters = (
+        initialize_topology_logk_offsets_from_trajectory_concentrations(
+            configured_parameters,
+            trajectory_primitive_calibration_targets,
+            audit_options,
+            coordinate_bounds,
+            fit_options,
+        )
     )
     baseline_audit_result = audit_molecular_property_db_cases(
         case_selection.cases,
@@ -8444,8 +8430,12 @@ def _transport_role_direct_scaling_audit(
         transport_roles=transport_roles,
         scale_factors=scale_factors,
         objective_value=objective_value,
-        target_direct_sigmas_mS_cm=tuple(float(value) for value in target_direct_vector),
-        fitted_direct_sigmas_mS_cm=tuple(float(value) for value in fitted_direct_vector),
+        target_direct_sigmas_mS_cm=tuple(
+            float(value) for value in target_direct_vector
+        ),
+        fitted_direct_sigmas_mS_cm=tuple(
+            float(value) for value in fitted_direct_vector
+        ),
     )
 
 
@@ -8586,10 +8576,7 @@ def print_decomposed_fit_result(result: DecomposedFitResult) -> None:
         "promotion_status="
         f"{'accepted' if not result.promotion_rejection_reasons else 'rejected'}"
     )
-    print(
-        "promotion_rejection_reasons="
-        f"{','.join(result.promotion_rejection_reasons)}"
-    )
+    print(f"promotion_rejection_reasons={','.join(result.promotion_rejection_reasons)}")
 
 
 def _print_transport_role_direct_scaling_audit(
@@ -8660,17 +8647,21 @@ def _run_full_fit_main() -> None:
         configured_parameters,
         audit_options,
     )
-    initialized_parameters = initialize_topology_logk_offsets_from_trajectory_concentrations(
-        configured_parameters,
-        trajectory_primitive_calibration_targets,
-        audit_options,
-        coordinate_bounds,
-        fit_options,
+    initialized_parameters = (
+        initialize_topology_logk_offsets_from_trajectory_concentrations(
+            configured_parameters,
+            trajectory_primitive_calibration_targets,
+            audit_options,
+            coordinate_bounds,
+            fit_options,
+        )
     )
-    initialized_trajectory_coverages = validate_trajectory_concentration_target_coverage(
-        trajectory_primitive_calibration_targets,
-        initialized_parameters,
-        audit_options,
+    initialized_trajectory_coverages = (
+        validate_trajectory_concentration_target_coverage(
+            trajectory_primitive_calibration_targets,
+            initialized_parameters,
+            audit_options,
+        )
     )
     print_trajectory_topology_initialization_changes(
         configured_parameters,
@@ -8812,9 +8803,7 @@ def _run_full_fit_main() -> None:
         mae_mS_cm=baseline_audit_result.mae_mS_cm,
         bias_mS_cm=baseline_audit_result.bias_mS_cm,
         pearson_r=baseline_audit_result.pearson_r,
-        worst_abs_residual_mS_cm=(
-            baseline_audit_result.maximum_abs_residual_mS_cm
-        ),
+        worst_abs_residual_mS_cm=(baseline_audit_result.maximum_abs_residual_mS_cm),
         proof_statuses=baseline_audit_result.proof_statuses,
         failed_rows=baseline_audit_result.failed_rows,
         trajectory_concentration_unreachable_target_count=(
@@ -8827,9 +8816,7 @@ def _run_full_fit_main() -> None:
             baseline_audit_result.maximum_mass_balance_residual
         ),
         maximum_row_sum_residual=baseline_audit_result.maximum_row_sum_residual,
-        maximum_stationary_residual=(
-            baseline_audit_result.maximum_stationary_residual
-        ),
+        maximum_stationary_residual=(baseline_audit_result.maximum_stationary_residual),
         maximum_detailed_balance_residual=(
             baseline_audit_result.maximum_detailed_balance_residual
         ),
@@ -8848,9 +8835,7 @@ def _run_full_fit_main() -> None:
         mae_mS_cm=candidate_audit_result.mae_mS_cm,
         bias_mS_cm=candidate_audit_result.bias_mS_cm,
         pearson_r=candidate_audit_result.pearson_r,
-        worst_abs_residual_mS_cm=(
-            candidate_audit_result.maximum_abs_residual_mS_cm
-        ),
+        worst_abs_residual_mS_cm=(candidate_audit_result.maximum_abs_residual_mS_cm),
         proof_statuses=candidate_audit_result.proof_statuses,
         failed_rows=candidate_audit_result.failed_rows,
         trajectory_concentration_unreachable_target_count=(
@@ -8913,11 +8898,13 @@ def _run_full_fit_main() -> None:
     reported_correlation_pair_count = (
         fit_options.descriptor_matrix_reported_correlation_pair_count
     )
-    for first_name, second_name, correlation_value in (
-        driver_matrix_diagnostics.high_correlation_pairs[
-            :reported_correlation_pair_count
-        ]
-    ):
+    for (
+        first_name,
+        second_name,
+        correlation_value,
+    ) in driver_matrix_diagnostics.high_correlation_pairs[
+        :reported_correlation_pair_count
+    ]:
         print(
             "descriptor_driver_high_correlation_pair "
             f"first={first_name} second={second_name} "
@@ -8949,40 +8936,42 @@ def _run_full_fit_main() -> None:
     print(f"configured_full_parameter_count={len(coordinate_bounds)}")
     print(f"active_speciation_parameter_count={len(speciation_coordinate_bounds)}")
     print(
-        "active_mobility_event_parameter_count="
-        f"{len(mobility_event_coordinate_bounds)}"
+        f"active_mobility_event_parameter_count={len(mobility_event_coordinate_bounds)}"
     )
     print(f"active_full_parameter_count={len(identifiable_coordinate_bounds)}")
     print(
         "speciation_latin_hypercube_sample_count="
-        f"{_fit_budget_count_from_parameter_count(
-            len(speciation_coordinate_bounds),
-            fit_options.latin_hypercube_samples_per_parameter,
-            'latin_hypercube_samples_per_parameter',
-        )}"
+        f"{
+            _fit_budget_count_from_parameter_count(
+                len(speciation_coordinate_bounds),
+                fit_options.latin_hypercube_samples_per_parameter,
+                'latin_hypercube_samples_per_parameter',
+            )
+        }"
     )
     print(
         "full_latin_hypercube_sample_count="
-        f"{_fit_budget_count_from_parameter_count(
-            len(identifiable_coordinate_bounds),
-            fit_options.latin_hypercube_samples_per_parameter,
-            'latin_hypercube_samples_per_parameter',
-        )}"
+        f"{
+            _fit_budget_count_from_parameter_count(
+                len(identifiable_coordinate_bounds),
+                fit_options.latin_hypercube_samples_per_parameter,
+                'latin_hypercube_samples_per_parameter',
+            )
+        }"
     )
     print(
         "full_powell_max_function_evaluations="
-        f"{_fit_budget_count_from_parameter_count_allowing_zero(
-            len(identifiable_coordinate_bounds),
-            fit_options.powell_max_function_evaluations_per_parameter,
-            'powell_max_function_evaluations_per_parameter',
-        )}"
+        f"{
+            _fit_budget_count_from_parameter_count_allowing_zero(
+                len(identifiable_coordinate_bounds),
+                fit_options.powell_max_function_evaluations_per_parameter,
+                'powell_max_function_evaluations_per_parameter',
+            )
+        }"
     )
     print(f"candidate_count={fit_result.candidate_count}")
     print(f"accepted_candidate_count={fit_result.accepted_candidate_count}")
-    print(
-        "speciation_prefit_candidate_count="
-        f"{speciation_fit_result.candidate_count}"
-    )
+    print(f"speciation_prefit_candidate_count={speciation_fit_result.candidate_count}")
     print(
         "speciation_prefit_accepted_candidate_count="
         f"{speciation_fit_result.accepted_candidate_count}"
@@ -9049,15 +9038,14 @@ def _run_full_fit_main() -> None:
     print(f"best_mae_mS_cm={best_candidate.mae_mS_cm:.6f}")
     print(f"best_bias_mS_cm={best_candidate.bias_mS_cm:.6f}")
     print(f"best_pearson_r={best_candidate.pearson_r:.6f}")
-    print(f"best_worst_abs_residual_mS_cm={best_candidate.worst_abs_residual_mS_cm:.6f}")
+    print(
+        f"best_worst_abs_residual_mS_cm={best_candidate.worst_abs_residual_mS_cm:.6f}"
+    )
     print(f"best_failed_rows={best_candidate.failed_rows}")
     print(f"best_rejected={best_candidate.rejected}")
     print(f"best_rejection_reasons={','.join(best_candidate.rejection_reasons)}")
     print(f"best_cluster_activation_loss={best_candidate.cluster_activation_loss:.6f}")
-    print(
-        "promotion_candidate_objective="
-        f"{promotion_candidate.objective_value:.6f}"
-    )
+    print(f"promotion_candidate_objective={promotion_candidate.objective_value:.6f}")
     print(f"promotion_candidate_mae_mS_cm={promotion_candidate.mae_mS_cm:.6f}")
     print(f"promotion_candidate_bias_mS_cm={promotion_candidate.bias_mS_cm:.6f}")
     print(f"promotion_candidate_pearson_r={promotion_candidate.pearson_r:.6f}")
@@ -9093,16 +9081,13 @@ def _run_full_fit_main() -> None:
         "promotion_status="
         f"{'accepted' if not promotion_rejection_reasons else 'rejected'}"
     )
-    print(
-        "promotion_rejection_reasons="
-        f"{','.join(promotion_rejection_reasons)}"
-    )
+    print(f"promotion_rejection_reasons={','.join(promotion_rejection_reasons)}")
     print("verified_candidate_worst_rows")
     for row_result in sorted(
         candidate_audit_result.rows,
         key=_absolute_residual_sort_key,
         reverse=True,
-    )[:audit_options.audit_worst_row_count]:
+    )[: audit_options.audit_worst_row_count]:
         print(
             "row_id={row_id} empirical={empirical:.6f} predicted={predicted:.6f} "
             "residual={residual:.6f} direct={direct:.6f} corrector={corrector:.6f} "
@@ -9150,18 +9135,9 @@ def main() -> None:
         print("fit_block=onsager_operator")
         print(f"subset_mode={parsed_arguments.subset}")
         print(f"candidate_count={fit_result.candidate_count}")
-        print(
-            "accepted_candidate_count="
-            f"{fit_result.accepted_candidate_count}"
-        )
-        print(
-            "best_mae_mS_cm="
-            f"{fit_result.best_candidate.mae_mS_cm:.6f}"
-        )
-        print(
-            "best_bias_mS_cm="
-            f"{fit_result.best_candidate.bias_mS_cm:.6f}"
-        )
+        print(f"accepted_candidate_count={fit_result.accepted_candidate_count}")
+        print(f"best_mae_mS_cm={fit_result.best_candidate.mae_mS_cm:.6f}")
+        print(f"best_bias_mS_cm={fit_result.best_candidate.bias_mS_cm:.6f}")
         print(
             "best_worst_abs_residual_mS_cm="
             f"{fit_result.best_candidate.worst_abs_residual_mS_cm:.6f}"
@@ -9184,8 +9160,7 @@ def main() -> None:
             f"{decomposed_fit_result.cluster_sink_result.accepted}"
         )
         print(
-            "final_joint_block_accepted="
-            f"{decomposed_fit_result.final_result.accepted}"
+            f"final_joint_block_accepted={decomposed_fit_result.final_result.accepted}"
         )
         print(
             "candidate_mae_mS_cm="

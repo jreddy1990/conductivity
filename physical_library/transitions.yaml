@@ -14,3 +14,153 @@ families:
 - atmosphere_capture_release
 numerical_method: committor finite-element capacity solve plus deterministic Doob-conditioned endpoint
   moment boundary-value solves
+transition_records:
+  free_to_SSIP:
+    reaction_coordinate: Li_anion_distance
+    gradient_policy: pair_distance_gradient
+    moment_policy: conditioned_endpoint_bvp
+    displacement_policy: charge_polarization_endpoint_moment
+    barrier_J_mol: 6000.0
+    rate_bounds_s_inv:
+      lower: 0.0
+      upper: 1.0e13
+  SSIP_to_CIP:
+    reaction_coordinate: Li_anion_distance
+    gradient_policy: pair_distance_gradient
+    moment_policy: conditioned_endpoint_bvp
+    displacement_policy: charge_polarization_endpoint_moment
+    barrier_J_mol: 8000.0
+    rate_bounds_s_inv:
+      lower: 0.0
+      upper: 1.0e13
+  SSIP_to_additive_separated_SSIP:
+    reaction_coordinate: Li_ligand_coordination
+    gradient_policy: coordination_switch_gradient
+    moment_policy: zero_motif_exchange
+    displacement_policy: zero
+    barrier_J_mol: 10000.0
+    rate_bounds_s_inv:
+      lower: 0.0
+      upper: 1.0e13
+  pair_to_aggregate:
+    reaction_coordinate: cluster_coordinate
+    coordinate_domain:
+      lower: 0.0
+      upper: 1.0
+    gradient_policy: cluster_coordinate_gradient
+    moment_policy: zero_motif_exchange
+    displacement_policy: zero
+    barrier_J_mol: 14000.0
+    rate_bounds_s_inv:
+      lower: 0.0
+      upper: 1.0e13
+  Li_to_Li_ligand:
+    reaction_coordinate: Li_ligand_coordination
+    gradient_policy: coordination_switch_gradient
+    moment_policy: zero_motif_exchange
+    displacement_policy: zero
+    barrier_J_mol: 9000.0
+    rate_bounds_s_inv:
+      lower: 0.0
+      upper: 1.0e13
+  LiA_to_Li_ligand_anion:
+    reaction_coordinate: Li_ligand_coordination
+    gradient_policy: coordination_switch_gradient
+    moment_policy: zero_motif_exchange
+    displacement_policy: zero
+    barrier_J_mol: 11000.0
+    rate_bounds_s_inv:
+      lower: 0.0
+      upper: 1.0e13
+  partner_switch:
+    reaction_coordinate: partner_residence_coordinate
+    gradient_policy: partner_residence_gradient
+    moment_policy: identity_diffusion
+    displacement_policy: unwrapped_identity_displacement
+    endpoint_geometry:
+      start:
+        Li_partner: old_anion_partner
+        Li_position: source_partner_shell
+      end:
+        Li_partner: new_anion_partner
+        Li_position: target_partner_shell
+      displacement:
+        type: charge_identity
+        length_m: 3.0e-10
+        direction_policy: pair_axis
+    barrier_J_mol: 30000.0
+    rate_bounds_s_inv:
+      lower: 0.0
+      upper: 1.0e13
+  identity_diffusion:
+    reaction_coordinate: identity_coordinate
+    coordinate_domain:
+      lower: 0.0
+      upper: 1.0
+    gradient_policy: identity_coordinate_gradient
+    moment_policy: identity_diffusion
+    displacement_policy: unwrapped_identity_displacement
+    endpoint_geometry:
+      start:
+        carrier_identity: source_lithium
+      end:
+        carrier_identity: target_lithium
+      displacement:
+        type: charge_identity
+        length_m: 3.0e-10
+        direction_policy: identity_axis
+    barrier_J_mol: 30000.0
+    rate_bounds_s_inv:
+      lower: 0.0
+      upper: 1.0e13
+  structural_hop:
+    reaction_coordinate: structural_hop_coordinate
+    coordinate_domain:
+      lower: 0.0
+      upper: 1.0
+    gradient_policy: structural_hop_gradient
+    moment_policy: conditioned_endpoint_bvp
+    displacement_policy: unwrapped_structural_hop
+    endpoint_geometry:
+      start:
+        hop_site: source_cage
+      end:
+        hop_site: target_cage
+      displacement:
+        type: unwrapped_structural_hop
+        length_m: 5.0e-10
+        direction_policy: hop_axis
+    barrier_J_mol: 32000.0
+    rate_bounds_s_inv:
+      lower: 0.0
+      upper: 1.0e13
+  bridge_network_formation_breakup:
+    reaction_coordinate: cluster_coordinate
+    coordinate_domain:
+      lower: 0.0
+      upper: 1.0
+    gradient_policy: cluster_coordinate_gradient
+    moment_policy: zero_motif_exchange
+    displacement_policy: zero
+    barrier_J_mol: 18000.0
+    rate_bounds_s_inv:
+      lower: 0.0
+      upper: 1.0e13
+  cage_capture_release:
+    reaction_coordinate: cage_coordinate
+    gradient_policy: cage_coordinate_gradient
+    moment_policy: zero_motif_exchange
+    displacement_policy: zero
+    barrier_J_mol: 12000.0
+    rate_bounds_s_inv:
+      lower: 0.0
+      upper: 1.0e13
+  atmosphere_capture_release:
+    reaction_coordinate: atmosphere_polarization
+    gradient_policy: atmosphere_coordinate_gradient
+    moment_policy: zero_motif_exchange
+    displacement_policy: zero
+    barrier_J_mol: 12000.0
+    rate_bounds_s_inv:
+      lower: 0.0
+      upper: 1.0e13
