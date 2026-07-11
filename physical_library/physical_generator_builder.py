@@ -266,6 +266,7 @@ def _build_reduced_state_quadrature(
         _pad_transport_ownership_basis(
             ownership_basis,
             common_coordinate_count,
+            int(np.asarray(state_quadrature.configurations[0].positions_m).size),
         )
         for ownership_basis in state_quadrature.transport_ownership_bases
     )
@@ -622,8 +623,7 @@ def _physical_memory_gradient_function(
         if not _configuration_has_role(build_input.records, configuration, "cation"):
             return np.zeros(
                 (
-                    len(build_input.memory_coordinate_gradient_functions)
-                    + LOCAL_FIELD_VECTOR_LENGTH,
+                    len(build_input.memory_coordinate_gradient_functions),
                     generator_dimension,
                 ),
                 dtype=float,
@@ -631,13 +631,9 @@ def _physical_memory_gradient_function(
         gradients = []
         for gradient_function in build_input.memory_coordinate_gradient_functions:
             gradients.append(np.asarray(gradient_function(configuration), dtype=float))
-        gradients.append(
-            _local_field_memory_gradients(
-                generator_point,
-                configuration,
-                local_fields,
-            )
-        )
+        _ = local_fields
+        if not gradients:
+            return np.empty((0, generator_dimension), dtype=float)
         return np.vstack(
             tuple(
                 _extend_gradient_to_dimension(
@@ -649,39 +645,6 @@ def _physical_memory_gradient_function(
         )
 
     return memory_coordinate_gradient
-
-
-def _local_field_memory_gradients(
-    generator_point: Array,
-    configuration: SiteConfiguration,
-    local_fields: PhysicalLocalFields,
-) -> Array:
-    point = np.asarray(generator_point, dtype=float)
-    local_field_start_index = len(configuration.species_names) * CARTESIAN_DIMENSION
-    local_field_stop_index = local_field_start_index + LOCAL_FIELD_VECTOR_LENGTH
-    if point.size < local_field_stop_index:
-        raise ValueError("generator point is shorter than local-field coordinate block")
-    validate_local_fields(local_fields, "generator_point.local_field_memory")
-    local_field_values = np.asarray(
-        [
-            local_fields.dielectric_constant,
-            local_fields.viscosity_Pa_s,
-            local_fields.ionic_strength_mol_m3,
-            local_fields.local_packing_fraction,
-        ],
-        dtype=float,
-    )
-    gradients = np.zeros((LOCAL_FIELD_VECTOR_LENGTH, point.size), dtype=float)
-    for local_field_index, local_field_value in enumerate(local_field_values):
-        coordinate_index = local_field_start_index + local_field_index
-        if local_field_index == 2 and local_field_value == 0.0:
-            gradients[local_field_index, coordinate_index] = 0.0
-            continue
-        if local_field_index == 3:
-            gradients[local_field_index, coordinate_index] = 1.0
-            continue
-        gradients[local_field_index, coordinate_index] = 1.0 / float(local_field_value)
-    return gradients
 
 
 def _configuration_has_role(
@@ -758,7 +721,25 @@ def _extend_position_gradients_to_generator_points(
 def _pad_transport_ownership_basis(
     ownership_basis: StateTransportOwnershipBasis,
     generator_dimension: int,
+    physical_position_coordinate_count: int,
 ) -> StateTransportOwnershipBasis:
+    ownership_coordinate_count = ownership_basis.bounded_memory_gradients.shape[1]
+    allowed_ownership_coordinate_counts = (
+        physical_position_coordinate_count,
+        physical_position_coordinate_count + LOCAL_FIELD_VECTOR_LENGTH,
+    )
+    if ownership_coordinate_count not in allowed_ownership_coordinate_counts:
+        raise ValueError(
+            "transport ownership width must contain positions with optional local fields"
+        )
+    bounded_memory_gradients = _extend_position_gradients_to_generator_points(
+        ownership_basis.bounded_memory_gradients,
+        generator_dimension,
+    )
+    bounded_memory_mode_indices = np.asarray(
+        ownership_basis.bounded_memory_mode_indices,
+        dtype=int,
+    )
     return StateTransportOwnershipBasis(
         transition_displacement_gradients=_extend_position_gradients_to_generator_points(
             ownership_basis.transition_displacement_gradients,
@@ -768,14 +749,8 @@ def _pad_transport_ownership_basis(
             ownership_basis.transition_edge_indices,
             dtype=int,
         ),
-        bounded_memory_gradients=_extend_position_gradients_to_generator_points(
-            ownership_basis.bounded_memory_gradients,
-            generator_dimension,
-        ),
-        bounded_memory_mode_indices=np.asarray(
-            ownership_basis.bounded_memory_mode_indices,
-            dtype=int,
-        ),
+        bounded_memory_gradients=bounded_memory_gradients,
+        bounded_memory_mode_indices=bounded_memory_mode_indices,
         diagnostic_gradients=_extend_position_gradients_to_generator_points(
             ownership_basis.diagnostic_gradients,
             generator_dimension,

@@ -34,6 +34,10 @@ class TrajectoryMarkovAdditiveSampleInput:
     charge_displacement_by_step_m: Array
     self_charge_polarization_by_frame_and_center_m: Array
     state_index_by_frame_and_center: Array
+    self_current_valid_step_by_center: Array
+    transition_commitment_time_s: float
+    zero_frequency_integration_window_s: float
+    zero_frequency_plateau_window_s: float
     dt_s: float
     total_transport_concentration_mol_m3: float
     temperature_K: float
@@ -137,20 +141,6 @@ class StateDiffusionConvergence:
     log_log_exponent_standard_error: float
 
 
-class NoDiffusiveWindowError(ValueError):
-    def __init__(self, diagnostics: tuple[StateDiffusionConvergence, ...]) -> None:
-        self.diagnostics = diagnostics
-        failed_states = tuple(
-            diagnostic.state_label
-            for diagnostic in diagnostics
-            if diagnostic.convergence_status != "converged"
-        )
-        super().__init__(
-            "no converged long-time diffusive window for occupied states: "
-            + ", ".join(failed_states)
-        )
-
-
 @dataclass(frozen=True)
 class ProjectedGeneratorPrimitiveSet:
     state_labels: tuple[str, ...]
@@ -160,6 +150,16 @@ class ProjectedGeneratorPrimitiveSet:
     conditional_displacement_moments: tuple[ProjectedGeneratorConditionalMoment, ...]
     self_current_tensors: tuple[ProjectedGeneratorSelfCurrentTensor, ...]
     diagnostics: ProjectedGeneratorPrimitiveDiagnostics
+
+
+@dataclass(frozen=True)
+class CommittedTransitionEvent:
+    source_state_index: int
+    destination_state_index: int
+    source_endpoint_frame: int
+    destination_commitment_frame: int
+    center_index: int
+    charge_displacement_m: tuple[float, float, float]
 
 
 @dataclass(frozen=True)
@@ -176,6 +176,76 @@ class TrajectoryBasisRefinement:
     conductivity_change_tolerance_S_m: float
     final_mori_memory_matrix_A: Array
     final_mori_current_coupling_matrix_h: Array
+
+
+def _extract_committed_transition_events(
+    state_index_by_frame_and_center: Array,
+    charge_polarization_by_frame_and_center_m: Array,
+    timestep_s: float,
+    commitment_time_s: float,
+) -> tuple[CommittedTransitionEvent, ...]:
+    state_indices = np.asarray(state_index_by_frame_and_center, dtype=int)
+    polarizations_m = np.asarray(
+        charge_polarization_by_frame_and_center_m,
+        dtype=float,
+    )
+    if state_indices.ndim != 2:
+        raise ValueError("state_index_by_frame_and_center must be two-dimensional")
+    if polarizations_m.shape != (*state_indices.shape, CARTESIAN):
+        raise ValueError("charge polarization must align with state frames and centers")
+    physical_timestep_s = _positive_float(timestep_s, "timestep_s")
+    physical_commitment_time_s = _positive_float(
+        commitment_time_s,
+        "commitment_time_s",
+    )
+    commitment_frame_count = int(
+        np.ceil(physical_commitment_time_s / physical_timestep_s)
+    )
+    if commitment_frame_count >= state_indices.shape[0]:
+        raise ValueError("commitment time is unresolved by the trajectory duration")
+
+    events: list[CommittedTransitionEvent] = []
+    for center_index in range(state_indices.shape[1]):
+        center_states = state_indices[:, center_index]
+        run_starts = np.concatenate(
+            (np.asarray([0], dtype=int), np.flatnonzero(np.diff(center_states)) + 1)
+        )
+        run_stops = np.concatenate(
+            (run_starts[1:], np.asarray([center_states.size], dtype=int))
+        )
+        committed_run_indices = np.flatnonzero(
+            (run_stops - run_starts) >= commitment_frame_count
+        )
+        for committed_pair_index in range(committed_run_indices.size - 1):
+            source_run_index = int(committed_run_indices[committed_pair_index])
+            destination_run_index = int(
+                committed_run_indices[committed_pair_index + 1]
+            )
+            source_state_index = int(center_states[run_starts[source_run_index]])
+            destination_state_index = int(
+                center_states[run_starts[destination_run_index]]
+            )
+            if source_state_index == destination_state_index:
+                continue
+            source_endpoint_frame = int(run_stops[source_run_index] - 1)
+            destination_commitment_frame = int(
+                run_starts[destination_run_index] + commitment_frame_count - 1
+            )
+            displacement_m = (
+                polarizations_m[destination_commitment_frame, center_index]
+                - polarizations_m[source_endpoint_frame, center_index]
+            )
+            events.append(
+                CommittedTransitionEvent(
+                    source_state_index=source_state_index,
+                    destination_state_index=destination_state_index,
+                    source_endpoint_frame=source_endpoint_frame,
+                    destination_commitment_frame=destination_commitment_frame,
+                    center_index=center_index,
+                    charge_displacement_m=_vector_to_tuple(displacement_m),
+                )
+            )
+    return tuple(events)
 
 
 def refine_trajectory_basis_from_state_current_samples(
@@ -317,6 +387,14 @@ def project_sampled_trajectory_to_generator_primitives(
         sample_input.displacement_zero_tolerance_m,
         "displacement_zero_tolerance_m",
     )
+    committed_events = _extract_committed_transition_events(
+        state_index_by_frame_and_center=sample_input.state_index_by_frame_and_center,
+        charge_polarization_by_frame_and_center_m=(
+            sample_input.self_charge_polarization_by_frame_and_center_m
+        ),
+        timestep_s=timestep_s,
+        commitment_time_s=sample_input.transition_commitment_time_s,
+    )
 
     remap = _visited_state_remap(
         occupancy_state_indices,
@@ -331,13 +409,17 @@ def project_sampled_trajectory_to_generator_primitives(
         dtype=int,
     )
     remapped_from = np.asarray(
-        [remap[int(index)] for index in from_state_indices],
+        [remap[event.source_state_index] for event in committed_events],
         dtype=int,
     )
     remapped_to = np.asarray(
-        [remap[int(index)] for index in to_state_indices],
+        [remap[event.destination_state_index] for event in committed_events],
         dtype=int,
     )
+    committed_displacements = np.asarray(
+        [event.charge_displacement_m for event in committed_events],
+        dtype=float,
+    ).reshape((-1, CARTESIAN))
 
     state_concentrations = _state_concentrations(
         remapped_labels,
@@ -352,12 +434,17 @@ def project_sampled_trajectory_to_generator_primitives(
         state_concentrations,
         total_concentration_mol_m3,
         timestep_s,
+        exposure_time_s=(
+            (sample_input.state_index_by_frame_and_center.shape[0] - 1)
+            * sample_input.state_index_by_frame_and_center.shape[1]
+            * timestep_s
+        ),
     )
     conditional_moments = _conditional_displacement_moments(
         remapped_labels,
         remapped_from,
         remapped_to,
-        charge_displacements,
+        committed_displacements,
     )
     self_current_tensors, self_diffusion_convergence = _self_current_tensors(
         remapped_labels,
@@ -367,6 +454,9 @@ def project_sampled_trajectory_to_generator_primitives(
         ),
         state_concentrations,
         timestep_s,
+        np.asarray(sample_input.self_current_valid_step_by_center, dtype=bool),
+        sample_input.zero_frequency_integration_window_s,
+        sample_input.zero_frequency_plateau_window_s,
     )
     component_drift_residuals = _component_drift_residuals_from_records(
         remapped_labels,
@@ -384,11 +474,11 @@ def project_sampled_trajectory_to_generator_primitives(
         original_state_count=len(state_labels),
         visited_state_count=len(remapped_labels),
         observation_count=int(remapped_occupancy.size),
-        step_count=int(remapped_from.size),
-        transition_sample_count=int(np.count_nonzero(remapped_from != remapped_to)),
+        step_count=int(from_state_indices.size),
+        transition_sample_count=len(committed_events),
         self_displacement_sample_count=_self_displacement_sample_count(
-            remapped_from,
-            remapped_to,
+            from_state_indices,
+            to_state_indices,
             charge_displacements,
             displacement_zero_tolerance_m,
         ),
@@ -396,7 +486,7 @@ def project_sampled_trajectory_to_generator_primitives(
         minimum_state_concentration_mol_m3=float(min(state_concentrations.values())),
         maximum_state_concentration_mol_m3=float(max(state_concentrations.values())),
         total_transport_concentration_mol_m3=total_concentration_mol_m3,
-        trajectory_time_s=float(remapped_from.size * timestep_s),
+        trajectory_time_s=float(from_state_indices.size * timestep_s),
         self_diffusion_convergence=self_diffusion_convergence,
         component_drift_residuals=component_drift_residuals,
         finite_process_legality=finite_process_legality,
@@ -491,6 +581,7 @@ def _reactive_fluxes(
     state_concentrations: Mapping[str, float],
     total_concentration_mol_m3: float,
     timestep_s: float,
+    exposure_time_s: float,
 ) -> tuple[ProjectedGeneratorReactiveFlux, ...]:
     directed_counts: dict[tuple[int, int], int] = defaultdict(int)
     for sample_index, from_state_index in enumerate(from_indices):
@@ -498,8 +589,10 @@ def _reactive_fluxes(
         if int(from_state_index) == to_state_index:
             continue
         directed_counts[(int(from_state_index), to_state_index)] += 1
+    _positive_float(timestep_s, "timestep_s")
+    physical_exposure_time_s = _positive_float(exposure_time_s, "exposure_time_s")
     event_flux_per_sample_mol_m3_s = total_concentration_mol_m3 / (
-        2.0 * float(from_indices.size) * timestep_s
+        2.0 * physical_exposure_time_s
     )
     unordered_pairs = sorted(
         {
@@ -588,6 +681,9 @@ def _self_current_tensors(
     charge_polarization_by_frame_and_center_m: Array,
     state_concentrations: Mapping[str, float],
     timestep_s: float,
+    self_current_valid_step_by_center: Array,
+    integration_window_s: float,
+    plateau_window_s: float,
 ) -> tuple[
     tuple[ProjectedGeneratorSelfCurrentTensor, ...],
     tuple[StateDiffusionConvergence, ...],
@@ -606,30 +702,45 @@ def _self_current_tensors(
             "self_charge_polarization_by_frame_and_center_m must have shape "
             f"{expected_shape} and contain finite values"
         )
-    if state_indices.shape[0] < MINIMUM_DIFFUSIVE_WINDOW_LAG_COUNT + 1:
+    if state_indices.shape[0] < 2:
+        raise ValueError("self-current estimation needs at least two trajectory frames")
+    valid_step_mask = np.asarray(self_current_valid_step_by_center, dtype=bool)
+    if valid_step_mask.shape != (state_indices.shape[0] - 1, state_indices.shape[1]):
         raise ValueError(
-            "self diffusion estimation needs at least five trajectory frames"
+            "self_current_valid_step_by_center must have shape (frames-1, centers)"
         )
+    integration_window_s = _positive_float(
+        integration_window_s, "zero_frequency_integration_window_s"
+    )
+    maximum_integration_lag_frames = min(
+        state_indices.shape[0] - 1,
+        int(np.floor(integration_window_s / timestep_s)),
+    )
     records: list[ProjectedGeneratorSelfCurrentTensor] = []
     diagnostics: list[StateDiffusionConvergence] = []
     for state_index, state_label in enumerate(state_labels):
         covariance_by_lag_m2, sample_count_by_lag, populated_lags = (
             _state_conditioned_covariances_by_lag(
-                state_indices, polarizations_m, state_index
+                state_indices=state_indices,
+                polarizations_m=polarizations_m,
+                valid_step_mask=valid_step_mask,
+                target_state_index=state_index,
+                maximum_lag_frames=maximum_integration_lag_frames,
             )
         )
-        convergence, diffusion_tensor, window_converged = (
-            _find_diffusive_covariance_window(
-                state_label,
-                covariance_by_lag_m2,
-                sample_count_by_lag,
-                populated_lags,
-                timestep_s,
-            )
+        convergence, diffusion_tensor, converged = _find_diffusive_covariance_window(
+            state_label=state_label,
+            covariance_by_lag_m2=covariance_by_lag_m2,
+            sample_count_by_lag=sample_count_by_lag,
+            populated_lags=populated_lags,
+            timestep_s=timestep_s,
+            integration_window_s=integration_window_s,
+            plateau_window_s=plateau_window_s,
         )
         diagnostics.append(convergence)
-        if not window_converged:
+        if not converged:
             continue
+        _validate_psd(diffusion_tensor, f"within-state diffusion {state_label}")
         records.append(
             ProjectedGeneratorSelfCurrentTensor(
                 state_label=state_label,
@@ -644,7 +755,9 @@ def _self_current_tensors(
 def _state_conditioned_covariances_by_lag(
     state_indices: Array,
     polarizations_m: Array,
+    valid_step_mask: Array,
     target_state_index: int,
+    maximum_lag_frames: int,
 ) -> tuple[Array, Array, Array]:
     frame_count, center_count = state_indices.shape
     covariance_by_lag_m2 = np.zeros(
@@ -659,12 +772,25 @@ def _state_conditioned_covariances_by_lag(
             np.cumsum(non_target_state, axis=0, dtype=int),
         )
     )
-    for lag_frames in _diffusion_lag_frames(frame_count):
+    invalid_step_count = (~valid_step_mask).astype(int)
+    invalid_step_prefix_count = np.vstack(
+        (
+            np.zeros((1, center_count), dtype=int),
+            np.cumsum(invalid_step_count, axis=0, dtype=int),
+        )
+    )
+    for lag_frames in range(1, maximum_lag_frames + 1):
         non_target_count_by_origin_and_center = (
             non_target_prefix_count[lag_frames + 1 :]
             - non_target_prefix_count[: frame_count - lag_frames]
         )
-        valid_residence = non_target_count_by_origin_and_center == 0
+        invalid_count_by_origin_and_center = (
+            invalid_step_prefix_count[lag_frames:]
+            - invalid_step_prefix_count[: frame_count - lag_frames]
+        )
+        valid_residence = (non_target_count_by_origin_and_center == 0) & (
+            invalid_count_by_origin_and_center == 0
+        )
         displacement_by_origin_and_center = (
             polarizations_m[lag_frames:] - polarizations_m[:-lag_frames]
         )
@@ -680,29 +806,33 @@ def _state_conditioned_covariances_by_lag(
     return covariance_by_lag_m2, sample_count_by_lag, populated_lags
 
 
-def _diffusion_lag_frames(frame_count: int) -> Array:
-    maximum_lag_frames = frame_count - 1
-    exponent_count = int(np.ceil(np.log2(maximum_lag_frames)))
-    candidate_count = max(
-        MINIMUM_DIFFUSIVE_WINDOW_LAG_COUNT,
-        MINIMUM_DIFFUSIVE_WINDOW_LAG_COUNT * exponent_count,
-    )
-    return np.unique(
-        np.rint(
-            np.geomspace(1.0, float(maximum_lag_frames), num=candidate_count)
-        ).astype(int)
-    )
-
-
 def _find_diffusive_covariance_window(
     state_label: str,
     covariance_by_lag_m2: Array,
     sample_count_by_lag: Array,
     populated_lags: Array,
     timestep_s: float,
+    integration_window_s: float,
+    plateau_window_s: float,
 ) -> tuple[StateDiffusionConvergence, Array, bool]:
+    integration_window_s = _positive_float(
+        integration_window_s, "zero_frequency_integration_window_s"
+    )
+    plateau_window_s = _positive_float(
+        plateau_window_s, "zero_frequency_plateau_window_s"
+    )
+    if plateau_window_s >= integration_window_s:
+        raise ValueError(
+            "zero_frequency_plateau_window_s must be shorter than "
+            "zero_frequency_integration_window_s"
+        )
     trace_by_lag_m2 = np.trace(covariance_by_lag_m2, axis1=1, axis2=2)
-    finite_lag_indices = np.flatnonzero(populated_lags & (trace_by_lag_m2 > 0.0))
+    lag_times_s = (np.arange(trace_by_lag_m2.size, dtype=float) + 1.0) * timestep_s
+    finite_lag_indices = np.flatnonzero(
+        populated_lags
+        & (trace_by_lag_m2 > 0.0)
+        & (lag_times_s <= integration_window_s)
+    )
     if finite_lag_indices.size < MINIMUM_DIFFUSIVE_WINDOW_LAG_COUNT:
         return (
             _failed_diffusion_convergence(
@@ -711,71 +841,96 @@ def _find_diffusive_covariance_window(
             np.zeros((CARTESIAN, CARTESIAN), dtype=float),
             False,
         )
+    integration_start_s = max(timestep_s, integration_window_s - plateau_window_s)
     for window_start_offset in range(
         finite_lag_indices.size - MINIMUM_DIFFUSIVE_WINDOW_LAG_COUNT + 1
     ):
-        for window_stop_offset in range(
-            finite_lag_indices.size,
-            window_start_offset + MINIMUM_DIFFUSIVE_WINDOW_LAG_COUNT - 1,
-            -1,
+        window_indices = finite_lag_indices[window_start_offset:]
+        window_lag_times_s = lag_times_s[window_indices]
+        plateau_mask = window_lag_times_s >= integration_start_s
+        if np.count_nonzero(plateau_mask) < MINIMUM_DIFFUSIVE_WINDOW_LAG_COUNT:
+            continue
+        covariance_window_m2 = covariance_by_lag_m2[window_indices]
+        trace_covariance_m2 = trace_by_lag_m2[window_indices]
+        trace_slope_m2_s, trace_slope_standard_error_m2_s = _linear_slope_and_error(
+            window_lag_times_s, trace_covariance_m2
+        )
+        plateau_slope_m2_s, plateau_slope_standard_error_m2_s = (
+            _linear_slope_and_error(
+            window_lag_times_s[plateau_mask], trace_covariance_m2[plateau_mask]
+            )
+        )
+        minimum_plateau_sample_count = int(
+            np.min(sample_count_by_lag[window_indices[plateau_mask]])
+        )
+        integration_slope_uncertainty_m2_s = max(
+            trace_slope_standard_error_m2_s,
+            abs(trace_slope_m2_s) / np.sqrt(minimum_plateau_sample_count),
+        )
+        plateau_slope_uncertainty_m2_s = max(
+            plateau_slope_standard_error_m2_s,
+            abs(plateau_slope_m2_s) / np.sqrt(minimum_plateau_sample_count),
+        )
+        slope_difference_limit_m2_s = NORMAL_CONFIDENCE_MULTIPLIER_95_PERCENT * (
+            integration_slope_uncertainty_m2_s + plateau_slope_uncertainty_m2_s
+        )
+        if (
+            plateau_slope_m2_s <= 0.0
+            or abs(plateau_slope_m2_s - trace_slope_m2_s)
+            > slope_difference_limit_m2_s
         ):
-            window_indices = finite_lag_indices[window_start_offset:window_stop_offset]
-            lag_times_s = (window_indices.astype(float) + 1.0) * timestep_s
-            covariance_window_m2 = covariance_by_lag_m2[window_indices]
-            trace_covariance_m2 = trace_by_lag_m2[window_indices]
-            trace_slope_m2_s, trace_slope_standard_error_m2_s = _linear_slope_and_error(
-                lag_times_s, trace_covariance_m2
-            )
-            log_log_exponent, log_log_exponent_standard_error = _linear_slope_and_error(
-                np.log(lag_times_s), np.log(trace_covariance_m2)
-            )
-            exponent_margin = (
-                NORMAL_CONFIDENCE_MULTIPLIER_95_PERCENT
-                * log_log_exponent_standard_error
-            )
-            if trace_slope_m2_s <= 0.0 or not (
-                log_log_exponent - exponent_margin
-                <= 1.0
-                <= log_log_exponent + exponent_margin
-            ):
-                continue
-            tensor_slopes_m2_s = np.empty((CARTESIAN, CARTESIAN), dtype=float)
-            for first_axis in range(CARTESIAN):
-                for second_axis in range(CARTESIAN):
-                    tensor_slopes_m2_s[first_axis, second_axis], _ = (
-                        _linear_slope_and_error(
-                            lag_times_s,
-                            covariance_window_m2[:, first_axis, second_axis],
-                        )
+            continue
+        log_log_exponent, log_log_exponent_standard_error = _linear_slope_and_error(
+            np.log(window_lag_times_s), np.log(trace_covariance_m2)
+        )
+        exponent_margin = (
+            NORMAL_CONFIDENCE_MULTIPLIER_95_PERCENT
+            * log_log_exponent_standard_error
+        )
+        if trace_slope_m2_s <= 0.0 or not (
+            log_log_exponent - exponent_margin
+            <= 1.0
+            <= log_log_exponent + exponent_margin
+        ):
+            continue
+        tensor_slopes_m2_s = np.empty((CARTESIAN, CARTESIAN), dtype=float)
+        for first_axis in range(CARTESIAN):
+            for second_axis in range(CARTESIAN):
+                tensor_slopes_m2_s[first_axis, second_axis], _ = (
+                    _linear_slope_and_error(
+                        window_lag_times_s,
+                        covariance_window_m2[:, first_axis, second_axis],
                     )
-            diffusion_tensor_m2_s = DIFFUSION_FROM_SYMMETRIZED_COVARIANCE_SLOPE * (
-                tensor_slopes_m2_s + tensor_slopes_m2_s.T
-            )
-            if np.min(np.linalg.eigvalsh(diffusion_tensor_m2_s)) < 0.0:
-                continue
-            sample_counts = sample_count_by_lag[window_indices]
-            return (
-                StateDiffusionConvergence(
-                    state_label=state_label,
-                    convergence_status="converged",
-                    not_complete_reason="",
-                    lag_start_frames=int(window_indices[0] + 1),
-                    lag_stop_frames=int(window_indices[-1] + 1),
-                    lag_count=int(window_indices.size),
-                    minimum_samples_per_lag=int(np.min(sample_counts)),
-                    maximum_samples_per_lag=int(np.max(sample_counts)),
-                    trace_slope_m2_s=trace_slope_m2_s,
-                    trace_slope_standard_error_m2_s=trace_slope_standard_error_m2_s,
-                    log_log_exponent=log_log_exponent,
-                    log_log_exponent_standard_error=log_log_exponent_standard_error,
-                ),
-                diffusion_tensor_m2_s,
-                True,
-            )
+                )
+        diffusion_tensor_m2_s = DIFFUSION_FROM_SYMMETRIZED_COVARIANCE_SLOPE * (
+            tensor_slopes_m2_s + tensor_slopes_m2_s.T
+        )
+        if np.min(np.linalg.eigvalsh(diffusion_tensor_m2_s)) < 0.0:
+            continue
+        sample_counts = sample_count_by_lag[window_indices]
+        return (
+            StateDiffusionConvergence(
+                state_label=state_label,
+                convergence_status="converged",
+                not_complete_reason="",
+                lag_start_frames=int(window_indices[0] + 1),
+                lag_stop_frames=int(window_indices[-1] + 1),
+                lag_count=int(window_indices.size),
+                minimum_samples_per_lag=int(np.min(sample_counts)),
+                maximum_samples_per_lag=int(np.max(sample_counts)),
+                trace_slope_m2_s=trace_slope_m2_s,
+                trace_slope_standard_error_m2_s=trace_slope_standard_error_m2_s,
+                log_log_exponent=log_log_exponent,
+                log_log_exponent_standard_error=log_log_exponent_standard_error,
+            ),
+            diffusion_tensor_m2_s,
+            True,
+        )
     return (
         _failed_diffusion_convergence(
             state_label,
-            "no contiguous long-lag window has linear covariance growth and a PSD slope",
+            "no physical integration window has linear covariance growth, a stable "
+            "final plateau, and a PSD slope",
         ),
         np.zeros((CARTESIAN, CARTESIAN), dtype=float),
         False,

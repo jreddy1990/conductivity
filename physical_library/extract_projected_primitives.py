@@ -226,19 +226,17 @@ def _extract_projected_primitives_from_lammps_dump_with_context(
         _charged_center_frame_from_lammps_frame(frame, center_catalog)
         for frame in frames
     )
-    environment_frames = tuple(
-        _molecular_environment_frame_from_lammps_frame(frame, environment_catalog)
-        for frame in frames
+    environment_frames = _unwrap_environment_molecular_centers(
+        tuple(
+            _molecular_environment_frame_from_lammps_frame(
+                frame, environment_catalog
+            )
+            for frame in frames
+        )
     )
-    association_distances_A = _nearest_counterion_distances_A(
-        center_frames,
-        center_catalog,
-    )
-    thresholds = _association_thresholds_from_distances_A(
-        association_distances_A,
-    )
+    thresholds = _association_thresholds_from_physical_library(records)
     (
-        state_labels,
+        observed_state_labels,
         state_index_by_frame_and_center,
         counterion_index_by_frame_and_center,
     ) = _assign_center_states(
@@ -250,6 +248,12 @@ def _extract_projected_primitives_from_lammps_dump_with_context(
         records,
         mixture,
     )
+    state_labels, state_index_by_frame_and_center = (
+        _merge_transport_equivalent_observed_states(
+            observed_state_labels,
+            state_index_by_frame_and_center,
+        )
+    )
     charge_displacements_m = _charge_displacements_by_step_m(
         center_frames,
         center_catalog,
@@ -260,6 +264,8 @@ def _extract_projected_primitives_from_lammps_dump_with_context(
     self_charge_polarizations_m = _self_charge_polarization_by_frame_and_center_m(
         center_frames,
         center_catalog,
+        environment_frames,
+        environment_catalog,
         counterion_index_by_frame_and_center,
         thresholds,
     )
@@ -274,6 +280,27 @@ def _extract_projected_primitives_from_lammps_dump_with_context(
         charge_displacement_by_step_m=charge_displacements_m,
         self_charge_polarization_by_frame_and_center_m=self_charge_polarizations_m,
         state_index_by_frame_and_center=state_index_by_frame_and_center,
+        self_current_valid_step_by_center=(
+            _state_local_membership_stable_step_mask(
+                center_frames,
+                center_catalog,
+                counterion_index_by_frame_and_center,
+                thresholds,
+            )
+        ),
+        transition_commitment_time_s=float(
+            records.transition_record["trajectory_projection"]["commitment_time_s"]
+        ),
+        zero_frequency_integration_window_s=float(
+            records.transition_record["trajectory_projection"][
+                "zero_frequency_integration_window_s"
+            ]
+        ),
+        zero_frequency_plateau_window_s=float(
+            records.transition_record["trajectory_projection"][
+                "zero_frequency_plateau_window_s"
+            ]
+        ),
         dt_s=(
             timestep_fs
             * float(trajectory_dump_stride_steps)
@@ -314,6 +341,8 @@ def _extract_projected_primitives_from_lammps_dump_with_context(
         primitive_set,
         component_drift_violation,
     )
+    diagnostics["observed_microstate_count"] = len(observed_state_labels)
+    diagnostics["merged_transport_state_count"] = len(state_labels)
     if component_drift_violation:
         failure_reason = _invalid_component_drift_failure_reason(
             primitive_set.diagnostics.component_drift_residuals
@@ -772,15 +801,33 @@ def _molecular_environment_frame_from_lammps_frame(
     atom_positions_A = frame.atom_table[
         :, LAMMPS_POSITION_COLUMN_START:LAMMPS_POSITION_COLUMN_STOP
     ]
+    box_low_A = frame.box_bounds_A[:, BOX_BOUND_LOW_COLUMN]
+    box_high_A = frame.box_bounds_A[:, BOX_BOUND_HIGH_COLUMN]
+    box_lengths_A = box_high_A - box_low_A
+    wrapped_atom_positions_A = box_low_A + np.mod(
+        atom_positions_A - box_low_A,
+        box_lengths_A,
+    )
     positions_A = np.zeros((environment_catalog.molecule_ids.size, CARTESIAN))
     orientations = np.zeros_like(positions_A)
     for molecule_index, molecule_id in enumerate(environment_catalog.molecule_ids):
-        molecule_positions_A = atom_positions_A[molecule_ids == molecule_id]
+        molecule_positions_A = wrapped_atom_positions_A[molecule_ids == molecule_id]
         if molecule_positions_A.size == 0:
             raise ValueError(f"dump frame missing molecule id {molecule_id}")
-        center_A = np.mean(molecule_positions_A, axis=0)
-        positions_A[molecule_index] = center_A
-        centered_positions_A = molecule_positions_A - center_A
+        anchor_position_A = molecule_positions_A[0]
+        local_positions_A = molecule_positions_A - anchor_position_A
+        local_positions_A -= box_lengths_A * np.round(
+            local_positions_A / box_lengths_A
+        )
+        center_A = anchor_position_A + np.mean(local_positions_A, axis=0)
+        positions_A[molecule_index] = box_low_A + np.mod(
+            center_A - box_low_A,
+            box_lengths_A,
+        )
+        centered_positions_A = local_positions_A - np.mean(
+            local_positions_A,
+            axis=0,
+        )
         if molecule_positions_A.shape[0] == 1:
             orientations[molecule_index, 0] = 1.0
             continue
@@ -795,6 +842,51 @@ def _molecular_environment_frame_from_lammps_frame(
         orientation_vectors=orientations,
         box_bounds_A=frame.box_bounds_A,
     )
+
+
+def _unwrap_environment_molecular_centers(
+    environment_frames: tuple[MolecularEnvironmentFrame, ...],
+) -> tuple[MolecularEnvironmentFrame, ...]:
+    if not environment_frames:
+        raise ValueError("environment frame sequence must not be empty")
+    unwrapped_positions_A = np.asarray(
+        environment_frames[0].wrapped_positions_A,
+        dtype=float,
+    ).copy()
+    unwrapped_frames = [
+        MolecularEnvironmentFrame(
+            positions_A=unwrapped_positions_A.copy(),
+            wrapped_positions_A=environment_frames[0].wrapped_positions_A,
+            orientation_vectors=environment_frames[0].orientation_vectors,
+            box_bounds_A=environment_frames[0].box_bounds_A,
+        )
+    ]
+    previous_wrapped_positions_A = np.asarray(
+        environment_frames[0].wrapped_positions_A,
+        dtype=float,
+    )
+    for environment_frame in environment_frames[1:]:
+        box_lengths_A = (
+            environment_frame.box_bounds_A[:, BOX_BOUND_HIGH_COLUMN]
+            - environment_frame.box_bounds_A[:, BOX_BOUND_LOW_COLUMN]
+        )
+        current_wrapped_positions_A = np.asarray(
+            environment_frame.wrapped_positions_A,
+            dtype=float,
+        )
+        displacement_A = current_wrapped_positions_A - previous_wrapped_positions_A
+        displacement_A -= box_lengths_A * np.round(displacement_A / box_lengths_A)
+        unwrapped_positions_A = unwrapped_positions_A + displacement_A
+        unwrapped_frames.append(
+            MolecularEnvironmentFrame(
+                positions_A=unwrapped_positions_A.copy(),
+                wrapped_positions_A=current_wrapped_positions_A,
+                orientation_vectors=environment_frame.orientation_vectors,
+                box_bounds_A=environment_frame.box_bounds_A,
+            )
+        )
+        previous_wrapped_positions_A = current_wrapped_positions_A
+    return tuple(unwrapped_frames)
 
 
 def _wrap_positions_into_box_A(
@@ -849,6 +941,26 @@ def _association_thresholds_from_distances_A(
     return AssociationThresholds(
         contact_pair_max_distance_A=float(thresholds_A[0]),
         solvent_separated_pair_max_distance_A=float(thresholds_A[1]),
+    )
+
+
+def _association_thresholds_from_physical_library(
+    records,
+) -> AssociationThresholds:
+    pair_basins = records.basis_record["pair_basins"]
+    contact_pair_max_distance_A = float(pair_basins["r_CIP_m"]) / ANGSTROM_TO_M
+    solvent_separated_pair_max_distance_A = (
+        float(pair_basins["r_SSIP_m"]) / ANGSTROM_TO_M
+    )
+    if not (
+        0.0
+        < contact_pair_max_distance_A
+        < solvent_separated_pair_max_distance_A
+    ):
+        raise ValueError("physical-library association thresholds are not ordered")
+    return AssociationThresholds(
+        contact_pair_max_distance_A=contact_pair_max_distance_A,
+        solvent_separated_pair_max_distance_A=solvent_separated_pair_max_distance_A,
     )
 
 
@@ -942,6 +1054,105 @@ def _assign_center_states(
                 state_index_by_label,
             )
     return tuple(state_labels), state_indices, counterion_indices
+
+
+def _merge_transport_equivalent_observed_states(
+    observed_state_labels: tuple[str, ...],
+    observed_state_indices: np.ndarray,
+) -> tuple[tuple[str, ...], np.ndarray]:
+    retained_field_indices = (
+        generator_construction.STATE_KEY_PAIR_INDEX,
+        generator_construction.STATE_KEY_LIGAND_INDEX,
+        generator_construction.STATE_KEY_CLUSTER_INDEX,
+        generator_construction.STATE_KEY_ENVIRONMENT_INDEX,
+    )
+    merged_labels: list[str] = []
+    merged_index_by_label: dict[str, int] = {}
+    observed_to_merged_index = np.empty(len(observed_state_labels), dtype=int)
+    for observed_state_index, observed_label in enumerate(observed_state_labels):
+        state_key = tuple(observed_label.split("|"))
+        if len(state_key) != generator_construction.STATE_KEY_LENGTH:
+            raise ValueError(f"observed state label has wrong key length: {observed_label}")
+        merged_label = "|".join(
+            state_key[field_index] for field_index in retained_field_indices
+        )
+        if merged_label not in merged_index_by_label:
+            merged_index_by_label[merged_label] = len(merged_labels)
+            merged_labels.append(merged_label)
+        observed_to_merged_index[observed_state_index] = merged_index_by_label[
+            merged_label
+        ]
+    state_indices = np.asarray(observed_state_indices, dtype=int)
+    if np.any(state_indices < 0) or np.any(state_indices >= len(observed_state_labels)):
+        raise ValueError("observed state indices are out of range")
+    return _merge_nonpersistent_transport_states(
+        tuple(merged_labels),
+        observed_to_merged_index[state_indices],
+    )
+
+
+def _merge_nonpersistent_transport_states(
+    state_labels: tuple[str, ...],
+    state_indices: np.ndarray,
+) -> tuple[tuple[str, ...], np.ndarray]:
+    merged_labels = tuple(state_labels)
+    merged_indices = np.asarray(state_indices, dtype=int).copy()
+    while True:
+        self_step_counts = np.asarray(
+            [
+                np.count_nonzero(
+                    (merged_indices[:-1] == state_index)
+                    & (merged_indices[1:] == state_index)
+                )
+                for state_index in range(len(merged_labels))
+            ],
+            dtype=int,
+        )
+        nonpersistent_indices = np.flatnonzero(self_step_counts < 2)
+        if nonpersistent_indices.size == 0:
+            return merged_labels, merged_indices
+        if len(merged_labels) == 1:
+            raise ValueError(
+                "trajectory has no persistent transport basin for self-current estimation"
+            )
+        state_index_to_merge = int(nonpersistent_indices[0])
+        neighbor_counts = np.zeros(len(merged_labels), dtype=int)
+        for first_frame_indices, second_frame_indices in zip(
+            merged_indices[:-1],
+            merged_indices[1:],
+            strict=True,
+        ):
+            leaving_mask = first_frame_indices == state_index_to_merge
+            entering_mask = second_frame_indices == state_index_to_merge
+            if np.any(leaving_mask):
+                neighbor_counts += np.bincount(
+                    second_frame_indices[leaving_mask],
+                    minlength=len(merged_labels),
+                )
+            if np.any(entering_mask):
+                neighbor_counts += np.bincount(
+                    first_frame_indices[entering_mask],
+                    minlength=len(merged_labels),
+                )
+        neighbor_counts[state_index_to_merge] = 0
+        if np.max(neighbor_counts) == 0:
+            raise ValueError(
+                f"nonpersistent state {merged_labels[state_index_to_merge]} has no neighboring basin"
+            )
+        target_state_index = int(np.argmax(neighbor_counts))
+        merged_indices[merged_indices == state_index_to_merge] = target_state_index
+        retained_old_indices = tuple(
+            index for index in range(len(merged_labels)) if index != state_index_to_merge
+        )
+        compact_index_by_old_index = {
+            old_index: new_index
+            for new_index, old_index in enumerate(retained_old_indices)
+        }
+        merged_indices = np.asarray(
+            [compact_index_by_old_index[int(index)] for index in merged_indices.flat],
+            dtype=int,
+        ).reshape(merged_indices.shape)
+        merged_labels = tuple(merged_labels[index] for index in retained_old_indices)
 
 
 def _state_index_for_label(
@@ -1402,6 +1613,8 @@ def _charge_displacements_by_step_m(
 def _self_charge_polarization_by_frame_and_center_m(
     center_frames: tuple[ChargedCenterFrame, ...],
     center_catalog: ChargedCenterCatalog,
+    environment_frames: tuple[MolecularEnvironmentFrame, ...],
+    environment_catalog: MolecularEnvironmentCatalog,
     counterion_index_by_frame_and_center: np.ndarray,
     thresholds: AssociationThresholds,
 ) -> np.ndarray:
@@ -1412,10 +1625,20 @@ def _self_charge_polarization_by_frame_and_center_m(
             "counterion_index_by_frame_and_center must have shape "
             f"{expected_shape}"
         )
+    if len(environment_frames) != len(center_frames):
+        raise ValueError("environment frames must align with charged-center frames")
+    environment_index_by_molecule_id = {
+        int(molecule_id): environment_index
+        for environment_index, molecule_id in enumerate(
+            environment_catalog.molecule_ids
+        )
+    }
     polarizations_m = np.zeros(
         (len(center_frames), center_count, CARTESIAN), dtype=float
     )
-    for frame_index, center_frame in enumerate(center_frames):
+    for frame_index, (center_frame, environment_frame) in enumerate(
+        zip(center_frames, environment_frames, strict=True)
+    ):
         for center_index in range(center_count):
             counterion_index = int(
                 counterion_index_by_frame_and_center[frame_index, center_index]
@@ -1423,13 +1646,23 @@ def _self_charge_polarization_by_frame_and_center_m(
             local_center_indices = _state_local_charged_center_indices(
                 center_frame, center_catalog, center_index, counterion_index, thresholds
             )
+            local_molecule_ids = center_catalog.molecule_ids[local_center_indices]
+            local_environment_indices = np.asarray(
+                [
+                    environment_index_by_molecule_id[int(molecule_id)]
+                    for molecule_id in local_molecule_ids
+                ],
+                dtype=int,
+            )
+            cluster_center_A = np.mean(
+                environment_frame.positions_A[local_environment_indices],
+                axis=0,
+            )
+            net_formal_charge_e = float(
+                np.sum(center_catalog.formal_charges_e[local_center_indices])
+            )
             polarizations_m[frame_index, center_index] = (
-                np.einsum(
-                    "i,ia->a",
-                    center_catalog.formal_charges_e[local_center_indices],
-                    center_frame.positions_A[local_center_indices],
-                )
-                * ANGSTROM_TO_M
+                net_formal_charge_e * cluster_center_A * ANGSTROM_TO_M
             )
     return polarizations_m
 
@@ -1470,6 +1703,42 @@ def _state_local_charged_center_indices(
             f"assigned counterion {counterion_index} is outside the observed local state"
         )
     return np.concatenate((np.asarray((center_index,), dtype=int), associated_indices))
+
+
+def _state_local_membership_stable_step_mask(
+    center_frames: tuple[ChargedCenterFrame, ...],
+    center_catalog: ChargedCenterCatalog,
+    counterion_index_by_frame_and_center: np.ndarray,
+    thresholds: AssociationThresholds,
+) -> np.ndarray:
+    center_count = int(center_catalog.molecule_ids.size)
+    memberships: list[list[tuple[int, ...]]] = []
+    for frame_index, center_frame in enumerate(center_frames):
+        frame_memberships = []
+        for center_index in range(center_count):
+            counterion_index = int(
+                counterion_index_by_frame_and_center[frame_index, center_index]
+            )
+            local_indices = _state_local_charged_center_indices(
+                center_frame,
+                center_catalog,
+                center_index,
+                counterion_index,
+                thresholds,
+            )
+            frame_memberships.append(tuple(sorted(int(index) for index in local_indices)))
+        memberships.append(frame_memberships)
+    return np.asarray(
+        [
+            [
+                memberships[frame_index][center_index]
+                == memberships[frame_index + 1][center_index]
+                for center_index in range(center_count)
+            ]
+            for frame_index in range(len(center_frames) - 1)
+        ],
+        dtype=bool,
+    )
 
 
 def _mean_box_volume_m3(center_frames: tuple[ChargedCenterFrame, ...]) -> float:

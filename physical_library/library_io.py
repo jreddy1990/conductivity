@@ -254,8 +254,11 @@ def validate_physical_library_records(records: PhysicalLibraryRecords) -> None:
     )
     _require_mapping_keys(
         records.transition_record,
-        ("schema", "families", "numerical_method"),
+        ("schema", "families", "numerical_method", "trajectory_projection"),
         "transitions.yaml",
+    )
+    _validate_trajectory_projection_record(
+        records.transition_record["trajectory_projection"]
     )
     _require_mapping_keys(
         records.memory_record,
@@ -263,6 +266,47 @@ def validate_physical_library_records(records: PhysicalLibraryRecords) -> None:
         "memory.yaml",
     )
     _validate_memory_records(records.memory_record, records.transition_record)
+
+
+def _validate_trajectory_projection_record(trajectory_projection_record: dict) -> None:
+    required_fields = (
+        "commitment_time_s",
+        "recrossing_window_s",
+        "endpoint_persistence_condition",
+        "zero_frequency_integration_window_s",
+        "zero_frequency_plateau_window_s",
+    )
+    _require_mapping_keys(
+        trajectory_projection_record,
+        required_fields,
+        "transitions.yaml trajectory_projection",
+    )
+    for time_field in (
+        "commitment_time_s",
+        "recrossing_window_s",
+        "zero_frequency_integration_window_s",
+        "zero_frequency_plateau_window_s",
+    ):
+        time_value_s = float(trajectory_projection_record[time_field])
+        if not np.isfinite(time_value_s) or time_value_s <= 0.0:
+            raise ValueError(
+                f"transitions.yaml trajectory_projection.{time_field} must be positive"
+            )
+    integration_window_s = float(
+        trajectory_projection_record["zero_frequency_integration_window_s"]
+    )
+    plateau_window_s = float(
+        trajectory_projection_record["zero_frequency_plateau_window_s"]
+    )
+    if plateau_window_s >= integration_window_s:
+        raise ValueError(
+            "zero-frequency plateau window must be shorter than integration window"
+        )
+    if (
+        str(trajectory_projection_record["endpoint_persistence_condition"])
+        != "uninterrupted_destination_residence"
+    ):
+        raise ValueError("unsupported transition endpoint persistence condition")
 
 
 def _validate_memory_records(memory_record: dict, transition_record: dict) -> None:

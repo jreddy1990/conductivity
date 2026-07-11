@@ -29,6 +29,7 @@ coordination_switches:
     r0_m: 2.4e-10
     exponent: 8
     cutoff: 0.5
+    aggregation: site_sum
     minimum_value: 1.0e-6
     source: Li-carbonate first-shell oxygen coordination switch
   Li_ligand:
@@ -38,6 +39,7 @@ coordination_switches:
     r0_m: 2.4e-10
     exponent: 8
     cutoff: 0.5
+    aggregation: molecule_max_site_sum
     minimum_value: 1.0e-6
     source: Li-additive first-shell coordination switch
   Li_anion:
@@ -47,6 +49,7 @@ coordination_switches:
     r0_m: 3.0e-10
     exponent: 8
     cutoff: 0.5
+    aggregation: molecule_max_site_sum
     minimum_value: 1.0e-6
     source: Li-anion contact coordination switch
 orientation_bins:
@@ -167,7 +170,7 @@ free_energy_terms:
   coordination_J_mol:
     Li_solvent: -12000.0
     Li_ligand: -16000.0
-    Li_anion: -18000.0
+    Li_anion: -500.0
   solvation_competition:
     targets:
       Li_solvent: 4.0

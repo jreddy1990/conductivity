@@ -1,0 +1,72 @@
+schema: projected_primitives_v1
+projected_readout_status: failed
+failure_reason: 'no converged long-time diffusive window for occupied states: free|none|free_ions|packing_0:ionic_1:dielectric_1:viscosity_1,
+  SSIP|none|LiA|packing_0:ionic_1:dielectric_1:viscosity_1, CIP|none|LiA|packing_0:ionic_1:dielectric_1:viscosity_1,
+  CIP|none|bridge_network|packing_0:ionic_1:dielectric_1:viscosity_1, SSIP|none|bridge_network|packing_0:ionic_1:dielectric_1:viscosity_1'
+diagnostics:
+  self_diffusion_readiness_status: failed
+  component_drift_residuals: []
+  self_diffusion_convergence:
+  - state_label: free|none|free_ions|packing_0:ionic_1:dielectric_1:viscosity_1
+    convergence_status: not_converged
+    not_complete_reason: no contiguous long-lag window has linear covariance growth
+      and a PSD slope
+    lag_start_frames: 0
+    lag_stop_frames: 0
+    lag_count: 0
+    minimum_samples_per_lag: 0
+    maximum_samples_per_lag: 0
+    trace_slope_m2_s: 0.0
+    trace_slope_standard_error_m2_s: 0.0
+    log_log_exponent: 0.0
+    log_log_exponent_standard_error: 0.0
+  - state_label: SSIP|none|LiA|packing_0:ionic_1:dielectric_1:viscosity_1
+    convergence_status: not_converged
+    not_complete_reason: fewer than four populated positive-covariance lags
+    lag_start_frames: 0
+    lag_stop_frames: 0
+    lag_count: 0
+    minimum_samples_per_lag: 0
+    maximum_samples_per_lag: 0
+    trace_slope_m2_s: 0.0
+    trace_slope_standard_error_m2_s: 0.0
+    log_log_exponent: 0.0
+    log_log_exponent_standard_error: 0.0
+  - state_label: CIP|none|LiA|packing_0:ionic_1:dielectric_1:viscosity_1
+    convergence_status: not_converged
+    not_complete_reason: fewer than four populated positive-covariance lags
+    lag_start_frames: 0
+    lag_stop_frames: 0
+    lag_count: 0
+    minimum_samples_per_lag: 0
+    maximum_samples_per_lag: 0
+    trace_slope_m2_s: 0.0
+    trace_slope_standard_error_m2_s: 0.0
+    log_log_exponent: 0.0
+    log_log_exponent_standard_error: 0.0
+  - state_label: CIP|none|bridge_network|packing_0:ionic_1:dielectric_1:viscosity_1
+    convergence_status: not_converged
+    not_complete_reason: no contiguous long-lag window has linear covariance growth
+      and a PSD slope
+    lag_start_frames: 0
+    lag_stop_frames: 0
+    lag_count: 0
+    minimum_samples_per_lag: 0
+    maximum_samples_per_lag: 0
+    trace_slope_m2_s: 0.0
+    trace_slope_standard_error_m2_s: 0.0
+    log_log_exponent: 0.0
+    log_log_exponent_standard_error: 0.0
+  - state_label: SSIP|none|bridge_network|packing_0:ionic_1:dielectric_1:viscosity_1
+    convergence_status: not_converged
+    not_complete_reason: no contiguous long-lag window has linear covariance growth
+      and a PSD slope
+    lag_start_frames: 0
+    lag_stop_frames: 0
+    lag_count: 0
+    minimum_samples_per_lag: 0
+    maximum_samples_per_lag: 0
+    trace_slope_m2_s: 0.0
+    trace_slope_standard_error_m2_s: 0.0
+    log_log_exponent: 0.0
+    log_log_exponent_standard_error: 0.0

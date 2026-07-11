@@ -27,6 +27,7 @@ from constants import (
     S_M_TO_MS_CM,
     T_REF_K,
 )
+from utils.strict_validation import strict_nonnegative_finite_array
 
 F_C_PER_MOL = F
 R_J_PER_MOL_K = R
@@ -635,7 +636,10 @@ def compute_projected_analytical_conductivity(
             volume_m3=volume_m3,
             self_current_coordinate_projectors=self_current_coordinate_projectors,
             state_transport_ownership_bases=(
-                _empty_state_transport_ownership_bases(basin_quadrature_points)
+                _bounded_memory_state_transport_ownership_bases(
+                    basin_quadrature_points,
+                    memory_coordinate_gradient,
+                )
             ),
             transition_transport_ownership=tuple(
                 TransportOwnership.TRANSITION_DISPLACEMENT
@@ -737,6 +741,17 @@ def _compute_projected_analytical_conductivity_from_input(
         model_input.basin_quadrature_points,
         density_weights,
     )
+    bounded_memory_candidate_indices = _declared_bounded_memory_mode_indices(
+        model_input.state_transport_ownership_bases
+    )
+    if np.any(bounded_memory_candidate_indices >= raw_memory_matrix.shape[0]):
+        raise ValueError("MORI_OWNER_INDEX_OUT_OF_RANGE")
+    bounded_memory_matrix = raw_memory_matrix[np.ix_(
+        bounded_memory_candidate_indices, bounded_memory_candidate_indices
+    )]
+    bounded_memory_current_coupling = raw_current_coupling[
+        bounded_memory_candidate_indices
+    ]
     remaining_direct_tensor = _symmetrize(
         direct_for_filter - finite_correction_for_filter
     )
@@ -753,27 +768,40 @@ def _compute_projected_analytical_conductivity_from_input(
         direct_diffusivity_tensor=remaining_direct_tensor,
         initial_mori_memory_matrix_A=np.zeros((0, 0), dtype=float),
         initial_mori_current_coupling_matrix_h=np.zeros((0, CARTESIAN), dtype=float),
-        candidate_self_energies_A_gg=np.diag(raw_memory_matrix),
+        candidate_self_energies_A_gg=np.diag(bounded_memory_matrix),
         candidate_cross_energies_A_gPhi=np.zeros(
-            (raw_memory_matrix.shape[0], 0), dtype=float
+            (bounded_memory_matrix.shape[0], 0), dtype=float
         ),
-        candidate_cross_energy_matrix=raw_memory_matrix,
-        candidate_current_couplings_h_g=raw_current_coupling,
+        candidate_cross_energy_matrix=bounded_memory_matrix,
+        candidate_current_couplings_h_g=bounded_memory_current_coupling,
         temperature_K=model_input.temperature_K,
         residual_score_tolerance=BASIS_REFINEMENT_RESIDUAL_RELATIVE_TOL
         * max(_maximum_abs_eigenvalue(remaining_direct_tensor), np.finfo(float).tiny),
         conductivity_change_tolerance_S_m=(
             BASIS_REFINEMENT_CONDUCTIVITY_RELATIVE_TOL * conductivity_scale_S_m
         ),
-        max_added_coordinates=raw_memory_matrix.shape[0],
+        max_added_coordinates=bounded_memory_matrix.shape[0],
         require_candidate_set_exhaustion=False,
     )
-    accepted_bounded_memory_mode_indices = np.intersect1d(
-        np.asarray(refinement_result["selected_candidate_indices"], dtype=int),
-        _declared_bounded_memory_mode_indices(
-            model_input.state_transport_ownership_bases
-        ),
-        assume_unique=False,
+    for candidate_index_field in (
+        "selected_candidate_indices",
+        "rejected_null_energy_candidate_indices",
+        "rejected_current_spanning_candidate_indices",
+        "rejected_psd_candidate_indices",
+    ):
+        local_candidate_indices = np.asarray(
+            refinement_result[candidate_index_field], dtype=int
+        )
+        refinement_result[candidate_index_field] = bounded_memory_candidate_indices[
+            local_candidate_indices
+        ]
+    accepted_bounded_memory_mode_indices = np.asarray(
+        refinement_result["selected_candidate_indices"], dtype=int
+    )
+    _validate_bounded_memory_owner_consumer_closure(
+        accepted_bounded_memory_mode_indices,
+        refinement_result["final_mori_memory_matrix_A"],
+        refinement_result["final_mori_current_coupling_matrix_h"],
     )
     if accepted_bounded_memory_mode_indices.size:
         (
@@ -912,6 +940,16 @@ def _compute_projected_analytical_conductivity_from_input(
             "mori_filter_accepted_candidate_indices": refinement_result[
                 "selected_candidate_indices"
             ],
+            "mori_declared_bounded_memory_mode_indices": (
+                bounded_memory_candidate_indices.copy()
+            ),
+            "mori_declared_bounded_memory_A_diagonal": np.diag(
+                bounded_memory_matrix
+            ).copy(),
+            "mori_declared_bounded_memory_h_norms": np.linalg.norm(
+                bounded_memory_current_coupling,
+                axis=1,
+            ),
             "mori_filter_discarded_candidate_indices": refinement_result[
                 "discarded_candidate_indices"
             ],
@@ -967,6 +1005,59 @@ def _empty_state_transport_ownership_bases(
     )
 
 
+def _bounded_memory_state_transport_ownership_bases(
+    basin_quadrature_points: Sequence[Array],
+    memory_coordinate_gradient: Callable[[Array], Array],
+) -> tuple[tuple[StateTransportOwnershipBasis, ...], ...]:
+    points_by_state = tuple(
+        as_2d(state_points, "basin_quadrature_points[]")
+        for state_points in basin_quadrature_points
+    )
+    return tuple(
+        tuple(
+            _bounded_memory_ownership_basis_for_point(
+                point,
+                points.shape[1],
+                memory_coordinate_gradient,
+            )
+            for point in points
+        )
+        for points in points_by_state
+    )
+
+
+def _bounded_memory_ownership_basis_for_point(
+    point: Array,
+    coordinate_dimension: int,
+    memory_coordinate_gradient: Callable[[Array], Array],
+) -> StateTransportOwnershipBasis:
+    bounded_gradients = as_2d(
+        memory_coordinate_gradient(point),
+        "memory_coordinate_gradient(point)",
+    )
+    if bounded_gradients.shape[1] != coordinate_dimension:
+        raise ValueError(
+            "memory coordinate gradient width must match coordinate dimension"
+        )
+    return StateTransportOwnershipBasis(
+        transition_displacement_gradients=np.empty(
+            (0, coordinate_dimension),
+            dtype=float,
+        ),
+        transition_edge_indices=np.empty(0, dtype=int),
+        bounded_memory_gradients=bounded_gradients,
+        bounded_memory_mode_indices=np.arange(
+            bounded_gradients.shape[0],
+            dtype=int,
+        ),
+        diagnostic_gradients=np.empty(
+            (0, coordinate_dimension),
+            dtype=float,
+        ),
+        diagnostic_source_ids=(),
+    )
+
+
 def _declared_bounded_memory_mode_indices(
     state_transport_ownership_bases: Sequence[
         Sequence[StateTransportOwnershipBasis]
@@ -979,6 +1070,30 @@ def _declared_bounded_memory_mode_indices(
         for mode_index in ownership_basis.bounded_memory_mode_indices
     }
     return np.asarray(sorted(declared_indices), dtype=int)
+
+
+def _validate_bounded_memory_owner_consumer_closure(
+    admitted_owner_mode_indices: Array,
+    mori_memory_matrix_A: Array,
+    mori_current_coupling_matrix_h: Array,
+) -> None:
+    owner_indices = np.asarray(admitted_owner_mode_indices, dtype=int)
+    if owner_indices.ndim != 1 or np.unique(owner_indices).size != owner_indices.size:
+        raise ValueError("MORI_OWNER_CONSUMER_CLOSURE_DUPLICATE_OWNER")
+    memory_matrix = as_matrix_shape(
+        mori_memory_matrix_A,
+        (owner_indices.size, owner_indices.size),
+        "mori_memory_matrix_A",
+    )
+    current_coupling = as_matrix_shape(
+        mori_current_coupling_matrix_h,
+        (owner_indices.size, CARTESIAN),
+        "mori_current_coupling_matrix_h",
+    )
+    if not np.all(np.isfinite(memory_matrix)) or not np.all(
+        np.isfinite(current_coupling)
+    ):
+        raise ValueError("MORI_OWNER_CONSUMER_CLOSURE_NONFINITE_CONSUMER")
 
 
 def _state_ownership_bases_with_memory_mode_indices(
@@ -1437,8 +1552,9 @@ def _compute_projected_analytical_conductivity_from_functions_input(
             volume_m3=model_input.volume_m3,
             self_current_coordinate_projectors=model_input.self_current_coordinate_projectors,
             state_transport_ownership_bases=(
-                _empty_state_transport_ownership_bases(
-                    model_input.basin_quadrature_points
+                _bounded_memory_state_transport_ownership_bases(
+                    model_input.basin_quadrature_points,
+                    gradpsi,
                 )
             ),
             transition_transport_ownership=tuple(
@@ -1630,60 +1746,107 @@ def solve_basin_chemical_potentials(
     if restricted_partitions.size != basin_count:
         raise ValueError("restricted_partition_values length must match basin count")
 
-    component_denominators = np.maximum(
-        component_totals,
-        CHEMICAL_POTENTIAL_MIN_CONCENTRATION_MOL_M3,
-    )
-    constraint_projection = _mass_constraint_projection_matrix(stoichiometry)
     component_partition_availability = stoichiometry.T @ restricted_partitions
     positive_vector(
         component_partition_availability,
         "component_partition_availability",
     )
-    initial_chemical_potentials = np.log(
-        np.maximum(component_totals, CHEMICAL_POTENTIAL_MIN_CONCENTRATION_MOL_M3)
-        / (STANDARD_CONCENTRATION_MOL_M3 * component_partition_availability)
-    )
+    def scaled_basin_concentrations(
+        chemical_potentials: Array,
+    ) -> tuple[bool, Array]:
+        log_concentrations = (
+            np.log(STANDARD_CONCENTRATION_MOL_M3)
+            + np.log(restricted_partitions)
+            + stoichiometry @ chemical_potentials
+        )
+        if not np.all(np.isfinite(log_concentrations)):
+            return False, np.zeros(basin_count, dtype=float)
+        log_reference = float(np.max(log_concentrations))
+        if log_reference >= LOG_FLOAT_MAX:
+            return False, np.zeros(basin_count, dtype=float)
+        concentrations = (
+            np.exp(log_concentrations - log_reference) * np.exp(log_reference)
+        )
+        return True, concentrations
+
+    initial_chemical_potentials = np.zeros(component_count, dtype=float)
+    for _iteration_index in range(CHEMICAL_POTENTIAL_MAX_ITERATIONS):
+        for component_index in range(component_count):
+            is_representable, basin_concentrations = scaled_basin_concentrations(
+                initial_chemical_potentials
+            )
+            if not is_representable:
+                raise ValueError(
+                    "chemical potential iterative-scaling initialization became "
+                    "nonrepresentable"
+                )
+            predicted_component_total = float(
+                stoichiometry[:, component_index] @ basin_concentrations
+            )
+            if predicted_component_total <= 0.0:
+                raise ValueError(
+                    "chemical potential iterative-scaling initialization has an "
+                    "unrepresented conserved component"
+                )
+            maximum_component_stoichiometry = positive_float(
+                float(np.max(stoichiometry[:, component_index])),
+                "maximum_component_stoichiometry",
+            )
+            initial_chemical_potentials[component_index] += (
+                np.log(
+                    component_totals[component_index]
+                    / predicted_component_total
+                )
+                / maximum_component_stoichiometry
+            )
+        is_representable, basin_concentrations = scaled_basin_concentrations(
+            initial_chemical_potentials
+        )
+        if not is_representable:
+            raise ValueError(
+                "chemical potential iterative-scaling initialization became "
+                "nonrepresentable"
+            )
+        predicted_component_totals = stoichiometry.T @ basin_concentrations
+        initialization_residual = _normalized_mass_residual(
+            predicted_component_totals - component_totals,
+            component_totals,
+        )
+        if initialization_residual < CHEMICAL_POTENTIAL_MASS_TOL:
+            break
 
     def normalized_component_residual(chemical_potentials: Array) -> Array:
-        if not _chemical_potential_trial_is_representable(
-            chemical_potentials,
-            stoichiometry,
-            restricted_partitions,
-        ):
+        is_representable, basin_concentrations = scaled_basin_concentrations(
+            chemical_potentials
+        )
+        if not is_representable:
             return np.full(
                 component_count,
                 FAILED_CHEMICAL_POTENTIAL_RESIDUAL,
                 dtype=float,
             )
-        basin_concentrations = _basin_concentrations_from_chemical_potentials(
-            chemical_potentials,
-            stoichiometry,
-            restricted_partitions,
-        )
-        residual = stoichiometry.T @ basin_concentrations - component_totals
-        normalized_residual = residual / component_denominators
-        return constraint_projection @ normalized_residual
+        predicted_component_totals = stoichiometry.T @ basin_concentrations
+        if np.any(predicted_component_totals <= 0.0):
+            return np.full(
+                component_count,
+                FAILED_CHEMICAL_POTENTIAL_RESIDUAL,
+                dtype=float,
+            )
+        return np.log(predicted_component_totals / component_totals)
 
     def normalized_component_jacobian(chemical_potentials: Array) -> Array:
-        if not _chemical_potential_trial_is_representable(
-            chemical_potentials,
-            stoichiometry,
-            restricted_partitions,
-        ):
-            return np.zeros(
-                (constraint_projection.shape[0], component_count), dtype=float
-            )
-        basin_concentrations = _basin_concentrations_from_chemical_potentials(
-            chemical_potentials,
-            stoichiometry,
-            restricted_partitions,
+        is_representable, basin_concentrations = scaled_basin_concentrations(
+            chemical_potentials
         )
+        if not is_representable:
+            return np.zeros((component_count, component_count), dtype=float)
         jacobian = stoichiometry.T @ (
             basin_concentrations[:, np.newaxis] * stoichiometry
         )
-        normalized_jacobian = jacobian / component_denominators[:, np.newaxis]
-        return constraint_projection @ normalized_jacobian
+        predicted_component_totals = stoichiometry.T @ basin_concentrations
+        if np.any(predicted_component_totals <= 0.0):
+            return np.zeros((component_count, component_count), dtype=float)
+        return jacobian / predicted_component_totals[:, np.newaxis]
 
     least_squares_result = least_squares(
         normalized_component_residual,
@@ -1705,7 +1868,12 @@ def solve_basin_chemical_potentials(
     if normalized_residual >= CHEMICAL_POTENTIAL_MASS_TOL:
         raise ValueError(
             "chemical potential mass-balance solve did not converge; "
-            f"normalized_residual={normalized_residual:.9g}"
+            f"normalized_residual={normalized_residual:.9g}; "
+            f"target_totals={component_totals.tolist()}; "
+            f"predicted_totals={(stoichiometry.T @ basin_concentrations).tolist()}; "
+            f"residual={residual.tolist()}; "
+            f"solver_status={least_squares_result.status}; "
+            f"solver_message={least_squares_result.message}"
         )
     return {
         "chemical_potentials": chemical_potentials,
@@ -1716,10 +1884,24 @@ def solve_basin_chemical_potentials(
     }
 
 
-def _mass_constraint_projection_matrix(basin_stoichiometry: Array) -> Array:
+def _mass_constraint_projection_matrix(
+    basin_stoichiometry: Array,
+    component_denominators_mol_m3: Array,
+) -> Array:
     constraint_matrix = np.asarray(basin_stoichiometry, dtype=float).T
+    component_denominators = positive_vector(
+        component_denominators_mol_m3,
+        "component_denominators_mol_m3",
+    )
+    if component_denominators.size != constraint_matrix.shape[0]:
+        raise ValueError(
+            "component_denominators_mol_m3 length must match conserved components"
+        )
+    normalized_constraint_matrix = (
+        constraint_matrix / component_denominators[:, np.newaxis]
+    )
     left_singular_vectors, singular_values, _right_singular_vectors = np.linalg.svd(
-        constraint_matrix,
+        normalized_constraint_matrix,
         full_matrices=False,
     )
     if singular_values.size == 0:
@@ -1834,26 +2016,13 @@ def _basin_concentrations_from_chemical_potentials(
         + np.log(restricted_partition_values)
         + stoichiometry @ chemical_potentials
     )
-    return positive_vector(
-        np.exp(log_concentrations),
+    basin_concentrations = strict_nonnegative_finite_array(
+        np.exp(np.maximum(log_concentrations, np.log(np.nextafter(0.0, 1.0)))),
         "basin_concentrations_mol_m3",
     )
-
-
-def _chemical_potential_trial_is_representable(
-    chemical_potentials: Array,
-    stoichiometry: Array,
-    restricted_partition_values: Array,
-) -> bool:
-    log_concentrations = (
-        np.log(STANDARD_CONCENTRATION_MOL_M3)
-        + np.log(restricted_partition_values)
-        + stoichiometry @ chemical_potentials
-    )
-    return bool(
-        np.all(np.isfinite(log_concentrations))
-        and np.max(log_concentrations) < LOG_FLOAT_MAX
-    )
+    if basin_concentrations.ndim != 1:
+        raise ValueError("basin_concentrations_mol_m3 must be a 1D array")
+    return np.asarray(basin_concentrations, dtype=float)
 
 
 def _normalized_mass_residual(
@@ -3534,6 +3703,20 @@ def compute_primitive_prediction_readiness_diagnostics(
     effect_attribution,
 ) -> PrimitivePredictionReadinessDiagnostics:
     not_complete_reasons: list[str] = []
+    not_complete_reasons.extend(
+        str(reason)
+        for reason in effect_attribution.get(
+            "physical_library_not_complete_reasons",
+            (),
+        )
+    )
+    not_complete_reasons.extend(
+        str(reason)
+        for reason in effect_attribution.get(
+            "primitive_estimator_not_complete_reasons",
+            (),
+        )
+    )
     finite_process_status = str(effect_attribution["finite_process_readout_status"])
     finite_process_reasons = tuple(
         str(reason)

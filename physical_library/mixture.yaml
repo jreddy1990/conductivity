@@ -39,12 +39,9 @@ packing:
 atmosphere:
   charge_sites_source: species_record_sites
   screening_source: composition_ionic_strength_and_mixture_dielectric
-  response_model: finite_wavevector_pnp_stokes_provisional
-  electrophoretic_amplitude: 1.0
-  relaxation_amplitude: 1.0
-  chemical_relaxation_time_s: 2.1e-11
+  response_model: finite_wavevector_pnp_stokes
   maximum_wavevector_integer: 2
-  provenance: provisional_dimensional_assumption
+  provenance: linearized_pnp_stokes_debye_falkenhagen
   fitted_to_conductivity: false
 local_fields:
   dielectric_decrement_per_mol_m3: 0.002

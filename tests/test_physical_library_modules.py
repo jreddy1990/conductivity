@@ -10,6 +10,7 @@ from constants import T_REF_K
 from conductivity.physical_library import generator_construction
 from conductivity.physical_library import extract_projected_primitives
 from conductivity.physical_library import physical_generator_builder
+from conductivity.physical_library import physical_objects
 from conductivity.physical_library import property_db_validation
 from conductivity.physical_library.transition_surface_builder import (
     MomentBoundaryValueInput,
@@ -715,9 +716,30 @@ def test_physical_generator_builder_exposes_physical_functions() -> None:
         registered_coordinate_count,
     )
     assert generator_specification.memory_coordinate_gradient(point).shape == (
-        4,
+        0,
         registered_coordinate_count,
     )
+
+
+def test_cloud_atmosphere_wavevector_partition_has_disjoint_limits() -> None:
+    charge_cloud_radius_m = 1.5e-10
+
+    zero_screening_fraction = physical_objects._short_range_wavevector_fraction(
+        0.0,
+        charge_cloud_radius_m,
+    )
+    intermediate_fraction = physical_objects._short_range_wavevector_fraction(
+        1.0 / charge_cloud_radius_m,
+        charge_cloud_radius_m,
+    )
+    all_atmosphere_fraction = physical_objects._short_range_wavevector_fraction(
+        100.0 / charge_cloud_radius_m,
+        charge_cloud_radius_m,
+    )
+
+    assert zero_screening_fraction == pytest.approx(1.0)
+    assert 0.0 < intermediate_fraction < 1.0
+    assert all_atmosphere_fraction == pytest.approx(0.0)
 
 
 def test_bulk_matrix_properties_exclude_additive_local_field_corrections() -> None:
@@ -1048,6 +1070,19 @@ def test_mixed_salt_recipe_keeps_additive_stoichiometry_and_transition_channel()
     active_additive_name = _single_active_additive_name(recipe_context)
     active_additive_component_index = component_names.index(active_additive_name)
     assert component_names == ("Li+", "FSI-", "PF6-", active_additive_name)
+    lithium_component_index = component_names.index("Li+")
+    anion_component_indices = tuple(
+        component_names.index(anion_name) for anion_name in ("FSI-", "PF6-")
+    )
+    ionic_state_mask = state_stoichiometry[:, lithium_component_index] > 0.0
+    assert np.all(state_stoichiometry[ionic_state_mask, lithium_component_index] == 1.0)
+    assert np.all(
+        np.sum(
+            state_stoichiometry[ionic_state_mask][:, anion_component_indices],
+            axis=1,
+        )
+        == 1.0
+    )
     assert np.any(state_stoichiometry[:, active_additive_component_index] == 1.0)
     assert np.any(state_stoichiometry[:, active_additive_component_index] == 0.0)
     assert any(
@@ -1070,6 +1105,58 @@ def test_mixed_salt_recipe_keeps_additive_stoichiometry_and_transition_channel()
                 configuration,
                 active_additive_name,
             ) < float(records.basis_record["pair_basins"]["r_free_m"])
+            if state_quadrature.label.startswith("addSSIP|"):
+                cation_index = generator_construction._first_role_index(
+                    records,
+                    configuration,
+                    generator_construction.SpeciesRole.CATION,
+                )
+                anion_indices = generator_construction._first_molecule_indices_with_role(
+                    records,
+                    configuration,
+                    generator_construction.SpeciesRole.ANION,
+                )
+                additive_indices = (
+                    generator_construction._first_molecule_indices_with_role(
+                        records,
+                        configuration,
+                        generator_construction.SpeciesRole.ADDITIVE,
+                    )
+                )
+                anion_site_index = (
+                    generator_construction._molecule_coordination_site_index(
+                        records,
+                        configuration,
+                        anion_indices,
+                    )
+                )
+                additive_site_index = (
+                    generator_construction._molecule_coordination_site_index(
+                        records,
+                        configuration,
+                        additive_indices,
+                    )
+                )
+                positions_m = np.asarray(configuration.positions_m, dtype=float)
+                cation_to_anion_m = generator_construction._minimum_image_vector_m(
+                    positions_m[cation_index],
+                    positions_m[anion_site_index],
+                    configuration.box_lengths_m,
+                )
+                cation_to_additive_m = (
+                    generator_construction._minimum_image_vector_m(
+                        positions_m[cation_index],
+                        positions_m[additive_site_index],
+                        configuration.box_lengths_m,
+                    )
+                )
+                assert np.linalg.norm(
+                    np.cross(cation_to_anion_m, cation_to_additive_m)
+                ) == pytest.approx(0.0, abs=1.0e-24)
+                assert np.dot(cation_to_anion_m, cation_to_additive_m) > 0.0
+                assert np.linalg.norm(cation_to_additive_m) < np.linalg.norm(
+                    cation_to_anion_m
+                )
     non_additive_state_quadratures = tuple(
         state_quadrature
         for state_quadrature in state_quadratures
@@ -1609,6 +1696,30 @@ def test_trajectory_state_key_alignment_uses_active_sparse_basis() -> None:
 
 
 def test_trajectory_transition_moments_are_reciprocal_edge_oriented() -> None:
+    random_generator = np.random.default_rng(1701)
+    frame_count = 96
+    center_count_per_state = 96
+    center_count = 2 * center_count_per_state
+    timestep_s = 1.0e-12
+    diffusion_m2_s = 1.0e-10
+    increments_m = random_generator.normal(
+        scale=np.sqrt(2.0 * diffusion_m2_s * timestep_s),
+        size=(frame_count - 1, center_count, 3),
+    )
+    polarizations_m = np.concatenate(
+        (np.zeros((1, center_count, 3)), np.cumsum(increments_m, axis=0)), axis=0
+    )
+    frame_indices = np.arange(frame_count)[:, np.newaxis]
+    center_indices = np.arange(center_count)[np.newaxis, :]
+    initial_state_indices = (center_indices >= center_count_per_state).astype(int)
+    switching_centers = (center_indices == 0) | (
+        center_indices == center_count_per_state
+    )
+    state_indices = np.where(
+        (frame_indices >= frame_count // 2) & switching_centers,
+        1 - initial_state_indices,
+        initial_state_indices,
+    )
     sample_input = TrajectoryMarkovAdditiveSampleInput(
         state_labels=("state_a", "state_b"),
         occupancy_state_index_by_observation=np.asarray([0, 1, 0, 1], dtype=int),
@@ -1618,9 +1729,15 @@ def test_trajectory_transition_moments_are_reciprocal_edge_oriented() -> None:
             [[2.0e-10, 0.0, 0.0], [-4.0e-10, 0.0, 0.0]],
             dtype=float,
         ),
-        self_charge_polarization_by_frame_and_center_m=np.zeros((5, 2, 3)),
-        state_index_by_frame_and_center=np.asarray(((0, 1),) * 5, dtype=int),
-        dt_s=1.0e-12,
+        self_charge_polarization_by_frame_and_center_m=polarizations_m,
+        state_index_by_frame_and_center=state_indices,
+        self_current_valid_step_by_center=np.ones(
+            (frame_count - 1, center_count), dtype=bool
+        ),
+        transition_commitment_time_s=timestep_s,
+        zero_frequency_integration_window_s=20.0e-12,
+        zero_frequency_plateau_window_s=5.0e-12,
+        dt_s=timestep_s,
         total_transport_concentration_mol_m3=1000.0,
         temperature_K=T_REF_K,
     )
@@ -1632,8 +1749,14 @@ def test_trajectory_transition_moments_are_reciprocal_edge_oriented() -> None:
     assert moment.from_state_label == "state_a"
     assert moment.to_state_label == "state_b"
     assert moment.sample_count == 2
+    expected_oriented_displacements_m = np.asarray(
+        (
+            increments_m[frame_count // 2 - 1, 0],
+            -increments_m[frame_count // 2 - 1, center_count_per_state],
+        )
+    )
     assert np.asarray(moment.mean_charge_displacement_m, dtype=float) == pytest.approx(
-        np.asarray([3.0e-10, 0.0, 0.0], dtype=float)
+        np.mean(expected_oriented_displacements_m, axis=0)
     )
     component_residual = primitive_set.diagnostics.component_drift_residuals[0]
     assert component_residual.weighted_drift_norm_mol_m2_s == pytest.approx(0.0)
@@ -2450,7 +2573,13 @@ def test_resistance_component_diagnostics_expose_finite_thickness_shape_drag() -
     )
 
     assert 0.0 < diagnostics.free_volume_trace_kg_s < diagnostics.stokes_trace_kg_s
-    assert diagnostics.charge_cloud_trace_kg_s > diagnostics.stokes_trace_kg_s
+    assert diagnostics.charge_cloud_trace_kg_s > 0.0
+    assert diagnostics.total_trace_kg_s == pytest.approx(
+        diagnostics.stokes_trace_kg_s
+        + diagnostics.free_volume_trace_kg_s
+        + diagnostics.charge_cloud_trace_kg_s
+        + diagnostics.atmosphere_trace_kg_s
+    )
     assert diagnostics.total_trace_kg_s == pytest.approx(
         diagnostics.stokes_trace_kg_s
         + diagnostics.free_volume_trace_kg_s

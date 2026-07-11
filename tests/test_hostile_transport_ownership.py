@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from pathlib import Path
 
 import numpy as np
 import pytest
 
 from conductivity.physical_library import generator_construction
+from conductivity.physical_library import physical_generator_builder
 from conductivity.physical_library import projected_analytical_conductivity as model
+from conductivity.physical_library.library_io import load_physical_library
 from conductivity.physical_library.reduced_generator import (
     ReducedGeneratorSpecification,
     ReducedStateQuadrature,
@@ -21,6 +24,10 @@ from conductivity.physical_library.transition_moment_bvp import (
 
 def _zero_potential_J_mol(point: np.ndarray) -> float:
     return 0.0
+
+
+def _offset_linear_potential_J_mol(point: np.ndarray) -> float:
+    return 100.0 + float(point[0])
 
 
 def _unit_mobility_tensor_m2_s(point: np.ndarray) -> np.ndarray:
@@ -208,6 +215,115 @@ def test_transport_ownership_rejects_source_cardinality_with_code(
             mobility_tensor_m2_s=np.eye(2),
             charge_polarization_gradient=np.zeros((3, 2)),
             ownership_basis=ownership_basis,
+        )
+
+
+def test_static_local_field_rows_are_not_mori_owners() -> None:
+    padded = physical_generator_builder._pad_transport_ownership_basis(
+        _empty_ownership_basis(2),
+        generator_dimension=7,
+        physical_position_coordinate_count=2,
+    )
+
+    assert padded.bounded_memory_mode_indices.size == 0
+    assert padded.bounded_memory_gradients.shape == (0, 7)
+
+
+def test_molecular_charge_center_excludes_rigid_internal_rotation() -> None:
+    identity = np.eye(3, dtype=float)
+    internal_rotation_mobility = np.block(
+        [[identity, -identity], [-identity, identity]]
+    )
+    center = generator_construction.MolecularChargeCenter(
+        label="anion:0",
+        formal_charge_number=-1.0,
+        site_indices=(0, 1),
+        center_of_mass_weights=(0.5, 0.5),
+    )
+
+    center_mobility = generator_construction._charged_center_mobility_matrix(
+        internal_rotation_mobility,
+        site_count=2,
+        charged_centers=(center,),
+    )
+
+    assert center_mobility == pytest.approx(np.zeros((1, 1)))
+
+
+def test_orientation_bins_preserve_unsplit_cosine_measure() -> None:
+    records = load_physical_library(
+        Path(__file__).resolve().parents[1] / "physical_library"
+    )
+    orientation_bins = records.basis_record["orientation_bins"]
+    values, weights = generator_construction._nodes_from_thresholds(
+        -1.0,
+        1.0,
+        [
+            orientation_bins["bridging_max"],
+            -float(orientation_bins["tangential_abs_max"]),
+            orientation_bins["tangential_abs_max"],
+            orientation_bins["radial_min"],
+        ],
+    )
+
+    assert values.size == 5
+    assert float(np.sum(weights)) == pytest.approx(2.0)
+
+
+def test_energy_reference_preserves_disconnected_basin_energy_difference() -> None:
+    state_quadratures = tuple(
+        ReducedStateQuadrature(
+            points=np.asarray([[coordinate]], dtype=float),
+            weights=np.asarray([1.0], dtype=float),
+            stoichiometry=np.asarray([1.0], dtype=float),
+            self_current_projector=np.eye(1, dtype=float),
+            transport_ownership_bases=(_empty_ownership_basis(1),),
+            relative_displacement_fluctuations_m=np.empty((0, 3), dtype=float),
+            relative_displacement_mobility_m2_s=np.empty((0, 0), dtype=float),
+            relative_center_charge_numbers=np.empty(0, dtype=float),
+        )
+        for coordinate in (2.0, 7.0)
+    )
+    specification = ReducedGeneratorSpecification(
+        potential_energy_J_mol=_offset_linear_potential_J_mol,
+        mobility_tensor_m2_s=_unit_mobility_tensor_m2_s,
+        charge_polarization_gradient=_zero_charge_gradient,
+        memory_coordinate_gradient=_empty_memory_gradient,
+        state_quadratures=state_quadratures,
+        transition_quadratures=(),
+        total_component_concentrations_mol_m3=np.asarray([1.0], dtype=float),
+        temperature_K=300.0,
+        volume_m3=1.0,
+    )
+
+    normalized = generator_construction._normalize_potential_energy_reference(
+        specification
+    )
+    normalized_energies = tuple(
+        normalized.potential_energy_J_mol(state.points[0])
+        for state in normalized.state_quadratures
+    )
+
+    assert normalized_energies == pytest.approx((0.0, 5.0))
+
+
+def test_mori_owner_consumer_closure_rejects_duplicate_owner() -> None:
+    with pytest.raises(
+        ValueError, match="^MORI_OWNER_CONSUMER_CLOSURE_DUPLICATE_OWNER$"
+    ):
+        model._validate_bounded_memory_owner_consumer_closure(
+            np.asarray([2, 2], dtype=int),
+            np.eye(2),
+            np.zeros((2, 3)),
+        )
+
+
+def test_mori_owner_consumer_closure_rejects_missing_A_h_row() -> None:
+    with pytest.raises(ValueError, match="mori_memory_matrix_A must have shape"):
+        model._validate_bounded_memory_owner_consumer_closure(
+            np.asarray([2, 3], dtype=int),
+            np.eye(1),
+            np.zeros((1, 3)),
         )
 
 

@@ -10,7 +10,10 @@ import numpy as np
 
 from constants import EPS_0, E_CHARGE, F, K_B, N_A, R
 from conductivity.physical_library.library_io import PhysicalLibraryRecords
-from utils.strict_validation import symmetric_psd_pseudoinverse_numpy
+from utils.strict_validation import (
+    symmetric_psd_numpy,
+    symmetric_psd_pseudoinverse_numpy,
+)
 
 Array = np.ndarray
 _BONDED_ENERGY_CACHE: dict[tuple, float] = {}
@@ -120,7 +123,6 @@ def build_physical_objects(
         records,
         configuration,
     )
-    cluster_energy_J_mol = compute_cluster_energy_J_mol(records, configuration)
     activity_energy_J_mol = compute_activity_energy_J_mol(
         records,
         configuration,
@@ -136,7 +138,6 @@ def build_physical_objects(
             + packing_energy_J_mol
             + coordination_energy_J_mol
             + solvation_energy_J_mol
-            + cluster_energy_J_mol
             + activity_energy_J_mol
         ),
         mobility_tensor_m2_s=compute_mobility_tensor_m2_s(
@@ -369,48 +370,6 @@ def compute_solvation_competition_energy_J_mol(
         stiffness_J_mol = float(competition_record["stiffness_J_mol"][switch_name])
         total_energy_J_mol += HARMONIC_PREFRACTOR * stiffness_J_mol * displacement * displacement
     return total_energy_J_mol
-
-
-def compute_cluster_energy_J_mol(
-    records: PhysicalLibraryRecords,
-    configuration: SiteConfiguration,
-) -> float:
-    if not _has_role(records, configuration, "cation"):
-        return 0.0
-    if not _has_role(records, configuration, "anion"):
-        return 0.0
-    pair_distance_m = _minimum_cation_acceptor_distance_m(records, configuration)
-    basin = assign_pair_basin(pair_distance_m, records.basis_record)
-    basin_energies = records.basis_record["free_energy_terms"]["pair_basin_J_mol"]
-    return float(basin_energies[basin.value])
-
-
-def _minimum_cation_acceptor_distance_m(
-    records: PhysicalLibraryRecords,
-    configuration: SiteConfiguration,
-) -> float:
-    cation_indices = tuple(
-        site_index
-        for site_index, species_name in enumerate(configuration.species_names)
-        if str(records.species_records[species_name]["role"]) == "cation"
-    )
-    acceptor_indices = tuple(
-        site_index
-        for site_index, species_name in enumerate(configuration.species_names)
-        if str(records.species_records[species_name]["role"]) == "anion"
-        and bool(_site_record(records, configuration, site_index)["acceptor_flag"])
-    )
-    if not cation_indices or not acceptor_indices:
-        raise ValueError("cluster pair distance requires cation and anion acceptor sites")
-    return min(
-        _minimum_image_distance_m(
-            configuration.positions_m[cation_index],
-            configuration.positions_m[acceptor_index],
-            configuration.box_lengths_m,
-        )
-        for cation_index in cation_indices
-        for acceptor_index in acceptor_indices
-    )
 
 
 def compute_activity_energy_J_mol(
@@ -849,7 +808,7 @@ def _rigid_molecule_geometry(
     species_name: str,
     molecule_id: int,
 ) -> tuple[tuple[int, ...], Array, float, Array]:
-    site_indices, _mass_fractions = _molecule_site_indices_and_mass_fractions(
+    site_indices, _mass_fractions = molecule_site_indices_and_mass_fractions(
         records,
         configuration,
         species_name,
@@ -964,13 +923,17 @@ def compute_resistance_tensor_kg_s(
             local_packing_fraction,
         )
         additional_drag_kg_s += _charge_cloud_drag_kg_s(
-            site_record,
+            float(site_record["hydrodynamic_radius_m"]),
+            float(site_record["charge_cloud_radius_m"]),
             stokes_drag_kg_s,
             _effective_charge_cloud_number(records, configuration, site_index),
             kappa_m_inv,
             dielectric_constant,
             temperature_K,
-            _site_internal_charge_response_multiplier(records, configuration, site_index),
+            _short_range_wavevector_fraction(
+                kappa_m_inv,
+                float(site_record["charge_cloud_radius_m"]),
+            ),
         )
         start = CARTESIAN_DIMENSION * site_index
         stop = start + CARTESIAN_DIMENSION
@@ -1021,13 +984,17 @@ def compute_resistance_component_diagnostics(
             local_packing_fraction,
         )
         charge_cloud_trace_kg_s += CARTESIAN_DIMENSION * _charge_cloud_drag_kg_s(
-            site_record,
+            float(site_record["hydrodynamic_radius_m"]),
+            float(site_record["charge_cloud_radius_m"]),
             stokes_drag_kg_s,
             _effective_charge_cloud_number(records, configuration, site_index),
             kappa_m_inv,
             dielectric_constant,
             temperature_K,
-            _site_internal_charge_response_multiplier(records, configuration, site_index),
+            _short_range_wavevector_fraction(
+                kappa_m_inv,
+                float(site_record["charge_cloud_radius_m"]),
+            ),
         )
     atmosphere_diagnostics = compute_atmosphere_resistance_diagnostics(
         records,
@@ -1086,13 +1053,21 @@ def compute_atmosphere_resistance_diagnostics(
         if _site_formal_charge_number(records, configuration, site_index) != 0.0
     )
     if kappa_m_inv == 0.0 or not charged_site_indices:
-        return _zero_atmosphere_diagnostics(zero_tensor)
+        return AtmosphereResistanceDiagnostics(
+            atmosphere_resistance_tensor_kg_s=zero_tensor,
+            electrophoretic_resistance_tensor_kg_s=zero_tensor.copy(),
+            relaxation_resistance_tensor_kg_s=zero_tensor.copy(),
+            cation_diagonal_resistance_trace_kg_s=0.0,
+            anion_diagonal_resistance_trace_kg_s=0.0,
+            cation_anion_cross_resistance_trace_kg_s=0.0,
+            mean_charge_cloud_form_factor=0.0,
+            mean_state_geometry_form_factor=0.0,
+            minimum_separation_over_debye_length=math.inf,
+            debye_falkenhagen_time_s=0.0,
+        )
     atmosphere_record = records.mixture_record["atmosphere"]
     required_keys = (
         "response_model",
-        "electrophoretic_amplitude",
-        "relaxation_amplitude",
-        "chemical_relaxation_time_s",
         "maximum_wavevector_integer",
         "provenance",
         "fitted_to_conductivity",
@@ -1100,22 +1075,10 @@ def compute_atmosphere_resistance_diagnostics(
     missing_keys = tuple(key for key in required_keys if key not in atmosphere_record)
     if missing_keys:
         raise KeyError(f"mixture.atmosphere missing required keys {missing_keys}")
-    if atmosphere_record["response_model"] != "finite_wavevector_pnp_stokes_provisional":
+    if atmosphere_record["response_model"] != "finite_wavevector_pnp_stokes":
         raise ValueError("unsupported atmosphere response model")
     if bool(atmosphere_record["fitted_to_conductivity"]):
         raise ValueError("atmosphere response may not be fitted to conductivity")
-    electrophoretic_amplitude = _positive_float(
-        atmosphere_record["electrophoretic_amplitude"],
-        "atmosphere.electrophoretic_amplitude",
-    )
-    relaxation_amplitude = _positive_float(
-        atmosphere_record["relaxation_amplitude"],
-        "atmosphere.relaxation_amplitude",
-    )
-    chemical_relaxation_time_s = _positive_float(
-        atmosphere_record["chemical_relaxation_time_s"],
-        "atmosphere.chemical_relaxation_time_s",
-    )
     maximum_wavevector_integer = int(atmosphere_record["maximum_wavevector_integer"])
     if maximum_wavevector_integer <= 0:
         raise ValueError("atmosphere.maximum_wavevector_integer must be positive")
@@ -1138,16 +1101,33 @@ def compute_atmosphere_resistance_diagnostics(
     ambipolar_diffusivity_m2_s = float(
         np.dot(charge_weights, site_diffusivities_m2_s) / np.sum(charge_weights)
     )
-    electrophoretic_tensor = np.zeros(matrix_shape, dtype=float)
-    relaxation_tensor = np.zeros(matrix_shape, dtype=float)
+    debye_falkenhagen_time_s = UNITY / (
+        ambipolar_diffusivity_m2_s * kappa_m_inv * kappa_m_inv
+    )
+    charged_matrix_shape = (
+        CARTESIAN_DIMENSION * len(charged_site_indices),
+        CARTESIAN_DIMENSION * len(charged_site_indices),
+    )
+    charged_electrophoretic_tensor = np.zeros(charged_matrix_shape, dtype=float)
+    charged_relaxation_tensor = np.zeros(charged_matrix_shape, dtype=float)
     cloud_form_factors: list[float] = []
     geometry_form_factors: list[float] = []
     wavevectors_m_inv = _periodic_wavevectors_m_inv(
         np.asarray(configuration.box_lengths_m, dtype=float),
         maximum_wavevector_integer,
     )
+    screening_arguments = kappa_m_inv * cloud_radii_m
+    atmosphere_formation_activation = float(
+        np.mean(
+            screening_arguments
+            * screening_arguments
+            / (UNITY + screening_arguments * screening_arguments)
+        )
+    )
     for wavevector_m_inv in wavevectors_m_inv:
         wavevector_norm_m_inv = float(np.linalg.norm(wavevector_m_inv))
+        if wavevector_norm_m_inv > kappa_m_inv:
+            continue
         direction = wavevector_m_inv / wavevector_norm_m_inv
         longitudinal_projector = np.outer(direction, direction)
         transverse_projector = np.eye(CARTESIAN_DIMENSION) - longitudinal_projector
@@ -1155,7 +1135,7 @@ def compute_atmosphere_resistance_diagnostics(
         phases = positions_m @ wavevector_m_inv
         cloud_factors = np.exp(
             -HARMONIC_PREFRACTOR
-            * wavevector_squared_m_inv2
+            * (wavevector_squared_m_inv2 + kappa_m_inv * kappa_m_inv)
             * cloud_radii_m
             * cloud_radii_m
         )
@@ -1165,39 +1145,63 @@ def compute_atmosphere_resistance_diagnostics(
             np.sqrt(stokes_drags_kg_s[:, None] * stokes_drags_kg_s[None, :])
             * form_factor_matrix
         )
-        screened_shape = (
-            wavevector_squared_m_inv2
+        screened_activation = (
+            kappa_m_inv
             * kappa_m_inv
-            * kappa_m_inv
-            / (wavevector_squared_m_inv2 + kappa_m_inv * kappa_m_inv) ** 2
+            / (wavevector_squared_m_inv2 + kappa_m_inv * kappa_m_inv)
         )
-        electrophoretic_kernel = electrophoretic_amplitude * screened_shape
+        electrophoretic_kernel = atmosphere_formation_activation * screened_activation
+        mode_relaxation_time_s = UNITY / (
+            ambipolar_diffusivity_m2_s
+            * (wavevector_squared_m_inv2 + kappa_m_inv * kappa_m_inv)
+        )
         relaxation_kernel = (
-            relaxation_amplitude
-            * screened_shape
-            / (
-                UNITY
-                + chemical_relaxation_time_s
-                * ambipolar_diffusivity_m2_s
-                * wavevector_squared_m_inv2
-            )
+            atmosphere_formation_activation
+            * screened_activation
+            * mode_relaxation_time_s
+            / debye_falkenhagen_time_s
         )
         mode_weight = UNITY / float(len(wavevectors_m_inv))
-        electrophoretic_tensor += mode_weight * np.kron(
+        charged_electrophoretic_tensor += mode_weight * np.kron(
             drag_weighted_form_factor,
             electrophoretic_kernel * transverse_projector,
         )
-        relaxation_tensor += mode_weight * np.kron(
+        charged_relaxation_tensor += mode_weight * np.kron(
             drag_weighted_form_factor,
             relaxation_kernel * longitudinal_projector,
         )
         cloud_form_factors.append(float(np.mean(cloud_factors)))
         geometry_form_factors.append(float(np.mean(np.abs(charge_mode) ** 2)))
-    electrophoretic_tensor = _symmetrize(electrophoretic_tensor)
-    relaxation_tensor = _symmetrize(relaxation_tensor)
-    validate_psd(electrophoretic_tensor, "electrophoretic atmosphere resistance", allow_zero=True)
-    validate_psd(relaxation_tensor, "relaxation atmosphere resistance", allow_zero=True)
-    total_tensor = _symmetrize(electrophoretic_tensor + relaxation_tensor)
+    charged_coordinate_indices = np.concatenate(
+        tuple(
+            np.arange(
+                CARTESIAN_DIMENSION * site_index,
+                CARTESIAN_DIMENSION * (site_index + 1),
+                dtype=int,
+            )
+            for site_index in charged_site_indices
+        )
+    )
+    electrophoretic_tensor = np.zeros(matrix_shape, dtype=float)
+    relaxation_tensor = np.zeros(matrix_shape, dtype=float)
+    electrophoretic_tensor[
+        np.ix_(charged_coordinate_indices, charged_coordinate_indices)
+    ] = charged_electrophoretic_tensor
+    relaxation_tensor[
+        np.ix_(charged_coordinate_indices, charged_coordinate_indices)
+    ] = charged_relaxation_tensor
+    electrophoretic_tensor = symmetric_psd_numpy(
+        electrophoretic_tensor,
+        "electrophoretic atmosphere resistance",
+    )
+    relaxation_tensor = symmetric_psd_numpy(
+        relaxation_tensor,
+        "relaxation atmosphere resistance",
+    )
+    total_tensor = symmetric_psd_numpy(
+        electrophoretic_tensor + relaxation_tensor,
+        "total atmosphere resistance",
+    )
     cation_coordinate_indices = _charged_role_coordinate_indices(
         records, configuration, site_records, "cation"
     )
@@ -1221,28 +1225,16 @@ def compute_atmosphere_resistance_diagnostics(
         cation_anion_cross_resistance_trace_kg_s=_cross_block_sum(
             total_tensor, cation_coordinate_indices, anion_coordinate_indices
         ),
-        mean_charge_cloud_form_factor=float(np.mean(cloud_form_factors)),
-        mean_state_geometry_form_factor=float(np.mean(geometry_form_factors)),
+        mean_charge_cloud_form_factor=(
+            float(np.mean(cloud_form_factors)) if cloud_form_factors else 0.0
+        ),
+        mean_state_geometry_form_factor=(
+            float(np.mean(geometry_form_factors)) if geometry_form_factors else 0.0
+        ),
         minimum_separation_over_debye_length=_minimum_scaled_nonself_distance(
             charged_distances_m, kappa_m_inv
         ),
-        debye_falkenhagen_time_s=UNITY
-        / (ambipolar_diffusivity_m2_s * kappa_m_inv * kappa_m_inv),
-    )
-
-
-def _zero_atmosphere_diagnostics(zero_tensor: Array) -> AtmosphereResistanceDiagnostics:
-    return AtmosphereResistanceDiagnostics(
-        atmosphere_resistance_tensor_kg_s=zero_tensor,
-        electrophoretic_resistance_tensor_kg_s=zero_tensor.copy(),
-        relaxation_resistance_tensor_kg_s=zero_tensor.copy(),
-        cation_diagonal_resistance_trace_kg_s=0.0,
-        anion_diagonal_resistance_trace_kg_s=0.0,
-        cation_anion_cross_resistance_trace_kg_s=0.0,
-        mean_charge_cloud_form_factor=0.0,
-        mean_state_geometry_form_factor=0.0,
-        minimum_separation_over_debye_length=math.inf,
-        debye_falkenhagen_time_s=0.0,
+        debye_falkenhagen_time_s=debye_falkenhagen_time_s,
     )
 
 
@@ -1367,7 +1359,7 @@ def compute_charge_polarization_gradient(
         formal_charge_number = float(records.species_records[species_name]["formal_charge_e"])
         if formal_charge_number == 0.0:
             continue
-        site_indices, mass_fractions = _molecule_site_indices_and_mass_fractions(
+        site_indices, mass_fractions = molecule_site_indices_and_mass_fractions(
             records,
             configuration,
             species_name,
@@ -1413,7 +1405,7 @@ def molecule_center_of_mass_m(
     species_name: str,
     molecule_id: int,
 ) -> Array:
-    site_indices, mass_fractions = _molecule_site_indices_and_mass_fractions(
+    site_indices, mass_fractions = molecule_site_indices_and_mass_fractions(
         records,
         configuration,
         species_name,
@@ -1427,7 +1419,7 @@ def molecule_center_of_mass_m(
     )
 
 
-def _molecule_site_indices_and_mass_fractions(
+def molecule_site_indices_and_mass_fractions(
     records: PhysicalLibraryRecords,
     configuration: SiteConfiguration,
     species_name: str,
@@ -1540,10 +1532,11 @@ def _coordination_number(
     ligand_roles = tuple(str(ligand_role) for ligand_role in switch_record["ligand_roles"])
     switch_radius_m = float(switch_record["r0_m"])
     exponent = float(switch_record["exponent"])
+    aggregation = str(switch_record["aggregation"])
     if not _has_role(records, configuration, center_role):
         return 0.0
     center_index = _first_role_index(records, configuration, center_role)
-    coordination_number = 0.0
+    site_switch_values_by_molecule: dict[tuple[str, int], list[float]] = {}
     for site_index, species_name in enumerate(configuration.species_names):
         if site_index == center_index:
             continue
@@ -1556,8 +1549,25 @@ def _coordination_number(
         )
         if distance_m <= ZERO_DISTANCE_TOLERANCE_M:
             raise ValueError("coordination distance is zero")
-        coordination_number += UNITY / (UNITY + (distance_m / switch_radius_m) ** exponent)
-    return coordination_number
+        molecule_key = (species_name, int(configuration.molecule_ids[site_index]))
+        site_switch_values_by_molecule.setdefault(molecule_key, []).append(
+            UNITY / (UNITY + (distance_m / switch_radius_m) ** exponent)
+        )
+    if aggregation == "site_sum":
+        return float(
+            sum(
+                sum(site_switch_values)
+                for site_switch_values in site_switch_values_by_molecule.values()
+            )
+        )
+    if aggregation == "molecule_max_site_sum":
+        return float(
+            sum(
+                max(site_switch_values)
+                for site_switch_values in site_switch_values_by_molecule.values()
+            )
+        )
+    raise ValueError(f"unsupported coordination aggregation {aggregation}")
 
 
 def _first_role_index(
@@ -1615,31 +1625,31 @@ def _free_volume_drag_kg_s(
 
 
 def _charge_cloud_drag_kg_s(
-    site_record: dict,
+    hydrodynamic_radius_m: float,
+    charge_cloud_radius_m: float,
     stokes_drag_kg_s: float,
     effective_charge_number: float,
     kappa_m_inv: float,
     dielectric_constant: float,
     temperature_K: float,
-    internal_charge_response_multiplier: float,
+    short_range_wavevector_fraction: float,
 ) -> float:
     charge_number = abs(effective_charge_number)
     if charge_number == 0.0:
         return 0.0
     if stokes_drag_kg_s <= 0.0:
         raise ValueError("stokes_drag_kg_s must be positive")
-    cloud_radius_m = float(site_record["charge_cloud_radius_m"])
+    cloud_radius_m = float(charge_cloud_radius_m)
     if cloud_radius_m <= 0.0:
         raise ValueError("charge_cloud_radius_m must be positive")
     screen_argument = kappa_m_inv * cloud_radius_m
     screen_factor = screen_argument * screen_argument / (
         UNITY + screen_argument * screen_argument
     )
-    hydrodynamic_radius_m = float(site_record["hydrodynamic_radius_m"])
     if hydrodynamic_radius_m <= 0.0:
         raise ValueError("hydrodynamic_radius_m must be positive")
-    if internal_charge_response_multiplier <= 0.0:
-        raise ValueError("internal_charge_response_multiplier must be positive")
+    if not 0.0 <= short_range_wavevector_fraction <= UNITY:
+        raise ValueError("short_range_wavevector_fraction must be between zero and one")
     cloud_geometry_factor = hydrodynamic_radius_m / cloud_radius_m
     bjerrum_length_m = _bjerrum_length_m(dielectric_constant, temperature_K)
     electrostatic_coupling = bjerrum_length_m / cloud_radius_m
@@ -1651,7 +1661,78 @@ def _charge_cloud_drag_kg_s(
         * cloud_geometry_factor
         * electrostatic_cloud_factor
         * screen_factor
-        * internal_charge_response_multiplier
+        * short_range_wavevector_fraction
+    )
+
+
+def _short_range_wavevector_fraction(
+    kappa_m_inv: float,
+    charge_cloud_radius_m: float,
+) -> float:
+    if kappa_m_inv < 0.0:
+        raise ValueError("kappa_m_inv must be nonnegative")
+    if charge_cloud_radius_m <= 0.0:
+        raise ValueError("charge_cloud_radius_m must be positive")
+    if kappa_m_inv == 0.0:
+        return UNITY
+    scaled_cutoff = kappa_m_inv * charge_cloud_radius_m
+    return float(
+        math.erfc(scaled_cutoff)
+        + 2.0
+        * scaled_cutoff
+        * math.exp(-scaled_cutoff * scaled_cutoff)
+        / math.sqrt(math.pi)
+    )
+
+
+def _effective_charge_cloud_number(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+    site_index: int,
+) -> float:
+    species_name = configuration.species_names[site_index]
+    species_record = records.species_records[species_name]
+    formal_charge_number = float(species_record["formal_charge_e"])
+    if formal_charge_number == 0.0:
+        return 0.0
+    molecule_site_indices = _site_indices_for_molecule(
+        configuration,
+        species_name,
+        int(configuration.molecule_ids[site_index]),
+    )
+    absolute_partial_charges = np.asarray(
+        [
+            abs(
+                float(
+                    _site_record(records, configuration, molecule_site_index)[
+                        "charge_number"
+                    ]
+                )
+            )
+            for molecule_site_index in molecule_site_indices
+        ],
+        dtype=float,
+    )
+    partial_charge_total = float(np.sum(absolute_partial_charges))
+    if partial_charge_total == 0.0:
+        raise ValueError("formally charged molecule has no charged force-field sites")
+    site_partial_charge = abs(
+        float(_site_record(records, configuration, site_index)["charge_number"])
+    )
+    return abs(formal_charge_number) * site_partial_charge / partial_charge_total
+
+
+def _species_absolute_partial_charge_sum(species_record: dict) -> float:
+    return float(
+        np.sum(
+            np.asarray(
+                [
+                    abs(float(site_record["charge_number"]))
+                    for site_record in species_record["sites"]
+                ],
+                dtype=float,
+            )
+        )
     )
 
 
@@ -1706,78 +1787,6 @@ def _site_formal_charge_number(
 ) -> float:
     species_name = configuration.species_names[site_index]
     return float(records.species_records[species_name]["formal_charge_e"])
-
-
-def _effective_charge_cloud_number(
-    records: PhysicalLibraryRecords,
-    configuration: SiteConfiguration,
-    site_index: int,
-) -> float:
-    species_name = configuration.species_names[site_index]
-    species_record = records.species_records[species_name]
-    formal_charge_number = float(species_record["formal_charge_e"])
-    if formal_charge_number == 0.0:
-        return 0.0
-    molecule_site_indices = _site_indices_for_molecule(
-        configuration,
-        species_name,
-        int(configuration.molecule_ids[site_index]),
-    )
-    absolute_partial_charges = np.asarray(
-        [
-            abs(
-                float(
-                    _site_record(records, configuration, molecule_site_index)[
-                        "charge_number"
-                    ]
-                )
-            )
-            for molecule_site_index in molecule_site_indices
-        ],
-        dtype=float,
-    )
-    partial_charge_total = float(np.sum(absolute_partial_charges))
-    if partial_charge_total == 0.0:
-        raise ValueError("formally charged molecule has no charged force-field sites")
-    site_partial_charge = abs(
-        float(_site_record(records, configuration, site_index)["charge_number"])
-    )
-    return abs(formal_charge_number) * site_partial_charge / partial_charge_total
-
-
-def _site_internal_charge_response_multiplier(
-    records: PhysicalLibraryRecords,
-    configuration: SiteConfiguration,
-    site_index: int,
-) -> float:
-    species_name = configuration.species_names[site_index]
-    species_record = records.species_records[species_name]
-    formal_charge_number = abs(float(species_record["formal_charge_e"]))
-    if formal_charge_number == 0.0:
-        return UNITY
-    if str(species_record["role"]) != "anion":
-        return UNITY
-    absolute_partial_charge_sum = _species_absolute_partial_charge_sum(species_record)
-    normalized_partial_charge_sum = max(
-        absolute_partial_charge_sum,
-        formal_charge_number,
-    )
-    charge_participation_fraction = formal_charge_number / normalized_partial_charge_sum
-    return charge_participation_fraction * charge_participation_fraction
-
-
-def _species_absolute_partial_charge_sum(species_record: dict) -> float:
-    return float(
-        np.sum(
-            np.asarray(
-                [
-                    abs(float(site_record["charge_number"]))
-                    for site_record in species_record["sites"]
-                ],
-                dtype=float,
-            )
-        )
-    )
 
 
 def _debye_kappa_m_inv(

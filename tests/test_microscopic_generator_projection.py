@@ -15,14 +15,28 @@ from conductivity.physical_library.trajectory_primitives import (
 
 def test_sampled_trajectory_projection_exposes_reversible_primitives() -> None:
     frame_count = 96
-    state_index_by_frame_and_center = np.tile(
-        np.asarray([[0, 1]], dtype=int),
-        (frame_count, 1),
+    state_index_by_frame_and_center = np.concatenate(
+        (
+            np.tile(np.asarray([[0, 1]], dtype=int), (frame_count // 2, 1)),
+            np.tile(np.asarray([[1, 0]], dtype=int), (frame_count // 2, 1)),
+        ),
+        axis=0,
     )
     random_generator = np.random.default_rng(1742)
-    polarization_increments_m = random_generator.normal(
-        scale=1.0e-11,
-        size=(frame_count - 1, 2, 3),
+    transition_frame = frame_count // 2
+    polarization_increments_m = np.concatenate(
+        (
+            random_generator.normal(
+                scale=1.0e-11,
+                size=(transition_frame - 1, 2, 3),
+            ),
+            np.asarray([[[2.0e-10, 0.0, 0.0], [-2.0e-10, 0.0, 0.0]]]),
+            random_generator.normal(
+                scale=1.0e-11,
+                size=(frame_count - transition_frame - 1, 2, 3),
+            ),
+        ),
+        axis=0,
     )
     charge_polarization_by_frame_and_center_m = np.concatenate(
         (
@@ -40,6 +54,9 @@ def test_sampled_trajectory_projection_exposes_reversible_primitives() -> None:
             [[2.0e-10, 0.0, 0.0], [-2.0e-10, 0.0, 0.0]],
             dtype=float,
         ),
+        transition_commitment_time_s=1.0e-12,
+        zero_frequency_integration_window_s=20.0e-12,
+        zero_frequency_plateau_window_s=5.0e-12,
         dt_s=1.0e-12,
         total_transport_concentration_mol_m3=1000.0,
         temperature_K=T_REF_K,
@@ -47,6 +64,9 @@ def test_sampled_trajectory_projection_exposes_reversible_primitives() -> None:
             charge_polarization_by_frame_and_center_m
         ),
         state_index_by_frame_and_center=state_index_by_frame_and_center,
+        self_current_valid_step_by_center=np.ones(
+            (frame_count - 1, 2), dtype=bool
+        ),
     )
 
     primitive_set = project_sampled_trajectory_to_generator_primitives(sample_input)
@@ -55,7 +75,12 @@ def test_sampled_trajectory_projection_exposes_reversible_primitives() -> None:
     assert primitive_set.state_concentrations_mol_m3["free_ion_center:Li+"] == 500.0
     assert len(primitive_set.reactive_fluxes) == 1
     assert len(primitive_set.conditional_displacement_moments) == 1
-    assert primitive_set.diagnostics.component_drift_residuals[0].weighted_drift_norm_mol_m2_s == 0.0
+    drift_residual = primitive_set.diagnostics.component_drift_residuals[0]
+    assert drift_residual.weighted_drift_norm_mol_m2_s <= (
+        64.0
+        * np.finfo(float).eps
+        * drift_residual.weighted_absolute_drift_scale_mol_m2_s
+    )
 
 
 def test_projected_primitive_input_returns_c_k_q_m_and_self_current() -> None:

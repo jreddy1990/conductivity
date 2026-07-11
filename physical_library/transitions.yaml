@@ -14,6 +14,12 @@ families:
 - atmosphere_capture_release
 numerical_method: committor finite-element capacity solve plus deterministic Doob-conditioned endpoint
   moment boundary-value solves
+trajectory_projection:
+  commitment_time_s: 5.0e-12
+  recrossing_window_s: 5.0e-12
+  endpoint_persistence_condition: uninterrupted_destination_residence
+  zero_frequency_integration_window_s: 2.0e-11
+  zero_frequency_plateau_window_s: 5.0e-12
 transition_records:
   free_to_SSIP:
     transport_ownership: bounded_memory
