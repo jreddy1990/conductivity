@@ -14,6 +14,7 @@ from conductivity.physical_library.projected_analytical_conductivity import (
     compute_finite_state_memory_correction,
     compute_projected_analytical_conductivity_from_primitives,
     compute_reversible_generator,
+    primitive_prediction_readiness_as_effect_attribution,
     validate_primitive_input,
     validate_reversible_generator,
 )
@@ -43,6 +44,28 @@ BASIS_REFINEMENT_CONVERGED = "converged"
 PRIMITIVE_PREDICTION_COMPLETE = "complete"
 PRIMITIVE_PREDICTION_SCALAR_LABEL = "primitive_prediction"
 FINITE_PROCESS_LEGAL_DETAIL = "finite_process_legal"
+CANONICAL_SIGMA_FIELDS = ("sigma_mS_cm", "sigma_S_m")
+TRAJECTORY_ONLY_EDGE_DIAGNOSTIC_FIELDS = frozenset(
+    ("forward_sample_count", "reverse_sample_count", "missing_reverse_event_candidate")
+)
+DIRECT_PRIMITIVE_AUDIT_FIELDS = (
+    "B_self_full_tensor_mol_m_s",
+    "B_self_full_trace_mol_m_s",
+    "B_self_tangent_tensor_mol_m_s",
+    "B_self_tangent_trace_mol_m_s",
+    "B_transition_tensor_mol_m_s",
+    "B_transition_trace_mol_m_s",
+    "B_overlap_removed_tensor_mol_m_s",
+    "B_overlap_removed_trace_mol_m_s",
+    "B_total_tensor_mol_m_s",
+    "B_total_trace_mol_m_s",
+    "state_drift_b_i_m_s",
+    "state_exit_rates_s_inv",
+    "state_drift_b_i_norms_m_s",
+    "state_drift_components",
+    "C_Q_contribution_tensor_mol_m_s",
+    "C_Q_contribution_trace_mol_m_s",
+)
 
 
 @dataclass(frozen=True)
@@ -75,6 +98,7 @@ def read_projected_primitive_yaml(path: Path) -> ProjectedPrimitiveArtifact:
             f"{path} projected_readout_status must be one of "
             f"{VALID_PROJECTED_READOUT_STATUSES}, got {projected_readout_status}"
         )
+    _validate_canonical_sigma_field_legality(record, projected_readout_status, path)
     if projected_readout_status == PROJECTED_READOUT_FAILED:
         failure_reason = str(record["failure_reason"])
         diagnostics = record["diagnostics"]
@@ -101,7 +125,6 @@ def read_projected_primitive_yaml(path: Path) -> ProjectedPrimitiveArtifact:
             f"{projected_readout_status}; direct_only_reasons={direct_only_reasons}"
         )
     _validate_succeeded_artifact_diagnostics(record, path)
-    _projected_sigma_mS_cm(record, path)
     state_labels = tuple(str(label) for label in record["state_labels"])
     primitives = record["primitives"]
     memory_matrix_A = _array(
@@ -143,6 +166,24 @@ def read_projected_primitive_yaml(path: Path) -> ProjectedPrimitiveArtifact:
         volume_m3=float(record["volume_m3"]),
     )
     validate_projected_primitive_artifact_input(primitive_input)
+    recomputed_result = compute_projected_analytical_conductivity_from_primitives(
+        primitive_input.state_concentrations_mol_m3,
+        primitive_input.symmetric_capacity_fluxes_K_ij_mol_m3_s,
+        primitive_input.transition_first_moments_d_ij_m,
+        primitive_input.transition_second_moments_M_ij_m2,
+        primitive_input.self_current_tensors_D_self_i_m2_s,
+        primitive_input.mori_memory_matrix_A,
+        primitive_input.mori_current_coupling_matrix_h,
+        primitive_input.temperature_K,
+        primitive_input.volume_m3,
+    )
+    _validate_succeeded_artifact_readout(
+        record,
+        path,
+        state_labels,
+        primitive_input,
+        recomputed_result,
+    )
     return ProjectedPrimitiveArtifact(
         schema=schema,
         state_labels=state_labels,
@@ -208,6 +249,9 @@ def write_projected_primitive_yaml(
     """Write projected primitive tensors and readout diagnostics to YAML."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
+    projected_readout_status = _projected_readout_status_from_result(
+        conductivity_result
+    )
     record = {
         "schema": PRIMITIVE_SCHEMA,
         "state_labels": list(state_labels),
@@ -243,15 +287,24 @@ def write_projected_primitive_yaml(
                 dtype=float,
             ).tolist(),
         },
-        "projected_readout_status": _projected_readout_status_from_result(
-            conductivity_result
-        ),
-        "sigma_mS_cm": float(conductivity_result.sigma_mS_cm),
-        "sigma_S_m": float(conductivity_result.sigma_S_m),
+        "projected_readout_status": projected_readout_status,
     }
+    if record["projected_readout_status"] == PROJECTED_READOUT_SUCCEEDED:
+        record.update(
+            {
+                "sigma_mS_cm": float(conductivity_result.sigma_mS_cm),
+                "sigma_S_m": float(conductivity_result.sigma_S_m),
+            }
+        )
     record["diagnostics"] = _primitive_artifact_diagnostics(
         tuple(str(label) for label in state_labels),
         primitive_input,
+    )
+    _persist_prediction_readiness_diagnostics(
+        record["diagnostics"], conductivity_result.effect_attribution
+    )
+    _persist_direct_primitive_audit_diagnostics(
+        record["diagnostics"], conductivity_result.effect_attribution
     )
     if record["projected_readout_status"] == PROJECTED_READOUT_DIRECT_ONLY:
         record["diagnostics"].update(
@@ -1032,6 +1085,8 @@ def _array(value, label: str) -> Array:
 
 def _validate_succeeded_artifact_diagnostics(record: dict, path: Path) -> None:
     diagnostics = record["diagnostics"]
+    if record.get("source_schema") == "projected_primitives_from_lammps_trajectory_v1":
+        _validate_succeeded_trajectory_basis_refinement(diagnostics, path)
     component_drift_residuals = _required_component_drift_residual_records(
         diagnostics,
         "component_drift_residuals",
@@ -1057,6 +1112,221 @@ def _validate_succeeded_artifact_diagnostics(record: dict, path: Path) -> None:
         )
         if not np.isfinite(weighted_drift_norm):
             raise ValueError(f"{path} component drift residual norm must be finite")
+
+
+def _validate_succeeded_artifact_readout(
+    record: dict,
+    path: Path,
+    state_labels: tuple[str, ...],
+    primitive_input: ProjectedPrimitiveInput,
+    recomputed_result: ProjectedConductivityResult,
+) -> None:
+    stored_diagnostics = record["diagnostics"]
+    recomputed_effect_attribution = dict(recomputed_result.effect_attribution)
+    recomputed_effect_attribution.update(
+        _stored_basis_refinement_effect_attribution(stored_diagnostics)
+    )
+    recomputed_effect_attribution.update(
+        primitive_prediction_readiness_as_effect_attribution(
+            recomputed_effect_attribution
+        )
+    )
+    recomputed_status = _projected_readout_status_from_effect_attribution(
+        recomputed_effect_attribution
+    )
+    stored_status = str(record["projected_readout_status"])
+    if stored_status != recomputed_status:
+        raise ValueError(
+            f"{path} projected_readout_status mismatch: stored {stored_status}, "
+            f"recomputed {recomputed_status}"
+        )
+    _validate_stored_prediction_readiness(
+        stored_diagnostics, recomputed_effect_attribution, path
+    )
+    _validate_stored_direct_primitive_audit(
+        stored_diagnostics, recomputed_effect_attribution, path
+    )
+    stored_sigma_mS_cm = _projected_sigma_mS_cm(record, path)
+    stored_sigma_S_m = float(record["sigma_S_m"])
+    if not np.isfinite(stored_sigma_S_m):
+        raise ValueError(f"{path} sigma_S_m must be finite")
+    if stored_sigma_mS_cm != recomputed_result.sigma_mS_cm:
+        raise ValueError(
+            f"{path} sigma_mS_cm mismatch: stored {stored_sigma_mS_cm}, "
+            f"recomputed {recomputed_result.sigma_mS_cm}"
+        )
+    if stored_sigma_S_m != recomputed_result.sigma_S_m:
+        raise ValueError(
+            f"{path} sigma_S_m mismatch: stored {stored_sigma_S_m}, "
+            f"recomputed {recomputed_result.sigma_S_m}"
+        )
+    recomputed_diagnostics = _primitive_artifact_diagnostics(
+        state_labels,
+        primitive_input,
+    )
+    for diagnostic_name, recomputed_diagnostic in recomputed_diagnostics.items():
+        stored_recomputed_view = _recomputed_diagnostic_view(
+            stored_diagnostics[diagnostic_name]
+        )
+        recomputed_view = _recomputed_diagnostic_view(recomputed_diagnostic)
+        if stored_recomputed_view != recomputed_view:
+            raise ValueError(
+                f"{path} diagnostics mismatch for {diagnostic_name}"
+            )
+
+
+def _persist_prediction_readiness_diagnostics(
+    diagnostics: dict, effect_attribution: dict
+) -> None:
+    basis_fields = (
+        "basis_refinement_convergence_status",
+        "basis_refinement_not_complete_reasons",
+        "basis_refinement_hard_convergence_failure",
+    )
+    if "basis_refinement_convergence_status" in effect_attribution:
+        for field_name in basis_fields:
+            diagnostics[field_name] = effect_attribution[field_name]
+    else:
+        diagnostics.update(
+            {
+                "basis_refinement_convergence_status": "not_run",
+                "basis_refinement_not_complete_reasons": (
+                    "basis_refinement_not_run",
+                ),
+                "basis_refinement_hard_convergence_failure": True,
+            }
+        )
+    for field_name in (
+        "primitive_prediction_readiness_status",
+        "primitive_prediction_scalar_label",
+        "primitive_prediction_not_complete_reasons",
+    ):
+        diagnostics[field_name] = effect_attribution[field_name]
+
+
+def _persist_direct_primitive_audit_diagnostics(
+    diagnostics: dict, effect_attribution: dict
+) -> None:
+    diagnostics["direct_primitive_audit"] = {
+        field_name: _yaml_diagnostic_value(effect_attribution[field_name])
+        for field_name in DIRECT_PRIMITIVE_AUDIT_FIELDS
+    }
+
+
+def _validate_stored_direct_primitive_audit(
+    diagnostics: dict,
+    recomputed_effect_attribution: dict,
+    path: Path,
+) -> None:
+    stored_audit = diagnostics["direct_primitive_audit"]
+    if not isinstance(stored_audit, dict):
+        raise TypeError(f"{path} diagnostics direct_primitive_audit must be a mapping")
+    recomputed_audit = {
+        field_name: _yaml_diagnostic_value(recomputed_effect_attribution[field_name])
+        for field_name in DIRECT_PRIMITIVE_AUDIT_FIELDS
+    }
+    if stored_audit != recomputed_audit:
+        raise ValueError(f"{path} diagnostics mismatch for direct_primitive_audit")
+
+
+def _yaml_diagnostic_value(value):
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, tuple):
+        return [_yaml_diagnostic_value(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _yaml_diagnostic_value(item_value)
+            for key, item_value in value.items()
+        }
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    return value
+
+
+def _stored_basis_refinement_effect_attribution(diagnostics: dict) -> dict:
+    return {
+        "basis_refinement_convergence_status": str(
+            diagnostics["basis_refinement_convergence_status"]
+        ),
+        "basis_refinement_not_complete_reasons": tuple(
+            str(reason)
+            for reason in diagnostics["basis_refinement_not_complete_reasons"]
+        ),
+        "basis_refinement_hard_convergence_failure": bool(
+            diagnostics["basis_refinement_hard_convergence_failure"]
+        ),
+    }
+
+
+def _validate_stored_prediction_readiness(
+    diagnostics: dict, recomputed_effect_attribution: dict, path: Path
+) -> None:
+    for field_name in (
+        "primitive_prediction_readiness_status",
+        "primitive_prediction_scalar_label",
+        "primitive_prediction_not_complete_reasons",
+    ):
+        stored_value = diagnostics[field_name]
+        recomputed_value = recomputed_effect_attribution[field_name]
+        if isinstance(recomputed_value, tuple):
+            stored_value = tuple(str(value) for value in stored_value)
+        else:
+            stored_value = str(stored_value)
+        if stored_value != recomputed_value:
+            raise ValueError(
+                f"{path} diagnostics mismatch for {field_name}: stored "
+                f"{stored_value}, recomputed {recomputed_value}"
+            )
+
+
+def _recomputed_diagnostic_view(value):
+    if isinstance(value, dict):
+        return {
+            field_name: _recomputed_diagnostic_view(field_value)
+            for field_name, field_value in value.items()
+            if field_name not in TRAJECTORY_ONLY_EDGE_DIAGNOSTIC_FIELDS
+        }
+    if isinstance(value, list):
+        return [_recomputed_diagnostic_view(item) for item in value]
+    return value
+
+
+def _validate_succeeded_trajectory_basis_refinement(
+    diagnostics: dict, path: Path
+) -> None:
+    trajectory_basis_refinement = diagnostics["trajectory_basis_refinement"]
+    if not isinstance(trajectory_basis_refinement, dict):
+        raise TypeError(
+            f"{path} diagnostics trajectory_basis_refinement must be a mapping"
+        )
+    if not bool(trajectory_basis_refinement["candidate_set_exhausted"]):
+        raise ValueError(
+            f"{path} succeeded artifact requires an exhausted trajectory basis "
+            "candidate set"
+        )
+    if str(trajectory_basis_refinement["convergence_status"]) != "converged":
+        raise ValueError(
+            f"{path} succeeded artifact requires converged trajectory basis refinement"
+        )
+    conductivity_change = float(
+        trajectory_basis_refinement["final_conductivity_change_abs_S_m"]
+    )
+    conductivity_change_tolerance = float(
+        trajectory_basis_refinement["conductivity_change_tolerance_S_m"]
+    )
+    if (
+        not np.isfinite(conductivity_change)
+        or not np.isfinite(conductivity_change_tolerance)
+        or conductivity_change_tolerance <= 0.0
+        or conductivity_change > conductivity_change_tolerance
+    ):
+        raise ValueError(
+            f"{path} succeeded artifact requires final conductivity change within "
+            "the configured tolerance"
+        )
 
 
 def _required_component_drift_residual_records(
@@ -1106,6 +1376,33 @@ def _projected_sigma_mS_cm(record: dict, path: Path) -> float:
     return projected_sigma_mS_cm
 
 
+def _validate_canonical_sigma_field_legality(
+    record: dict,
+    projected_readout_status: str,
+    path: Path,
+) -> None:
+    present_sigma_fields = tuple(
+        field_name for field_name in CANONICAL_SIGMA_FIELDS if field_name in record
+    )
+    if projected_readout_status == PROJECTED_READOUT_SUCCEEDED:
+        missing_sigma_fields = tuple(
+            field_name
+            for field_name in CANONICAL_SIGMA_FIELDS
+            if field_name not in record
+        )
+        if missing_sigma_fields:
+            raise KeyError(
+                f"{path} succeeded artifact missing canonical sigma fields: "
+                f"{missing_sigma_fields}"
+            )
+        return
+    if present_sigma_fields:
+        raise ValueError(
+            f"{path} {projected_readout_status} artifact must not contain canonical "
+            f"prediction sigma fields: {present_sigma_fields}"
+        )
+
+
 def _projected_sigma_field(record: dict) -> str:
     if "sigma_mS_cm" in record:
         return "sigma_mS_cm"
@@ -1115,7 +1412,14 @@ def _projected_sigma_field(record: dict) -> str:
 def _projected_readout_status_from_result(
     conductivity_result: ProjectedConductivityResult,
 ) -> str:
-    effect_attribution = conductivity_result.effect_attribution
+    return _projected_readout_status_from_effect_attribution(
+        conductivity_result.effect_attribution
+    )
+
+
+def _projected_readout_status_from_effect_attribution(
+    effect_attribution: dict,
+) -> str:
     if "finite_process_readout_status" not in effect_attribution:
         raise KeyError("conductivity result missing finite_process_readout_status")
     if "primitive_prediction_readiness_status" not in effect_attribution:

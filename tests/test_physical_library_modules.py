@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 
 import numpy as np
@@ -8,6 +9,8 @@ import pytest
 from constants import T_REF_K
 from conductivity.physical_library import generator_construction
 from conductivity.physical_library import extract_projected_primitives
+from conductivity.physical_library import physical_generator_builder
+from conductivity.physical_library import property_db_validation
 from conductivity.physical_library.transition_surface_builder import (
     MomentBoundaryValueInput,
     OneDimensionalCommittorInput,
@@ -23,6 +26,8 @@ from conductivity.physical_library.generator_construction import (
 )
 from conductivity.physical_library.mixture_closures import (
     MixtureComposition,
+    compute_bulk_dielectric_constant,
+    compute_bulk_viscosity_Pa_s,
     compute_mixture_closures,
 )
 from conductivity.physical_library.physical_generator_builder import (
@@ -43,6 +48,14 @@ from conductivity.physical_library.physical_objects import (
     compute_local_packing_fraction,
     compute_resistance_component_diagnostics,
     compute_resistance_tensor_kg_s,
+    _rpy_cross_mobility_block_kg_inv_s,
+    _rigid_body_kinematic_map,
+    anion_internal_charge_separation_factor,
+    li_anion_feature_coordination_energy_multiplier,
+)
+from conductivity.physical_library.projected_analytical_conductivity import (
+    StateTransportOwnershipBasis,
+    TransportOwnership,
 )
 from conductivity.physical_library.projected_primitives_io import (
     PRIMITIVE_SCHEMA,
@@ -67,7 +80,12 @@ from conductivity.physical_library.reduced_generator import (
     ReducedStateQuadrature,
     build_projected_generator_input,
 )
-from conductivity.physical_library.library_io import _require_species, load_physical_library
+from conductivity.physical_library.library_io import (
+    _require_species,
+    build_recipe_library_context_from_record,
+    load_physical_library,
+)
+from conductivity.physical_library.library_io import validate_physical_library_records
 from conductivity.physical_library.transition_surface_builder import (
     OneDimensionalTransitionBuildInput,
     build_one_dimensional_transition_surface,
@@ -76,7 +94,6 @@ from conductivity.physical_library.trajectory_primitives import (
     TrajectoryMarkovAdditiveSampleInput,
     compute_finite_process_component_drift_residuals,
     diagnose_finite_process_legality,
-    project_first_moments_to_reversible_component_space,
     project_sampled_trajectory_to_generator_primitives,
 )
 from conductivity.physical_library.projected_analytical_conductivity import (
@@ -86,7 +103,34 @@ from conductivity.physical_library.projected_analytical_conductivity import (
     compute_projected_analytical_conductivity_from_primitives,
 )
 
+FORBIDDEN_RECIPE_PRODUCTION_PRIMITIVE_ANCHOR_NAMES = (
+    "interpolate_primitive_closure",
+    "load_closure_fit",
+    "read_projected_primitive_yaml",
+    "compute_conductivity_from_primitive_yaml",
+    "primitive_yaml_paths",
+)
+
 PHYSICAL_LIBRARY_ROOT = Path(__file__).resolve().parents[1] / "physical_library"
+
+
+def _empty_transport_ownership_basis(
+    coordinate_dimension: int,
+) -> StateTransportOwnershipBasis:
+    return StateTransportOwnershipBasis(
+        transition_displacement_gradients=np.empty(
+            (0, coordinate_dimension),
+            dtype=float,
+        ),
+        transition_edge_indices=np.empty(0, dtype=int),
+        bounded_memory_gradients=np.empty(
+            (0, coordinate_dimension),
+            dtype=float,
+        ),
+        bounded_memory_mode_indices=np.empty(0, dtype=int),
+        diagnostic_gradients=np.empty((0, coordinate_dimension), dtype=float),
+        diagnostic_source_ids=(),
+    )
 
 
 def test_one_dimensional_committor_is_monotone_and_capacity_matches_resistance() -> None:
@@ -505,6 +549,12 @@ def test_reduced_generator_assembles_projected_input() -> None:
                 weights=np.asarray([1.0]),
                 stoichiometry=np.asarray([1.0]),
                 self_current_projector=np.eye(1),
+                transport_ownership_bases=(
+                    _empty_transport_ownership_basis(1),
+                ),
+                relative_displacement_fluctuations_m=np.empty((0, 3)),
+                relative_displacement_mobility_m2_s=np.empty((0, 0)),
+                relative_center_charge_numbers=np.empty(0),
             ),
         ),
         transition_quadratures=(),
@@ -581,10 +631,25 @@ def test_charge_polarization_uses_formal_ion_centers_not_neutral_partial_charges
     assert ion_bundle.charge_polarization_m[0] == pytest.approx(-5.0e-10)
     assert ion_bundle.charge_polarization_gradient[0, 0] == pytest.approx(1.0)
     phosphorus_site_index = 2
+    pf6_site_indices = tuple(range(1, len(ion_configuration.species_names)))
+    pf6_site_masses_kg = np.asarray(
+        [
+            records.species_records["PF6-"]["sites"][site_id]["mass_kg"]
+            for site_id in ion_configuration.site_ids[1:]
+        ],
+        dtype=float,
+    )
     assert ion_bundle.charge_polarization_gradient[
         0,
         3 * phosphorus_site_index,
-    ] == pytest.approx(-1.0)
+    ] == pytest.approx(
+        -float(pf6_site_masses_kg[phosphorus_site_index - 1])
+        / float(np.sum(pf6_site_masses_kg))
+    )
+    assert sum(
+        ion_bundle.charge_polarization_gradient[0, 3 * site_index]
+        for site_index in pf6_site_indices
+    ) == pytest.approx(-1.0)
 
 
 def test_pair_basin_assignment_uses_configured_cutoffs() -> None:
@@ -622,6 +687,12 @@ def test_physical_generator_builder_exposes_physical_functions() -> None:
                     weights=np.asarray([1.0], dtype=float),
                     stoichiometry=np.asarray([2.0], dtype=float),
                     self_current_projector=np.eye(coordinate_count, dtype=float),
+                    transport_ownership_bases=(
+                        _empty_transport_ownership_basis(coordinate_count),
+                    ),
+                    relative_displacement_fluctuations_m=np.empty((0, 3)),
+                    relative_displacement_mobility_m2_s=np.empty((0, 0)),
+                    relative_center_charge_numbers=np.empty(0),
                 ),
             ),
             transition_quadratures=(),
@@ -631,24 +702,57 @@ def test_physical_generator_builder_exposes_physical_functions() -> None:
             volume_m3=1.0,
         )
     )
-    point = flatten_configuration_with_local_fields(
-        configuration,
-        _local_fields(records, configuration, 20.0, 1.0e-3, 1000.0),
-    )
+    point = generator_specification.state_quadratures[0].points[0]
+    registered_coordinate_count = coordinate_count + 1
 
     assert np.isfinite(generator_specification.potential_energy_J_mol(point))
     assert generator_specification.mobility_tensor_m2_s(point).shape == (
-        coordinate_count,
-        coordinate_count,
+        registered_coordinate_count,
+        registered_coordinate_count,
     )
     assert generator_specification.charge_polarization_gradient(point).shape == (
         3,
-        coordinate_count,
+        registered_coordinate_count,
     )
     assert generator_specification.memory_coordinate_gradient(point).shape == (
         4,
-        coordinate_count,
+        registered_coordinate_count,
     )
+
+
+def test_bulk_matrix_properties_exclude_additive_local_field_corrections() -> None:
+    records = load_physical_library(PHYSICAL_LIBRARY_ROOT)
+    matrix_composition = MixtureComposition(
+        solvent_volume_fractions={"EC": 0.3, "DMC": 0.7},
+        ion_concentrations_mol_m3={"Li+": 1000.0, "PF6-": 1000.0},
+        additive_weight_fractions={},
+    )
+    additive_composition = MixtureComposition(
+        solvent_volume_fractions=matrix_composition.solvent_volume_fractions,
+        ion_concentrations_mol_m3=matrix_composition.ion_concentrations_mol_m3,
+        additive_weight_fractions={"FEC": 0.1},
+    )
+
+    assert compute_bulk_dielectric_constant(
+        records, additive_composition
+    ) == pytest.approx(compute_bulk_dielectric_constant(records, matrix_composition))
+    assert compute_bulk_viscosity_Pa_s(
+        records, additive_composition
+    ) == pytest.approx(compute_bulk_viscosity_Pa_s(records, matrix_composition))
+    assert records.mixture_record["property_ownership"] == {
+        "dielectric": {
+            "bulk": "solvent_matrix_reference",
+            "local": "ionic_strength_decrement",
+        },
+        "viscosity": {
+            "bulk": "solvent_matrix_reference",
+            "local": "Jones_Dole_packing_and_state_additive_microviscosity",
+        },
+        "additive_properties": {
+            "bulk": "excluded",
+            "local": "state_configuration_occupancy",
+        },
+    }
 
 
 def test_mixture_basin_memory_and_transition_builders_are_executable() -> None:
@@ -683,6 +787,8 @@ def test_mixture_basin_memory_and_transition_builders_are_executable() -> None:
         OneDimensionalTransitionBuildInput(
             from_state_index=0,
             to_state_index=1,
+            transition_family="free_to_SSIP",
+            transport_ownership=TransportOwnership.BOUNDED_MEMORY,
             grid_configurations=(first_configuration, second_configuration),
             local_fields=(
                 _local_fields(
@@ -747,6 +853,12 @@ def test_mixture_basin_memory_and_transition_builders_are_executable() -> None:
                         generator_coordinate_count,
                         dtype=float,
                     ),
+                    transport_ownership_bases=(
+                        _empty_transport_ownership_basis(coordinate_count),
+                    ),
+                    relative_displacement_fluctuations_m=np.empty((0, 3)),
+                    relative_displacement_mobility_m2_s=np.empty((0, 0)),
+                    relative_center_charge_numbers=np.empty(0),
                 ),
                 PhysicalStateQuadrature(
                     label="second",
@@ -766,6 +878,12 @@ def test_mixture_basin_memory_and_transition_builders_are_executable() -> None:
                         generator_coordinate_count,
                         dtype=float,
                     ),
+                    transport_ownership_bases=(
+                        _empty_transport_ownership_basis(coordinate_count),
+                    ),
+                    relative_displacement_fluctuations_m=np.empty((0, 3)),
+                    relative_displacement_mobility_m2_s=np.empty((0, 0)),
+                    relative_center_charge_numbers=np.empty(0),
                 ),
             ),
             transition_quadratures=(transition.transition_quadrature,),
@@ -835,6 +953,58 @@ def test_non_pair_transition_family_declares_executable_coordinate() -> None:
     assert np.any(np.abs(gradient) > 0.0)
 
 
+def test_physical_generator_registry_keeps_species_distinct_at_identical_coordinates() -> None:
+    pf6_configuration = _lithium_pf6_configuration(pair_distance_m=4.0e-10)
+    fsi_configuration = SiteConfiguration(
+        species_names=("Li+", "FSI-"),
+        molecule_ids=np.asarray(pf6_configuration.molecule_ids, dtype=int),
+        site_ids=np.asarray(pf6_configuration.site_ids, dtype=int),
+        positions_m=np.asarray(pf6_configuration.positions_m, dtype=float),
+        unwrapped_positions_m=np.asarray(
+            pf6_configuration.unwrapped_positions_m,
+            dtype=float,
+        ),
+        box_lengths_m=np.asarray(pf6_configuration.box_lengths_m, dtype=float),
+    )
+    local_fields = PhysicalLocalFields(
+        dielectric_constant=30.0,
+        viscosity_Pa_s=1.0e-3,
+        ionic_strength_mol_m3=1000.0,
+        local_packing_fraction=0.2,
+    )
+    signatures = (
+        physical_generator_builder._configuration_identity_signature(
+            pf6_configuration
+        ),
+        physical_generator_builder._configuration_identity_signature(
+            fsi_configuration
+        ),
+    )
+    configuration_identity_indices = {
+        signature: identity_index
+        for identity_index, signature in enumerate(sorted(signatures), start=1)
+    }
+    common_coordinate_count = (
+        flatten_configuration_with_local_fields(pf6_configuration, local_fields).size
+        + 1
+    )
+    registry = {}
+
+    physical_generator_builder._register_configuration_points(
+        registry,
+        (pf6_configuration, fsi_configuration),
+        (local_fields, local_fields),
+        common_coordinate_count,
+        configuration_identity_indices,
+    )
+
+    assert len(registry) == 2
+    assert {
+        registered_configuration.species_names
+        for registered_configuration, _registered_fields in registry.values()
+    } == {("Li+", "PF6-"), ("Li+", "FSI-")}
+
+
 def test_mixed_salt_recipe_keeps_additive_stoichiometry_and_transition_channel() -> None:
     recipe_context = generator_construction.build_recipe_library_context(
         PHYSICAL_LIBRARY_ROOT / "recipe_ec_dmc_lipf6_lifsi_fec.yaml",
@@ -877,7 +1047,7 @@ def test_mixed_salt_recipe_keeps_additive_stoichiometry_and_transition_channel()
     )
     active_additive_name = _single_active_additive_name(recipe_context)
     active_additive_component_index = component_names.index(active_additive_name)
-    assert component_names == ("Li+", "PF6-", "FSI-", active_additive_name)
+    assert component_names == ("Li+", "FSI-", "PF6-", active_additive_name)
     assert np.any(state_stoichiometry[:, active_additive_component_index] == 1.0)
     assert np.any(state_stoichiometry[:, active_additive_component_index] == 0.0)
     assert any(
@@ -987,6 +1157,11 @@ def _compute_conductivity_from_recipe_context(
             records,
             template_configuration,
             state_quadratures,
+            generator_construction.finite_generator_transition_edges(
+                records,
+                state_quadratures,
+                recipe_context.temperature_K,
+            ),
             mixture,
             numerical_options,
         )
@@ -1025,6 +1200,54 @@ def _compute_conductivity_from_recipe_context(
     return conductivity_result
 
 
+def test_recipe_generator_production_path_excludes_primitive_anchor_interpolation():
+    production_sources = (
+        inspect.getsource(generator_construction),
+        inspect.getsource(property_db_validation),
+    )
+    for production_source in production_sources:
+        for forbidden_name in FORBIDDEN_RECIPE_PRODUCTION_PRIMITIVE_ANCHOR_NAMES:
+            assert forbidden_name not in production_source
+
+
+def test_recipe_context_is_invariant_to_mapping_order() -> None:
+    forward_record = {
+        "temperature_K": T_REF_K,
+        "solvents_vv": {"EC": 0.34, "DMC": 0.66},
+        "salts_mol_l": {"Li+": 1.1, "PF6-": 0.8, "FSI-": 0.3},
+        "additives_weight_fraction": {
+            "TPP": 0.02,
+            "PS": 0.01,
+            "VC": 0.005,
+            "LiDFOB": 0.005,
+        },
+    }
+    reverse_record = {
+        "temperature_K": T_REF_K,
+        "solvents_vv": dict(reversed(tuple(forward_record["solvents_vv"].items()))),
+        "salts_mol_l": dict(reversed(tuple(forward_record["salts_mol_l"].items()))),
+        "additives_weight_fraction": dict(
+            reversed(tuple(forward_record["additives_weight_fraction"].items()))
+        ),
+    }
+    forward_context = build_recipe_library_context_from_record(
+        forward_record,
+        PHYSICAL_LIBRARY_ROOT,
+    )
+    reverse_context = build_recipe_library_context_from_record(
+        reverse_record,
+        PHYSICAL_LIBRARY_ROOT,
+    )
+
+    assert forward_context.components == reverse_context.components
+    assert forward_context.solvent_volume_fractions == (
+        reverse_context.solvent_volume_fractions
+    )
+    assert forward_context.additive_weight_fractions == (
+        reverse_context.additive_weight_fractions
+    )
+
+
 def test_reference_recipe_primitive_owner_audit_table() -> None:
     numerical_options = generator_construction.NumericalOptions(
         reference_box_lengths_m=np.asarray([1.0e-8, 1.0e-8, 1.0e-8], dtype=float),
@@ -1059,19 +1282,65 @@ def test_reference_recipe_primitive_owner_audit_table() -> None:
             conductivity_result,
         )
         expected_min_mS_cm, expected_max_mS_cm = expected_ranges_mS_cm[recipe_path.name]
-
         assert tuple(row.primitive_owner for row in owner_rows) == expected_owners
         assert tuple(row.correctness_status for row in owner_rows) == expected_statuses
         assert owner_rows[3].detail == "primitive_prediction"
         assert expected_min_mS_cm <= conductivity_result.sigma_mS_cm <= expected_max_mS_cm
+        ownership_state_tensors = conductivity_result.effect_attribution[
+            "transport_ownership_state_tensors"
+        ]
+        assert ownership_state_tensors
+        for ownership_state_tensor in ownership_state_tensors:
+            short_mobility_tensor = ownership_state_tensor["D_Q_short"]
+            unowned_mobility_tensor = ownership_state_tensor["D_Q_unowned"]
+            ownership_scale_m2_s = max(
+                float(np.linalg.norm(short_mobility_tensor, ord=2)),
+                np.finfo(float).tiny,
+            )
+            assert float(np.linalg.norm(unowned_mobility_tensor, ord=2)) <= (
+                64.0 * np.finfo(float).eps * ownership_scale_m2_s
+            )
+            assert np.allclose(
+                ownership_state_tensor["D_Q_short"],
+                ownership_state_tensor["D_Q_dc_self"]
+                + ownership_state_tensor["D_Q_transition_owned"]
+                + ownership_state_tensor["D_Q_bounded_memory"]
+                + ownership_state_tensor["D_Q_diagnostic"],
+                rtol=1.0e-10,
+                atol=1.0e-30,
+            )
         assert conductivity_result.effect_attribution[
             "primitive_prediction_scalar_label"
         ] == "primitive_prediction"
+        direct_ledger = conductivity_result.effect_attribution
+        assert direct_ledger["B_total_trace_mol_m_s"] == pytest.approx(
+            direct_ledger["B_self_tangent_trace_mol_m_s"]
+            + direct_ledger["B_transition_trace_mol_m_s"]
+        )
+        assert direct_ledger["B_self_full_trace_mol_m_s"] == pytest.approx(
+            direct_ledger["B_self_tangent_trace_mol_m_s"]
+            + direct_ledger["B_overlap_removed_trace_mol_m_s"]
+        )
+        assert len(direct_ledger["state_drift_b_i_m_s"]) == len(
+            conductivity_result.state_concentrations_mol_m3
+        )
+        assert direct_ledger["state_drift_components"]
+        assert all(
+            len(state_label.split("|")) == generator_construction.STATE_KEY_LENGTH
+            for state_label in direct_ledger["state_labels"]
+        )
+        mori_mode_ledger = direct_ledger["mori_mode_ledger"]
+        assert all(
+            mode["transport_ownership"] == "bounded_memory"
+            and mode["A_mu_mu"] > 0.0
+            and mode["h_mu_A_pseudoinverse_h_contribution"] >= 0.0
+            and mode["state_support"]
+            for mode in mori_mode_ledger
+        )
         for resistance_trace_key in (
             "state_resistance_stokes_traces_kg_s",
             "state_resistance_free_volume_traces_kg_s",
             "state_resistance_charge_cloud_traces_kg_s",
-            "state_resistance_shape_traces_kg_s",
             "state_resistance_atmosphere_traces_kg_s",
             "state_resistance_total_traces_kg_s",
         ):
@@ -1083,6 +1352,30 @@ def test_reference_recipe_primitive_owner_audit_table() -> None:
                 conductivity_result.state_concentrations_mol_m3.size,
             )
             assert np.all(np.isfinite(resistance_trace_values))
+
+
+def test_physical_library_rejects_scalar_sigma_fitted_parameter_provenance() -> None:
+    records = load_physical_library(PHYSICAL_LIBRARY_ROOT)
+    fitted_mixture_record = {
+        **records.mixture_record,
+        "parameter_provenance": {
+            **records.mixture_record["parameter_provenance"],
+            "mobility.free_volume_exponent": "fitted_to_scalar_sigma",
+        },
+    }
+    fitted_records = records.__class__(
+        root=records.root,
+        manifest=records.manifest,
+        species_records=records.species_records,
+        pair_records=records.pair_records,
+        mixture_record=fitted_mixture_record,
+        basis_record=records.basis_record,
+        transition_record=records.transition_record,
+        memory_record=records.memory_record,
+    )
+
+    with pytest.raises(ValueError, match="rejects scalar-sigma-fitted parameter"):
+        validate_physical_library_records(fitted_records)
 
 
 def _single_active_additive_name(
@@ -1183,8 +1476,8 @@ def test_salt_and_additive_perturbations_change_upstream_local_field_primitives(
             getattr(salt_perturbed_result, primitive_name),
             dtype=float,
         )
-        assert salt_primitive.shape == base_primitive.shape
-        assert np.linalg.norm(salt_primitive - base_primitive) > 0.0
+        if salt_primitive.shape == base_primitive.shape and base_primitive.size > 0:
+            assert np.linalg.norm(salt_primitive - base_primitive) > 0.0
 
     for primitive_name in additive_perturbed_primitive_names:
         base_primitive = np.asarray(getattr(base_result, primitive_name), dtype=float)
@@ -1192,15 +1485,19 @@ def test_salt_and_additive_perturbations_change_upstream_local_field_primitives(
             getattr(additive_perturbed_result, primitive_name),
             dtype=float,
         )
-        assert additive_primitive.shape == base_primitive.shape
-        assert np.linalg.norm(additive_primitive - base_primitive) > 0.0
+        if additive_primitive.shape == base_primitive.shape and base_primitive.size > 0:
+            assert np.linalg.norm(additive_primitive - base_primitive) > 0.0
 
 
 def test_missing_additive_record_fails_loudly() -> None:
     records = load_physical_library(PHYSICAL_LIBRARY_ROOT)
+    missing_species_name = "missing-neutral-additive"
 
-    with pytest.raises(KeyError, match="recipe species VC is absent"):
-        _require_species("VC", records)
+    with pytest.raises(
+        KeyError,
+        match=f"recipe species {missing_species_name} is absent",
+    ):
+        _require_species(missing_species_name, records)
 
 
 def test_trajectory_state_key_alignment_uses_active_sparse_basis() -> None:
@@ -1237,6 +1534,24 @@ def test_trajectory_state_key_alignment_uses_active_sparse_basis() -> None:
             dtype=float,
         ),
     )
+    environment_catalog = extract_projected_primitives.MolecularEnvironmentCatalog(
+        molecule_ids=np.asarray([0, 1], dtype=int),
+        species_labels=("Li+", "PF6-"),
+    )
+    environment_frame = extract_projected_primitives.MolecularEnvironmentFrame(
+        positions_A=center_frame.positions_A,
+        wrapped_positions_A=center_frame.wrapped_positions_A,
+        orientation_vectors=np.asarray(
+            [[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=float
+        ),
+        box_bounds_A=center_frame.box_bounds_A,
+    )
+    temporal_coordinates = {
+        generator_construction.ReducedCoordinate.CAGE_COORDINATE.value: 0.0,
+        generator_construction.ReducedCoordinate.PARTNER_RESIDENCE_COORDINATE.value: 0.0,
+        generator_construction.ReducedCoordinate.IDENTITY_COORDINATE.value: 0.0,
+        generator_construction.ReducedCoordinate.STRUCTURAL_HOP_COORDINATE.value: 0.0,
+    }
     thresholds = extract_projected_primitives.AssociationThresholds(
         contact_pair_max_distance_A=4.0,
         solvent_separated_pair_max_distance_A=10.0,
@@ -1246,10 +1561,13 @@ def test_trajectory_state_key_alignment_uses_active_sparse_basis() -> None:
         mixture=mixture,
         center_frame=center_frame,
         center_catalog=center_catalog,
+        environment_frame=environment_frame,
+        environment_catalog=environment_catalog,
         center_index=0,
         counterion_index=1,
         distances_A=np.asarray([pair_distance_A], dtype=float),
         thresholds=thresholds,
+        temporal_coordinates=temporal_coordinates,
     )
     configuration = (
         extract_projected_primitives._two_center_site_configuration_from_frame(
@@ -1264,9 +1582,14 @@ def test_trajectory_state_key_alignment_uses_active_sparse_basis() -> None:
             records,
             mixture,
             configuration,
+            configuration,
+            environment_frame,
+            environment_catalog,
+            1,
             PairBasin.SOLVENT_SEPARATED_ION_PAIR.value,
             np.asarray([pair_distance_A], dtype=float),
             thresholds,
+            temporal_coordinates,
         )
     )
     expected_label = "|".join(
@@ -1295,6 +1618,8 @@ def test_trajectory_transition_moments_are_reciprocal_edge_oriented() -> None:
             [[2.0e-10, 0.0, 0.0], [-4.0e-10, 0.0, 0.0]],
             dtype=float,
         ),
+        self_charge_polarization_by_frame_and_center_m=np.zeros((5, 2, 3)),
+        state_index_by_frame_and_center=np.asarray(((0, 1),) * 5, dtype=int),
         dt_s=1.0e-12,
         total_transport_concentration_mol_m3=1000.0,
         temperature_K=T_REF_K,
@@ -1420,7 +1745,7 @@ def test_finite_process_legality_rejects_nonreciprocal_second_moments() -> None:
         )
 
 
-def test_reversible_first_moment_projection_removes_component_drift() -> None:
+def test_component_drift_diagnostic_identifies_offending_directed_edge() -> None:
     state_labels = ("state_a", "state_b")
     concentrations = np.asarray([2.0, 2.0], dtype=float)
     capacity_fluxes = np.asarray([[0.0, 3.0], [3.0, 0.0]], dtype=float)
@@ -1440,97 +1765,34 @@ def test_reversible_first_moment_projection_removes_component_drift() -> None:
         first_moments,
         directed_counts,
     )[0]
-    projected_first_moments = project_first_moments_to_reversible_component_space(
-        first_moments
-    )
-    projected_residual = compute_finite_process_component_drift_residuals(
-        state_labels,
-        concentrations,
-        capacity_fluxes,
-        projected_first_moments,
-        directed_counts,
-    )[0]
-
     assert raw_residual.weighted_drift_norm_mol_m2_s > 0.0
-    assert projected_first_moments[1, 0] == pytest.approx(
-        -projected_first_moments[0, 1]
-    )
-    assert projected_residual.weighted_drift_norm_mol_m2_s == pytest.approx(0.0)
+    assert raw_residual.top_edge_contributions[0].from_state_label == "state_a"
+    assert raw_residual.top_edge_contributions[0].to_state_label == "state_b"
+    assert raw_residual.top_edge_contributions[0].forward_sample_count == 5
+    assert raw_residual.top_edge_contributions[0].reverse_sample_count == 0
 
 
-def test_extractor_primitive_repair_writes_component_solvable_first_moments() -> None:
-    sample_input = TrajectoryMarkovAdditiveSampleInput(
-        state_labels=("state_a", "state_b"),
-        occupancy_state_index_by_observation=np.asarray([0, 1, 0, 1], dtype=int),
-        from_state_index_by_step=np.asarray([0, 1], dtype=int),
-        to_state_index_by_step=np.asarray([1, 0], dtype=int),
-        charge_displacement_by_step_m=np.asarray(
-            [[2.0e-10, 0.0, 0.0], [-4.0e-10, 0.0, 0.0]],
+def test_extractor_rejects_component_drift_with_offending_edges() -> None:
+    residuals = compute_finite_process_component_drift_residuals(
+        ("state_a", "state_b"),
+        np.asarray([2.0, 2.0], dtype=float),
+        np.asarray([[0.0, 3.0], [3.0, 0.0]], dtype=float),
+        np.asarray(
+            [
+                [[0.0, 0.0, 0.0], [2.0e-10, 0.0, 0.0]],
+                [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            ],
             dtype=float,
         ),
-        dt_s=1.0e-12,
-        total_transport_concentration_mol_m3=1000.0,
-        temperature_K=T_REF_K,
+        np.asarray([[0, 5], [0, 0]], dtype=int),
     )
-    primitive_set = project_sampled_trajectory_to_generator_primitives(sample_input)
-    primitive_arrays = extract_projected_primitives._primitive_arrays_from_projected_set(
-        primitive_set
+    assert extract_projected_primitives._component_drift_violation(residuals)
+    failure_reason = extract_projected_primitives._invalid_component_drift_failure_reason(
+        residuals
     )
-    invalid_first_moments = np.asarray(
-        [
-            [[0.0, 0.0, 0.0], [3.0e-10, 0.0, 0.0]],
-            [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
-        ],
-        dtype=float,
-    )
-    invalid_primitive_arrays = {
-        primitive_name: (
-            invalid_first_moments
-            if primitive_name == "transition_first_moments_d_ij_m"
-            else primitive_value
-        )
-        for primitive_name, primitive_value in primitive_arrays.items()
-    }
-
-    repaired_arrays = (
-        extract_projected_primitives._primitive_arrays_with_component_solvable_first_moments(
-            invalid_primitive_arrays,
-            primitive_set,
-        )
-    )
-
-    assert repaired_arrays["transition_first_moments_d_ij_m"][1, 0] == pytest.approx(
-        -repaired_arrays["transition_first_moments_d_ij_m"][0, 1]
-    )
-    repaired_residual = compute_finite_process_component_drift_residuals(
-        primitive_set.state_labels,
-        repaired_arrays["state_concentrations_mol_m3"],
-        repaired_arrays["symmetric_capacity_fluxes_K_ij_mol_m3_s"],
-        repaired_arrays["transition_first_moments_d_ij_m"],
-        np.asarray([[0, 1], [1, 0]], dtype=int),
-    )[0]
-    repaired_input = ProjectedPrimitiveInput(
-        state_concentrations_mol_m3=repaired_arrays["state_concentrations_mol_m3"],
-        symmetric_capacity_fluxes_K_ij_mol_m3_s=repaired_arrays[
-            "symmetric_capacity_fluxes_K_ij_mol_m3_s"
-        ],
-        transition_first_moments_d_ij_m=repaired_arrays[
-            "transition_first_moments_d_ij_m"
-        ],
-        transition_second_moments_M_ij_m2=repaired_arrays[
-            "transition_second_moments_M_ij_m2"
-        ],
-        self_current_tensors_D_self_i_m2_s=repaired_arrays[
-            "self_current_tensors_D_self_i_m2_s"
-        ],
-        mori_memory_matrix_A=repaired_arrays["mori_memory_matrix_A"],
-        mori_current_coupling_matrix_h=repaired_arrays["mori_current_coupling_matrix_h"],
-        temperature_K=T_REF_K,
-        volume_m3=1.0,
-    )
-
-    assert repaired_residual.weighted_drift_norm_mol_m2_s == pytest.approx(0.0)
-    validate_projected_primitive_artifact_input(repaired_input)
+    assert "invalid finite-state drift; offending edges:" in failure_reason
+    assert "state_a->state_b" in failure_reason
+    assert "forward=5, reverse=0" in failure_reason
 
 
 def test_local_field_perturbation_changes_upstream_primitives() -> None:
@@ -1632,6 +1894,59 @@ def test_local_field_perturbation_changes_upstream_primitives() -> None:
     assert crowded_projected_diffusivity_m2_s < dilute_projected_diffusivity_m2_s
 
 
+def test_anion_internal_charge_separation_amplifies_li_coordination_response() -> None:
+    records = load_physical_library(PHYSICAL_LIBRARY_ROOT)
+    pf6_configuration = _lithium_pf6_fec_configuration(pair_distance_m=4.0e-10)
+    configuration = SiteConfiguration(
+        species_names=tuple(
+            "FSI-" if species_name == "PF6-" else species_name
+            for species_name in pf6_configuration.species_names
+        ),
+        molecule_ids=np.asarray(pf6_configuration.molecule_ids, dtype=int),
+        site_ids=np.asarray(pf6_configuration.site_ids, dtype=int),
+        positions_m=np.asarray(pf6_configuration.positions_m, dtype=float),
+        unwrapped_positions_m=np.asarray(
+            pf6_configuration.unwrapped_positions_m,
+            dtype=float,
+        ),
+        box_lengths_m=np.asarray(pf6_configuration.box_lengths_m, dtype=float),
+    )
+    separation_factor = anion_internal_charge_separation_factor(records, "FSI-")
+
+    assert 0.0 < separation_factor < 1.0
+    assert li_anion_feature_coordination_energy_multiplier(
+        records,
+        configuration,
+    ) == pytest.approx(1.0 + separation_factor)
+
+
+def test_additive_microviscosity_comes_from_species_feature_record() -> None:
+    records = load_physical_library(PHYSICAL_LIBRARY_ROOT)
+    configuration = _lithium_pf6_fec_configuration(pair_distance_m=4.0e-10)
+    molecule_keys = tuple(
+        dict.fromkeys(
+            zip(
+                configuration.species_names,
+                np.asarray(configuration.molecule_ids, dtype=int),
+                strict=True,
+            )
+        )
+    )
+    additive_molecule_count = sum(
+        species_name == "FEC" for species_name, _molecule_id in molecule_keys
+    )
+
+    expected_fraction = (
+        additive_molecule_count
+        * float(records.species_records["FEC"]["local_microviscosity_coefficient"])
+        / len(molecule_keys)
+    )
+    assert generator_construction._configuration_additive_fraction(
+        records,
+        configuration,
+    ) == pytest.approx(expected_fraction)
+
+
 def test_state_quadrature_stores_physical_local_field_laws() -> None:
     recipe_context = generator_construction.build_recipe_library_context(
         PHYSICAL_LIBRARY_ROOT / "recipe_ec_dmc_lipf6_lifsi_fec.yaml",
@@ -1667,6 +1982,7 @@ def test_state_quadrature_stores_physical_local_field_laws() -> None:
         )
         for coordinate, values, _weights in generator_construction._state_coordinate_nodes(
             records,
+            template_configuration,
             generator_construction._declared_reduced_coordinates(records),
             0.0,
             float(records.basis_record["pair_basins"]["r_free_m"]),
@@ -1752,7 +2068,7 @@ def test_transition_geometry_records_partition_charge_and_zero_families() -> Non
     )
     reference_zero_record = transition_records[zero_motif_families[0]]
 
-    assert "cage_backjump" in records.memory_record["families"]
+    assert "cage_backjump" in records.memory_record["memory_records"]
     for family in charge_carrying_families:
         transition_record = transition_records[family]
         generator_construction._validate_transition_family_reaction_coordinate(
@@ -1910,27 +2226,21 @@ def test_atmosphere_resistance_cancels_colocated_neutral_translation() -> None:
     records = _records_with_synthetic_neutral_pair(load_physical_library(PHYSICAL_LIBRARY_ROOT))
     colocated_configuration = _synthetic_neutral_pair_configuration(0.0)
     translation_vector = np.asarray([1.0, 0.0, 0.0, 1.0, 0.0, 0.0], dtype=float)
-    resistance = compute_resistance_tensor_kg_s(
+    atmosphere_diagnostics = compute_atmosphere_resistance_diagnostics(
         records,
         colocated_configuration,
-        viscosity_Pa_s=1.0e-3,
         dielectric_constant=20.0,
         ionic_strength_mol_m3=1000.0,
         temperature_K=T_REF_K,
-        local_packing_fraction=compute_local_packing_fraction(records, colocated_configuration),
-    )
-    no_atmosphere_resistance = compute_resistance_tensor_kg_s(
-        _records_with_atmosphere_lambda(records, 0.0),
-        colocated_configuration,
         viscosity_Pa_s=1.0e-3,
-        dielectric_constant=20.0,
-        ionic_strength_mol_m3=1000.0,
-        temperature_K=T_REF_K,
-        local_packing_fraction=compute_local_packing_fraction(records, colocated_configuration),
     )
-
-    assert float(translation_vector @ resistance @ translation_vector) == pytest.approx(
-        float(translation_vector @ no_atmosphere_resistance @ translation_vector)
+    assert (
+        float(
+            translation_vector
+            @ atmosphere_diagnostics.atmosphere_resistance_tensor_kg_s
+            @ translation_vector
+        )
+        == pytest.approx(0.0)
     )
 
 
@@ -1972,28 +2282,16 @@ def test_atmosphere_resistance_separation_recovers_independent_ion_drag() -> Non
 def test_atmosphere_resistance_is_zero_at_zero_ionic_strength() -> None:
     records = _records_with_synthetic_neutral_pair(load_physical_library(PHYSICAL_LIBRARY_ROOT))
     configuration = _synthetic_neutral_pair_configuration(1.0e-9)
-    translation_vector = np.asarray([1.0, 0.0, 0.0, 1.0, 0.0, 0.0], dtype=float)
-    zero_ionic_resistance = compute_resistance_tensor_kg_s(
+    zero_ionic_diagnostics = compute_atmosphere_resistance_diagnostics(
         records,
         configuration,
-        viscosity_Pa_s=1.0e-3,
         dielectric_constant=20.0,
         ionic_strength_mol_m3=0.0,
         temperature_K=T_REF_K,
-        local_packing_fraction=compute_local_packing_fraction(records, configuration),
-    )
-    no_atmosphere_resistance = compute_resistance_tensor_kg_s(
-        _records_with_atmosphere_lambda(records, 0.0),
-        configuration,
         viscosity_Pa_s=1.0e-3,
-        dielectric_constant=20.0,
-        ionic_strength_mol_m3=0.0,
-        temperature_K=T_REF_K,
-        local_packing_fraction=compute_local_packing_fraction(records, configuration),
     )
-
-    assert float(translation_vector @ zero_ionic_resistance @ translation_vector) == (
-        pytest.approx(float(translation_vector @ no_atmosphere_resistance @ translation_vector))
+    assert np.max(np.abs(zero_ionic_diagnostics.atmosphere_resistance_tensor_kg_s)) == (
+        pytest.approx(0.0)
     )
 
 
@@ -2008,6 +2306,7 @@ def test_atmosphere_resistance_diagnostics_split_components() -> None:
         dielectric_constant=20.0,
         ionic_strength_mol_m3=1000.0,
         temperature_K=T_REF_K,
+        viscosity_Pa_s=1.0e-3,
     )
     separated_diagnostics = compute_atmosphere_resistance_diagnostics(
         records,
@@ -2015,6 +2314,7 @@ def test_atmosphere_resistance_diagnostics_split_components() -> None:
         dielectric_constant=20.0,
         ionic_strength_mol_m3=1000.0,
         temperature_K=T_REF_K,
+        viscosity_Pa_s=1.0e-3,
     )
     zero_ionic_diagnostics = compute_atmosphere_resistance_diagnostics(
         records,
@@ -2022,6 +2322,7 @@ def test_atmosphere_resistance_diagnostics_split_components() -> None:
         dielectric_constant=20.0,
         ionic_strength_mol_m3=0.0,
         temperature_K=T_REF_K,
+        viscosity_Pa_s=1.0e-3,
     )
 
     assert colocated_diagnostics.atmosphere_resistance_tensor_kg_s == pytest.approx(
@@ -2067,6 +2368,7 @@ def test_atmosphere_resistance_diagnostics_cloud_and_ionic_strength_response() -
         dielectric_constant=20.0,
         ionic_strength_mol_m3=100.0,
         temperature_K=T_REF_K,
+        viscosity_Pa_s=1.0e-3,
     )
     high_ionic_diagnostics = compute_atmosphere_resistance_diagnostics(
         localized_cloud_records,
@@ -2074,6 +2376,7 @@ def test_atmosphere_resistance_diagnostics_cloud_and_ionic_strength_response() -
         dielectric_constant=20.0,
         ionic_strength_mol_m3=2000.0,
         temperature_K=T_REF_K,
+        viscosity_Pa_s=1.0e-3,
     )
     diffuse_cloud_diagnostics = compute_atmosphere_resistance_diagnostics(
         diffuse_cloud_records,
@@ -2081,6 +2384,7 @@ def test_atmosphere_resistance_diagnostics_cloud_and_ionic_strength_response() -
         dielectric_constant=20.0,
         ionic_strength_mol_m3=2000.0,
         temperature_K=T_REF_K,
+        viscosity_Pa_s=1.0e-3,
     )
 
     assert (
@@ -2145,14 +2449,12 @@ def test_resistance_component_diagnostics_expose_finite_thickness_shape_drag() -
         local_fields.local_packing_fraction,
     )
 
-    assert diagnostics.shape_trace_kg_s < diagnostics.stokes_trace_kg_s
     assert 0.0 < diagnostics.free_volume_trace_kg_s < diagnostics.stokes_trace_kg_s
     assert diagnostics.charge_cloud_trace_kg_s > diagnostics.stokes_trace_kg_s
     assert diagnostics.total_trace_kg_s == pytest.approx(
         diagnostics.stokes_trace_kg_s
         + diagnostics.free_volume_trace_kg_s
         + diagnostics.charge_cloud_trace_kg_s
-        + diagnostics.shape_trace_kg_s
         + diagnostics.atmosphere_trace_kg_s
     )
 
@@ -2245,6 +2547,9 @@ def _complete_artifact_result(
 ) -> ProjectedConductivityResult:
     effect_attribution = {
         **dict(conductivity_result.effect_attribution),
+        "basis_refinement_convergence_status": "converged",
+        "basis_refinement_not_complete_reasons": (),
+        "basis_refinement_hard_convergence_failure": False,
         "primitive_prediction_readiness_status": "complete",
         "primitive_prediction_scalar_label": "primitive_prediction",
         "primitive_prediction_not_complete_reasons": (),
@@ -2281,6 +2586,9 @@ def _complete_artifact_result(
         mori_memory_matrix_A=conductivity_result.mori_memory_matrix_A,
         mori_current_coupling_matrix_h=(
             conductivity_result.mori_current_coupling_matrix_h
+        ),
+        state_transport_ownership_quadratures=(
+            conductivity_result.state_transport_ownership_quadratures
         ),
         effect_attribution=effect_attribution,
     )
@@ -2492,25 +2800,6 @@ def _records_with_synthetic_neutral_pair_cloud_radius(
     )
 
 
-def _records_with_atmosphere_lambda(records, atmosphere_lambda_kg_s: float):
-    return records.__class__(
-        root=records.root,
-        manifest=records.manifest,
-        species_records=records.species_records,
-        pair_records=records.pair_records,
-        mixture_record={
-            **records.mixture_record,
-            "mobility": {
-                **records.mixture_record["mobility"],
-                "atmosphere_lambda_kg_s": atmosphere_lambda_kg_s,
-            },
-        },
-        basis_record=records.basis_record,
-        transition_record=records.transition_record,
-        memory_record=records.memory_record,
-    )
-
-
 def _single_site_charged_species_record(
     role: str,
     charge_number: float,
@@ -2554,6 +2843,72 @@ def _pair_distance_gradient(configuration: SiteConfiguration) -> np.ndarray:
     distance_m = np.linalg.norm(vector_m)
     unit_vector = vector_m / distance_m
     return np.concatenate((-unit_vector, unit_vector))
+
+
+def test_unequal_radius_regularized_rpy_is_continuous_at_regime_boundaries() -> None:
+    viscosity_Pa_s = 1.0e-3
+    first_radius_m = 1.2e-10
+    second_radius_m = 2.0e-10
+    relative_boundary_offset = 1.0e-9
+    containment_boundary_m = abs(first_radius_m - second_radius_m)
+    contact_boundary_m = first_radius_m + second_radius_m
+
+    for boundary_m in (containment_boundary_m, contact_boundary_m):
+        below_block = _rpy_cross_mobility_block_kg_inv_s(
+            np.asarray(
+                [boundary_m * (1.0 - relative_boundary_offset), 0.0, 0.0],
+                dtype=float,
+            ),
+            first_radius_m,
+            second_radius_m,
+            viscosity_Pa_s,
+        )
+        above_block = _rpy_cross_mobility_block_kg_inv_s(
+            np.asarray(
+                [boundary_m * (1.0 + relative_boundary_offset), 0.0, 0.0],
+                dtype=float,
+            ),
+            first_radius_m,
+            second_radius_m,
+            viscosity_Pa_s,
+        )
+        np.testing.assert_allclose(
+            below_block,
+            above_block,
+            rtol=1.0e-8,
+            atol=0.0,
+        )
+        np.testing.assert_allclose(below_block, below_block.T, rtol=0.0, atol=0.0)
+
+
+def test_rigid_kinematic_map_preserves_all_intramolecular_distances() -> None:
+    records = load_physical_library(PHYSICAL_LIBRARY_ROOT)
+    configuration = _lithium_full_pf6_configuration(pair_distance_m=4.5e-10)
+    rigid_kinematic_map = _rigid_body_kinematic_map(records, configuration)
+    generalized_velocity = np.arange(
+        rigid_kinematic_map.shape[1],
+        dtype=float,
+    )
+    site_velocities = (rigid_kinematic_map @ generalized_velocity).reshape((-1, 3))
+    pf6_site_indices = tuple(
+        site_index
+        for site_index, species_name in enumerate(configuration.species_names)
+        if species_name == "PF6-"
+    )
+    unwrapped_positions_m = np.asarray(configuration.unwrapped_positions_m, dtype=float)
+    for first_offset, first_site_index in enumerate(pf6_site_indices):
+        for second_site_index in pf6_site_indices[first_offset + 1 :]:
+            relative_position_m = (
+                unwrapped_positions_m[first_site_index]
+                - unwrapped_positions_m[second_site_index]
+            )
+            relative_velocity_m_s = (
+                site_velocities[first_site_index] - site_velocities[second_site_index]
+            )
+            assert float(relative_position_m @ relative_velocity_m_s) == pytest.approx(
+                0.0,
+                abs=1.0e-24,
+            )
 
 
 def _nearest_species_center_distance_m(

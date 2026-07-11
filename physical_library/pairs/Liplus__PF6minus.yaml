@@ -2,7 +2,7 @@ schema: conductivity_physical_pair_record_v1
 species_i: Li+
 species_j: PF6-
 source:
-  force_field: openff-2.2.0.offxml
+  force_field: rdkit_etkdg_uff_gasteiger
   lj_mixing_policy: Lorentz-Berthelot; sigma arithmetic, epsilon geometric
 lj_mixing_policy:
   sigma: 0.5*(sigma_i+sigma_j)
@@ -10,6 +10,6 @@ lj_mixing_policy:
 coulomb_policy:
   boundary: periodic conducting tin-foil
   ewald_or_pppm_tolerance: 0.0001
-  electronic_screening: fixed AM1-BCC Sage charges; ECC charge scaling must be recorded as a separate
-    upstream transform
+  electronic_screening: RDKit Gasteiger or manifest fixed charges; ECC charge scaling must be recorded
+    as a separate upstream transform
 site_pair_count: 7

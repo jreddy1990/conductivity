@@ -13,7 +13,9 @@ estimator, and no empirical correction path.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from enum import Enum
 from typing import Any
 
 import numpy as np
@@ -51,6 +53,9 @@ POISSON_SOLVABILITY_EPSILON_FACTOR = (
     100.0  # Floating-point guard factor used by the Poisson component solvability test.
 )
 PROJECTED_DIFFUSIVITY_PSD_RELATIVE_TOL = 1.0e-10
+FINITE_PROCESS_NONZERO_EPSILON_FACTOR = 100.0
+BASIS_REFINEMENT_RESIDUAL_RELATIVE_TOL = 1.0e-8
+BASIS_REFINEMENT_CONDUCTIVITY_RELATIVE_TOL = 1.0e-8
 DIAGNOSTIC_TOP_RECORD_COUNT = (
     5  # Limit failure payload size while keeping dominant contributors visible.
 )
@@ -59,6 +64,118 @@ LOG_FLOAT_MAX = np.log(np.finfo(float).max)
 LOG_FLOAT_TINY = np.log(np.finfo(float).tiny)
 
 Array = np.ndarray
+
+
+class TransportOwnership(str, Enum):
+    DC_SELF = "dc_self"
+    BOUNDED_MEMORY = "bounded_memory"
+    TRANSITION_DISPLACEMENT = "transition_displacement"
+    DIAGNOSTIC = "diagnostic"
+
+
+@dataclass(frozen=True)
+class StateTransportOwnershipBasis:
+    transition_displacement_gradients: Array
+    transition_edge_indices: Array
+    bounded_memory_gradients: Array
+    bounded_memory_mode_indices: Array
+    diagnostic_gradients: Array
+    diagnostic_source_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        transition_gradients = _immutable_2d_array(
+            self.transition_displacement_gradients,
+            "transition_displacement_gradients",
+        )
+        bounded_memory_gradients = _immutable_2d_array(
+            self.bounded_memory_gradients,
+            "bounded_memory_gradients",
+        )
+        diagnostic_gradients = _immutable_2d_array(
+            self.diagnostic_gradients,
+            "diagnostic_gradients",
+        )
+        coordinate_dimensions = {
+            transition_gradients.shape[1],
+            bounded_memory_gradients.shape[1],
+            diagnostic_gradients.shape[1],
+        }
+        if len(coordinate_dimensions) != 1:
+            raise ValueError("transport ownership gradients must share one width")
+        transition_edge_indices = _immutable_index_vector(
+            self.transition_edge_indices,
+            "transition_edge_indices",
+        )
+        bounded_memory_mode_indices = _immutable_index_vector(
+            self.bounded_memory_mode_indices,
+            "bounded_memory_mode_indices",
+        )
+        if transition_edge_indices.size != transition_gradients.shape[0]:
+            raise ValueError("TRANSITION_OWNER_SOURCE_CARDINALITY_FAILED")
+        if bounded_memory_mode_indices.size != bounded_memory_gradients.shape[0]:
+            raise ValueError("MEMORY_OWNER_SOURCE_CARDINALITY_FAILED")
+        if len(self.diagnostic_source_ids) != diagnostic_gradients.shape[0]:
+            raise ValueError("DIAGNOSTIC_OWNER_SOURCE_CARDINALITY_FAILED")
+        if any(not source_id.strip() for source_id in self.diagnostic_source_ids):
+            raise ValueError("diagnostic_source_ids must not contain empty values")
+        object.__setattr__(
+            self,
+            "transition_displacement_gradients",
+            transition_gradients,
+        )
+        object.__setattr__(self, "transition_edge_indices", transition_edge_indices)
+        object.__setattr__(self, "bounded_memory_gradients", bounded_memory_gradients)
+        object.__setattr__(
+            self,
+            "bounded_memory_mode_indices",
+            bounded_memory_mode_indices,
+        )
+        object.__setattr__(self, "diagnostic_gradients", diagnostic_gradients)
+
+
+@dataclass(frozen=True)
+class TransportOwnershipTensorSet:
+    state_index: int
+    quadrature_index: int
+    full_short_time_tensor_m2_s: Array
+    dc_self_tensor_m2_s: Array
+    transition_displacement_tensor_m2_s: Array
+    bounded_memory_tensor_m2_s: Array
+    diagnostic_tensor_m2_s: Array
+    closure_residual_tensor_m2_s: Array
+    coordinate_support_rank: int
+    transition_rank: int
+    bounded_memory_rank: int
+    diagnostic_rank: int
+
+
+@dataclass(frozen=True)
+class StateTransportOwnershipQuadrature:
+    point_tensors: tuple[TransportOwnershipTensorSet, ...]
+    density_weighted_full_tensor_m2_s: Array
+    density_weighted_dc_self_tensor_m2_s: Array
+    density_weighted_transition_displacement_tensor_m2_s: Array
+    density_weighted_bounded_memory_tensor_m2_s: Array
+    density_weighted_diagnostic_tensor_m2_s: Array
+    maximum_closure_residual_m2_s: float
+
+
+def _immutable_2d_array(values: Array, label: str) -> Array:
+    array = np.asarray(values, dtype=float).copy()
+    if array.ndim != 2:
+        raise ValueError(f"{label} must be two-dimensional")
+    if not np.all(np.isfinite(array)):
+        raise ValueError(f"{label} must be finite")
+    array.setflags(write=False)
+    return array
+
+
+def _immutable_index_vector(values: Array, label: str) -> Array:
+    array = np.asarray(values, dtype=int).copy()
+    if array.ndim != 1 or np.any(array < 0):
+        raise ValueError(f"{label} must be a nonnegative one-dimensional vector")
+    array.setflags(write=False)
+    return array
 
 FULL_LIBRARY_REQUIRED_SECTIONS = (
     "species",
@@ -120,6 +237,8 @@ PROJECTED_GENERATOR_REQUIRED_FIELDS = (
     "basin_stoichiometry",
     "volume_m3",
     "self_current_coordinate_projectors",
+    "state_transport_ownership_bases",
+    "transition_transport_ownership",
 )
 
 PROJECTED_PRIMITIVE_REQUIRED_FIELDS = (
@@ -161,6 +280,13 @@ class ProjectedGeneratorInput:
         temperature_K: float,
         volume_m3: float,
         self_current_coordinate_projectors: tuple[Array, ...],
+        state_transport_ownership_bases: tuple[
+            tuple[StateTransportOwnershipBasis, ...], ...
+        ],
+        transition_transport_ownership: tuple[TransportOwnership, ...],
+        state_relative_displacement_fluctuations_m: tuple[Array, ...],
+        state_relative_displacement_mobilities_m2_s: tuple[Array, ...],
+        state_relative_center_charge_numbers: tuple[Array, ...],
         max_transition_displacement_m: float = DEFAULT_MAX_TRANSITION_DISPLACEMENT_M,
     ) -> None:
         self.potential_energy_J_mol = potential_energy_J_mol
@@ -192,6 +318,15 @@ class ProjectedGeneratorInput:
         self.temperature_K = temperature_K
         self.volume_m3 = volume_m3
         self.self_current_coordinate_projectors = self_current_coordinate_projectors
+        self.state_transport_ownership_bases = state_transport_ownership_bases
+        self.transition_transport_ownership = transition_transport_ownership
+        self.state_relative_displacement_fluctuations_m = (
+            state_relative_displacement_fluctuations_m
+        )
+        self.state_relative_displacement_mobilities_m2_s = (
+            state_relative_displacement_mobilities_m2_s
+        )
+        self.state_relative_center_charge_numbers = state_relative_center_charge_numbers
         self.max_transition_displacement_m = max_transition_displacement_m
 
 
@@ -245,18 +380,6 @@ class FunctionGeneratorInput:
         self.max_transition_displacement_m = max_transition_displacement_m
 
 
-class ConductivityPhysicalLibrary:
-    def __init__(
-        self,
-        generator_input: ProjectedGeneratorInput,
-        state_labels: tuple[str, ...],
-        transition_labels: tuple[str, ...],
-    ) -> None:
-        self.generator_input = generator_input
-        self.state_labels = state_labels
-        self.transition_labels = transition_labels
-
-
 class ProjectedPrimitiveInput:
     def __init__(
         self,
@@ -302,6 +425,9 @@ class ProjectedConductivityResult:
         self_current_tensors_D_self_i_m2_s: Array,
         mori_memory_matrix_A: Array,
         mori_current_coupling_matrix_h: Array,
+        state_transport_ownership_quadratures: tuple[
+            StateTransportOwnershipQuadrature, ...
+        ],
         effect_attribution,
     ) -> None:
         self.sigma_S_m = sigma_S_m
@@ -322,6 +448,9 @@ class ProjectedConductivityResult:
         self.self_current_tensors_D_self_i_m2_s = self_current_tensors_D_self_i_m2_s
         self.mori_memory_matrix_A = mori_memory_matrix_A
         self.mori_current_coupling_matrix_h = mori_current_coupling_matrix_h
+        self.state_transport_ownership_quadratures = (
+            state_transport_ownership_quadratures
+        )
         self.effect_attribution = effect_attribution
 
     def __getitem__(self, key: str):
@@ -343,6 +472,7 @@ class ProjectedConductivityResult:
             "self_current_tensors_D_self_i_m2_s": self.self_current_tensors_D_self_i_m2_s,
             "mori_memory_matrix_A": self.mori_memory_matrix_A,
             "mori_current_coupling_matrix_h": self.mori_current_coupling_matrix_h,
+            "state_transport_ownership_quadratures": self.state_transport_ownership_quadratures,
             "effect_attribution": dict(self.effect_attribution),
         }
 
@@ -383,6 +513,42 @@ class FiniteProcessReadoutDiagnostics:
         self.active_transition_second_moment_count = (
             active_transition_second_moment_count
         )
+
+
+@dataclass(frozen=True)
+class FiniteLifetimeCovarianceDiagnostics:
+    state_index: int
+    lifetime_rate_s_inv: float
+    relative_covariance_trace_m2: float
+    instantaneous_relative_mobility_trace_m2_s: float
+    finite_relative_mobility_trace_m2_s: float
+    center_covariance_min_eigenvalue_m2_s: float
+    short_trace_m2_s: float
+    dc_self_trace_m2_s: float
+    bounded_memory_trace_m2_s: float
+    transition_owned_trace_m2_s: float
+
+
+@dataclass(frozen=True)
+class StateDriftComponentAudit:
+    component_id: int
+    state_indices: Array
+    c_transpose_b_mol_m2_s: Array
+    c_transpose_b_norm_mol_m2_s: float
+
+
+@dataclass(frozen=True)
+class DirectPrimitiveAuditLedger:
+    B_self_full_tensor_mol_m_s: Array
+    B_self_tangent_tensor_mol_m_s: Array
+    B_transition_tensor_mol_m_s: Array
+    B_overlap_removed_tensor_mol_m_s: Array
+    B_total_tensor_mol_m_s: Array
+    C_Q_contribution_tensor_mol_m_s: Array
+    state_drift_b_i_m_s: Array
+    state_exit_rates_s_inv: Array
+    state_drift_b_i_norms_m_s: Array
+    state_drift_components: tuple[StateDriftComponentAudit, ...]
 
 
 class PrimitivePredictionReadinessDiagnostics:
@@ -468,6 +634,24 @@ def compute_projected_analytical_conductivity(
             temperature_K=temperature_K,
             volume_m3=volume_m3,
             self_current_coordinate_projectors=self_current_coordinate_projectors,
+            state_transport_ownership_bases=(
+                _empty_state_transport_ownership_bases(basin_quadrature_points)
+            ),
+            transition_transport_ownership=tuple(
+                TransportOwnership.TRANSITION_DISPLACEMENT
+                for _transition_index in range(
+                    np.asarray(transition_pair_indices, dtype=int).shape[0]
+                )
+            ),
+            state_relative_displacement_fluctuations_m=tuple(
+                np.empty((0, CARTESIAN), dtype=float) for _ in range(state_count)
+            ),
+            state_relative_displacement_mobilities_m2_s=tuple(
+                np.empty((0, 0), dtype=float) for _ in range(state_count)
+            ),
+            state_relative_center_charge_numbers=tuple(
+                np.empty(0, dtype=float) for _ in range(state_count)
+            ),
         )
     )
 
@@ -514,75 +698,234 @@ def _compute_projected_analytical_conductivity_from_input(
         concentrations,
     )
     d, M = transition_moments_from_generator_input(model_input, len(partitions))
-    Dself = compute_self_current_tensors(
-        model_input.mobility_tensor_m2_s,
-        model_input.charge_polarization_gradient,
-        model_input.basin_quadrature_points,
-        density_weights,
-        concentrations,
-        self_current_coordinate_projectors=model_input.self_current_coordinate_projectors,
+    (
+        Dself_full,
+        Dself_tangent,
+        transition_owned_self_current,
+        bounded_memory_owned_self_current,
+        diagnostic_owned_self_current,
+        state_transport_ownership_quadratures,
+    ) = compute_state_transport_ownership_quadratures(
+        mobility_tensor_m2_s=model_input.mobility_tensor_m2_s,
+        charge_polarization_gradient=model_input.charge_polarization_gradient,
+        basin_quadrature_points=model_input.basin_quadrature_points,
+        basin_density_weights_mol_m3=density_weights,
+        basin_concentrations_mol_m3=concentrations,
+        state_transport_ownership_bases=(
+            _state_ownership_bases_with_memory_mode_indices(
+                model_input.state_transport_ownership_bases,
+                np.empty(0, dtype=int),
+            )
+        ),
     )
+    Dself_continuous = Dself_tangent + bounded_memory_owned_self_current
     Q_for_filter = compute_reversible_generator(K, concentrations)
     validate_reversible_generator(Q_for_filter, concentrations)
-    direct_for_filter = compute_direct_diffusivity_tensor(concentrations, K, M, Dself)
+    finite_lifetime_diagnostics = ()
+    direct_for_filter = compute_direct_diffusivity_tensor(
+        concentrations, K, M, Dself_tangent
+    )
     finite_correction_for_filter = compute_finite_state_memory_correction(
         concentrations,
         Q_for_filter,
         d,
     )
-    filtered_memory = filter_memory_basis_by_dirichlet_residual(
-        model_input.memory_coordinate_gradient,
+    raw_memory_matrix, raw_current_coupling = compute_mori_memory_matrices(
         model_input.mobility_tensor_m2_s,
         model_input.charge_polarization_gradient,
+        model_input.memory_coordinate_gradient,
         model_input.basin_quadrature_points,
         density_weights,
-        _symmetrize(direct_for_filter - finite_correction_for_filter),
-        MEMORY_NULLSPACE_RELATIVE_TOL,
-        MEMORY_NULLSPACE_RELATIVE_TOL,
-        PROJECTED_DIFFUSIVITY_PSD_RELATIVE_TOL,
     )
+    remaining_direct_tensor = _symmetrize(
+        direct_for_filter - finite_correction_for_filter
+    )
+    conductivity_scale_S_m = max(
+        abs(
+            conductivity_from_projected_diffusivity(
+                remaining_direct_tensor,
+                model_input.temperature_K,
+            )
+        ),
+        np.finfo(float).tiny,
+    )
+    refinement_result = refine_mori_basis_by_projected_residual(
+        direct_diffusivity_tensor=remaining_direct_tensor,
+        initial_mori_memory_matrix_A=np.zeros((0, 0), dtype=float),
+        initial_mori_current_coupling_matrix_h=np.zeros((0, CARTESIAN), dtype=float),
+        candidate_self_energies_A_gg=np.diag(raw_memory_matrix),
+        candidate_cross_energies_A_gPhi=np.zeros(
+            (raw_memory_matrix.shape[0], 0), dtype=float
+        ),
+        candidate_cross_energy_matrix=raw_memory_matrix,
+        candidate_current_couplings_h_g=raw_current_coupling,
+        temperature_K=model_input.temperature_K,
+        residual_score_tolerance=BASIS_REFINEMENT_RESIDUAL_RELATIVE_TOL
+        * max(_maximum_abs_eigenvalue(remaining_direct_tensor), np.finfo(float).tiny),
+        conductivity_change_tolerance_S_m=(
+            BASIS_REFINEMENT_CONDUCTIVITY_RELATIVE_TOL * conductivity_scale_S_m
+        ),
+        max_added_coordinates=raw_memory_matrix.shape[0],
+        require_candidate_set_exhaustion=False,
+    )
+    accepted_bounded_memory_mode_indices = np.intersect1d(
+        np.asarray(refinement_result["selected_candidate_indices"], dtype=int),
+        _declared_bounded_memory_mode_indices(
+            model_input.state_transport_ownership_bases
+        ),
+        assume_unique=False,
+    )
+    if accepted_bounded_memory_mode_indices.size:
+        (
+            Dself_full,
+            Dself_tangent,
+            transition_owned_self_current,
+            bounded_memory_owned_self_current,
+            diagnostic_owned_self_current,
+            state_transport_ownership_quadratures,
+        ) = compute_state_transport_ownership_quadratures(
+            mobility_tensor_m2_s=model_input.mobility_tensor_m2_s,
+            charge_polarization_gradient=model_input.charge_polarization_gradient,
+            basin_quadrature_points=model_input.basin_quadrature_points,
+            basin_density_weights_mol_m3=density_weights,
+            basin_concentrations_mol_m3=concentrations,
+            state_transport_ownership_bases=(
+                _state_ownership_bases_with_memory_mode_indices(
+                    model_input.state_transport_ownership_bases,
+                    accepted_bounded_memory_mode_indices,
+                )
+            ),
+        )
+        Dself_continuous = Dself_tangent + bounded_memory_owned_self_current
+        post_ownership_direct_tensor = compute_direct_diffusivity_tensor(
+            concentrations,
+            K,
+            M,
+            Dself_continuous,
+        )
+        post_ownership_mori_correction = compute_continuous_mori_correction(
+            refinement_result["final_mori_memory_matrix_A"],
+            refinement_result["final_mori_current_coupling_matrix_h"],
+        )
+        post_ownership_projected_tensor = _symmetrize(
+            post_ownership_direct_tensor
+            - finite_correction_for_filter
+            - post_ownership_mori_correction
+        )
+        post_ownership_eigenvalues = np.linalg.eigvalsh(post_ownership_projected_tensor)
+        post_ownership_scale = max(
+            _maximum_abs_eigenvalue(post_ownership_direct_tensor),
+            np.finfo(float).tiny,
+        )
+        if float(np.min(post_ownership_eigenvalues)) < (
+            -PROJECTED_DIFFUSIVITY_PSD_RELATIVE_TOL * post_ownership_scale
+        ):
+            refinement_result["rejected_psd_candidate_indices"] = np.unique(
+                np.concatenate(
+                    (
+                        np.asarray(
+                            refinement_result["rejected_psd_candidate_indices"],
+                            dtype=int,
+                        ),
+                        accepted_bounded_memory_mode_indices,
+                    )
+                )
+            )
+            refinement_result["selected_candidate_indices"] = np.empty(0, dtype=int)
+            refinement_result["final_mori_memory_matrix_A"] = np.zeros(
+                (0, 0), dtype=float
+            )
+            refinement_result["final_mori_current_coupling_matrix_h"] = np.zeros(
+                (0, CARTESIAN), dtype=float
+            )
+            (
+                Dself_full,
+                Dself_tangent,
+                transition_owned_self_current,
+                bounded_memory_owned_self_current,
+                diagnostic_owned_self_current,
+                state_transport_ownership_quadratures,
+            ) = compute_state_transport_ownership_quadratures(
+                mobility_tensor_m2_s=model_input.mobility_tensor_m2_s,
+                charge_polarization_gradient=model_input.charge_polarization_gradient,
+                basin_quadrature_points=model_input.basin_quadrature_points,
+                basin_density_weights_mol_m3=density_weights,
+                basin_concentrations_mol_m3=concentrations,
+                state_transport_ownership_bases=(
+                    _state_ownership_bases_with_memory_mode_indices(
+                        model_input.state_transport_ownership_bases,
+                        np.empty(0, dtype=int),
+                    )
+                ),
+            )
+            Dself_continuous = Dself_tangent + bounded_memory_owned_self_current
     projector_ranks = tuple(
         int(np.linalg.matrix_rank(np.asarray(projector, dtype=float)))
         for projector in model_input.self_current_coordinate_projectors
     )
-    conductivity_result = _compute_projected_analytical_conductivity_from_primitive_input(
-        ProjectedPrimitiveInput(
-            state_concentrations_mol_m3=concentrations,
-            symmetric_capacity_fluxes_K_ij_mol_m3_s=K,
-            transition_first_moments_d_ij_m=d,
-            transition_second_moments_M_ij_m2=M,
-            self_current_tensors_D_self_i_m2_s=Dself,
-            mori_memory_matrix_A=filtered_memory.mori_memory_matrix_A,
-            mori_current_coupling_matrix_h=filtered_memory.mori_current_coupling_matrix_h,
-            temperature_K=model_input.temperature_K,
-            volume_m3=model_input.volume_m3,
-            max_transition_displacement_m=model_input.max_transition_displacement_m,
-        ),
-        self_current_projector_ranks=projector_ranks,
+    conductivity_result = (
+        _compute_projected_analytical_conductivity_from_primitive_input(
+            ProjectedPrimitiveInput(
+                state_concentrations_mol_m3=concentrations,
+                symmetric_capacity_fluxes_K_ij_mol_m3_s=K,
+                transition_first_moments_d_ij_m=d,
+                transition_second_moments_M_ij_m2=M,
+                self_current_tensors_D_self_i_m2_s=Dself_continuous,
+                mori_memory_matrix_A=refinement_result["final_mori_memory_matrix_A"],
+                mori_current_coupling_matrix_h=refinement_result[
+                    "final_mori_current_coupling_matrix_h"
+                ],
+                temperature_K=model_input.temperature_K,
+                volume_m3=model_input.volume_m3,
+                max_transition_displacement_m=model_input.max_transition_displacement_m,
+            ),
+            self_current_projector_ranks=projector_ranks,
+            full_self_current_tensors_D_self_i_m2_s=Dself_full,
+        )
+    )
+    conductivity_result.state_transport_ownership_quadratures = (
+        state_transport_ownership_quadratures
     )
     conductivity_result.effect_attribution.update(
         {
-            "mori_filter_accepted_candidate_indices": (
-                filtered_memory.accepted_candidate_indices
+            "finite_lifetime_relative_covariance": finite_lifetime_diagnostics,
+            "transport_ownership_state_tensors": tuple(
+                {
+                    "state_index": state_index,
+                    "D_Q_short": Dself_full[state_index],
+                    "D_Q_dc_self": Dself_tangent[state_index],
+                    "D_Q_transition_owned": transition_owned_self_current[state_index],
+                    "D_Q_bounded_memory": bounded_memory_owned_self_current[
+                        state_index
+                    ],
+                    "D_Q_diagnostic": diagnostic_owned_self_current[state_index],
+                    "D_Q_unowned": _symmetrize(
+                        Dself_full[state_index]
+                        - Dself_tangent[state_index]
+                        - transition_owned_self_current[state_index]
+                        - bounded_memory_owned_self_current[state_index]
+                        - diagnostic_owned_self_current[state_index]
+                    ),
+                }
+                for state_index in range(len(concentrations))
             ),
-            "mori_filter_discarded_candidate_indices": (
-                filtered_memory.discarded_candidate_indices
-            ),
-            "mori_filter_rejected_candidate_indices": (
-                filtered_memory.rejected_candidate_indices
-            ),
-            "basis_refinement_convergence_status": "converged",
-            "basis_refinement_not_complete_reasons": (),
-            "basis_refinement_hard_convergence_failure": False,
-            "basis_refinement_final_maximum_residual_score": np.asarray(
-                [0.0],
-                dtype=float,
-            ),
-            "basis_refinement_final_conductivity_change_S_m": np.asarray(
-                [0.0],
-                dtype=float,
+            "mori_filter_accepted_candidate_indices": refinement_result[
+                "selected_candidate_indices"
+            ],
+            "mori_filter_discarded_candidate_indices": refinement_result[
+                "discarded_candidate_indices"
+            ],
+            "mori_filter_rejected_candidate_indices": np.concatenate(
+                (
+                    refinement_result["rejected_null_energy_candidate_indices"],
+                    refinement_result["rejected_current_spanning_candidate_indices"],
+                    refinement_result["rejected_psd_candidate_indices"],
+                )
             ),
         }
+    )
+    conductivity_result.effect_attribution.update(
+        basis_refinement_as_effect_attribution(refinement_result)
     )
     conductivity_result.effect_attribution.update(
         primitive_prediction_readiness_as_effect_attribution(
@@ -590,6 +933,360 @@ def _compute_projected_analytical_conductivity_from_input(
         )
     )
     return conductivity_result
+
+
+def _empty_state_transport_ownership_bases(
+    basin_quadrature_points: Sequence[Array],
+) -> tuple[tuple[StateTransportOwnershipBasis, ...], ...]:
+    points_by_state = tuple(
+        as_2d(state_points, "basin_quadrature_points[]")
+        for state_points in basin_quadrature_points
+    )
+    return tuple(
+        tuple(
+            StateTransportOwnershipBasis(
+                transition_displacement_gradients=np.empty(
+                    (0, points.shape[1]),
+                    dtype=float,
+                ),
+                transition_edge_indices=np.empty(0, dtype=int),
+                bounded_memory_gradients=np.empty(
+                    (0, points.shape[1]),
+                    dtype=float,
+                ),
+                bounded_memory_mode_indices=np.empty(0, dtype=int),
+                diagnostic_gradients=np.empty(
+                    (0, points.shape[1]),
+                    dtype=float,
+                ),
+                diagnostic_source_ids=(),
+            )
+            for _point in points
+        )
+        for points in points_by_state
+    )
+
+
+def _declared_bounded_memory_mode_indices(
+    state_transport_ownership_bases: Sequence[
+        Sequence[StateTransportOwnershipBasis]
+    ],
+) -> Array:
+    declared_indices = {
+        int(mode_index)
+        for state_bases in state_transport_ownership_bases
+        for ownership_basis in state_bases
+        for mode_index in ownership_basis.bounded_memory_mode_indices
+    }
+    return np.asarray(sorted(declared_indices), dtype=int)
+
+
+def _state_ownership_bases_with_memory_mode_indices(
+    state_transport_ownership_bases: Sequence[
+        Sequence[StateTransportOwnershipBasis]
+    ],
+    selected_memory_mode_indices: Array,
+) -> tuple[tuple[StateTransportOwnershipBasis, ...], ...]:
+    selected_indices = np.asarray(selected_memory_mode_indices, dtype=int)
+    if selected_indices.ndim != 1 or np.any(selected_indices < 0):
+        raise ValueError("selected_memory_mode_indices must be nonnegative and 1D")
+    selected_index_set = set(int(index) for index in selected_indices)
+    return tuple(
+        tuple(
+            _ownership_basis_with_selected_memory_modes(
+                ownership_basis,
+                selected_index_set,
+            )
+            for ownership_basis in state_bases
+        )
+        for state_bases in state_transport_ownership_bases
+    )
+
+
+def _ownership_basis_with_selected_memory_modes(
+    ownership_basis: StateTransportOwnershipBasis,
+    selected_memory_mode_indices: set[int],
+) -> StateTransportOwnershipBasis:
+    retained_row_indices = np.asarray(
+        [
+            row_index
+            for row_index, mode_index in enumerate(
+                ownership_basis.bounded_memory_mode_indices
+            )
+            if int(mode_index) in selected_memory_mode_indices
+        ],
+        dtype=int,
+    )
+    coordinate_dimension = ownership_basis.bounded_memory_gradients.shape[1]
+    retained_gradients = np.empty((0, coordinate_dimension), dtype=float)
+    retained_mode_indices = np.empty(0, dtype=int)
+    if retained_row_indices.size:
+        retained_gradients = ownership_basis.bounded_memory_gradients[
+            retained_row_indices
+        ]
+        retained_mode_indices = ownership_basis.bounded_memory_mode_indices[
+            retained_row_indices
+        ]
+    return StateTransportOwnershipBasis(
+        transition_displacement_gradients=(
+            ownership_basis.transition_displacement_gradients
+        ),
+        transition_edge_indices=ownership_basis.transition_edge_indices,
+        bounded_memory_gradients=retained_gradients,
+        bounded_memory_mode_indices=retained_mode_indices,
+        diagnostic_gradients=ownership_basis.diagnostic_gradients,
+        diagnostic_source_ids=ownership_basis.diagnostic_source_ids,
+    )
+
+
+def apply_finite_lifetime_relative_covariance(
+    self_current_tensors_D_self_i_m2_s: Array,
+    symmetric_capacity_fluxes_K_ij_mol_m3_s: Array,
+    reversible_generator_Q_ij_s_inv: Array,
+    transition_second_moments_M_ij_m2: Array,
+    state_concentrations_mol_m3: Array,
+    state_relative_displacement_fluctuations_m: Sequence[Array],
+    state_relative_displacement_mobilities_m2_s: Sequence[Array],
+    state_relative_center_charge_numbers: Sequence[Array],
+    transition_displacement_edge_mask: Array,
+    temperature_K: float,
+) -> tuple[Array, Array, tuple[FiniteLifetimeCovarianceDiagnostics, ...]]:
+    self_currents = np.asarray(self_current_tensors_D_self_i_m2_s, dtype=float).copy()
+    generator = as_square_any(
+        reversible_generator_Q_ij_s_inv, "reversible_generator_Q_ij_s_inv"
+    )
+    state_count = generator.shape[0]
+    capacity_fluxes = as_matrix_shape(
+        symmetric_capacity_fluxes_K_ij_mol_m3_s,
+        (state_count, state_count),
+        "symmetric_capacity_fluxes_K_ij_mol_m3_s",
+    )
+    concentrations = positive_vector(
+        state_concentrations_mol_m3, "state_concentrations_mol_m3"
+    )
+    second_moments = np.asarray(transition_second_moments_M_ij_m2, dtype=float).copy()
+    displacement_edge_mask = np.asarray(transition_displacement_edge_mask, dtype=bool)
+    if self_currents.shape != (state_count, CARTESIAN, CARTESIAN):
+        raise ValueError("self-current tensor shape must match finite-lifetime states")
+    if concentrations.shape != (state_count,):
+        raise ValueError("state concentration count must match finite-lifetime states")
+    if second_moments.shape != (state_count, state_count, CARTESIAN, CARTESIAN):
+        raise ValueError("transition second moments must have shape (n,n,3,3)")
+    if displacement_edge_mask.shape != (state_count, state_count):
+        raise ValueError("transition displacement edge mask must have shape (n,n)")
+    if not np.array_equal(displacement_edge_mask, displacement_edge_mask.T):
+        raise ValueError("transition displacement edge mask must be symmetric")
+    if not np.allclose(capacity_fluxes, capacity_fluxes.T):
+        raise ValueError("finite-lifetime capacity fluxes must be symmetric")
+    if np.any(capacity_fluxes < 0.0):
+        raise ValueError("finite-lifetime capacity fluxes must be nonnegative")
+    if not np.allclose(second_moments, np.swapaxes(second_moments, 0, 1)):
+        raise ValueError("finite-lifetime transition moments require M_ji=M_ij")
+    if (
+        not len(state_relative_displacement_fluctuations_m)
+        == len(state_relative_displacement_mobilities_m2_s)
+        == len(state_relative_center_charge_numbers)
+        == state_count
+    ):
+        raise ValueError("finite-lifetime descriptor count must match state count")
+    diagnostics = []
+    for state_index in range(state_count):
+        fluctuations = np.asarray(
+            state_relative_displacement_fluctuations_m[state_index], dtype=float
+        )
+        if fluctuations.shape == (0, CARTESIAN):
+            continue
+        if fluctuations.ndim != 2 or fluctuations.shape[1] != CARTESIAN:
+            raise ValueError(
+                "relative displacement fluctuations must have three columns"
+            )
+        instantaneous_relative_mobility = as_matrix_shape(
+            state_relative_displacement_mobilities_m2_s[state_index],
+            (CARTESIAN, CARTESIAN),
+            "state_relative_displacement_mobility",
+        )
+        validate_psd(
+            instantaneous_relative_mobility,
+            "state_relative_displacement_mobility",
+            allow_zero=True,
+        )
+        relative_covariance = _symmetrize(fluctuations.T @ fluctuations)
+        validate_psd(
+            relative_covariance, "relative_displacement_covariance", allow_zero=True
+        )
+        positive_float(temperature_K, "temperature_K")
+        lifetime_rate = -float(generator[state_index, state_index])
+        finite_relative_mobility = _finite_lifetime_relative_mobility(
+            relative_covariance,
+            instantaneous_relative_mobility,
+            lifetime_rate,
+        )
+        validate_psd(
+            finite_relative_mobility, "finite_relative_mobility", allow_zero=True
+        )
+        charges = as_1d(
+            state_relative_center_charge_numbers[state_index],
+            "state_relative_center_charge_numbers",
+        )
+        if charges.shape != (2,):
+            raise ValueError("relative center charge vector must contain two centers")
+        if not np.isclose(float(np.sum(charges)), 0.0):
+            raise ValueError("finite relative covariance requires a neutral bound pair")
+        self_currents[state_index] = _project_psd_numerical_roundoff(
+            _symmetrize(self_currents[state_index] - instantaneous_relative_mobility),
+            f"finite_lifetime_dc_self[{state_index}]",
+        )
+        positive_outgoing_indices = np.flatnonzero(
+            (capacity_fluxes[state_index] > 0.0) & displacement_edge_mask[state_index]
+        )
+        transition_owned_trace = float(np.trace(finite_relative_mobility))
+        short_trace = float(np.trace(instantaneous_relative_mobility))
+        bounded_memory_trace = float(
+            np.trace(instantaneous_relative_mobility - finite_relative_mobility)
+        )
+        ownership_scale = max(abs(short_trace), np.finfo(float).tiny)
+        if not np.isclose(
+            short_trace,
+            bounded_memory_trace + transition_owned_trace,
+            rtol=np.sqrt(np.finfo(float).eps),
+            atol=np.finfo(float).eps * ownership_scale,
+        ):
+            raise ValueError(
+                f"bound-state transport ownership does not reconstruct state {state_index}"
+            )
+        if transition_owned_trace > _scale_aware_nonzero_threshold(
+            finite_relative_mobility
+        ):
+            if positive_outgoing_indices.size == 0:
+                raise ValueError(
+                    "bound state with nonzero finite relative mobility requires a positive-K outgoing edge"
+                )
+            outgoing_capacity = float(
+                np.sum(capacity_fluxes[state_index, positive_outgoing_indices])
+            )
+            state_transition_moment = (
+                concentrations[state_index]
+                * finite_relative_mobility
+                / outgoing_capacity
+            )
+            for outgoing_index in positive_outgoing_indices:
+                second_moments[state_index, outgoing_index] = _symmetrize(
+                    second_moments[state_index, outgoing_index]
+                    + state_transition_moment
+                )
+                second_moments[state_index, outgoing_index] = (
+                    _project_psd_numerical_roundoff(
+                        second_moments[state_index, outgoing_index],
+                        f"finite_M[{state_index},{outgoing_index}]",
+                    )
+                )
+                second_moments[outgoing_index, state_index] = second_moments[
+                    state_index, outgoing_index
+                ]
+                validate_psd(
+                    second_moments[state_index, outgoing_index],
+                    f"finite_M[{state_index},{outgoing_index}]",
+                    allow_zero=True,
+                )
+        diagnostics.append(
+            FiniteLifetimeCovarianceDiagnostics(
+                state_index=state_index,
+                lifetime_rate_s_inv=lifetime_rate,
+                relative_covariance_trace_m2=float(np.trace(relative_covariance)),
+                instantaneous_relative_mobility_trace_m2_s=float(
+                    np.trace(instantaneous_relative_mobility)
+                ),
+                finite_relative_mobility_trace_m2_s=transition_owned_trace,
+                center_covariance_min_eigenvalue_m2_s=float(
+                    np.min(np.linalg.eigvalsh(self_currents[state_index]))
+                ),
+                short_trace_m2_s=short_trace,
+                dc_self_trace_m2_s=float(np.trace(self_currents[state_index])),
+                bounded_memory_trace_m2_s=bounded_memory_trace,
+                transition_owned_trace_m2_s=transition_owned_trace,
+            )
+        )
+    return self_currents, second_moments, tuple(diagnostics)
+
+
+def _finite_lifetime_relative_mobility(
+    relative_covariance_m2: Array,
+    instantaneous_relative_mobility_m2_s: Array,
+    lifetime_rate_s_inv: float,
+) -> Array:
+    covariance = _symmetrize(np.asarray(relative_covariance_m2, dtype=float))
+    mobility = _symmetrize(
+        np.asarray(instantaneous_relative_mobility_m2_s, dtype=float)
+    )
+    validate_psd(covariance, "relative_displacement_covariance", allow_zero=True)
+    validate_psd(mobility, "state_relative_displacement_mobility", allow_zero=True)
+    if lifetime_rate_s_inv < 0.0:
+        raise ValueError("finite-lifetime exit rate must be nonnegative")
+    if lifetime_rate_s_inv == 0.0:
+        return np.zeros((CARTESIAN, CARTESIAN), dtype=float)
+    covariance_square_root = symmetric_psd_square_root(
+        covariance,
+        "relative_displacement_covariance",
+    )
+    covariance_inverse_square_root = symmetric_psd_inverse_square_root(
+        covariance,
+        "relative_displacement_covariance",
+    )
+    mobility_square_root = symmetric_psd_square_root(
+        mobility,
+        "state_relative_displacement_mobility",
+    )
+    whitened_mobility_factor = covariance_inverse_square_root @ mobility_square_root
+    whitened_relaxation = _symmetrize(
+        whitened_mobility_factor @ whitened_mobility_factor.T
+    )
+    validate_psd(whitened_relaxation, "whitened_relative_relaxation", allow_zero=True)
+    relaxation_rates_s_inv, relaxation_modes = np.linalg.eigh(whitened_relaxation)
+    finite_response_rates_s_inv = (
+        lifetime_rate_s_inv
+        * relaxation_rates_s_inv
+        / (lifetime_rate_s_inv + relaxation_rates_s_inv)
+    )
+    finite_mobility_factor = (
+        covariance_square_root
+        @ relaxation_modes
+        @ np.diag(np.sqrt(finite_response_rates_s_inv))
+    )
+    finite_mobility = _symmetrize(finite_mobility_factor @ finite_mobility_factor.T)
+    return _project_psd_numerical_roundoff(
+        finite_mobility,
+        "finite_relative_mobility",
+    )
+
+
+def _project_psd_numerical_roundoff(matrix: Array, name: str) -> Array:
+    symmetric_matrix = _symmetrize(np.asarray(matrix, dtype=float))
+    eigenvalues, eigenvectors = np.linalg.eigh(symmetric_matrix)
+    maximum_abs_eigenvalue = float(np.max(np.abs(eigenvalues)))
+    if maximum_abs_eigenvalue == 0.0:
+        return symmetric_matrix
+    numerical_tolerance = np.sqrt(np.finfo(float).eps) * maximum_abs_eigenvalue
+    if float(np.min(eigenvalues)) < -numerical_tolerance:
+        raise ValueError(f"{name} has a physical negative eigenvalue")
+    nonnegative_eigenvalues = np.where(eigenvalues > 0.0, eigenvalues, 0.0)
+    return _symmetrize(eigenvectors @ np.diag(nonnegative_eigenvalues) @ eigenvectors.T)
+
+
+def symmetric_psd_square_root(matrix: Array, name: str) -> Array:
+    symmetric_matrix = _symmetrize(np.asarray(matrix, dtype=float))
+    validate_psd(symmetric_matrix, name, allow_zero=True)
+    left_vectors, singular_values, _right_vectors = np.linalg.svd(
+        symmetric_matrix,
+        hermitian=True,
+    )
+    return _symmetrize(
+        (left_vectors * np.sqrt(singular_values)[None, :]) @ left_vectors.T
+    )
+
+
+def symmetric_psd_inverse_square_root(matrix: Array, name: str) -> Array:
+    square_root = symmetric_psd_square_root(matrix, name)
+    return np.linalg.pinv(square_root, hermitian=True)
 
 
 def compute_projected_analytical_conductivity_from_functions(
@@ -739,6 +1436,28 @@ def _compute_projected_analytical_conductivity_from_functions_input(
             temperature_K=model_input.temperature_K,
             volume_m3=model_input.volume_m3,
             self_current_coordinate_projectors=model_input.self_current_coordinate_projectors,
+            state_transport_ownership_bases=(
+                _empty_state_transport_ownership_bases(
+                    model_input.basin_quadrature_points
+                )
+            ),
+            transition_transport_ownership=tuple(
+                TransportOwnership.TRANSITION_DISPLACEMENT
+                for _transition_index in range(
+                    np.asarray(model_input.transition_pair_indices, dtype=int).shape[0]
+                )
+            ),
+            state_relative_displacement_fluctuations_m=tuple(
+                np.empty((0, CARTESIAN), dtype=float)
+                for _ in model_input.basin_quadrature_points
+            ),
+            state_relative_displacement_mobilities_m2_s=tuple(
+                np.empty((0, 0), dtype=float)
+                for _ in model_input.basin_quadrature_points
+            ),
+            state_relative_center_charge_numbers=tuple(
+                np.empty(0, dtype=float) for _ in model_input.basin_quadrature_points
+            ),
             max_transition_displacement_m=model_input.max_transition_displacement_m,
         )
     )
@@ -768,59 +1487,25 @@ def compute_projected_analytical_conductivity_from_primitives(
             volume_m3=volume_m3,
         ),
         self_current_projector_ranks=(),
+        full_self_current_tensors_D_self_i_m2_s=self_current_tensors_D_self_i_m2_s,
     )
-
-
-def compute_projected_analytical_conductivity_from_composition(
-    recipe: Mapping[str, Mapping[str, float]],
-    temperature_K: float,
-) -> ProjectedConductivityResult:
-    raise ValueError(
-        "composition-only conductivity evaluation requires a populated full "
-        "ConductivityPhysicalLibrary; call compute_projected_analytical_conductivity "
-        "or build_projected_generator_from_physical_library with explicit U, D, P, "
-        "basins, transition surfaces, transition moments, and memory coordinates"
-    )
-
-
-def build_projected_primitives_from_electrolyte_composition(
-    recipe: Mapping[str, Mapping[str, float]],
-    temperature_K: float,
-) -> dict[str, Array]:
-    raise ValueError(
-        "composition-only primitive construction requires a populated full "
-        "ConductivityPhysicalLibrary; recipe dictionaries do not determine U, D, P, "
-        "basins, transition surfaces, transition moments, or memory coordinates"
-    )
-
-
-def build_projected_generator_from_electrolyte_composition(
-    recipe: Mapping[str, Mapping[str, float]],
-    temperature_K: float,
-) -> ProjectedGeneratorInput:
-    raise ValueError(
-        "recipe-to-generator construction requires a populated full "
-        "ConductivityPhysicalLibrary; composition species/loadings alone are not "
-        "an executable physical library"
-    )
-
-
-def build_projected_generator_from_physical_library(
-    physical_library: ConductivityPhysicalLibrary,
-) -> ProjectedGeneratorInput:
-    validate_physical_library(physical_library)
-    return physical_library.generator_input
 
 
 def _compute_projected_analytical_conductivity_from_primitive_input(
     primitive_input: ProjectedPrimitiveInput,
     self_current_projector_ranks: tuple[int, ...],
+    full_self_current_tensors_D_self_i_m2_s: Array,
 ) -> ProjectedConductivityResult:
     c, K, d, M, Dself, A, h = validate_primitive_input(primitive_input)
     Q = compute_reversible_generator(K, c)
     validate_reversible_generator(Q, c)
     direct = compute_direct_diffusivity_tensor(c, K, M, Dself)
-    finite_process_diagnostics = compute_finite_process_readout_diagnostics(K, d, M)
+    finite_process_diagnostics = compute_finite_process_readout_diagnostics(
+        K,
+        d,
+        M,
+        primitive_input.max_transition_displacement_m,
+    )
     finite_corr = compute_finite_state_memory_correction(c, Q, d)
     mori_corr = compute_continuous_mori_correction(A, h)
     validate_memory_schur_compatibility(
@@ -842,11 +1527,27 @@ def _compute_projected_analytical_conductivity_from_primitive_input(
         c, K, M, Dself, finite_corr, mori_corr, projected
     )
     attribution.update(
+        direct_primitive_audit_as_effect_attribution(
+            compute_direct_primitive_audit_ledger(
+                c,
+                K,
+                Q,
+                d,
+                M,
+                full_self_current_tensors_D_self_i_m2_s,
+                Dself,
+                finite_corr,
+            )
+        )
+    )
+    attribution.update(
         finite_process_readout_diagnostics_as_effect_attribution(
             finite_process_diagnostics
         )
     )
-    attribution.update(primitive_prediction_readiness_as_effect_attribution(attribution))
+    attribution.update(
+        primitive_prediction_readiness_as_effect_attribution(attribution)
+    )
     return ProjectedConductivityResult(
         sigma_S_m=sigma_S_m,
         sigma_mS_cm=sigma_S_m * S_M_TO_MS_CM,
@@ -862,6 +1563,7 @@ def _compute_projected_analytical_conductivity_from_primitive_input(
         self_current_tensors_D_self_i_m2_s=Dself,
         mori_memory_matrix_A=A,
         mori_current_coupling_matrix_h=h,
+        state_transport_ownership_quadratures=(),
         effect_attribution=attribution,
     )
 
@@ -1531,6 +2233,550 @@ def compute_transition_path_displacement_moments_from_polarization(
     )
 
 
+def transition_normal_gradient_matrix_for_state(
+    state_index: int,
+    coordinate_dimension: int,
+    transition_committor_gradients: Sequence[Array],
+    transition_surface_state_indices: Sequence[Array],
+) -> Array:
+    """Collect the committor normals that constrain one state's local motion."""
+
+    if state_index < 0:
+        raise ValueError("state_index must be nonnegative")
+    if coordinate_dimension <= 0:
+        raise ValueError("coordinate_dimension must be positive")
+    if len(transition_committor_gradients) != len(transition_surface_state_indices):
+        raise ValueError("transition gradient/state collections must have equal length")
+    state_normal_gradients = []
+    for transition_index, (committor_gradients, surface_state_indices) in enumerate(
+        zip(
+            transition_committor_gradients,
+            transition_surface_state_indices,
+            strict=True,
+        )
+    ):
+        gradient_matrix = as_2d(
+            committor_gradients,
+            f"transition_committor_gradients[{transition_index}]",
+        )
+        if gradient_matrix.shape[1] != coordinate_dimension:
+            raise ValueError(
+                "transition committor gradient has wrong coordinate dimension"
+            )
+        surface_states = np.asarray(surface_state_indices, dtype=int)
+        if surface_states.shape != (gradient_matrix.shape[0],):
+            raise ValueError("transition surface states must match gradient rows")
+        if np.any(surface_states < 0):
+            raise ValueError("transition surface state indices must be nonnegative")
+        state_normal_gradients.extend(gradient_matrix[surface_states == state_index])
+    if not state_normal_gradients:
+        return np.empty((0, coordinate_dimension), dtype=float)
+    normal_gradient_matrix = np.asarray(state_normal_gradients, dtype=float)
+    if not np.all(np.isfinite(normal_gradient_matrix)):
+        raise ValueError("transition normal gradients must be finite")
+    return normal_gradient_matrix
+
+
+def tangent_mobility(
+    mobility_tensor_m2_s: Array,
+    transition_normal_gradient_matrix: Array,
+) -> Array:
+    """Project a PSD mobility onto the tangent space of transition constraints."""
+
+    mobility = as_square_any(mobility_tensor_m2_s, "mobility_tensor_m2_s")
+    if not np.allclose(mobility, mobility.T, atol=PSD_TOL, rtol=PSD_TOL):
+        raise ValueError("mobility_tensor_m2_s must be symmetric")
+    validate_psd(mobility, "mobility_tensor_m2_s", allow_zero=True)
+    normal_gradients = as_2d(
+        transition_normal_gradient_matrix,
+        "transition_normal_gradient_matrix",
+    )
+    if normal_gradients.shape[1] != mobility.shape[0]:
+        raise ValueError("transition normals and mobility have incompatible dimensions")
+    if not np.all(np.isfinite(normal_gradients)):
+        raise ValueError("transition_normal_gradient_matrix must be finite")
+    if normal_gradients.shape[0] == 0:
+        return mobility.copy()
+
+    mobility_eigenvalues, mobility_eigenvectors = np.linalg.eigh(mobility)
+    maximum_mobility_eigenvalue = float(np.max(mobility_eigenvalues))
+    positive_mobility_mask = mobility_eigenvalues > (
+        PSEUDOINVERSE_RELATIVE_TOL * maximum_mobility_eigenvalue
+    )
+    if not np.any(positive_mobility_mask):
+        return np.zeros_like(mobility)
+    mobility_square_root = (
+        mobility_eigenvectors[:, positive_mobility_mask]
+        * np.sqrt(mobility_eigenvalues[positive_mobility_mask])[None, :]
+    )
+    whitened_normals = normal_gradients @ mobility_square_root
+    _, singular_values, right_singular_vectors = np.linalg.svd(
+        whitened_normals,
+        full_matrices=False,
+    )
+    maximum_singular_value = float(np.max(singular_values))
+    active_normal_mask = singular_values > (
+        PSEUDOINVERSE_RELATIVE_TOL * maximum_singular_value
+    )
+    tangent_projector = np.eye(mobility_square_root.shape[1], dtype=float)
+    if np.any(active_normal_mask):
+        active_normal_rows = right_singular_vectors[active_normal_mask]
+        tangent_projector -= active_normal_rows.T @ active_normal_rows
+    tangent_mobility_tensor = _symmetrize(
+        mobility_square_root @ tangent_projector @ mobility_square_root.T
+    )
+    validate_psd(tangent_mobility_tensor, "tangent_mobility", allow_zero=True)
+
+    mobility_rank = np.linalg.matrix_rank(mobility, hermitian=True)
+    tangent_rank = np.linalg.matrix_rank(tangent_mobility_tensor, hermitian=True)
+    if tangent_rank > mobility_rank:
+        raise ValueError("tangent mobility rank exceeds the source mobility rank")
+    normal_residual = normal_gradients @ tangent_mobility_tensor
+    residual_scale = max(
+        _maximum_abs_entry(normal_gradients @ mobility),
+        np.finfo(float).tiny,
+    )
+    if (
+        _maximum_abs_entry(normal_residual)
+        > PSEUDOINVERSE_RELATIVE_TOL * residual_scale
+    ):
+        raise ValueError("tangent mobility retains mobility along a transition normal")
+    return tangent_mobility_tensor
+
+
+def compute_self_current_tangent_tensor(
+    mobility_tensor_m2_s: Array,
+    charge_polarization_gradient: Array,
+    transition_normal_gradient_matrix: Array,
+) -> Array:
+    """Compute the Cartesian self-current tensor from tangent state mobility."""
+
+    mobility = as_square_any(mobility_tensor_m2_s, "mobility_tensor_m2_s")
+    charge_gradient = as_matrix_shape(
+        charge_polarization_gradient,
+        (CARTESIAN, mobility.shape[0]),
+        "charge_polarization_gradient",
+    )
+    tangent_mobility_tensor = tangent_mobility(
+        mobility_tensor_m2_s=mobility,
+        transition_normal_gradient_matrix=transition_normal_gradient_matrix,
+    )
+    self_current_tensor = _symmetrize(
+        charge_gradient @ tangent_mobility_tensor @ charge_gradient.T
+    )
+    validate_psd(self_current_tensor, "self_current_tangent_tensor", allow_zero=True)
+    return self_current_tensor
+
+
+def compute_transport_ownership_tensor_set(
+    state_index: int,
+    quadrature_index: int,
+    mobility_tensor_m2_s: Array,
+    charge_polarization_gradient: Array,
+    ownership_basis: StateTransportOwnershipBasis,
+) -> TransportOwnershipTensorSet:
+    mobility = as_square_any(mobility_tensor_m2_s, "mobility_tensor_m2_s")
+    validate_psd(mobility, "mobility_tensor_m2_s", allow_zero=True)
+    charge_gradient = as_matrix_shape(
+        charge_polarization_gradient,
+        (CARTESIAN, mobility.shape[0]),
+        "charge_polarization_gradient",
+    )
+    transition_gradients = _validated_ownership_gradient_matrix(
+        ownership_basis.transition_displacement_gradients,
+        mobility.shape[0],
+        "transition_displacement_gradients",
+    )
+    bounded_memory_gradients = _validated_ownership_gradient_matrix(
+        ownership_basis.bounded_memory_gradients,
+        mobility.shape[0],
+        "bounded_memory_gradients",
+    )
+    diagnostic_gradients = _validated_ownership_gradient_matrix(
+        ownership_basis.diagnostic_gradients,
+        mobility.shape[0],
+        "diagnostic_gradients",
+    )
+    _validate_ownership_source_cardinality(ownership_basis)
+
+    mobility_eigenvalues, mobility_eigenvectors = np.linalg.eigh(mobility)
+    maximum_eigenvalue = max(float(np.max(mobility_eigenvalues)), 0.0)
+    support_mask = mobility_eigenvalues > (
+        PSEUDOINVERSE_RELATIVE_TOL * maximum_eigenvalue
+    )
+    mobility_square_root = np.zeros_like(mobility)
+    support_projector = np.zeros_like(mobility)
+    if np.any(support_mask):
+        support_vectors = mobility_eigenvectors[:, support_mask]
+        mobility_square_root = _symmetrize(
+            (support_vectors * np.sqrt(mobility_eigenvalues[support_mask])[None, :])
+            @ support_vectors.T
+        )
+        support_projector = _symmetrize(support_vectors @ support_vectors.T)
+
+    transition_projector = _row_space_projector_within_support(
+        transition_gradients @ mobility_square_root,
+        support_projector,
+    )
+    memory_residual_support = _orthogonal_complement_projector(
+        support_projector,
+        transition_projector,
+    )
+    bounded_memory_projector = _row_space_projector_within_support(
+        bounded_memory_gradients @ mobility_square_root,
+        memory_residual_support,
+    )
+    diagnostic_residual_support = _orthogonal_complement_projector(
+        support_projector,
+        transition_projector + bounded_memory_projector,
+    )
+    diagnostic_projector = _row_space_projector_within_support(
+        diagnostic_gradients @ mobility_square_root,
+        diagnostic_residual_support,
+    )
+    dc_self_projector = _orthogonal_complement_projector(
+        support_projector,
+        transition_projector + bounded_memory_projector + diagnostic_projector,
+    )
+    owner_projectors = (
+        dc_self_projector,
+        transition_projector,
+        bounded_memory_projector,
+        diagnostic_projector,
+    )
+    _validate_ownership_projectors(owner_projectors, support_projector)
+    owner_mobilities = tuple(
+        _symmetrize(mobility_square_root @ projector @ mobility_square_root)
+        for projector in owner_projectors
+    )
+    owner_tensors = tuple(
+        _symmetrize(charge_gradient @ owner_mobility @ charge_gradient.T)
+        for owner_mobility in owner_mobilities
+    )
+    full_short_time_tensor = _symmetrize(
+        charge_gradient @ mobility @ charge_gradient.T
+    )
+    closure_residual = _symmetrize(
+        full_short_time_tensor - sum(owner_tensors, start=np.zeros((3, 3)))
+    )
+    closure_scale = max(
+        _maximum_abs_eigenvalue(full_short_time_tensor),
+        np.finfo(float).tiny,
+    )
+    closure_tolerance = PSEUDOINVERSE_RELATIVE_TOL * closure_scale
+    if _maximum_abs_eigenvalue(closure_residual) > closure_tolerance:
+        raise ValueError(
+            "TRANSPORT_OWNER_TENSOR_CLOSURE_FAILED: "
+            f"state={state_index}; quadrature={quadrature_index}"
+        )
+    diagnostic_tensor = owner_tensors[3]
+    if _maximum_abs_eigenvalue(diagnostic_tensor) > closure_tolerance:
+        raise ValueError(
+            "DIAGNOSTIC_CURRENT_NONZERO: "
+            f"state={state_index}; quadrature={quadrature_index}"
+        )
+    for owner_index, owner_tensor in enumerate(owner_tensors):
+        validate_psd(
+            owner_tensor,
+            f"transport_owner_tensor[{owner_index}]",
+            allow_zero=True,
+        )
+    return TransportOwnershipTensorSet(
+        state_index=state_index,
+        quadrature_index=quadrature_index,
+        full_short_time_tensor_m2_s=full_short_time_tensor,
+        dc_self_tensor_m2_s=owner_tensors[0],
+        transition_displacement_tensor_m2_s=owner_tensors[1],
+        bounded_memory_tensor_m2_s=owner_tensors[2],
+        diagnostic_tensor_m2_s=diagnostic_tensor,
+        closure_residual_tensor_m2_s=closure_residual,
+        coordinate_support_rank=int(np.count_nonzero(support_mask)),
+        transition_rank=int(np.linalg.matrix_rank(transition_projector)),
+        bounded_memory_rank=int(np.linalg.matrix_rank(bounded_memory_projector)),
+        diagnostic_rank=int(np.linalg.matrix_rank(diagnostic_projector)),
+    )
+
+
+def compute_state_transport_ownership_quadratures(
+    mobility_tensor_m2_s: Callable[[Array], Array],
+    charge_polarization_gradient: Callable[[Array], Array],
+    basin_quadrature_points: Sequence[Array],
+    basin_density_weights_mol_m3: Sequence[Array],
+    basin_concentrations_mol_m3: Array,
+    state_transport_ownership_bases: Sequence[
+        Sequence[StateTransportOwnershipBasis]
+    ],
+) -> tuple[
+    Array,
+    Array,
+    Array,
+    Array,
+    Array,
+    tuple[StateTransportOwnershipQuadrature, ...],
+]:
+    concentrations = positive_vector(
+        basin_concentrations_mol_m3,
+        "basin_concentrations_mol_m3",
+    )
+    state_count = len(basin_quadrature_points)
+    if len(basin_density_weights_mol_m3) != state_count:
+        raise ValueError("basin density-weight count must equal state count")
+    if len(state_transport_ownership_bases) != state_count:
+        raise ValueError("state ownership-basis count must equal state count")
+    if concentrations.size != state_count:
+        raise ValueError("basin concentration count must equal state count")
+    quadratures = tuple(
+        _compute_state_transport_ownership_quadrature(
+            state_index=state_index,
+            mobility_tensor_m2_s=mobility_tensor_m2_s,
+            charge_polarization_gradient=charge_polarization_gradient,
+            state_points=basin_quadrature_points[state_index],
+            state_density_weights=basin_density_weights_mol_m3[state_index],
+            state_concentration_mol_m3=float(concentrations[state_index]),
+            state_bases=state_transport_ownership_bases[state_index],
+        )
+        for state_index in range(state_count)
+    )
+    return (
+        np.asarray(
+            [item.density_weighted_full_tensor_m2_s for item in quadratures]
+        ),
+        np.asarray(
+            [item.density_weighted_dc_self_tensor_m2_s for item in quadratures]
+        ),
+        np.asarray(
+            [
+                item.density_weighted_transition_displacement_tensor_m2_s
+                for item in quadratures
+            ]
+        ),
+        np.asarray(
+            [item.density_weighted_bounded_memory_tensor_m2_s for item in quadratures]
+        ),
+        np.asarray(
+            [item.density_weighted_diagnostic_tensor_m2_s for item in quadratures]
+        ),
+        quadratures,
+    )
+
+
+def _compute_state_transport_ownership_quadrature(
+    state_index: int,
+    mobility_tensor_m2_s: Callable[[Array], Array],
+    charge_polarization_gradient: Callable[[Array], Array],
+    state_points: Array,
+    state_density_weights: Array,
+    state_concentration_mol_m3: float,
+    state_bases: Sequence[StateTransportOwnershipBasis],
+) -> StateTransportOwnershipQuadrature:
+    points = as_2d(state_points, f"basin_quadrature_points[{state_index}]")
+    density_weights = as_1d(
+        state_density_weights,
+        f"basin_density_weights_mol_m3[{state_index}]",
+    )
+    if points.shape[0] != density_weights.size:
+        raise ValueError("basin point/density-weight count mismatch")
+    if len(state_bases) != points.shape[0]:
+        raise ValueError("state ownership bases must align with basin points")
+    point_tensors = tuple(
+        compute_transport_ownership_tensor_set(
+            state_index=state_index,
+            quadrature_index=quadrature_index,
+            mobility_tensor_m2_s=mobility_tensor_m2_s(point),
+            charge_polarization_gradient=charge_polarization_gradient(point),
+            ownership_basis=state_bases[quadrature_index],
+        )
+        for quadrature_index, point in enumerate(points)
+    )
+    return StateTransportOwnershipQuadrature(
+        point_tensors=point_tensors,
+        density_weighted_full_tensor_m2_s=_aggregate_ownership_tensor_field(
+            point_tensors,
+            density_weights,
+            state_concentration_mol_m3,
+            "full_short_time_tensor_m2_s",
+        ),
+        density_weighted_dc_self_tensor_m2_s=_aggregate_ownership_tensor_field(
+            point_tensors,
+            density_weights,
+            state_concentration_mol_m3,
+            "dc_self_tensor_m2_s",
+        ),
+        density_weighted_transition_displacement_tensor_m2_s=(
+            _aggregate_ownership_tensor_field(
+                point_tensors,
+                density_weights,
+                state_concentration_mol_m3,
+                "transition_displacement_tensor_m2_s",
+            )
+        ),
+        density_weighted_bounded_memory_tensor_m2_s=(
+            _aggregate_ownership_tensor_field(
+                point_tensors,
+                density_weights,
+                state_concentration_mol_m3,
+                "bounded_memory_tensor_m2_s",
+            )
+        ),
+        density_weighted_diagnostic_tensor_m2_s=_aggregate_ownership_tensor_field(
+            point_tensors,
+            density_weights,
+            state_concentration_mol_m3,
+            "diagnostic_tensor_m2_s",
+        ),
+        maximum_closure_residual_m2_s=max(
+            _maximum_abs_eigenvalue(point_tensor.closure_residual_tensor_m2_s)
+            for point_tensor in point_tensors
+        ),
+    )
+
+
+def _aggregate_ownership_tensor_field(
+    point_tensors: tuple[TransportOwnershipTensorSet, ...],
+    density_weights: Array,
+    state_concentration_mol_m3: float,
+    field_name: str,
+) -> Array:
+    return _symmetrize(
+        sum(
+            (
+                float(density_weight)
+                * np.asarray(getattr(point_tensor, field_name), dtype=float)
+                for density_weight, point_tensor in zip(
+                    density_weights,
+                    point_tensors,
+                    strict=True,
+                )
+            ),
+            start=np.zeros((CARTESIAN, CARTESIAN), dtype=float),
+        )
+        / positive_float(state_concentration_mol_m3, "state_concentration_mol_m3")
+    )
+
+
+def _validated_ownership_gradient_matrix(
+    gradient_matrix: Array,
+    coordinate_dimension: int,
+    label: str,
+) -> Array:
+    gradients = as_2d(gradient_matrix, label)
+    if gradients.shape[1] != coordinate_dimension:
+        raise ValueError(f"{label} has wrong coordinate dimension")
+    if not np.all(np.isfinite(gradients)):
+        raise ValueError(f"{label} must be finite")
+    return gradients
+
+
+def _validate_ownership_source_cardinality(
+    ownership_basis: StateTransportOwnershipBasis,
+) -> None:
+    transition_edge_indices = np.asarray(
+        ownership_basis.transition_edge_indices,
+        dtype=int,
+    )
+    bounded_memory_mode_indices = np.asarray(
+        ownership_basis.bounded_memory_mode_indices,
+        dtype=int,
+    )
+    if transition_edge_indices.shape != (
+        ownership_basis.transition_displacement_gradients.shape[0],
+    ):
+        raise ValueError("TRANSITION_OWNER_SOURCE_CARDINALITY_FAILED")
+    if bounded_memory_mode_indices.shape != (
+        ownership_basis.bounded_memory_gradients.shape[0],
+    ):
+        raise ValueError("MEMORY_OWNER_SOURCE_CARDINALITY_FAILED")
+    if len(ownership_basis.diagnostic_source_ids) != (
+        ownership_basis.diagnostic_gradients.shape[0]
+    ):
+        raise ValueError("DIAGNOSTIC_OWNER_SOURCE_CARDINALITY_FAILED")
+    if np.any(transition_edge_indices < 0) or np.any(bounded_memory_mode_indices < 0):
+        raise ValueError("TRANSPORT_OWNER_SOURCE_INDEX_INVALID")
+
+
+def _row_space_projector(row_matrix: Array) -> Array:
+    rows = as_2d(row_matrix, "row_matrix")
+    coordinate_dimension = rows.shape[1]
+    if rows.shape[0] == 0:
+        return np.zeros((coordinate_dimension, coordinate_dimension), dtype=float)
+    _left_vectors, singular_values, right_vectors = np.linalg.svd(
+        rows,
+        full_matrices=False,
+    )
+    maximum_singular_value = max(float(np.max(singular_values)), 0.0)
+    active_rows = singular_values > (
+        PSEUDOINVERSE_RELATIVE_TOL * maximum_singular_value
+    )
+    if not np.any(active_rows):
+        return np.zeros((coordinate_dimension, coordinate_dimension), dtype=float)
+    basis = right_vectors[active_rows]
+    return _symmetrize(basis.T @ basis)
+
+
+def _row_space_projector_within_support(
+    row_matrix: Array,
+    support_projector: Array,
+) -> Array:
+    supported_rows = as_2d(row_matrix, "row_matrix") @ support_projector
+    row_projector = _row_space_projector(supported_rows)
+    return _spectral_projector(
+        support_projector @ row_projector @ support_projector
+    )
+
+
+def _orthogonal_complement_projector(
+    support_projector: Array,
+    owned_projector: Array,
+) -> Array:
+    return _spectral_projector(
+        support_projector - support_projector @ owned_projector @ support_projector
+    )
+
+
+def _spectral_projector(candidate_projector: Array) -> Array:
+    eigenvalues, eigenvectors = np.linalg.eigh(_symmetrize(candidate_projector))
+    active_mask = eigenvalues > 0.5
+    if not np.any(active_mask):
+        return np.zeros_like(candidate_projector)
+    active_vectors = eigenvectors[:, active_mask]
+    return _symmetrize(active_vectors @ active_vectors.T)
+
+
+def _validate_ownership_projectors(
+    owner_projectors: tuple[Array, Array, Array, Array],
+    support_projector: Array,
+) -> None:
+    tolerance = PSEUDOINVERSE_RELATIVE_TOL * max(
+        _maximum_abs_eigenvalue(support_projector),
+        np.finfo(float).tiny,
+    )
+    for owner_index, projector in enumerate(owner_projectors):
+        if _maximum_abs_entry(projector - projector.T) > tolerance:
+            raise ValueError(
+                f"TRANSPORT_OWNER_PROJECTOR_NOT_SYMMETRIC: owner={owner_index}"
+            )
+        if _maximum_abs_entry(projector @ projector - projector) > tolerance:
+            raise ValueError(
+                f"TRANSPORT_OWNER_PROJECTOR_NOT_IDEMPOTENT: owner={owner_index}"
+            )
+        validate_psd(
+            projector,
+            f"transport_owner_projector[{owner_index}]",
+            allow_zero=True,
+        )
+    for first_index, first_projector in enumerate(owner_projectors):
+        for second_index in range(first_index + 1, len(owner_projectors)):
+            overlap = first_projector @ owner_projectors[second_index]
+            if _maximum_abs_entry(overlap) > tolerance:
+                raise ValueError(
+                    "TRANSPORT_OWNER_PROJECTOR_OVERLAP: "
+                    f"owners={first_index},{second_index}"
+                )
+    closure = _symmetrize(support_projector - sum(owner_projectors))
+    if _maximum_abs_entry(closure) > tolerance:
+        raise ValueError("TRANSPORT_OWNER_PROJECTOR_CLOSURE_FAILED")
+
+
 def compute_self_current_tensors(
     mobility_tensor_m2_s: Callable[[Array], Array],
     charge_polarization_gradient: Callable[[Array], Array],
@@ -1538,13 +2784,23 @@ def compute_self_current_tensors(
     basin_density_weights_mol_m3: Sequence[Array],
     basin_concentrations_mol_m3: Array,
     self_current_coordinate_projectors: Sequence[Array],
-) -> Array:
+    self_current_ownership_normal_gradients_by_state: Sequence[Sequence[Array]],
+    bounded_memory_coordinate_gradient: Callable[[Array], Array],
+    bounded_memory_mode_indices: Array,
+) -> tuple[Array, Array, Array, Array, Array]:
     concentrations = positive_vector(
         basin_concentrations_mol_m3,
         "basin_concentrations_mol_m3",
     )
+    bounded_mode_indices = np.asarray(bounded_memory_mode_indices, dtype=int)
+    if bounded_mode_indices.ndim != 1 or np.any(bounded_mode_indices < 0):
+        raise ValueError("bounded_memory_mode_indices must be nonnegative and 1D")
     state_count = len(basin_quadrature_points)
-    tensors = np.zeros((state_count, CARTESIAN, CARTESIAN), dtype=float)
+    full_tensors = np.zeros((state_count, CARTESIAN, CARTESIAN), dtype=float)
+    tangent_tensors = np.zeros((state_count, CARTESIAN, CARTESIAN), dtype=float)
+    transition_owned_tensors = np.zeros_like(full_tensors)
+    bounded_memory_owned_tensors = np.zeros_like(full_tensors)
+    diagnostic_owned_tensors = np.zeros_like(full_tensors)
     if len(basin_density_weights_mol_m3) != state_count:
         raise ValueError("basin_density_weights_mol_m3 length must equal state count")
     if concentrations.size != state_count:
@@ -1553,6 +2809,8 @@ def compute_self_current_tensors(
         raise ValueError(
             "self_current_coordinate_projectors length must equal state count"
         )
+    if len(self_current_ownership_normal_gradients_by_state) != state_count:
+        raise ValueError("self-current ownership normal count must equal state count")
     for i, (points, density_weights) in enumerate(
         zip(basin_quadrature_points, basin_density_weights_mol_m3, strict=True)
     ):
@@ -1560,18 +2818,154 @@ def compute_self_current_tensors(
         W = as_1d(density_weights, "basin_density_weights_mol_m3[]")
         if pts.shape[0] != W.size:
             raise ValueError("basin quadrature point/density-weight count mismatch")
-        numerator = np.zeros((CARTESIAN, CARTESIAN), dtype=float)
-        for point, density_weight in zip(pts, W):
-            D = as_square(mobility_tensor_m2_s(point), point.size, "mobility_tensor")
-            gradP = as_matrix_shape(
+        coordinate_projector = as_matrix_shape(
+            self_current_coordinate_projectors[i],
+            (pts.shape[1], pts.shape[1]),
+            f"self_current_coordinate_projectors[{i}]",
+        )
+        state_point_normal_gradients = self_current_ownership_normal_gradients_by_state[
+            i
+        ]
+        if len(state_point_normal_gradients) != pts.shape[0]:
+            raise ValueError(
+                "self-current ownership normals must have one matrix per basin point"
+            )
+        full_numerator = np.zeros((CARTESIAN, CARTESIAN), dtype=float)
+        tangent_numerator = np.zeros((CARTESIAN, CARTESIAN), dtype=float)
+        transition_owned_numerator = np.zeros((CARTESIAN, CARTESIAN), dtype=float)
+        bounded_memory_owned_numerator = np.zeros((CARTESIAN, CARTESIAN), dtype=float)
+        diagnostic_owned_numerator = np.zeros((CARTESIAN, CARTESIAN), dtype=float)
+        for point_index, (point, density_weight) in enumerate(zip(pts, W)):
+            ownership_normal_gradients = as_2d(
+                state_point_normal_gradients[point_index],
+                (
+                    "self_current_ownership_normal_gradients_by_state"
+                    f"[{i}][{point_index}]"
+                ),
+            )
+            if ownership_normal_gradients.shape[1] != pts.shape[1]:
+                raise ValueError(
+                    "self-current ownership normals have wrong coordinate dimension"
+                )
+            mobility = as_square(
+                mobility_tensor_m2_s(point), point.size, "mobility_tensor"
+            )
+            charge_gradient = as_matrix_shape(
                 charge_polarization_gradient(point),
                 (CARTESIAN, point.size),
                 "charge_polarization_gradient",
             )
-            numerator += float(density_weight) * (gradP @ D @ gradP.T)
-        tensors[i] = _symmetrize(numerator / concentrations[i])
-        validate_psd(tensors[i], f"D_self[{i}]", allow_zero=True)
-    return tensors
+            bounded_memory_gradients = as_2d(
+                bounded_memory_coordinate_gradient(point),
+                "bounded_memory_coordinate_gradient",
+            )
+            if bounded_mode_indices.size:
+                if (
+                    int(np.max(bounded_mode_indices))
+                    >= bounded_memory_gradients.shape[0]
+                ):
+                    raise ValueError("bounded memory mode index is out of range")
+                bounded_memory_gradients = bounded_memory_gradients[
+                    bounded_mode_indices
+                ]
+            else:
+                bounded_memory_gradients = np.empty((0, point.size), dtype=float)
+            if bounded_memory_gradients.shape[1] != point.size:
+                raise ValueError(
+                    "bounded memory gradient has wrong coordinate dimension"
+                )
+            owned_gradient_rows = np.vstack(
+                (ownership_normal_gradients, bounded_memory_gradients)
+            )
+            base_mobility = _symmetrize(
+                coordinate_projector @ mobility @ coordinate_projector.T
+            )
+            transition_tangent_mobility = tangent_mobility(
+                mobility_tensor_m2_s=base_mobility,
+                transition_normal_gradient_matrix=ownership_normal_gradients,
+            )
+            projected_mobility = tangent_mobility(
+                mobility_tensor_m2_s=base_mobility,
+                transition_normal_gradient_matrix=owned_gradient_rows,
+            )
+            full_numerator += float(density_weight) * _symmetrize(
+                charge_gradient @ mobility @ charge_gradient.T
+            )
+            point_self_current_tensor = _symmetrize(
+                charge_gradient @ projected_mobility @ charge_gradient.T
+            )
+            tangent_numerator += float(density_weight) * point_self_current_tensor
+            transition_owned_numerator += float(density_weight) * _symmetrize(
+                charge_gradient
+                @ (base_mobility - transition_tangent_mobility)
+                @ charge_gradient.T
+            )
+            bounded_memory_owned_numerator += float(density_weight) * _symmetrize(
+                charge_gradient
+                @ (transition_tangent_mobility - projected_mobility)
+                @ charge_gradient.T
+            )
+            diagnostic_owned_numerator += float(density_weight) * _symmetrize(
+                charge_gradient @ (mobility - base_mobility) @ charge_gradient.T
+            )
+        full_tensors[i] = _symmetrize(full_numerator / concentrations[i])
+        tangent_tensors[i] = _symmetrize(tangent_numerator / concentrations[i])
+        transition_owned_tensors[i] = _symmetrize(
+            transition_owned_numerator / concentrations[i]
+        )
+        bounded_memory_owned_tensors[i] = _symmetrize(
+            bounded_memory_owned_numerator / concentrations[i]
+        )
+        diagnostic_owned_tensors[i] = _symmetrize(
+            diagnostic_owned_numerator / concentrations[i]
+        )
+        validate_psd(full_tensors[i], f"D_self_full[{i}]", allow_zero=True)
+        validate_psd(tangent_tensors[i], f"D_self_tangent[{i}]", allow_zero=True)
+        validate_psd(
+            transition_owned_tensors[i],
+            f"D_transition_owned[{i}]",
+            allow_zero=True,
+        )
+        validate_psd(
+            bounded_memory_owned_tensors[i],
+            f"D_bounded_memory_owned[{i}]",
+            allow_zero=True,
+        )
+        validate_psd(
+            diagnostic_owned_tensors[i],
+            f"D_diagnostic_owned[{i}]",
+            allow_zero=True,
+        )
+        ownership_closure_residual = _symmetrize(
+            full_tensors[i]
+            - tangent_tensors[i]
+            - transition_owned_tensors[i]
+            - bounded_memory_owned_tensors[i]
+            - diagnostic_owned_tensors[i]
+        )
+        closure_scale = max(
+            _maximum_abs_eigenvalue(full_tensors[i]),
+            np.finfo(float).tiny,
+        )
+        if _maximum_abs_eigenvalue(ownership_closure_residual) > (
+            max(
+                PROJECTED_DIFFUSIVITY_PSD_RELATIVE_TOL,
+                pts.shape[1] * np.sqrt(np.finfo(float).eps),
+            )
+            * closure_scale
+        ):
+            raise ValueError(
+                "STATE_OWNERSHIP_CLOSURE_FAILED: "
+                f"state={i}; residual={_maximum_abs_eigenvalue(ownership_closure_residual)}; "
+                f"scale={closure_scale}"
+            )
+    return (
+        full_tensors,
+        tangent_tensors,
+        transition_owned_tensors,
+        bounded_memory_owned_tensors,
+        diagnostic_owned_tensors,
+    )
 
 
 def compute_mori_memory_matrices(
@@ -1648,8 +3042,8 @@ def filter_memory_basis_by_dirichlet_residual(
             "direct_minus_finite_state_tensor",
         )
     )
-    energy_scale = max(_maximum_abs_entry(raw_memory_matrix), PSD_TOL)
-    coupling_scale = max(_maximum_abs_entry(raw_current_coupling), PSD_TOL)
+    energy_scale = max(_maximum_abs_entry(raw_memory_matrix), np.finfo(float).tiny)
+    coupling_scale = max(_maximum_abs_entry(raw_current_coupling), np.finfo(float).tiny)
     energy_threshold = positive_float(energy_tol, "energy_tol") * energy_scale
     null_current_threshold = (
         positive_float(null_current_tol, "null_current_tol") * coupling_scale
@@ -1709,8 +3103,8 @@ def filter_memory_basis_by_dirichlet_residual(
             rejected_indices.append(candidate_index)
             continue
         if _minimum_eigenvalue(candidate_remaining_tensor) < -psd_threshold * max(
-            1.0,
             _maximum_abs_eigenvalue(remaining_tensor),
+            np.finfo(float).tiny,
         ):
             rejected_indices.append(candidate_index)
             continue
@@ -1816,12 +3210,17 @@ def _maximum_abs_entry(matrix: Array) -> float:
     return float(np.max(np.abs(values)))
 
 
+def _scale_aware_nonzero_threshold(values: Array) -> float:
+    magnitude_scale = max(_maximum_abs_entry(values), np.finfo(float).tiny)
+    return FINITE_PROCESS_NONZERO_EPSILON_FACTOR * np.finfo(float).eps * magnitude_scale
+
+
 def compute_state_memory_coordinate_means(
     memory_coordinates: Callable[[Array], Array],
     basin_quadrature_points: Sequence[Array],
     basin_density_weights_mol_m3: Sequence[Array],
     basin_concentrations_mol_m3: Array,
-) -> Array:
+) -> tuple[Array, Array]:
     concentrations = positive_vector(
         basin_concentrations_mol_m3,
         "basin_concentrations_mol_m3",
@@ -1865,24 +3264,171 @@ def compute_direct_diffusivity_tensor(
     return _symmetrize(direct)
 
 
+def compute_direct_primitive_audit_ledger(
+    c: Array,
+    K: Array,
+    Q: Array,
+    d: Array,
+    M: Array,
+    Dself_full: Array,
+    Dself_tangent: Array,
+    finite_state_correction: Array,
+) -> DirectPrimitiveAuditLedger:
+    """Attribute the direct primitive tensor and finite-state overlap exactly."""
+
+    concentrations = positive_vector(c, "c")
+    generator = as_square_any(Q, "Q")
+    capacity_fluxes = as_square_any(K, "K")
+    first_moments = np.asarray(d, dtype=float)
+    second_moments = np.asarray(M, dtype=float)
+    full_self_tensors = np.asarray(Dself_full, dtype=float)
+    tangent_self_tensors = np.asarray(Dself_tangent, dtype=float)
+    finite_state_drift = compute_reversible_finite_state_drift(
+        concentrations, generator, first_moments
+    )
+    self_full = _symmetrize(np.einsum("i,iab->ab", concentrations, full_self_tensors))
+    self_tangent = _symmetrize(
+        np.einsum("i,iab->ab", concentrations, tangent_self_tensors)
+    )
+    overlap_removed = _symmetrize(self_full - self_tangent)
+    transition = _symmetrize(
+        0.5 * np.einsum("ij,ijab->ab", capacity_fluxes, second_moments)
+    )
+    total = _symmetrize(self_tangent + transition)
+    component_records: list[StateDriftComponentAudit] = []
+    for component_id, component_indices in enumerate(
+        _generator_connected_components(generator)
+    ):
+        component_weighted_drift = (
+            concentrations[component_indices] @ finite_state_drift[component_indices]
+        )
+        component_records.append(
+            StateDriftComponentAudit(
+                component_id=component_id,
+                state_indices=component_indices.copy(),
+                c_transpose_b_mol_m2_s=component_weighted_drift,
+                c_transpose_b_norm_mol_m2_s=float(
+                    np.linalg.norm(component_weighted_drift)
+                ),
+            )
+        )
+    return DirectPrimitiveAuditLedger(
+        B_self_full_tensor_mol_m_s=self_full,
+        B_self_tangent_tensor_mol_m_s=self_tangent,
+        B_transition_tensor_mol_m_s=transition,
+        B_overlap_removed_tensor_mol_m_s=overlap_removed,
+        B_total_tensor_mol_m_s=total,
+        C_Q_contribution_tensor_mol_m_s=_symmetrize(finite_state_correction),
+        state_drift_b_i_m_s=finite_state_drift,
+        state_exit_rates_s_inv=-np.diag(generator),
+        state_drift_b_i_norms_m_s=np.linalg.norm(finite_state_drift, axis=1),
+        state_drift_components=tuple(component_records),
+    )
+
+
+def direct_primitive_audit_as_effect_attribution(
+    ledger: DirectPrimitiveAuditLedger,
+) -> dict:
+    return {
+        "B_self_full_tensor_mol_m_s": ledger.B_self_full_tensor_mol_m_s,
+        "B_self_full_trace_mol_m_s": float(np.trace(ledger.B_self_full_tensor_mol_m_s)),
+        "B_self_tangent_tensor_mol_m_s": ledger.B_self_tangent_tensor_mol_m_s,
+        "B_self_tangent_trace_mol_m_s": float(
+            np.trace(ledger.B_self_tangent_tensor_mol_m_s)
+        ),
+        "B_transition_tensor_mol_m_s": ledger.B_transition_tensor_mol_m_s,
+        "B_transition_trace_mol_m_s": float(
+            np.trace(ledger.B_transition_tensor_mol_m_s)
+        ),
+        "B_overlap_removed_tensor_mol_m_s": ledger.B_overlap_removed_tensor_mol_m_s,
+        "B_overlap_removed_trace_mol_m_s": float(
+            np.trace(ledger.B_overlap_removed_tensor_mol_m_s)
+        ),
+        "B_total_tensor_mol_m_s": ledger.B_total_tensor_mol_m_s,
+        "B_total_trace_mol_m_s": float(np.trace(ledger.B_total_tensor_mol_m_s)),
+        "state_drift_b_i_m_s": ledger.state_drift_b_i_m_s,
+        "state_exit_rates_s_inv": ledger.state_exit_rates_s_inv,
+        "state_drift_b_i_norms_m_s": ledger.state_drift_b_i_norms_m_s,
+        "state_drift_components": tuple(
+            {
+                "component_id": component.component_id,
+                "state_indices": component.state_indices,
+                "c_transpose_b_mol_m2_s": component.c_transpose_b_mol_m2_s,
+                "c_transpose_b_norm_mol_m2_s": component.c_transpose_b_norm_mol_m2_s,
+            }
+            for component in ledger.state_drift_components
+        ),
+        "C_Q_contribution_tensor_mol_m_s": ledger.C_Q_contribution_tensor_mol_m_s,
+        "C_Q_contribution_trace_mol_m_s": float(
+            np.trace(ledger.C_Q_contribution_tensor_mol_m_s)
+        ),
+    }
+
+
 def compute_finite_state_memory_correction(c: Array, Q: Array, d: Array) -> Array:
     if c.size == 1 or np.max(np.abs(d)) == 0.0 or np.max(np.abs(Q)) == 0.0:
         return np.zeros((CARTESIAN, CARTESIAN), dtype=float)
-    b = np.einsum("ij,ija->ia", Q, d)
+    finite_state_drift = compute_reversible_finite_state_drift(c, Q, d)
     correction = np.zeros((CARTESIAN, CARTESIAN), dtype=float)
     chis = []
     for axis in range(CARTESIAN):
-        chis.append(solve_weighted_poisson(Q, c, b[:, axis]))
+        chis.append(solve_weighted_poisson(Q, c, finite_state_drift[:, axis]))
     for a in range(CARTESIAN):
         for b_axis in range(CARTESIAN):
-            correction[a, b_axis] = float(np.sum(c * b[:, a] * chis[b_axis]))
+            correction[a, b_axis] = float(
+                np.sum(c * finite_state_drift[:, a] * chis[b_axis])
+            )
     return _symmetrize(correction)
+
+
+def compute_reversible_finite_state_drift(c: Array, Q: Array, d: Array) -> Array:
+    """Return state-conditioned jump drift after enforcing reversible solvability."""
+
+    concentrations = positive_vector(c, "c")
+    generator = as_square_any(Q, "Q")
+    first_moments = np.asarray(d, dtype=float)
+    state_count = concentrations.size
+    if generator.shape != (state_count, state_count):
+        raise ValueError("Q shape does not match c")
+    if first_moments.shape != (state_count, state_count, CARTESIAN) or not np.all(
+        np.isfinite(first_moments)
+    ):
+        raise ValueError("d must have shape (n,n,3)")
+    validate_reversible_generator(generator, concentrations)
+    if not np.allclose(
+        first_moments,
+        -np.swapaxes(first_moments, 0, 1),
+        atol=PSD_TOL,
+        rtol=PSD_TOL,
+    ):
+        raise ValueError("d_ji must equal -d_ij")
+    finite_state_drift = np.einsum("ij,ija->ia", generator, first_moments)
+    for component_indices in _generator_connected_components(generator):
+        component_concentrations = concentrations[component_indices]
+        component_drift = finite_state_drift[component_indices]
+        weighted_drift = component_concentrations @ component_drift
+        weighted_absolute_scale = np.sum(
+            np.abs(component_concentrations[:, np.newaxis] * component_drift),
+            axis=0,
+        )
+        solvability_tolerance = np.maximum(
+            POISSON_SOLVABILITY_ABS_TOL,
+            POISSON_SOLVABILITY_EPSILON_FACTOR
+            * np.finfo(float).eps
+            * weighted_absolute_scale,
+        )
+        if np.any(np.abs(weighted_drift) > solvability_tolerance):
+            raise ValueError(
+                "reversible finite-state drift violates componentwise c^T b = 0"
+            )
+    return finite_state_drift
 
 
 def compute_finite_process_readout_diagnostics(
     K: Array,
     d: Array,
     M: Array,
+    max_transition_displacement_m: float,
 ) -> FiniteProcessReadoutDiagnostics:
     capacity_fluxes = as_square_any(K, "symmetric_capacity_fluxes_K_ij_mol_m3_s")
     first_moments = np.asarray(d, dtype=float)
@@ -1900,7 +3446,8 @@ def compute_finite_process_readout_diagnostics(
         CARTESIAN,
     ):
         raise ValueError("M must have shape (n,n,3,3)")
-    active_transition_mask = capacity_fluxes > PSD_TOL
+    capacity_threshold_mol_m3_s = _scale_aware_nonzero_threshold(capacity_fluxes)
+    active_transition_mask = capacity_fluxes > capacity_threshold_mol_m3_s
     active_transition_count = int(
         np.count_nonzero(np.triu(active_transition_mask, k=1))
     )
@@ -1909,14 +3456,36 @@ def compute_finite_process_readout_diagnostics(
         axis=1,
     ).reshape(capacity_fluxes.shape)
     second_moment_traces = np.trace(second_moments, axis1=2, axis2=3)
+    displacement_scale_m = positive_float(
+        max_transition_displacement_m,
+        "max_transition_displacement_m",
+    )
+    first_moment_threshold_m = (
+        FINITE_PROCESS_NONZERO_EPSILON_FACTOR
+        * np.finfo(float).eps
+        * displacement_scale_m
+    )
+    second_moment_threshold_m2 = (
+        FINITE_PROCESS_NONZERO_EPSILON_FACTOR
+        * np.finfo(float).eps
+        * displacement_scale_m**2
+    )
     active_first_moment_count = int(
         np.count_nonzero(
-            np.triu(active_transition_mask & (first_moment_norms > PSD_TOL), k=1)
+            np.triu(
+                active_transition_mask
+                & (first_moment_norms > first_moment_threshold_m),
+                k=1,
+            )
         )
     )
     active_second_moment_count = int(
         np.count_nonzero(
-            np.triu(active_transition_mask & (second_moment_traces > PSD_TOL), k=1)
+            np.triu(
+                active_transition_mask
+                & (second_moment_traces > second_moment_threshold_m2),
+                k=1,
+            )
         )
     )
     direct_only = active_transition_count == 0 or (
@@ -2024,6 +3593,10 @@ def basis_refinement_as_effect_attribution(refinement_result):
         ),
         "basis_refinement_final_conductivity_change_abs_S_m": np.asarray(
             refinement_result["final_conductivity_change_abs_S_m"],
+            dtype=float,
+        ),
+        "basis_refinement_selected_residual_score_history": np.asarray(
+            refinement_result["selected_residual_score_history"],
             dtype=float,
         ),
     }
@@ -2308,7 +3881,8 @@ def score_candidate_mori_coordinates(
     )
     coupling_norms = np.sum(residual_coupling * residual_coupling, axis=1)
     scores = np.zeros_like(residual_energy, dtype=float)
-    valid_energy = residual_energy > PSD_TOL
+    energy_threshold = _scale_aware_nonzero_threshold(residual_energy)
+    valid_energy = residual_energy > energy_threshold
     scores[valid_energy] = coupling_norms[valid_energy] / residual_energy[valid_energy]
     return {
         "residual_coupling": residual_coupling,
@@ -2329,6 +3903,7 @@ def refine_mori_basis_by_projected_residual(
     residual_score_tolerance: float,
     conductivity_change_tolerance_S_m: float,
     max_added_coordinates: int,
+    require_candidate_set_exhaustion: bool,
 ) -> dict[str, Any]:
     selected_candidate_indices: list[int] = []
     current_memory = as_square_any(initial_mori_memory_matrix_A, "initial_A").copy()
@@ -2354,7 +3929,8 @@ def refine_mori_basis_by_projected_residual(
         raise ValueError(
             "candidate_h must have one Cartesian coupling row per candidate"
         )
-    validate_psd(candidate_matrix, "candidate_A", allow_zero=True)
+    if candidate_matrix.size > 0:
+        validate_psd(candidate_matrix, "candidate_A", allow_zero=True)
     if max_added_coordinates < 0:
         raise ValueError("max_added_coordinates must be nonnegative")
     score_tolerance = positive_float(
@@ -2390,17 +3966,18 @@ def refine_mori_basis_by_projected_residual(
     energy_scale = max(
         _maximum_abs_entry(candidate_matrix),
         _maximum_abs_entry(current_memory),
-        PSD_TOL,
+        np.finfo(float).tiny,
     )
     coupling_scale = max(
         _maximum_abs_entry(candidate_coupling),
         _maximum_abs_entry(current_coupling),
-        PSD_TOL,
+        np.finfo(float).tiny,
     )
     energy_threshold = MEMORY_NULLSPACE_RELATIVE_TOL * energy_scale
     null_current_threshold = MEMORY_NULLSPACE_RELATIVE_TOL * coupling_scale
     conductivity_change = 0.0
     final_maximum_score = np.inf
+    candidate_set_exhausted = False
     for _iteration_index in range(max_added_coordinates + 1):
         dynamic_candidate_cross = np.hstack(
             [
@@ -2453,23 +4030,38 @@ def refine_mori_basis_by_projected_residual(
             if _minimum_eigenvalue(
                 candidate_remaining_tensor
             ) < -PROJECTED_DIFFUSIVITY_PSD_RELATIVE_TOL * max(
-                1.0,
                 _maximum_abs_eigenvalue(remaining_tensor),
+                np.finfo(float).tiny,
             ):
                 available_candidates[candidate_index] = False
                 eligible_candidates[candidate_index] = False
                 rejected_psd_indices.append(int(candidate_index))
         scores = np.where(eligible_candidates, score_result["scores"], -np.inf)
+        negligible_candidate_indices = np.flatnonzero(
+            eligible_candidates & (scores <= score_tolerance)
+        )
+        for candidate_index in negligible_candidate_indices:
+            available_candidates[candidate_index] = False
+            discarded_candidate_indices.append(int(candidate_index))
+        scores[negligible_candidate_indices] = -np.inf
         finite_scores = scores[np.isfinite(scores)]
         if finite_scores.size == 0:
             final_maximum_score = 0.0
+            candidate_set_exhausted = True
         else:
             final_maximum_score = float(np.max(finite_scores))
         maximum_score_history.append(final_maximum_score)
-        if (
-            final_maximum_score <= score_tolerance
-            and conductivity_change <= conductivity_tolerance
-        ):
+        residual_is_converged = final_maximum_score <= score_tolerance
+        if require_candidate_set_exhaustion:
+            candidate_policy_is_satisfied = (
+                candidate_set_exhausted
+                and conductivity_change <= conductivity_tolerance
+            )
+        else:
+            candidate_policy_is_satisfied = (
+                candidate_set_exhausted or conductivity_change <= conductivity_tolerance
+            )
+        if residual_is_converged and candidate_policy_is_satisfied:
             break
         if _iteration_index == max_added_coordinates:
             break
@@ -2512,10 +4104,15 @@ def refine_mori_basis_by_projected_residual(
         conductivity_change_history.append(float(conductivity_change))
     convergence_status = "converged"
     not_complete_reasons: list[str] = []
-    if final_maximum_score > score_tolerance:
+    if require_candidate_set_exhaustion and not candidate_set_exhausted:
+        convergence_status = "candidate_set_not_exhausted"
+        not_complete_reasons.append("candidate_set_not_exhausted")
+    elif final_maximum_score > score_tolerance:
         convergence_status = "basis_residual_above_tolerance"
         not_complete_reasons.append("basis_residual_score_above_tolerance")
-    elif conductivity_change > conductivity_tolerance:
+    elif conductivity_change > conductivity_tolerance and (
+        require_candidate_set_exhaustion or not candidate_set_exhausted
+    ):
         convergence_status = "conductivity_change_above_tolerance"
         not_complete_reasons.append("conductivity_change_above_tolerance")
     if (
@@ -2573,6 +4170,8 @@ def refine_mori_basis_by_projected_residual(
             dtype=float,
         ),
         "final_sigma_S_m": np.asarray(conductivity_history[-1], dtype=float),
+        "candidate_set_exhausted": candidate_set_exhausted,
+        "candidate_count": int(candidate_count),
         "convergence_status": convergence_status,
         "not_complete_reasons": tuple(not_complete_reasons),
         "hard_convergence_failure": convergence_status != "converged",
@@ -2756,11 +4355,27 @@ def validate_generator_input(x: ProjectedGeneratorInput) -> None:
     positive_float(x.volume_m3, "volume_m3")
     validate_basin_quadrature(x.basin_quadrature_points, x.basin_quadrature_weights)
     state_count = len(x.basin_quadrature_points)
-    validate_full_generator_projectors_are_identity(
+    validate_self_current_coordinate_projectors(
         x.self_current_coordinate_projectors,
         state_count,
         _infer_coordinate_dim(x.basin_quadrature_points),
     )
+    coordinate_dimension = _infer_coordinate_dim(x.basin_quadrature_points)
+    if len(x.state_transport_ownership_bases) != state_count:
+        raise ValueError("state transport ownership basis count must equal state count")
+    for state_index, state_bases in enumerate(x.state_transport_ownership_bases):
+        if len(state_bases) != len(x.basin_quadrature_points[state_index]):
+            raise ValueError("state ownership bases must align with basin points")
+        for ownership_basis in state_bases:
+            for gradient_matrix in (
+                ownership_basis.transition_displacement_gradients,
+                ownership_basis.bounded_memory_gradients,
+                ownership_basis.diagnostic_gradients,
+            ):
+                if gradient_matrix.shape[1] != coordinate_dimension:
+                    raise ValueError(
+                        "state ownership basis coordinate dimension mismatch"
+                    )
     validate_transition_inputs(
         x.transition_pair_indices,
         (
@@ -2778,6 +4393,13 @@ def validate_generator_input(x: ProjectedGeneratorInput) -> None:
         "transition_log_capacity_integrals",
     )
     transition_count = as_pairs(x.transition_pair_indices, state_count).shape[0]
+    if len(x.transition_transport_ownership) != transition_count:
+        raise ValueError("transition ownership count must equal transition count")
+    if any(
+        not isinstance(ownership, TransportOwnership)
+        for ownership in x.transition_transport_ownership
+    ):
+        raise TypeError("transition ownership values must be TransportOwnership")
     if log_capacity_integrals.size != transition_count:
         raise ValueError(
             "transition_log_capacity_integrals length must equal transition count"
@@ -2802,7 +4424,7 @@ def validate_generator_input(x: ProjectedGeneratorInput) -> None:
     transition_moments_from_generator_input(x, state_count)
 
 
-def validate_full_generator_projectors_are_identity(
+def validate_self_current_coordinate_projectors(
     self_current_coordinate_projectors: Sequence[Array],
     state_count: int,
     coordinate_dimension: int,
@@ -2811,40 +4433,28 @@ def validate_full_generator_projectors_are_identity(
         raise ValueError(
             "self_current_coordinate_projectors length must equal state count"
         )
-    identity_projector = np.eye(coordinate_dimension, dtype=float)
     for state_index, projector in enumerate(self_current_coordinate_projectors):
         projector_matrix = as_matrix_shape(
             projector,
             (coordinate_dimension, coordinate_dimension),
             f"self_current_coordinate_projectors[{state_index}]",
         )
-        if not np.allclose(projector_matrix, identity_projector):
+        if not np.allclose(projector_matrix, projector_matrix.T):
             raise ValueError(
-                "full-generator conductivity path requires identity "
-                f"self_current_coordinate_projectors[{state_index}]"
+                f"self_current_coordinate_projectors[{state_index}] must be symmetric"
             )
-
-
-def validate_physical_library(physical_library: ConductivityPhysicalLibrary) -> None:
-    validate_generator_input(physical_library.generator_input)
-    state_count = len(physical_library.generator_input.basin_quadrature_points)
-    if len(physical_library.state_labels) != state_count:
-        raise ValueError("physical library state labels do not match basin count")
-    if len(set(physical_library.state_labels)) != len(physical_library.state_labels):
-        raise ValueError("physical library state labels must be unique")
-    transition_pairs = as_pairs(
-        physical_library.generator_input.transition_pair_indices,
-        state_count,
-    )
-    transition_count = int(transition_pairs.shape[0])
-    if len(physical_library.transition_labels) != transition_count:
-        raise ValueError(
-            "physical library transition labels do not match transition count"
-        )
-    if len(set(physical_library.transition_labels)) != len(
-        physical_library.transition_labels
-    ):
-        raise ValueError("physical library transition labels must be unique")
+        if not np.allclose(projector_matrix @ projector_matrix, projector_matrix):
+            raise ValueError(
+                f"self_current_coordinate_projectors[{state_index}] must be idempotent"
+            )
+        if not np.array_equal(
+            projector_matrix,
+            np.eye(coordinate_dimension, dtype=float),
+        ):
+            raise ValueError(
+                "LEGACY_SELF_CURRENT_PROJECTOR_FORBIDDEN: "
+                f"state={state_index}"
+            )
 
 
 def validate_function_input(x: FunctionGeneratorInput) -> None:
@@ -2915,6 +4525,21 @@ def validate_primitive_input(
             if not np.allclose(M[i, j], M[i, j].T, atol=1e-12, rtol=1e-12):
                 raise ValueError("each M_ij must be symmetric")
             validate_psd(M[i, j], f"M[{i},{j}]", allow_zero=True)
+            transition_outer_moment_m2 = np.outer(d[i, j], d[i, j])
+            transition_covariance_m2 = M[i, j] - transition_outer_moment_m2
+            covariance_eigenvalues_m2 = np.linalg.eigvalsh(
+                _symmetrize(transition_covariance_m2)
+            )
+            covariance_scale_m2 = max(
+                _maximum_abs_entry(M[i, j]),
+                _maximum_abs_entry(transition_outer_moment_m2),
+                np.finfo(float).tiny,
+            )
+            if np.min(covariance_eigenvalues_m2) < -PSD_TOL * covariance_scale_m2:
+                raise ValueError(
+                    f"M[{i},{j}] - d[{i},{j}] d[{i},{j}]^T must be "
+                    "positive semidefinite"
+                )
     Dself = np.asarray(x.self_current_tensors_D_self_i_m2_s, dtype=float)
     if Dself.shape != (n, CARTESIAN, CARTESIAN) or not np.all(np.isfinite(Dself)):
         raise ValueError("D_self must have shape (n,3,3)")

@@ -1,9 +1,21 @@
 schema: conductivity_memory_coordinate_record_v1
-families:
-- cage_backjump
-- partner_residence
-- ligand_shell_residence
-- anion_orientation
-- free_volume_stress
-- bounded_internal_polarization
+memory_records:
+  cage_backjump:
+    transport_ownership: bounded_memory
+    matching_transition_families: [cage_capture_release]
+  partner_residence:
+    transport_ownership: bounded_memory
+    matching_transition_families: [partner_switch]
+  ligand_shell_residence:
+    transport_ownership: bounded_memory
+    matching_transition_families: [Li_to_Li_ligand, LiA_to_Li_ligand_anion]
+  anion_orientation:
+    transport_ownership: bounded_memory
+    matching_transition_families: []
+  free_volume_stress:
+    transport_ownership: bounded_memory
+    matching_transition_families: []
+  bounded_internal_polarization:
+    transport_ownership: bounded_memory
+    matching_transition_families: [free_to_SSIP, SSIP_to_CIP]
 orthogonalization: subtract state-conditional mean before Mori matrix construction

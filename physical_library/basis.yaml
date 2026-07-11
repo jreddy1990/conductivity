@@ -81,7 +81,10 @@ active_state_axis_coordinates:
 - atmosphere_polarization
 state_axis_generation: sparse_single_axis_plus_pair
 population_cutoff: 0.0
-finite_generator_log_partition_span: 100.0
+trajectory_basis_refinement:
+  residual_score_tolerance_m2_s: 1.0e-12
+  conductivity_change_tolerance_S_m: 1.0e-4
+  source: numerical convergence thresholds resolving 1 percent of molecular diffusivity and 0.001 mS/cm conductivity
 quadrature:
   free_outer_distance_factor: 1.5
 coordinate_domains:

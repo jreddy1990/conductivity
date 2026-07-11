@@ -1,0 +1,13 @@
+temperature_K: 298.15
+solvents_vv:
+  EC: 0.34
+  DMC: 0.66
+salts_mol_l:
+  Li+: 1.1
+  PF6-: 0.8
+  FSI-: 0.3
+additives_weight_fraction:
+  TPP: 0.02
+  PS: 0.01
+  VC: 0.005
+  LiDFOB: 0.005

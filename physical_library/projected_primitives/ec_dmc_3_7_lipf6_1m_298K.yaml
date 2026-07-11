@@ -1,0 +1,445 @@
+schema: projected_primitives_v1
+projected_readout_status: failed
+failure_reason: 'no converged long-time diffusive window for occupied states: CIP|anion_coordinated|none|PF6-:anion_delocalized|tangential|bridge_network|partner_a|carrier_identity_a|hop_source|cage_released|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released,
+  CIP|anion_coordinated|none|PF6-:anion_delocalized|radial|bridge_network|partner_a|carrier_identity_a|hop_source|cage_released|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released,
+  CIP|solvent_only|none|PF6-:anion_delocalized|bridging|bridge_network|partner_a|carrier_identity_a|hop_source|cage_released|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released,
+  CIP|anion_coordinated|none|PF6-:anion_delocalized|free_rotating|bridge_network|partner_a|carrier_identity_a|hop_source|cage_released|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released,
+  CIP|anion_coordinated|none|PF6-:anion_delocalized|bridging|bridge_network|partner_a|carrier_identity_a|hop_source|cage_released|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released,
+  CIP|solvent_only|none|PF6-:anion_delocalized|tangential|bridge_network|partner_a|carrier_identity_a|hop_source|cage_released|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released,
+  CIP|anion_coordinated|none|PF6-:anion_delocalized|radial|bridge_network|partner_b|carrier_identity_a|hop_source|cage_captured|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released,
+  CIP|anion_coordinated|none|PF6-:anion_delocalized|bridging|bridge_network|partner_a|carrier_identity_b|hop_target|cage_released|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released,
+  CIP|solvent_only|none|PF6-:anion_delocalized|bridging|bridge_network|partner_b|carrier_identity_a|hop_source|cage_captured|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released,
+  CIP|anion_coordinated|none|PF6-:anion_delocalized|tangential|bridge_network|partner_b|carrier_identity_a|hop_source|cage_captured|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released,
+  CIP|anion_coordinated|none|PF6-:anion_delocalized|free_rotating|bridge_network|partner_b|carrier_identity_a|hop_source|cage_captured|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released,
+  CIP|solvent_only|none|PF6-:anion_delocalized|free_rotating|bridge_network|partner_b|carrier_identity_a|hop_source|cage_captured|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released,
+  CIP|anion_coordinated|none|PF6-:anion_delocalized|bridging|bridge_network|partner_b|carrier_identity_a|hop_source|cage_captured|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released,
+  CIP|anion_coordinated|none|PF6-:anion_delocalized|radial|bridge_network|partner_a|carrier_identity_b|hop_target|cage_released|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released,
+  CIP|anion_coordinated|none|PF6-:anion_delocalized|free_rotating|bridge_network|partner_a|carrier_identity_b|hop_target|cage_released|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released,
+  CIP|solvent_only|none|PF6-:anion_delocalized|radial|bridge_network|partner_b|carrier_identity_a|hop_source|cage_captured|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released,
+  CIP|anion_coordinated|none|PF6-:anion_delocalized|tangential|bridge_network|partner_a|carrier_identity_b|hop_target|cage_released|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released,
+  CIP|solvent_only|none|PF6-:anion_delocalized|tangential|bridge_network|partner_b|carrier_identity_a|hop_source|cage_captured|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released,
+  CIP|solvent_only|none|PF6-:anion_delocalized|free_rotating|bridge_network|partner_a|carrier_identity_b|hop_target|cage_released|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released,
+  CIP|solvent_only|none|PF6-:anion_delocalized|bridging|bridge_network|partner_a|carrier_identity_b|hop_target|cage_released|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released,
+  CIP|solvent_only|none|PF6-:anion_delocalized|tangential|bridge_network|partner_a|carrier_identity_b|hop_target|cage_released|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released,
+  CIP|solvent_only|none|PF6-:anion_delocalized|radial|bridge_network|partner_a|carrier_identity_b|hop_target|cage_released|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released,
+  CIP|solvent_only|none|PF6-:anion_delocalized|radial|LiA|partner_b|carrier_identity_a|hop_source|cage_captured|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released,
+  CIP|anion_coordinated|none|PF6-:anion_delocalized|free_rotating|LiA|partner_b|carrier_identity_a|hop_source|cage_captured|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released,
+  CIP|anion_coordinated|none|PF6-:anion_delocalized|radial|LiA|partner_b|carrier_identity_a|hop_source|cage_captured|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released,
+  CIP|anion_coordinated|none|PF6-:anion_delocalized|bridging|LiA|partner_b|carrier_identity_a|hop_source|cage_captured|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released,
+  CIP|anion_coordinated|none|PF6-:anion_delocalized|tangential|LiA|partner_b|carrier_identity_a|hop_source|cage_captured|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released,
+  CIP|anion_coordinated|none|PF6-:anion_delocalized|free_rotating|LiA|partner_a|carrier_identity_b|hop_target|cage_released|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released,
+  SSIP|anion_coordinated|none|PF6-:anion_delocalized|free_rotating|bridge_network|partner_b|carrier_identity_a|hop_source|cage_captured|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released,
+  CIP|anion_coordinated|none|PF6-:anion_delocalized|tangential|LiA|partner_a|carrier_identity_b|hop_target|cage_released|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released,
+  SSIP|anion_coordinated|none|PF6-:anion_delocalized|bridging|LiA|partner_b|carrier_identity_a|hop_source|cage_captured|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released,
+  free|anion_coordinated|none|PF6-:anion_delocalized|bridging|free_ions|partner_b|carrier_identity_a|hop_source|cage_captured|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released,
+  free|anion_coordinated|none|PF6-:anion_delocalized|free_rotating|free_ions|partner_b|carrier_identity_a|hop_source|cage_captured|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released'
+diagnostics:
+  self_diffusion_readiness_status: failed
+  component_drift_residuals: []
+  self_diffusion_convergence:
+  - state_label: CIP|anion_coordinated|none|PF6-:anion_delocalized|tangential|bridge_network|partner_a|carrier_identity_a|hop_source|cage_released|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released
+    convergence_status: not_converged
+    not_complete_reason: fewer than four populated positive-covariance lags
+    lag_start_frames: 0
+    lag_stop_frames: 0
+    lag_count: 0
+    minimum_samples_per_lag: 0
+    maximum_samples_per_lag: 0
+    trace_slope_m2_s: 0.0
+    trace_slope_standard_error_m2_s: 0.0
+    log_log_exponent: 0.0
+    log_log_exponent_standard_error: 0.0
+  - state_label: CIP|anion_coordinated|none|PF6-:anion_delocalized|radial|bridge_network|partner_a|carrier_identity_a|hop_source|cage_released|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released
+    convergence_status: not_converged
+    not_complete_reason: fewer than four populated positive-covariance lags
+    lag_start_frames: 0
+    lag_stop_frames: 0
+    lag_count: 0
+    minimum_samples_per_lag: 0
+    maximum_samples_per_lag: 0
+    trace_slope_m2_s: 0.0
+    trace_slope_standard_error_m2_s: 0.0
+    log_log_exponent: 0.0
+    log_log_exponent_standard_error: 0.0
+  - state_label: CIP|solvent_only|none|PF6-:anion_delocalized|bridging|bridge_network|partner_a|carrier_identity_a|hop_source|cage_released|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released
+    convergence_status: not_converged
+    not_complete_reason: fewer than four populated positive-covariance lags
+    lag_start_frames: 0
+    lag_stop_frames: 0
+    lag_count: 0
+    minimum_samples_per_lag: 0
+    maximum_samples_per_lag: 0
+    trace_slope_m2_s: 0.0
+    trace_slope_standard_error_m2_s: 0.0
+    log_log_exponent: 0.0
+    log_log_exponent_standard_error: 0.0
+  - state_label: CIP|anion_coordinated|none|PF6-:anion_delocalized|free_rotating|bridge_network|partner_a|carrier_identity_a|hop_source|cage_released|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released
+    convergence_status: not_converged
+    not_complete_reason: fewer than four populated positive-covariance lags
+    lag_start_frames: 0
+    lag_stop_frames: 0
+    lag_count: 0
+    minimum_samples_per_lag: 0
+    maximum_samples_per_lag: 0
+    trace_slope_m2_s: 0.0
+    trace_slope_standard_error_m2_s: 0.0
+    log_log_exponent: 0.0
+    log_log_exponent_standard_error: 0.0
+  - state_label: CIP|anion_coordinated|none|PF6-:anion_delocalized|bridging|bridge_network|partner_a|carrier_identity_a|hop_source|cage_released|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released
+    convergence_status: not_converged
+    not_complete_reason: fewer than four populated positive-covariance lags
+    lag_start_frames: 0
+    lag_stop_frames: 0
+    lag_count: 0
+    minimum_samples_per_lag: 0
+    maximum_samples_per_lag: 0
+    trace_slope_m2_s: 0.0
+    trace_slope_standard_error_m2_s: 0.0
+    log_log_exponent: 0.0
+    log_log_exponent_standard_error: 0.0
+  - state_label: CIP|solvent_only|none|PF6-:anion_delocalized|tangential|bridge_network|partner_a|carrier_identity_a|hop_source|cage_released|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released
+    convergence_status: not_converged
+    not_complete_reason: fewer than four populated positive-covariance lags
+    lag_start_frames: 0
+    lag_stop_frames: 0
+    lag_count: 0
+    minimum_samples_per_lag: 0
+    maximum_samples_per_lag: 0
+    trace_slope_m2_s: 0.0
+    trace_slope_standard_error_m2_s: 0.0
+    log_log_exponent: 0.0
+    log_log_exponent_standard_error: 0.0
+  - state_label: CIP|anion_coordinated|none|PF6-:anion_delocalized|radial|bridge_network|partner_b|carrier_identity_a|hop_source|cage_captured|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released
+    convergence_status: not_converged
+    not_complete_reason: no contiguous long-lag window has linear covariance growth
+      and a PSD slope
+    lag_start_frames: 0
+    lag_stop_frames: 0
+    lag_count: 0
+    minimum_samples_per_lag: 0
+    maximum_samples_per_lag: 0
+    trace_slope_m2_s: 0.0
+    trace_slope_standard_error_m2_s: 0.0
+    log_log_exponent: 0.0
+    log_log_exponent_standard_error: 0.0
+  - state_label: CIP|anion_coordinated|none|PF6-:anion_delocalized|bridging|bridge_network|partner_a|carrier_identity_b|hop_target|cage_released|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released
+    convergence_status: not_converged
+    not_complete_reason: fewer than four populated positive-covariance lags
+    lag_start_frames: 0
+    lag_stop_frames: 0
+    lag_count: 0
+    minimum_samples_per_lag: 0
+    maximum_samples_per_lag: 0
+    trace_slope_m2_s: 0.0
+    trace_slope_standard_error_m2_s: 0.0
+    log_log_exponent: 0.0
+    log_log_exponent_standard_error: 0.0
+  - state_label: CIP|solvent_only|none|PF6-:anion_delocalized|bridging|bridge_network|partner_b|carrier_identity_a|hop_source|cage_captured|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released
+    convergence_status: not_converged
+    not_complete_reason: no contiguous long-lag window has linear covariance growth
+      and a PSD slope
+    lag_start_frames: 0
+    lag_stop_frames: 0
+    lag_count: 0
+    minimum_samples_per_lag: 0
+    maximum_samples_per_lag: 0
+    trace_slope_m2_s: 0.0
+    trace_slope_standard_error_m2_s: 0.0
+    log_log_exponent: 0.0
+    log_log_exponent_standard_error: 0.0
+  - state_label: CIP|anion_coordinated|none|PF6-:anion_delocalized|tangential|bridge_network|partner_b|carrier_identity_a|hop_source|cage_captured|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released
+    convergence_status: not_converged
+    not_complete_reason: no contiguous long-lag window has linear covariance growth
+      and a PSD slope
+    lag_start_frames: 0
+    lag_stop_frames: 0
+    lag_count: 0
+    minimum_samples_per_lag: 0
+    maximum_samples_per_lag: 0
+    trace_slope_m2_s: 0.0
+    trace_slope_standard_error_m2_s: 0.0
+    log_log_exponent: 0.0
+    log_log_exponent_standard_error: 0.0
+  - state_label: CIP|anion_coordinated|none|PF6-:anion_delocalized|free_rotating|bridge_network|partner_b|carrier_identity_a|hop_source|cage_captured|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released
+    convergence_status: not_converged
+    not_complete_reason: no contiguous long-lag window has linear covariance growth
+      and a PSD slope
+    lag_start_frames: 0
+    lag_stop_frames: 0
+    lag_count: 0
+    minimum_samples_per_lag: 0
+    maximum_samples_per_lag: 0
+    trace_slope_m2_s: 0.0
+    trace_slope_standard_error_m2_s: 0.0
+    log_log_exponent: 0.0
+    log_log_exponent_standard_error: 0.0
+  - state_label: CIP|solvent_only|none|PF6-:anion_delocalized|free_rotating|bridge_network|partner_b|carrier_identity_a|hop_source|cage_captured|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released
+    convergence_status: not_converged
+    not_complete_reason: no contiguous long-lag window has linear covariance growth
+      and a PSD slope
+    lag_start_frames: 0
+    lag_stop_frames: 0
+    lag_count: 0
+    minimum_samples_per_lag: 0
+    maximum_samples_per_lag: 0
+    trace_slope_m2_s: 0.0
+    trace_slope_standard_error_m2_s: 0.0
+    log_log_exponent: 0.0
+    log_log_exponent_standard_error: 0.0
+  - state_label: CIP|anion_coordinated|none|PF6-:anion_delocalized|bridging|bridge_network|partner_b|carrier_identity_a|hop_source|cage_captured|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released
+    convergence_status: not_converged
+    not_complete_reason: no contiguous long-lag window has linear covariance growth
+      and a PSD slope
+    lag_start_frames: 0
+    lag_stop_frames: 0
+    lag_count: 0
+    minimum_samples_per_lag: 0
+    maximum_samples_per_lag: 0
+    trace_slope_m2_s: 0.0
+    trace_slope_standard_error_m2_s: 0.0
+    log_log_exponent: 0.0
+    log_log_exponent_standard_error: 0.0
+  - state_label: CIP|anion_coordinated|none|PF6-:anion_delocalized|radial|bridge_network|partner_a|carrier_identity_b|hop_target|cage_released|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released
+    convergence_status: not_converged
+    not_complete_reason: fewer than four populated positive-covariance lags
+    lag_start_frames: 0
+    lag_stop_frames: 0
+    lag_count: 0
+    minimum_samples_per_lag: 0
+    maximum_samples_per_lag: 0
+    trace_slope_m2_s: 0.0
+    trace_slope_standard_error_m2_s: 0.0
+    log_log_exponent: 0.0
+    log_log_exponent_standard_error: 0.0
+  - state_label: CIP|anion_coordinated|none|PF6-:anion_delocalized|free_rotating|bridge_network|partner_a|carrier_identity_b|hop_target|cage_released|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released
+    convergence_status: not_converged
+    not_complete_reason: no contiguous long-lag window has linear covariance growth
+      and a PSD slope
+    lag_start_frames: 0
+    lag_stop_frames: 0
+    lag_count: 0
+    minimum_samples_per_lag: 0
+    maximum_samples_per_lag: 0
+    trace_slope_m2_s: 0.0
+    trace_slope_standard_error_m2_s: 0.0
+    log_log_exponent: 0.0
+    log_log_exponent_standard_error: 0.0
+  - state_label: CIP|solvent_only|none|PF6-:anion_delocalized|radial|bridge_network|partner_b|carrier_identity_a|hop_source|cage_captured|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released
+    convergence_status: not_converged
+    not_complete_reason: no contiguous long-lag window has linear covariance growth
+      and a PSD slope
+    lag_start_frames: 0
+    lag_stop_frames: 0
+    lag_count: 0
+    minimum_samples_per_lag: 0
+    maximum_samples_per_lag: 0
+    trace_slope_m2_s: 0.0
+    trace_slope_standard_error_m2_s: 0.0
+    log_log_exponent: 0.0
+    log_log_exponent_standard_error: 0.0
+  - state_label: CIP|anion_coordinated|none|PF6-:anion_delocalized|tangential|bridge_network|partner_a|carrier_identity_b|hop_target|cage_released|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released
+    convergence_status: not_converged
+    not_complete_reason: fewer than four populated positive-covariance lags
+    lag_start_frames: 0
+    lag_stop_frames: 0
+    lag_count: 0
+    minimum_samples_per_lag: 0
+    maximum_samples_per_lag: 0
+    trace_slope_m2_s: 0.0
+    trace_slope_standard_error_m2_s: 0.0
+    log_log_exponent: 0.0
+    log_log_exponent_standard_error: 0.0
+  - state_label: CIP|solvent_only|none|PF6-:anion_delocalized|tangential|bridge_network|partner_b|carrier_identity_a|hop_source|cage_captured|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released
+    convergence_status: not_converged
+    not_complete_reason: no contiguous long-lag window has linear covariance growth
+      and a PSD slope
+    lag_start_frames: 0
+    lag_stop_frames: 0
+    lag_count: 0
+    minimum_samples_per_lag: 0
+    maximum_samples_per_lag: 0
+    trace_slope_m2_s: 0.0
+    trace_slope_standard_error_m2_s: 0.0
+    log_log_exponent: 0.0
+    log_log_exponent_standard_error: 0.0
+  - state_label: CIP|solvent_only|none|PF6-:anion_delocalized|free_rotating|bridge_network|partner_a|carrier_identity_b|hop_target|cage_released|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released
+    convergence_status: not_converged
+    not_complete_reason: fewer than four populated positive-covariance lags
+    lag_start_frames: 0
+    lag_stop_frames: 0
+    lag_count: 0
+    minimum_samples_per_lag: 0
+    maximum_samples_per_lag: 0
+    trace_slope_m2_s: 0.0
+    trace_slope_standard_error_m2_s: 0.0
+    log_log_exponent: 0.0
+    log_log_exponent_standard_error: 0.0
+  - state_label: CIP|solvent_only|none|PF6-:anion_delocalized|bridging|bridge_network|partner_a|carrier_identity_b|hop_target|cage_released|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released
+    convergence_status: not_converged
+    not_complete_reason: fewer than four populated positive-covariance lags
+    lag_start_frames: 0
+    lag_stop_frames: 0
+    lag_count: 0
+    minimum_samples_per_lag: 0
+    maximum_samples_per_lag: 0
+    trace_slope_m2_s: 0.0
+    trace_slope_standard_error_m2_s: 0.0
+    log_log_exponent: 0.0
+    log_log_exponent_standard_error: 0.0
+  - state_label: CIP|solvent_only|none|PF6-:anion_delocalized|tangential|bridge_network|partner_a|carrier_identity_b|hop_target|cage_released|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released
+    convergence_status: not_converged
+    not_complete_reason: fewer than four populated positive-covariance lags
+    lag_start_frames: 0
+    lag_stop_frames: 0
+    lag_count: 0
+    minimum_samples_per_lag: 0
+    maximum_samples_per_lag: 0
+    trace_slope_m2_s: 0.0
+    trace_slope_standard_error_m2_s: 0.0
+    log_log_exponent: 0.0
+    log_log_exponent_standard_error: 0.0
+  - state_label: CIP|solvent_only|none|PF6-:anion_delocalized|radial|bridge_network|partner_a|carrier_identity_b|hop_target|cage_released|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released
+    convergence_status: not_converged
+    not_complete_reason: fewer than four populated positive-covariance lags
+    lag_start_frames: 0
+    lag_stop_frames: 0
+    lag_count: 0
+    minimum_samples_per_lag: 0
+    maximum_samples_per_lag: 0
+    trace_slope_m2_s: 0.0
+    trace_slope_standard_error_m2_s: 0.0
+    log_log_exponent: 0.0
+    log_log_exponent_standard_error: 0.0
+  - state_label: CIP|solvent_only|none|PF6-:anion_delocalized|radial|LiA|partner_b|carrier_identity_a|hop_source|cage_captured|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released
+    convergence_status: not_converged
+    not_complete_reason: fewer than four populated positive-covariance lags
+    lag_start_frames: 0
+    lag_stop_frames: 0
+    lag_count: 0
+    minimum_samples_per_lag: 0
+    maximum_samples_per_lag: 0
+    trace_slope_m2_s: 0.0
+    trace_slope_standard_error_m2_s: 0.0
+    log_log_exponent: 0.0
+    log_log_exponent_standard_error: 0.0
+  - state_label: CIP|anion_coordinated|none|PF6-:anion_delocalized|free_rotating|LiA|partner_b|carrier_identity_a|hop_source|cage_captured|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released
+    convergence_status: not_converged
+    not_complete_reason: fewer than four populated positive-covariance lags
+    lag_start_frames: 0
+    lag_stop_frames: 0
+    lag_count: 0
+    minimum_samples_per_lag: 0
+    maximum_samples_per_lag: 0
+    trace_slope_m2_s: 0.0
+    trace_slope_standard_error_m2_s: 0.0
+    log_log_exponent: 0.0
+    log_log_exponent_standard_error: 0.0
+  - state_label: CIP|anion_coordinated|none|PF6-:anion_delocalized|radial|LiA|partner_b|carrier_identity_a|hop_source|cage_captured|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released
+    convergence_status: not_converged
+    not_complete_reason: no contiguous long-lag window has linear covariance growth
+      and a PSD slope
+    lag_start_frames: 0
+    lag_stop_frames: 0
+    lag_count: 0
+    minimum_samples_per_lag: 0
+    maximum_samples_per_lag: 0
+    trace_slope_m2_s: 0.0
+    trace_slope_standard_error_m2_s: 0.0
+    log_log_exponent: 0.0
+    log_log_exponent_standard_error: 0.0
+  - state_label: CIP|anion_coordinated|none|PF6-:anion_delocalized|bridging|LiA|partner_b|carrier_identity_a|hop_source|cage_captured|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released
+    convergence_status: not_converged
+    not_complete_reason: fewer than four populated positive-covariance lags
+    lag_start_frames: 0
+    lag_stop_frames: 0
+    lag_count: 0
+    minimum_samples_per_lag: 0
+    maximum_samples_per_lag: 0
+    trace_slope_m2_s: 0.0
+    trace_slope_standard_error_m2_s: 0.0
+    log_log_exponent: 0.0
+    log_log_exponent_standard_error: 0.0
+  - state_label: CIP|anion_coordinated|none|PF6-:anion_delocalized|tangential|LiA|partner_b|carrier_identity_a|hop_source|cage_captured|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released
+    convergence_status: not_converged
+    not_complete_reason: fewer than four populated positive-covariance lags
+    lag_start_frames: 0
+    lag_stop_frames: 0
+    lag_count: 0
+    minimum_samples_per_lag: 0
+    maximum_samples_per_lag: 0
+    trace_slope_m2_s: 0.0
+    trace_slope_standard_error_m2_s: 0.0
+    log_log_exponent: 0.0
+    log_log_exponent_standard_error: 0.0
+  - state_label: CIP|anion_coordinated|none|PF6-:anion_delocalized|free_rotating|LiA|partner_a|carrier_identity_b|hop_target|cage_released|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released
+    convergence_status: not_converged
+    not_complete_reason: fewer than four populated positive-covariance lags
+    lag_start_frames: 0
+    lag_stop_frames: 0
+    lag_count: 0
+    minimum_samples_per_lag: 0
+    maximum_samples_per_lag: 0
+    trace_slope_m2_s: 0.0
+    trace_slope_standard_error_m2_s: 0.0
+    log_log_exponent: 0.0
+    log_log_exponent_standard_error: 0.0
+  - state_label: SSIP|anion_coordinated|none|PF6-:anion_delocalized|free_rotating|bridge_network|partner_b|carrier_identity_a|hop_source|cage_captured|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released
+    convergence_status: not_converged
+    not_complete_reason: fewer than four populated positive-covariance lags
+    lag_start_frames: 0
+    lag_stop_frames: 0
+    lag_count: 0
+    minimum_samples_per_lag: 0
+    maximum_samples_per_lag: 0
+    trace_slope_m2_s: 0.0
+    trace_slope_standard_error_m2_s: 0.0
+    log_log_exponent: 0.0
+    log_log_exponent_standard_error: 0.0
+  - state_label: CIP|anion_coordinated|none|PF6-:anion_delocalized|tangential|LiA|partner_a|carrier_identity_b|hop_target|cage_released|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released
+    convergence_status: not_converged
+    not_complete_reason: fewer than four populated positive-covariance lags
+    lag_start_frames: 0
+    lag_stop_frames: 0
+    lag_count: 0
+    minimum_samples_per_lag: 0
+    maximum_samples_per_lag: 0
+    trace_slope_m2_s: 0.0
+    trace_slope_standard_error_m2_s: 0.0
+    log_log_exponent: 0.0
+    log_log_exponent_standard_error: 0.0
+  - state_label: SSIP|anion_coordinated|none|PF6-:anion_delocalized|bridging|LiA|partner_b|carrier_identity_a|hop_source|cage_captured|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released
+    convergence_status: not_converged
+    not_complete_reason: fewer than four populated positive-covariance lags
+    lag_start_frames: 0
+    lag_stop_frames: 0
+    lag_count: 0
+    minimum_samples_per_lag: 0
+    maximum_samples_per_lag: 0
+    trace_slope_m2_s: 0.0
+    trace_slope_standard_error_m2_s: 0.0
+    log_log_exponent: 0.0
+    log_log_exponent_standard_error: 0.0
+  - state_label: free|anion_coordinated|none|PF6-:anion_delocalized|bridging|free_ions|partner_b|carrier_identity_a|hop_source|cage_captured|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released
+    convergence_status: not_converged
+    not_complete_reason: fewer than four populated positive-covariance lags
+    lag_start_frames: 0
+    lag_stop_frames: 0
+    lag_count: 0
+    minimum_samples_per_lag: 0
+    maximum_samples_per_lag: 0
+    trace_slope_m2_s: 0.0
+    trace_slope_standard_error_m2_s: 0.0
+    log_log_exponent: 0.0
+    log_log_exponent_standard_error: 0.0
+  - state_label: free|anion_coordinated|none|PF6-:anion_delocalized|free_rotating|free_ions|partner_b|carrier_identity_a|hop_source|cage_captured|packing_0:ionic_1:dielectric_1:viscosity_1|atmosphere_released
+    convergence_status: not_converged
+    not_complete_reason: fewer than four populated positive-covariance lags
+    lag_start_frames: 0
+    lag_stop_frames: 0
+    lag_count: 0
+    minimum_samples_per_lag: 0
+    maximum_samples_per_lag: 0
+    trace_slope_m2_s: 0.0
+    trace_slope_standard_error_m2_s: 0.0
+    log_log_exponent: 0.0
+    log_log_exponent_standard_error: 0.0

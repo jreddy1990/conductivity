@@ -13,6 +13,9 @@ from conductivity.physical_library.physical_generator_builder import (
     PhysicalLocalFields,
     PhysicalTransitionQuadrature,
 )
+from conductivity.physical_library.projected_analytical_conductivity import (
+    TransportOwnership,
+)
 from conductivity.physical_library.physical_objects import SiteConfiguration
 from conductivity.physical_library.projected_analytical_conductivity import CARTESIAN
 from utils.strict_validation import (
@@ -75,6 +78,8 @@ class MomentBoundaryValueResult:
 class OneDimensionalTransitionBuildInput:
     from_state_index: int
     to_state_index: int
+    transition_family: str
+    transport_ownership: TransportOwnership
     grid_configurations: tuple[SiteConfiguration, ...]
     local_fields: tuple[PhysicalLocalFields, ...]
     reaction_coordinate_values: Array
@@ -371,6 +376,8 @@ def build_one_dimensional_transition_surface(
         transition_quadrature=PhysicalTransitionQuadrature(
             from_state_index=build_input.from_state_index,
             to_state_index=build_input.to_state_index,
+            transition_family=build_input.transition_family,
+            transport_ownership=build_input.transport_ownership,
             configurations=build_input.grid_configurations,
             local_fields=build_input.local_fields,
             weights=quadrature_weights,

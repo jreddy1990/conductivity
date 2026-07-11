@@ -725,5 +725,6 @@ coordinate_map:
   unwrapping: molecule-contiguous periodic image tracking
 dielectric_constant: 107.0
 viscosity_Pa_s: 0.0040999999999999995
+local_microviscosity_coefficient: 3.0999999999999996
 donor_number: 14.5
 acceptor_number: 20.0

@@ -1,0 +1,15 @@
+schema: conductivity_physical_pair_record_v1
+species_i: TPP
+species_j: TFSI-
+source:
+  force_field: rdkit_etkdg_uff_gasteiger
+  lj_mixing_policy: Lorentz-Berthelot; sigma arithmetic, epsilon geometric
+lj_mixing_policy:
+  sigma: 0.5*(sigma_i+sigma_j)
+  epsilon: sqrt(epsilon_i*epsilon_j)
+coulomb_policy:
+  boundary: periodic conducting tin-foil
+  ewald_or_pppm_tolerance: 0.0001
+  electronic_screening: RDKit Gasteiger or manifest fixed charges; ECC charge scaling must be recorded
+    as a separate upstream transform
+site_pair_count: 570

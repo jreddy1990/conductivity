@@ -3635,6 +3635,132 @@ The atmosphere relaxation time is
 \[
 \tau_{\rm atm}=\frac{1}{D_{\rm amb}\kappa^2}.
 \]
+
+\subsubsection{Trajectory identification of atmosphere response primitives}
+
+The atmosphere coefficients are primitive response properties. They are not
+universal constants and they are not fitted to conductivity. A periodic molecular
+dynamics trajectory identifies them from species-resolved diffusion, charge-density
+relaxation, ionic current, and neutral-solvent momentum.
+
+For every charged species \(s\), the long-time molecular-center covariance gives
+
+\[
+D_s
+=
+\lim_{t\to\infty}
+\frac{1}{6t}
+\left\langle
+\left|R_s(t)-R_s(0)\right|^2
+\right\rangle,
+\]
+
+and the ambipolar diffusivity is
+
+\[
+D_{\rm amb}
+=
+\frac{\sum_s z_s^2c_sD_s}{\sum_s z_s^2c_s}.
+\]
+
+For each reciprocal-cell wavevector \(k\in\mathcal K\), define
+
+\[
+\rho_z(k,t)=\sum_p z_p\exp\!\left[\mathrm i k\cdot r_p(t)\right],
+\]
+
+\[
+C_{zz}(k,t)
+=
+\frac{
+\left\langle\rho_z(k,t)\rho_z(k,0)^*\right\rangle
+}{
+\left\langle|\rho_z(k,0)|^2\right\rangle
+}.
+\]
+
+Only a time interval with stable block estimates and resolved exponential decay is
+admissible. On that interval,
+
+\[
+C_{zz}(k,t)\simeq\exp[-\lambda(k)t],
+\qquad
+\lambda(k)=D_{\rm amb}k^2+\tau_{\rm chem}^{-1}.
+\]
+
+The slope of the multi-\(k\) regression must agree with the independently estimated
+\(D_{\rm amb}\). The intercept determines \(\tau_{\rm chem}^{-1}\). A single
+wavevector magnitude cannot identify both quantities and is diagnostic only.
+
+Let \(J_{z,L}(k,t)\) and \(J_{z,T}(k,t)\) be the longitudinal and transverse
+species-resolved ionic charge currents, and let \(P_{{\rm solv},T}(k,t)\) be the
+transverse neutral-solvent momentum. The relaxation response is identified from the
+charge-density/current correlation
+
+\[
+C_{\rho J}(k,t)
+=
+\left\langle
+\rho_z(k,0)^*J_{z,L}(k,t)
+\right\rangle,
+\]
+
+and the electrophoretic response is identified from
+
+\[
+C_{JP}(k,t)
+=
+\left\langle
+J_{z,T}(k,t)P_{{\rm solv},T}(k,0)^*
+\right\rangle.
+\]
+
+Projection of the ionic current onto these resolved modes followed by the converged
+zero-frequency memory integral gives the trajectory primitives
+
+\[
+R_{\rm rel}^{\rm MD}(k),
+\qquad
+R_{\rm ep}^{\rm MD}(k).
+\]
+
+The preferred production representation stores these wavevector-resolved kernels
+directly. If a scalar kernel parameterization is retained, its coefficients are
+identified by zero-intercept weighted regression,
+
+\[
+\Gamma_{\rm ep}
+=
+\underset{\Gamma}{\arg\min}
+\sum_{k\in\mathcal K}w_k
+\left[
+R_{\rm ep}^{\rm MD}(k)
+-\Gamma
+\frac{\eta k^2}{(k^2+\kappa^2)^2}
+\right]^2,
+\]
+
+\[
+\Gamma_{\rm rel}
+=
+\underset{\Gamma}{\arg\min}
+\sum_{k\in\mathcal K}w_k
+\left[
+R_{\rm rel}^{\rm MD}(k)
+-\Gamma
+\frac{\kappa^2}{(k^2+\kappa^2)^2}
+\frac{1}{D_{\rm amb}k^2+\tau_{\rm chem}^{-1}}
+\right]^2.
+\]
+
+The weights \(w_k\) are inverse block-bootstrap variances of the trajectory response
+estimates. The scalar representation is rejected when the inferred coefficient is not
+statistically constant over the converged wavevector interval. Every accepted response
+record stores its trajectory identifier, composition, temperature, box, wavevectors,
+fit interval, block uncertainty, and the provenance label
+\texttt{trajectory\_derived\_primitive}. Conductivity values and conductivity
+validation ranges are forbidden inputs to this identification.
+
 For state lifetime \(\tau_\alpha\), define the diagnostic gate
 \[
 g_\alpha^{\rm diag}

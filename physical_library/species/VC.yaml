@@ -1,0 +1,488 @@
+schema: conductivity_physical_species_record_v1
+name: VC
+role: additive
+source:
+  smiles: O=C1OC=CO1
+  force_field: rdkit_etkdg_uff_gasteiger
+  partial_charge_method: rdkit_gasteiger_charge_neutralized_to_formal_charge
+  metadata_source: data.species_data.ADDITIVES[VC]
+formal_charge_e: 0.0
+molecular_weight_kg_mol: 0.08604
+density_kg_m3: 1320.0
+partial_molar_volume_m3_mol: 6.518181818181818e-05
+sites:
+- site_id: 0
+  element: O
+  atomic_number: 8
+  mass_kg: 2.656696453571437e-26
+  steric_radius_m: 1.55e-10
+  hydrodynamic_radius_m: 1.55e-10
+  volume_m3: 1.5598531123848924e-29
+  lj_sigma_m: 3.1e-10
+  lj_epsilon_J: 4.1686172742332246e-22
+  charge_number: -0.2023095330338221
+  charge_cloud_radius_m: 1.55e-10
+  born_radius_m: 1.55e-10
+  polarizability_SI: 0.0
+  donor_flag: 1
+  acceptor_flag: 1
+  hba_count_contribution: 1
+  hbd_count_contribution: 0
+  parameter_ids:
+    vdw: UFF:O
+    charge: manifest_fixed_or_rdkit_gasteiger
+  derived_radius_source: rdkit_periodic_table_vdw_radius
+- site_id: 1
+  element: C
+  atomic_number: 6
+  mass_kg: 1.994473473582507e-26
+  steric_radius_m: 1.7e-10
+  hydrodynamic_radius_m: 1.7e-10
+  volume_m3: 2.057952627611554e-29
+  lj_sigma_m: 3.4e-10
+  lj_epsilon_J: 7.295080229908144e-22
+  charge_number: 0.5179537991458638
+  charge_cloud_radius_m: 1.7e-10
+  born_radius_m: 1.7e-10
+  polarizability_SI: 0.0
+  donor_flag: 0
+  acceptor_flag: 0
+  hba_count_contribution: 0
+  hbd_count_contribution: 0
+  parameter_ids:
+    vdw: UFF:C
+    charge: manifest_fixed_or_rdkit_gasteiger
+  derived_radius_source: rdkit_periodic_table_vdw_radius
+- site_id: 2
+  element: O
+  atomic_number: 8
+  mass_kg: 2.656696453571437e-26
+  steric_radius_m: 1.55e-10
+  hydrodynamic_radius_m: 1.55e-10
+  volume_m3: 1.5598531123848924e-29
+  lj_sigma_m: 3.1e-10
+  lj_epsilon_J: 4.1686172742332246e-22
+  charge_number: -0.39939192026488035
+  charge_cloud_radius_m: 1.55e-10
+  born_radius_m: 1.55e-10
+  polarizability_SI: 0.0
+  donor_flag: 1
+  acceptor_flag: 1
+  hba_count_contribution: 1
+  hbd_count_contribution: 0
+  parameter_ids:
+    vdw: UFF:O
+    charge: manifest_fixed_or_rdkit_gasteiger
+  derived_radius_source: rdkit_periodic_table_vdw_radius
+- site_id: 3
+  element: C
+  atomic_number: 6
+  mass_kg: 1.994473473582507e-26
+  steric_radius_m: 1.7e-10
+  hydrodynamic_radius_m: 1.7e-10
+  volume_m3: 2.057952627611554e-29
+  lj_sigma_m: 3.4e-10
+  lj_epsilon_J: 7.295080229908144e-22
+  charge_number: 0.13350832929619827
+  charge_cloud_radius_m: 1.7e-10
+  born_radius_m: 1.7e-10
+  polarizability_SI: 0.0
+  donor_flag: 0
+  acceptor_flag: 0
+  hba_count_contribution: 0
+  hbd_count_contribution: 0
+  parameter_ids:
+    vdw: UFF:C
+    charge: manifest_fixed_or_rdkit_gasteiger
+  derived_radius_source: rdkit_periodic_table_vdw_radius
+- site_id: 4
+  element: C
+  atomic_number: 6
+  mass_kg: 1.994473473582507e-26
+  steric_radius_m: 1.7e-10
+  hydrodynamic_radius_m: 1.7e-10
+  volume_m3: 2.057952627611554e-29
+  lj_sigma_m: 3.4e-10
+  lj_epsilon_J: 7.295080229908144e-22
+  charge_number: 0.13350832929619827
+  charge_cloud_radius_m: 1.7e-10
+  born_radius_m: 1.7e-10
+  polarizability_SI: 0.0
+  donor_flag: 0
+  acceptor_flag: 0
+  hba_count_contribution: 0
+  hbd_count_contribution: 0
+  parameter_ids:
+    vdw: UFF:C
+    charge: manifest_fixed_or_rdkit_gasteiger
+  derived_radius_source: rdkit_periodic_table_vdw_radius
+- site_id: 5
+  element: O
+  atomic_number: 8
+  mass_kg: 2.656696453571437e-26
+  steric_radius_m: 1.55e-10
+  hydrodynamic_radius_m: 1.55e-10
+  volume_m3: 1.5598531123848924e-29
+  lj_sigma_m: 3.1e-10
+  lj_epsilon_J: 4.1686172742332246e-22
+  charge_number: -0.39939192026488035
+  charge_cloud_radius_m: 1.55e-10
+  born_radius_m: 1.55e-10
+  polarizability_SI: 0.0
+  donor_flag: 1
+  acceptor_flag: 1
+  hba_count_contribution: 1
+  hbd_count_contribution: 0
+  parameter_ids:
+    vdw: UFF:O
+    charge: manifest_fixed_or_rdkit_gasteiger
+  derived_radius_source: rdkit_periodic_table_vdw_radius
+- site_id: 6
+  element: H
+  atomic_number: 1
+  mass_kg: 1.6738233797112375e-27
+  steric_radius_m: 1.2e-10
+  hydrodynamic_radius_m: 1.2e-10
+  volume_m3: 7.238229473870883e-30
+  lj_sigma_m: 2.4e-10
+  lj_epsilon_J: 3.0569860011043643e-22
+  charge_number: 0.10806145791266121
+  charge_cloud_radius_m: 1.2e-10
+  born_radius_m: 1.2e-10
+  polarizability_SI: 0.0
+  donor_flag: 0
+  acceptor_flag: 0
+  hba_count_contribution: 0
+  hbd_count_contribution: 0
+  parameter_ids:
+    vdw: UFF:H
+    charge: manifest_fixed_or_rdkit_gasteiger
+  derived_radius_source: rdkit_periodic_table_vdw_radius
+- site_id: 7
+  element: H
+  atomic_number: 1
+  mass_kg: 1.6738233797112375e-27
+  steric_radius_m: 1.2e-10
+  hydrodynamic_radius_m: 1.2e-10
+  volume_m3: 7.238229473870883e-30
+  lj_sigma_m: 2.4e-10
+  lj_epsilon_J: 3.0569860011043643e-22
+  charge_number: 0.10806145791266121
+  charge_cloud_radius_m: 1.2e-10
+  born_radius_m: 1.2e-10
+  polarizability_SI: 0.0
+  donor_flag: 0
+  acceptor_flag: 0
+  hba_count_contribution: 0
+  hbd_count_contribution: 0
+  parameter_ids:
+    vdw: UFF:H
+    charge: manifest_fixed_or_rdkit_gasteiger
+  derived_radius_source: rdkit_periodic_table_vdw_radius
+bonds:
+- site_i: 0
+  site_j: 1
+  k_J_m2_mol: 6.138543756395907e+26
+  r0_m: 1.2579485177162905e-10
+  parameter_id: rdkit_uff_bond_stretch
+  smirks: rdkit_uff_atom_types
+- site_i: 1
+  site_j: 2
+  k_J_m2_mol: 5.411425662918129e+26
+  r0_m: 1.311940343855554e-10
+  parameter_id: rdkit_uff_bond_stretch
+  smirks: rdkit_uff_atom_types
+- site_i: 2
+  site_j: 3
+  k_J_m2_mol: 5.411425662918129e+26
+  r0_m: 1.311940343855554e-10
+  parameter_id: rdkit_uff_bond_stretch
+  smirks: rdkit_uff_atom_types
+- site_i: 3
+  site_j: 4
+  k_J_m2_mol: 3.87149749281251e+26
+  r0_m: 1.3792564054007891e-10
+  parameter_id: rdkit_uff_bond_stretch
+  smirks: rdkit_uff_atom_types
+- site_i: 4
+  site_j: 5
+  k_J_m2_mol: 5.411425662918129e+26
+  r0_m: 1.311940343855554e-10
+  parameter_id: rdkit_uff_bond_stretch
+  smirks: rdkit_uff_atom_types
+- site_i: 5
+  site_j: 1
+  k_J_m2_mol: 5.411425662918129e+26
+  r0_m: 1.311940343855554e-10
+  parameter_id: rdkit_uff_bond_stretch
+  smirks: rdkit_uff_atom_types
+- site_i: 3
+  site_j: 6
+  k_J_m2_mol: 2.991061108574281e+26
+  r0_m: 1.0814180403267946e-10
+  parameter_id: rdkit_uff_bond_stretch
+  smirks: rdkit_uff_atom_types
+- site_i: 4
+  site_j: 7
+  k_J_m2_mol: 2.991061108574281e+26
+  r0_m: 1.0814180403267946e-10
+  parameter_id: rdkit_uff_bond_stretch
+  smirks: rdkit_uff_atom_types
+angles:
+- site_i: 0
+  site_j: 1
+  site_k: 2
+  k_J_rad2_mol: 1665788.2615474798
+  theta0_rad: 2.0943951023931953
+  parameter_id: rdkit_uff_angle_bend
+  smirks: rdkit_uff_atom_types
+- site_i: 0
+  site_j: 1
+  site_k: 5
+  k_J_rad2_mol: 1665788.2615474798
+  theta0_rad: 2.0943951023931953
+  parameter_id: rdkit_uff_angle_bend
+  smirks: rdkit_uff_atom_types
+- site_i: 2
+  site_j: 1
+  site_k: 5
+  k_J_rad2_mol: 1565956.7959655018
+  theta0_rad: 2.0943951023931953
+  parameter_id: rdkit_uff_angle_bend
+  smirks: rdkit_uff_atom_types
+- site_i: 1
+  site_j: 2
+  site_k: 3
+  k_J_rad2_mol: 1359596.0470733934
+  theta0_rad: 1.9198621771937625
+  parameter_id: rdkit_uff_angle_bend
+  smirks: rdkit_uff_atom_types
+- site_i: 2
+  site_j: 3
+  site_k: 4
+  k_J_rad2_mol: 1205542.401363969
+  theta0_rad: 2.0943951023931953
+  parameter_id: rdkit_uff_angle_bend
+  smirks: rdkit_uff_atom_types
+- site_i: 2
+  site_j: 3
+  site_k: 6
+  k_J_rad2_mol: 631109.0476077381
+  theta0_rad: 2.0943951023931953
+  parameter_id: rdkit_uff_angle_bend
+  smirks: rdkit_uff_atom_types
+- site_i: 4
+  site_j: 3
+  site_k: 6
+  k_J_rad2_mol: 479394.4863534196
+  theta0_rad: 2.0943951023931953
+  parameter_id: rdkit_uff_angle_bend
+  smirks: rdkit_uff_atom_types
+- site_i: 3
+  site_j: 4
+  site_k: 5
+  k_J_rad2_mol: 1205542.401363969
+  theta0_rad: 2.0943951023931953
+  parameter_id: rdkit_uff_angle_bend
+  smirks: rdkit_uff_atom_types
+- site_i: 3
+  site_j: 4
+  site_k: 7
+  k_J_rad2_mol: 479394.4863534196
+  theta0_rad: 2.0943951023931953
+  parameter_id: rdkit_uff_angle_bend
+  smirks: rdkit_uff_atom_types
+- site_i: 5
+  site_j: 4
+  site_k: 7
+  k_J_rad2_mol: 631109.0476077381
+  theta0_rad: 2.0943951023931953
+  parameter_id: rdkit_uff_angle_bend
+  smirks: rdkit_uff_atom_types
+- site_i: 4
+  site_j: 5
+  site_k: 1
+  k_J_rad2_mol: 1359596.0470733934
+  theta0_rad: 1.9198621771937625
+  parameter_id: rdkit_uff_angle_bend
+  smirks: rdkit_uff_atom_types
+torsions:
+- kind: ProperTorsions
+  site_i: 0
+  site_j: 1
+  site_k: 2
+  site_l: 3
+  terms:
+  - Vn_J_mol: 112752.2793151666
+    periodicity: 1
+    phase_rad: 0.0
+    idivf: 1.0
+  parameter_id: rdkit_uff_torsion
+  smirks: rdkit_uff_atom_types
+- kind: ProperTorsions
+  site_i: 5
+  site_j: 1
+  site_k: 2
+  site_l: 3
+  terms:
+  - Vn_J_mol: 112752.2793151666
+    periodicity: 1
+    phase_rad: 0.0
+    idivf: 1.0
+  parameter_id: rdkit_uff_torsion
+  smirks: rdkit_uff_atom_types
+- kind: ProperTorsions
+  site_i: 1
+  site_j: 2
+  site_k: 3
+  site_l: 4
+  terms:
+  - Vn_J_mol: 112752.2793151666
+    periodicity: 1
+    phase_rad: 0.0
+    idivf: 1.0
+  parameter_id: rdkit_uff_torsion
+  smirks: rdkit_uff_atom_types
+- kind: ProperTorsions
+  site_i: 1
+  site_j: 2
+  site_k: 3
+  site_l: 6
+  terms:
+  - Vn_J_mol: 112752.2793151666
+    periodicity: 1
+    phase_rad: 0.0
+    idivf: 1.0
+  parameter_id: rdkit_uff_torsion
+  smirks: rdkit_uff_atom_types
+- kind: ProperTorsions
+  site_i: 2
+  site_j: 3
+  site_k: 4
+  site_l: 5
+  terms:
+  - Vn_J_mol: 112752.2793151666
+    periodicity: 1
+    phase_rad: 0.0
+    idivf: 1.0
+  parameter_id: rdkit_uff_torsion
+  smirks: rdkit_uff_atom_types
+- kind: ProperTorsions
+  site_i: 2
+  site_j: 3
+  site_k: 4
+  site_l: 7
+  terms:
+  - Vn_J_mol: 112752.2793151666
+    periodicity: 1
+    phase_rad: 0.0
+    idivf: 1.0
+  parameter_id: rdkit_uff_torsion
+  smirks: rdkit_uff_atom_types
+- kind: ProperTorsions
+  site_i: 6
+  site_j: 3
+  site_k: 4
+  site_l: 5
+  terms:
+  - Vn_J_mol: 112752.2793151666
+    periodicity: 1
+    phase_rad: 0.0
+    idivf: 1.0
+  parameter_id: rdkit_uff_torsion
+  smirks: rdkit_uff_atom_types
+- kind: ProperTorsions
+  site_i: 6
+  site_j: 3
+  site_k: 4
+  site_l: 7
+  terms:
+  - Vn_J_mol: 112752.2793151666
+    periodicity: 1
+    phase_rad: 0.0
+    idivf: 1.0
+  parameter_id: rdkit_uff_torsion
+  smirks: rdkit_uff_atom_types
+- kind: ProperTorsions
+  site_i: 3
+  site_j: 4
+  site_k: 5
+  site_l: 1
+  terms:
+  - Vn_J_mol: 112752.2793151666
+    periodicity: 1
+    phase_rad: 0.0
+    idivf: 1.0
+  parameter_id: rdkit_uff_torsion
+  smirks: rdkit_uff_atom_types
+- kind: ProperTorsions
+  site_i: 7
+  site_j: 4
+  site_k: 5
+  site_l: 1
+  terms:
+  - Vn_J_mol: 112752.2793151666
+    periodicity: 1
+    phase_rad: 0.0
+    idivf: 1.0
+  parameter_id: rdkit_uff_torsion
+  smirks: rdkit_uff_atom_types
+- kind: ProperTorsions
+  site_i: 4
+  site_j: 5
+  site_k: 1
+  site_l: 0
+  terms:
+  - Vn_J_mol: 112752.2793151666
+    periodicity: 1
+    phase_rad: 0.0
+    idivf: 1.0
+  parameter_id: rdkit_uff_torsion
+  smirks: rdkit_uff_atom_types
+- kind: ProperTorsions
+  site_i: 4
+  site_j: 5
+  site_k: 1
+  site_l: 2
+  terms:
+  - Vn_J_mol: 112752.2793151666
+    periodicity: 1
+    phase_rad: 0.0
+    idivf: 1.0
+  parameter_id: rdkit_uff_torsion
+  smirks: rdkit_uff_atom_types
+constraints: []
+reference_conformer_coordinates_m:
+- - 2.4523229208999047e-10
+  - -5.372264014535909e-12
+  - 4.274019121983545e-11
+- - 1.2122569808650525e-10
+  - -2.655643894647303e-12
+  - 2.1428750382998934e-11
+- - 4.688501728416428e-11
+  - -1.1007754361827442e-10
+  - 9.912644608511297e-12
+- - -7.537639624334193e-11
+  - -6.740557735714253e-11
+  - -1.1561912269630471e-11
+- - -7.21729052323477e-11
+  - 7.063791298843937e-11
+  - -1.2605760854287923e-11
+- - 5.194406222371547e-11
+  - 1.079125888091525e-10
+  - 8.262940703851455e-12
+- - -1.6198160707129658e-10
+  - -1.3066000928671646e-10
+  - -2.5695154577269465e-11
+- - -1.5575616113739205e-10
+  - 1.3762053637371972e-10
+  - -2.772149355701042e-11
+coordinate_map:
+  type: site_cartesian_coordinates
+  dimension: 24
+  unwrapping: molecule-contiguous periodic image tracking
+dielectric_constant: 126.0
+viscosity_Pa_s: 0.002
+local_microviscosity_coefficient: 1.0
+donor_number: 13.0
+acceptor_number: 18.0

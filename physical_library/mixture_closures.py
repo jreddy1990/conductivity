@@ -57,6 +57,8 @@ def compute_bulk_dielectric_constant(
     records: PhysicalLibraryRecords,
     composition: MixtureComposition,
 ) -> float:
+    """Return the solvent-matrix dielectric before pointwise local corrections."""
+
     dielectric_constant = 0.0
     volume_fraction_sum = 0.0
     for solvent_name, volume_fraction in composition.solvent_volume_fractions.items():
@@ -66,13 +68,6 @@ def compute_bulk_dielectric_constant(
     if volume_fraction_sum <= 0.0:
         raise ValueError("solvent volume fractions must contain positive total volume")
     dielectric_constant /= volume_fraction_sum
-    for additive_name, weight_fraction in composition.additive_weight_fractions.items():
-        if weight_fraction == 0.0:
-            continue
-        species_record = records.species_records[additive_name]
-        dielectric_constant += weight_fraction * (
-            float(species_record["dielectric_constant"]) - dielectric_constant
-        )
     if dielectric_constant <= 0.0:
         raise ValueError("computed dielectric_constant must be positive")
     return dielectric_constant
@@ -82,6 +77,8 @@ def compute_bulk_viscosity_Pa_s(
     records: PhysicalLibraryRecords,
     composition: MixtureComposition,
 ) -> float:
+    """Return the solvent-matrix viscosity before pointwise local corrections."""
+
     reciprocal_viscosity = 0.0
     volume_fraction_sum = 0.0
     for solvent_name, volume_fraction in composition.solvent_volume_fractions.items():
@@ -93,21 +90,7 @@ def compute_bulk_viscosity_Pa_s(
         volume_fraction_sum += volume_fraction
     if reciprocal_viscosity <= 0.0 or volume_fraction_sum <= 0.0:
         raise ValueError("solvent volume fractions must define positive viscosity")
-    base_viscosity_Pa_s = volume_fraction_sum / reciprocal_viscosity
-    additive_multiplier = 1.0
-    for additive_name, weight_fraction in composition.additive_weight_fractions.items():
-        if weight_fraction == 0.0:
-            continue
-        species_record = records.species_records[additive_name]
-        additive_viscosity_Pa_s = float(species_record["viscosity_Pa_s"])
-        if additive_viscosity_Pa_s <= 0.0:
-            raise ValueError(f"{additive_name}.viscosity_Pa_s must be positive")
-        additive_multiplier += weight_fraction * (
-            additive_viscosity_Pa_s / base_viscosity_Pa_s - 1.0
-        )
-    if additive_multiplier <= 0.0:
-        raise ValueError("computed additive viscosity multiplier must be positive")
-    return base_viscosity_Pa_s * additive_multiplier
+    return volume_fraction_sum / reciprocal_viscosity
 
 
 def compute_ionic_strength_mol_m3(

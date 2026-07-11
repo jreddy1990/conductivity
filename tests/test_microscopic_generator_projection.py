@@ -14,9 +14,26 @@ from conductivity.physical_library.trajectory_primitives import (
 
 
 def test_sampled_trajectory_projection_exposes_reversible_primitives() -> None:
+    frame_count = 96
+    state_index_by_frame_and_center = np.tile(
+        np.asarray([[0, 1]], dtype=int),
+        (frame_count, 1),
+    )
+    random_generator = np.random.default_rng(1742)
+    polarization_increments_m = random_generator.normal(
+        scale=1.0e-11,
+        size=(frame_count - 1, 2, 3),
+    )
+    charge_polarization_by_frame_and_center_m = np.concatenate(
+        (
+            np.zeros((1, 2, 3), dtype=float),
+            np.cumsum(polarization_increments_m, axis=0),
+        ),
+        axis=0,
+    )
     sample_input = TrajectoryMarkovAdditiveSampleInput(
         state_labels=("free_ion_center:Li+", "free_ion_center:PF6-"),
-        occupancy_state_index_by_observation=np.asarray([0, 1, 0, 1], dtype=int),
+        occupancy_state_index_by_observation=state_index_by_frame_and_center.reshape(-1),
         from_state_index_by_step=np.asarray([0, 1], dtype=int),
         to_state_index_by_step=np.asarray([1, 0], dtype=int),
         charge_displacement_by_step_m=np.asarray(
@@ -26,6 +43,10 @@ def test_sampled_trajectory_projection_exposes_reversible_primitives() -> None:
         dt_s=1.0e-12,
         total_transport_concentration_mol_m3=1000.0,
         temperature_K=T_REF_K,
+        self_charge_polarization_by_frame_and_center_m=(
+            charge_polarization_by_frame_and_center_m
+        ),
+        state_index_by_frame_and_center=state_index_by_frame_and_center,
     )
 
     primitive_set = project_sampled_trajectory_to_generator_primitives(sample_input)

@@ -13,10 +13,8 @@ from conductivity.physical_library.basin_builder import (
     compute_basin_features,
 )
 from conductivity.physical_library.generator_construction import (
-    MemoryCoordinate,
-    build_default_memory_coordinates,
-    combine_memory_gradients,
-    combine_memory_values,
+    NumericalOptions,
+    compute_conductivity_from_recipe,
 )
 from conductivity.physical_library.mixture_closures import (
     MixtureClosureResult,
@@ -63,9 +61,9 @@ from conductivity.physical_library.transition_surface_builder import (
 
 __all__ = [
     "BasinFeatureVector",
-    "MemoryCoordinate",
     "MixtureClosureResult",
     "MixtureComposition",
+    "NumericalOptions",
     "OneDimensionalTransitionBuildInput",
     "PairBasin",
     "PhysicalGeneratorBuildInput",
@@ -88,16 +86,14 @@ __all__ = [
     "assign_pair_basin",
     "audit_primitive_oracle_closure",
     "audit_primitive_oracle_closure_from_yaml",
-    "build_default_memory_coordinates",
     "build_one_dimensional_transition_surface",
     "build_physical_objects",
     "build_reduced_generator_specification_from_physical_objects",
     "build_state_definition",
-    "combine_memory_gradients",
-    "combine_memory_values",
     "compute_basin_features",
     "compute_charge_polarization_gradient",
     "compute_charge_polarization_m",
+    "compute_conductivity_from_recipe",
     "compute_conductivity_from_primitive_yaml",
     "compute_mixture_closures",
     "load_physical_library",

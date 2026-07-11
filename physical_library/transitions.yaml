@@ -16,24 +16,27 @@ numerical_method: committor finite-element capacity solve plus deterministic Doo
   moment boundary-value solves
 transition_records:
   free_to_SSIP:
+    transport_ownership: bounded_memory
     reaction_coordinate: Li_anion_distance
     gradient_policy: pair_distance_gradient
-    moment_policy: isotropic_endpoint_bvp
-    displacement_policy: charge_polarization_endpoint_moment
+    moment_policy: zero_motif_exchange
+    displacement_policy: zero
     barrier_J_mol: 6000.0
     rate_bounds_s_inv:
       lower: 0.0
       upper: 1.0e13
   SSIP_to_CIP:
+    transport_ownership: bounded_memory
     reaction_coordinate: Li_anion_distance
     gradient_policy: pair_distance_gradient
-    moment_policy: isotropic_endpoint_bvp
-    displacement_policy: charge_polarization_endpoint_moment
+    moment_policy: zero_motif_exchange
+    displacement_policy: zero
     barrier_J_mol: 8000.0
     rate_bounds_s_inv:
       lower: 0.0
       upper: 1.0e13
   SSIP_to_additive_separated_SSIP:
+    transport_ownership: bounded_memory
     reaction_coordinate: Li_ligand_coordination
     gradient_policy: coordination_switch_gradient
     moment_policy: zero_motif_exchange
@@ -44,6 +47,7 @@ transition_records:
       lower: 0.0
       upper: 1.0e13
   pair_to_aggregate:
+    transport_ownership: bounded_memory
     reaction_coordinate: cluster_coordinate
     coordinate_domain:
       lower: 0.0
@@ -57,6 +61,7 @@ transition_records:
       lower: 0.0
       upper: 1.0e13
   Li_to_Li_ligand:
+    transport_ownership: bounded_memory
     reaction_coordinate: Li_ligand_coordination
     gradient_policy: coordination_switch_gradient
     moment_policy: zero_motif_exchange
@@ -67,6 +72,7 @@ transition_records:
       lower: 0.0
       upper: 1.0e13
   LiA_to_Li_ligand_anion:
+    transport_ownership: bounded_memory
     reaction_coordinate: Li_ligand_coordination
     gradient_policy: coordination_switch_gradient
     moment_policy: zero_motif_exchange
@@ -77,6 +83,7 @@ transition_records:
       lower: 0.0
       upper: 1.0e13
   partner_switch:
+    transport_ownership: transition_displacement
     reaction_coordinate: partner_residence_coordinate
     gradient_policy: partner_residence_gradient
     moment_policy: isotropic_endpoint_bvp
@@ -98,6 +105,7 @@ transition_records:
       lower: 0.0
       upper: 1.0e13
   identity_diffusion:
+    transport_ownership: transition_displacement
     reaction_coordinate: identity_coordinate
     coordinate_domain:
       lower: 0.0
@@ -120,6 +128,7 @@ transition_records:
       lower: 0.0
       upper: 1.0e13
   structural_hop:
+    transport_ownership: transition_displacement
     reaction_coordinate: structural_hop_coordinate
     coordinate_domain:
       lower: 0.0
@@ -142,6 +151,7 @@ transition_records:
       lower: 0.0
       upper: 1.0e13
   bridge_network_formation_breakup:
+    transport_ownership: transition_displacement
     reaction_coordinate: cluster_coordinate
     coordinate_domain:
       lower: 0.0
@@ -164,6 +174,7 @@ transition_records:
       lower: 0.0
       upper: 1.0e13
   cage_capture_release:
+    transport_ownership: bounded_memory
     reaction_coordinate: cage_coordinate
     gradient_policy: cage_coordinate_gradient
     moment_policy: zero_motif_exchange
@@ -174,6 +185,7 @@ transition_records:
       lower: 0.0
       upper: 1.0e13
   atmosphere_capture_release:
+    transport_ownership: bounded_memory
     reaction_coordinate: atmosphere_polarization
     gradient_policy: atmosphere_coordinate_gradient
     moment_policy: zero_motif_exchange

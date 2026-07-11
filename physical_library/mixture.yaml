@@ -2,30 +2,35 @@ schema: conductivity_mixture_closure_record_v1
 species:
 - EC
 - DMC
+- EMC
+- DEC
+- PC
 - FEC
+- VC
+- PS
+- TPP
 - Li+
 - PF6-
 - FSI-
-reference_density_kg_m3: 1193.521476171035
+- TFSI-
+- DFOB-
+- LiDFOB
+reference_density_kg_m3: 1256.090909090909
 dielectric:
-  mixing_rule: volume_fraction_linear_static_dielectric_with_salt_decrement
+  mixing_rule: solvent_volume_fraction_linear_static_dielectric
   pure_dielectric_source: data.species_data epsilon_r
+  ownership: solvent_matrix_reference_only
 viscosity:
-  mixing_rule: reciprocal_volume_fraction_plus_Jones_Dole_salt_terms
+  mixing_rule: solvent_reciprocal_volume_fraction
   pure_viscosity_source: data.species_data viscosity_cP
+  ownership: solvent_matrix_reference_only
 mobility:
   resistance_terms:
   - Stokes
   - free_volume
   - charge_cloud
-  - shape
   - atmosphere
   free_volume_exponent: 2.0
-  charge_cloud_lambda_kg_m4_s: 4.0e-40
-  charge_cloud_lambda_source: physical_library_global_screened_charge_cloud_resistance_scale
-  charge_cloud_exponent: 1.0
-  shape_exponent: 1.0
-  atmosphere_lambda_kg_s: 1.0e-13
 packing:
   local_volume_source: species_record_site_volumes
   invalid_state_rule: local_packing_fraction_must_remain_below_configured_phi_max
@@ -34,12 +39,36 @@ packing:
 atmosphere:
   charge_sites_source: species_record_sites
   screening_source: composition_ionic_strength_and_mixture_dielectric
+  response_model: finite_wavevector_pnp_stokes_provisional
+  electrophoretic_amplitude: 1.0
+  relaxation_amplitude: 1.0
+  chemical_relaxation_time_s: 2.1e-11
+  maximum_wavevector_integer: 2
+  provenance: provisional_dimensional_assumption
+  fitted_to_conductivity: false
 local_fields:
-  dielectric_decrement_per_mol_m3: 2.0e-3
-  jones_dole_A_sqrt_m3_mol: 3.0e-3
-  jones_dole_B_m3_mol: 1.0e-5
-  additive_microviscosity_coefficients:
-    FEC: 1.0
+  dielectric_decrement_per_mol_m3: 0.002
+  jones_dole_A_sqrt_m3_mol: 0.003
+  jones_dole_B_m3_mol: 1.0e-05
   local_ionic_strength_packing_coupling: 1.0
-  local_ionic_strength_kernel_width_m: 1.0e-9
   packing_viscosity_exponent: 2.0
+property_ownership:
+  dielectric:
+    bulk: solvent_matrix_reference
+    local: ionic_strength_decrement
+  viscosity:
+    bulk: solvent_matrix_reference
+    local: Jones_Dole_packing_and_state_additive_microviscosity
+  additive_properties:
+    bulk: excluded
+    local: state_configuration_occupancy
+parameter_provenance:
+  dielectric.pure_dielectric_source: measured_pure_property
+  viscosity.pure_viscosity_source: measured_pure_property
+  mobility.free_volume_exponent: continuum_theory
+  packing.phi_max: measured_pure_property
+  local_fields.dielectric_decrement_per_mol_m3: measured_mixture_property
+  local_fields.jones_dole_A_sqrt_m3_mol: measured_mixture_property
+  local_fields.jones_dole_B_m3_mol: measured_mixture_property
+  local_fields.local_ionic_strength_packing_coupling: continuum_theory
+  local_fields.packing_viscosity_exponent: continuum_theory

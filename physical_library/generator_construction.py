@@ -33,6 +33,8 @@ from conductivity.physical_library.physical_objects import (
     CARTESIAN_DIMENSION,
     PairBasin,
     SiteConfiguration,
+    molecule_center_of_mass_m,
+    anion_internal_charge_separation_factor,
     build_physical_objects,
     compute_atmosphere_resistance_diagnostics,
     compute_charge_polarization_m,
@@ -41,8 +43,11 @@ from conductivity.physical_library.physical_objects import (
 )
 from conductivity.physical_library.projected_analytical_conductivity import (
     ProjectedConductivityResult,
+    StateTransportOwnershipBasis,
+    TransportOwnership,
     _compute_projected_analytical_conductivity_from_input,
     primitive_prediction_readiness_as_effect_attribution,
+    symmetric_psd_pseudoinverse,
 )
 from conductivity.physical_library.library_io import (
     PhysicalLibraryRecords,
@@ -50,16 +55,25 @@ from conductivity.physical_library.library_io import (
     RecipeComponentLoading,
     build_recipe_library_context,
 )
-from conductivity.physical_library.reduced_generator import build_projected_generator_input
-from conductivity.physical_library.reduced_generator import ReducedGeneratorSpecification
+from conductivity.physical_library.reduced_generator import (
+    build_projected_generator_input,
+)
+from conductivity.physical_library.reduced_generator import (
+    ReducedGeneratorSpecification,
+)
 from conductivity.physical_library.transition_surface_builder import (
     MomentBoundaryValueInput,
     OneDimensionalCommittorInput,
-    solve_endpoint_moment_bvp,
     solve_one_dimensional_committor,
+)
+from conductivity.physical_library.transition_moment_bvp import (
+    EndpointTransportMomentInput,
+    build_endpoint_transport_moments,
 )
 
 Array = np.ndarray
+SUMMATION_ROUNDOFF_EPSILON_FACTOR = 64.0  # Numerical epsilon factor for accumulated sparse-sum roundoff.
+__all__ = ("NumericalOptions", "compute_conductivity_from_recipe")
 NO_TRANSITION_FAMILY = ""
 STATE_KEY_PAIR_FIELD = "pair"
 STATE_KEY_SHELL_FIELD = "shell"
@@ -107,9 +121,7 @@ LOCAL_FIELD_LAW_REQUIRED_KEYS = (
     "dielectric_decrement_per_mol_m3",
     "jones_dole_A_sqrt_m3_mol",
     "jones_dole_B_m3_mol",
-    "additive_microviscosity_coefficients",
     "local_ionic_strength_packing_coupling",
-    "local_ionic_strength_kernel_width_m",
     "packing_viscosity_exponent",
 )
 PAIR_STATE_FREE_ADDITIVE_RESERVOIR = "free_additive_reservoir"
@@ -281,7 +293,9 @@ class MemoryCoordinateFamily(Enum):
 
 
 PERPENDICULAR_AXIS_ALIGNMENT_LIMIT = 0.99  # Numerical sentinel: switch helper axis before near-collinear cross construction.
-FINITE_DIFFERENCE_STEP_M = 1.0e-12  # Site-coordinate gradient step for reduced scalar coordinates.
+FINITE_DIFFERENCE_STEP_M = (
+    1.0e-12  # Site-coordinate gradient step for reduced scalar coordinates.
+)
 CENTRAL_DIFFERENCE_WIDTH = 2.0
 ORIENTATION_MEMORY_VALUES = {
     OrientationBasin.RADIAL: 1.0,
@@ -303,6 +317,7 @@ class NumericalOptions:
 class MemoryCoordinate:
     family: MemoryCoordinateFamily
     records: PhysicalLibraryRecords
+    required_roles: tuple[SpeciesRole, ...]
     value_function: Callable[[PhysicalLibraryRecords, SiteConfiguration], float]
     gradient_function: Callable[[PhysicalLibraryRecords, SiteConfiguration], Array]
 
@@ -335,9 +350,7 @@ class StateChargeMobilityDiagnostics:
     charged_center_labels: tuple[str, ...]
     charged_center_charge_numbers: tuple[float, ...]
     charged_center_mobility_matrix_m2_s: tuple[tuple[float, ...], ...]
-    charged_center_pair_covariance_entries: tuple[
-        ChargedCenterPairCovarianceEntry, ...
-    ]
+    charged_center_pair_covariance_entries: tuple[ChargedCenterPairCovarianceEntry, ...]
     potential_energy_J_mol: float
     dielectric_constant: float
     viscosity_Pa_s: float
@@ -346,7 +359,6 @@ class StateChargeMobilityDiagnostics:
     resistance_stokes_trace_kg_s: float
     resistance_free_volume_trace_kg_s: float
     resistance_charge_cloud_trace_kg_s: float
-    resistance_shape_trace_kg_s: float
     resistance_atmosphere_trace_kg_s: float
     resistance_total_trace_kg_s: float
     atmosphere_electrophoretic_trace_kg_s: float
@@ -367,6 +379,12 @@ class StateQuadratureGroup:
     coordinate_values: list[dict[str, float]]
     local_fields: list[PhysicalLocalFields]
     weights: list[float]
+
+
+@dataclass(frozen=True)
+class StateQuadratureNode:
+    node_indices: tuple[int, ...]
+    active_coordinates: frozenset[ReducedCoordinate]
 
 
 def compute_conductivity_from_recipe(
@@ -403,12 +421,31 @@ def compute_conductivity_from_recipe(
         temperature_K=recipe_context.temperature_K,
         numerical_options=numerical_options,
     )
-    memory_gradient_functions = build_all_memory_coordinate_gradients(
+    transition_edges = finite_generator_transition_edges(
+        records,
+        state_quadratures,
+        recipe_context.temperature_K,
+    )
+    _validate_transport_graph_closure(
         records=records,
-        template_configuration=template_configuration,
         state_quadratures=state_quadratures,
-        mixture=mixture,
-        numerical_options=numerical_options,
+        declared_edges=enumerate_transition_edges(state_quadratures, records),
+        retained_edges=transition_edges,
+    )
+    selected_memory_coordinates = _selected_memory_coordinates(
+        records,
+        template_configuration,
+        transition_edges,
+    )
+    memory_gradient_functions = tuple(
+        _bind_memory_gradient(memory_coordinate)
+        for memory_coordinate in selected_memory_coordinates
+    )
+    state_quadratures = _state_quadratures_with_transport_ownership_bases(
+        records=records,
+        state_quadratures=state_quadratures,
+        transition_edges=transition_edges,
+        selected_memory_coordinates=selected_memory_coordinates,
     )
     projected_components = _projected_mass_balance_components(recipe_context)
     component_concentrations = np.asarray(
@@ -428,15 +465,10 @@ def compute_conductivity_from_recipe(
         )
     )
     generator_input = build_projected_generator_input(
-        _normalize_potential_energy_reference(reduced_specification)
+        _normalize_potential_energy_reference(reduced_specification),
     )
     conductivity_result = _compute_projected_analytical_conductivity_from_input(
         generator_input
-    )
-    transition_edges = finite_generator_transition_edges(
-        records,
-        state_quadratures,
-        recipe_context.temperature_K,
     )
     _validate_transition_rate_bounds(
         records,
@@ -463,7 +495,302 @@ def compute_conductivity_from_recipe(
         projected_components,
         state_quadratures,
     )
+    _annotate_mori_mode_diagnostics(
+        conductivity_result=conductivity_result,
+        records=records,
+        template_configuration=template_configuration,
+        reduced_specification=reduced_specification,
+        state_quadratures=state_quadratures,
+        transition_edges=transition_edges,
+    )
     return conductivity_result
+
+
+def _state_quadratures_with_transport_ownership_bases(
+    records: PhysicalLibraryRecords,
+    state_quadratures: tuple[PhysicalStateQuadrature, ...],
+    transition_edges: tuple[TransitionEdge, ...],
+    selected_memory_coordinates: tuple[MemoryCoordinate, ...],
+) -> tuple[PhysicalStateQuadrature, ...]:
+    incident_edges_by_state: list[list[tuple[int, TransitionEdge]]] = [
+        [] for _state_quadrature in state_quadratures
+    ]
+    for transition_edge_index, transition_edge in enumerate(transition_edges):
+        transition_record = _transition_family_record(records, transition_edge.family)
+        if (
+            _transition_transport_ownership(transition_record)
+            is not TransportOwnership.TRANSITION_DISPLACEMENT
+        ):
+            continue
+        edge_record = (transition_edge_index, transition_edge)
+        incident_edges_by_state[transition_edge.from_state_index].append(edge_record)
+        incident_edges_by_state[transition_edge.to_state_index].append(edge_record)
+    return tuple(
+        replace(
+            state_quadrature,
+            transport_ownership_bases=tuple(
+                _transport_ownership_basis_for_state_point(
+                    records=records,
+                    configuration=configuration,
+                    incident_edges=incident_edges_by_state[state_index],
+                    selected_memory_coordinates=selected_memory_coordinates,
+                )
+                for configuration in state_quadrature.configurations
+            ),
+        )
+        for state_index, state_quadrature in enumerate(state_quadratures)
+    )
+
+
+def _transport_ownership_basis_for_state_point(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+    incident_edges: list[tuple[int, TransitionEdge]],
+    selected_memory_coordinates: tuple[MemoryCoordinate, ...],
+) -> StateTransportOwnershipBasis:
+    coordinate_dimension = int(np.asarray(configuration.positions_m).size)
+    transition_rows = tuple(
+        np.asarray(
+            _reaction_coordinate_gradient(
+                records,
+                configuration,
+                _transition_family_record(records, transition_edge.family),
+            ),
+            dtype=float,
+        )
+        for _transition_edge_index, transition_edge in incident_edges
+    )
+    transition_edge_indices = np.asarray(
+        [transition_edge_index for transition_edge_index, _edge in incident_edges],
+        dtype=int,
+    )
+    bounded_memory_records = tuple(
+        (memory_mode_index, memory_coordinate)
+        for memory_mode_index, memory_coordinate in enumerate(
+            selected_memory_coordinates
+        )
+        if _memory_transport_ownership(
+            records,
+            memory_coordinate.family.value,
+        )[0]
+        is TransportOwnership.BOUNDED_MEMORY
+        and _memory_coordinate_is_supported(memory_coordinate, configuration)
+    )
+    diagnostic_records = tuple(
+        (memory_mode_index, memory_coordinate)
+        for memory_mode_index, memory_coordinate in enumerate(
+            selected_memory_coordinates
+        )
+        if _memory_transport_ownership(
+            records,
+            memory_coordinate.family.value,
+        )[0]
+        is TransportOwnership.DIAGNOSTIC
+        and _memory_coordinate_is_supported(memory_coordinate, configuration)
+    )
+    bounded_memory_rows = tuple(
+        np.asarray(memory_coordinate.gradient_function(records, configuration), dtype=float)
+        for _memory_mode_index, memory_coordinate in bounded_memory_records
+    )
+    diagnostic_rows = tuple(
+        np.asarray(memory_coordinate.gradient_function(records, configuration), dtype=float)
+        for _memory_mode_index, memory_coordinate in diagnostic_records
+    )
+    return StateTransportOwnershipBasis(
+        transition_displacement_gradients=_ownership_gradient_rows(
+            transition_rows,
+            coordinate_dimension,
+        ),
+        transition_edge_indices=transition_edge_indices,
+        bounded_memory_gradients=_ownership_gradient_rows(
+            bounded_memory_rows,
+            coordinate_dimension,
+        ),
+        bounded_memory_mode_indices=np.asarray(
+            [memory_mode_index for memory_mode_index, _coordinate in bounded_memory_records],
+            dtype=int,
+        ),
+        diagnostic_gradients=_ownership_gradient_rows(
+            diagnostic_rows,
+            coordinate_dimension,
+        ),
+        diagnostic_source_ids=tuple(
+            memory_coordinate.family.value
+            for _memory_mode_index, memory_coordinate in diagnostic_records
+        ),
+    )
+
+
+def _ownership_gradient_rows(
+    gradient_rows: tuple[Array, ...],
+    coordinate_dimension: int,
+) -> Array:
+    if not gradient_rows:
+        return np.empty((0, coordinate_dimension), dtype=float)
+    rows = np.asarray(
+        [
+            _ownership_gradient_row(gradient_row, coordinate_dimension)
+            for gradient_row in gradient_rows
+        ],
+        dtype=float,
+    )
+    if rows.shape != (len(gradient_rows), coordinate_dimension):
+        raise ValueError("transport ownership gradient has wrong physical width")
+    return rows
+
+
+def _ownership_gradient_row(
+    gradient_row: Array,
+    coordinate_dimension: int,
+) -> Array:
+    row = np.asarray(gradient_row, dtype=float)
+    if row.shape == (1, coordinate_dimension):
+        return row[0]
+    if row.shape == (coordinate_dimension,):
+        return row
+    raise ValueError("transport ownership source must provide one physical covector")
+
+
+def _annotate_mori_mode_diagnostics(
+    conductivity_result: ProjectedConductivityResult,
+    records: PhysicalLibraryRecords,
+    template_configuration: SiteConfiguration,
+    reduced_specification: ReducedGeneratorSpecification,
+    state_quadratures: tuple[PhysicalStateQuadrature, ...],
+    transition_edges: tuple[TransitionEdge, ...],
+) -> None:
+    selected_coordinates = _selected_memory_coordinates(
+        records,
+        template_configuration,
+        transition_edges,
+    )
+    candidate_labels = tuple(
+        coordinate.family.value for coordinate in selected_coordinates
+    ) + (
+        ReducedCoordinate.LOCAL_DIELECTRIC.value,
+        ReducedCoordinate.LOCAL_VISCOSITY.value,
+        ReducedCoordinate.LOCAL_IONIC_STRENGTH.value,
+        ReducedCoordinate.LOCAL_PACKING_FRACTION.value,
+    )
+    selected_indices = np.asarray(
+        conductivity_result.effect_attribution[
+            "mori_filter_accepted_candidate_indices"
+        ],
+        dtype=int,
+    )
+    memory_matrix = np.asarray(
+        conductivity_result.mori_memory_matrix_A,
+        dtype=float,
+    )
+    current_coupling = np.asarray(
+        conductivity_result.mori_current_coupling_matrix_h,
+        dtype=float,
+    )
+    if selected_indices.size != memory_matrix.shape[0]:
+        raise ValueError("selected Mori coordinate count does not match final matrix")
+    if current_coupling.shape != (selected_indices.size, CARTESIAN_DIMENSION):
+        raise ValueError("selected Mori current coupling shape mismatch")
+    if selected_indices.size == 0:
+        conductivity_result.effect_attribution["mori_mode_ledger"] = ()
+        return
+
+    maximum_candidate_index = int(np.max(selected_indices))
+    if maximum_candidate_index >= len(candidate_labels):
+        raise ValueError("selected Mori coordinate index exceeds candidate labels")
+    memory_solution = symmetric_psd_pseudoinverse(memory_matrix) @ current_coupling
+    mode_contributions = np.einsum("ia,ia->i", current_coupling, memory_solution)
+    mode_ledger = []
+    for selected_position, candidate_index in enumerate(selected_indices):
+        supported_state_labels = []
+        for state_index, state_quadrature in enumerate(
+            reduced_specification.state_quadratures
+        ):
+            coordinate_is_active = any(
+                np.linalg.norm(
+                    reduced_specification.memory_coordinate_gradient(point)[
+                        candidate_index
+                    ]
+                )
+                > 0.0
+                for point in np.asarray(state_quadrature.points, dtype=float)
+            )
+            if coordinate_is_active:
+                supported_state_labels.append(state_quadratures[state_index].label)
+        coordinate_label = candidate_labels[candidate_index]
+        transport_ownership, matching_transition_families = _memory_transport_ownership(
+            records, coordinate_label
+        )
+        mode_ledger.append(
+            {
+                "mode_label": coordinate_label,
+                "A_mu_mu": float(memory_matrix[selected_position, selected_position]),
+                "h_mu_norm": float(np.linalg.norm(current_coupling[selected_position])),
+                "h_mu_A_pseudoinverse_h_contribution": float(
+                    mode_contributions[selected_position]
+                ),
+                "state_support": tuple(supported_state_labels),
+                "physical_owner": _memory_coordinate_physical_owner(coordinate_label),
+                "transport_ownership": transport_ownership.value,
+                "matching_transition_families": matching_transition_families,
+            }
+        )
+    if not np.isclose(
+        float(np.sum(mode_contributions)),
+        float(np.trace(conductivity_result.continuous_mori_correction_tensor)),
+    ):
+        raise ValueError("Mori mode ledger does not sum to the correction tensor")
+    conductivity_result.effect_attribution["mori_mode_ledger"] = tuple(mode_ledger)
+
+
+def _memory_coordinate_physical_owner(coordinate_label: str) -> str:
+    owner_by_coordinate = {
+        MemoryCoordinateFamily.CAGE_BACKJUMP.value: "cage_backjump_memory",
+        MemoryCoordinateFamily.PARTNER_RESIDENCE.value: "partner_residence_memory",
+        MemoryCoordinateFamily.LIGAND_SHELL.value: "ligand_shell_residence_memory",
+        MemoryCoordinateFamily.ANION_ORIENTATION.value: "anion_orientation_memory",
+        MemoryCoordinateFamily.FREE_VOLUME_STRESS.value: "free_volume_stress_memory",
+        MemoryCoordinateFamily.BOUNDED_INTERNAL_POLARIZATION.value: (
+            "bounded_internal_polarization_memory"
+        ),
+        ReducedCoordinate.LOCAL_DIELECTRIC.value: "local_dielectric_memory",
+        ReducedCoordinate.LOCAL_VISCOSITY.value: "local_viscosity_memory",
+        ReducedCoordinate.LOCAL_IONIC_STRENGTH.value: "local_ionic_strength_memory",
+        ReducedCoordinate.LOCAL_PACKING_FRACTION.value: "local_packing_memory",
+    }
+    if coordinate_label not in owner_by_coordinate:
+        raise ValueError(
+            f"missing physical owner for Mori coordinate {coordinate_label}"
+        )
+    return owner_by_coordinate[coordinate_label]
+
+
+def _memory_transport_ownership(
+    records: PhysicalLibraryRecords,
+    coordinate_label: str,
+) -> tuple[TransportOwnership, tuple[str, ...]]:
+    record_key_by_coordinate = {
+        MemoryCoordinateFamily.CAGE_BACKJUMP.value: "cage_backjump",
+        MemoryCoordinateFamily.PARTNER_RESIDENCE.value: "partner_residence",
+        MemoryCoordinateFamily.LIGAND_SHELL.value: "ligand_shell_residence",
+        MemoryCoordinateFamily.ANION_ORIENTATION.value: "anion_orientation",
+        MemoryCoordinateFamily.FREE_VOLUME_STRESS.value: "free_volume_stress",
+        MemoryCoordinateFamily.BOUNDED_INTERNAL_POLARIZATION.value: (
+            "bounded_internal_polarization"
+        ),
+    }
+    if coordinate_label not in record_key_by_coordinate:
+        return TransportOwnership.BOUNDED_MEMORY, ()
+    memory_record_key = record_key_by_coordinate[coordinate_label]
+    memory_family_record = records.memory_record["memory_records"][memory_record_key]
+    ownership = TransportOwnership(str(memory_family_record["transport_ownership"]))
+    if ownership not in (
+        TransportOwnership.BOUNDED_MEMORY,
+        TransportOwnership.DIAGNOSTIC,
+    ):
+        raise ValueError(
+            f"memory coordinate {coordinate_label} has invalid transport ownership"
+        )
+    return ownership, tuple(memory_family_record["matching_transition_families"])
 
 
 def _validate_active_local_field_laws(records: PhysicalLibraryRecords) -> None:
@@ -523,7 +850,9 @@ def _annotate_component_mass_balance_diagnostics(
     )
     conductivity_result.effect_attribution.update(
         {
-            "component_names": tuple(component.name for component in projected_components),
+            "component_names": tuple(
+                component.name for component in projected_components
+            ),
             "component_total_concentrations_mol_m3": component_totals_mol_m3,
             "state_stoichiometry": state_stoichiometry,
             "component_mass_balance_residuals_mol_m3": component_residuals_mol_m3,
@@ -569,16 +898,19 @@ def build_template_site_configuration(
     positions: list[Array] = []
     molecule_id = 0
     for component in recipe_context.components:
-        if component.concentration_mol_m3 <= 0.0:
+        active_component = _component_with_active_recipe_loading(
+            recipe_context, component
+        )
+        if active_component.concentration_mol_m3 <= 0.0:
             continue
-        species_record = records.species_records[component.name]
+        species_record = records.species_records[active_component.name]
         conformer_coordinates = np.asarray(
             species_record["reference_conformer_coordinates_m"],
             dtype=float,
         )
-        offset = _reference_offset_m(records, component.name, molecule_id)
+        offset = _reference_offset_m(records, active_component.name, molecule_id)
         for site_index, site_record in enumerate(species_record["sites"]):
-            species_names.append(component.name)
+            species_names.append(active_component.name)
             molecule_ids.append(molecule_id)
             site_ids.append(int(site_record["site_id"]))
             positions.append(conformer_coordinates[site_index] + offset)
@@ -591,7 +923,9 @@ def build_template_site_configuration(
         site_ids=np.asarray(site_ids, dtype=int),
         positions_m=np.asarray(positions, dtype=float),
         unwrapped_positions_m=np.asarray(positions, dtype=float),
-        box_lengths_m=np.asarray(numerical_options.reference_box_lengths_m, dtype=float),
+        box_lengths_m=np.asarray(
+            numerical_options.reference_box_lengths_m, dtype=float
+        ),
     )
     return _configuration_with_pair_distance(
         records,
@@ -609,7 +943,8 @@ def build_all_state_quadratures(
 ) -> tuple[PhysicalStateQuadrature, ...]:
     declared_coordinates = _declared_reduced_coordinates(records)
     component_names = tuple(
-        component.name for component in _projected_mass_balance_components(recipe_context)
+        component.name
+        for component in _projected_mass_balance_components(recipe_context)
     )
     anion_component_names = tuple(
         component.name
@@ -630,6 +965,7 @@ def build_all_state_quadratures(
     ):
         coordinate_nodes = _state_coordinate_nodes(
             records,
+            template_configuration,
             declared_coordinates,
             lower_distance_m,
             upper_distance_m,
@@ -654,7 +990,9 @@ def build_all_state_quadratures(
                 )
                 if _state_requires_additive_component(state_key):
                     if not additive_component_names:
-                        raise ValueError("additive state generated without additive component")
+                        raise ValueError(
+                            "additive state generated without additive component"
+                        )
                     active_additive_component_names = additive_component_names
                 else:
                     active_additive_component_names = (NO_ACTIVE_ADDITIVE_COMPONENT,)
@@ -665,14 +1003,15 @@ def build_all_state_quadratures(
                     )
                     state_label_with_components = "|".join(additive_state_key)
                     configurations = tuple(
-                        _state_local_transport_configuration(
+                        _state_local_transport_configuration_from_coordinates(
                             records,
-                            configuration,
+                            template_configuration,
+                            coordinate_values,
                             anion_component_name,
                             active_additive_component_name,
                             additive_state_key,
                         )
-                        for configuration in state_group.configurations
+                        for coordinate_values in state_group.coordinate_values
                     )
                     local_fields = tuple(
                         _local_fields_for_coordinate_values(
@@ -689,6 +1028,15 @@ def build_all_state_quadratures(
                     representative_configuration = configurations[
                         len(configurations) // 2
                     ]
+                    relative_descriptor = _state_relative_displacement_descriptor(
+                        records,
+                        configurations,
+                        local_fields,
+                        np.asarray(state_group.weights, dtype=float),
+                        recipe_context.temperature_K,
+                        anion_component_name,
+                        additive_state_key,
+                    )
                     quadratures.append(
                         PhysicalStateQuadrature(
                             label=state_label_with_components,
@@ -707,6 +1055,15 @@ def build_all_state_quadratures(
                                 configuration=representative_configuration,
                                 records=records,
                             ),
+                            transport_ownership_bases=tuple(
+                                _empty_physical_transport_ownership_basis(
+                                    configuration
+                                )
+                                for configuration in configurations
+                            ),
+                            relative_displacement_fluctuations_m=relative_descriptor[0],
+                            relative_displacement_mobility_m2_s=relative_descriptor[1],
+                            relative_center_charge_numbers=relative_descriptor[2],
                         ),
                     )
     quadratures.extend(
@@ -762,9 +1119,37 @@ def _additive_reservoir_state_quadratures(
                     configuration=configuration,
                     records=records,
                 ),
+                transport_ownership_bases=(
+                    _empty_physical_transport_ownership_basis(configuration),
+                ),
+                relative_displacement_fluctuations_m=np.empty(
+                    (0, CARTESIAN_DIMENSION), dtype=float
+                ),
+                relative_displacement_mobility_m2_s=np.empty((0, 0), dtype=float),
+                relative_center_charge_numbers=np.empty(0, dtype=float),
             )
         )
     return quadratures
+
+
+def _empty_physical_transport_ownership_basis(
+    configuration: SiteConfiguration,
+) -> StateTransportOwnershipBasis:
+    coordinate_dimension = int(np.asarray(configuration.positions_m).size)
+    return StateTransportOwnershipBasis(
+        transition_displacement_gradients=np.empty(
+            (0, coordinate_dimension),
+            dtype=float,
+        ),
+        transition_edge_indices=np.empty(0, dtype=int),
+        bounded_memory_gradients=np.empty(
+            (0, coordinate_dimension),
+            dtype=float,
+        ),
+        bounded_memory_mode_indices=np.empty(0, dtype=int),
+        diagnostic_gradients=np.empty((0, coordinate_dimension), dtype=float),
+        diagnostic_source_ids=(),
+    )
 
 
 def _filter_state_quadratures_by_partition_weight(
@@ -856,10 +1241,10 @@ def _additive_reservoir_state_key(additive_component_name: str) -> tuple[str, ..
         "none",
         "free_rotating",
         "Li+",
-        "partner_a",
-        "carrier_identity_a",
-        "hop_source",
-        "cage_released",
+        "partner_inactive",
+        "identity_inactive",
+        "hop_inactive",
+        "cage_inactive",
         "bulk_environment",
         "atmosphere_relaxed",
     )
@@ -895,7 +1280,9 @@ def _single_molecule_configuration_for_species(
         np.asarray(site_indices, dtype=int)
     ]
     return SiteConfiguration(
-        species_names=tuple(configuration.species_names[site_index] for site_index in site_indices),
+        species_names=tuple(
+            configuration.species_names[site_index] for site_index in site_indices
+        ),
         molecule_ids=np.zeros(len(site_indices), dtype=int),
         site_ids=np.asarray(configuration.site_ids, dtype=int)[
             np.asarray(site_indices, dtype=int)
@@ -926,14 +1313,22 @@ def _transport_state_stoichiometry(
             continue
         if component_role == SpeciesRole.CATION:
             continue
-        if component_role == SpeciesRole.ANION and component_name == active_anion_component_name:
+        if (
+            component_role == SpeciesRole.ANION
+            and (
+                component_name == active_anion_component_name
+                or _state_requires_multiple_anions(state_key)
+            )
+        ):
             stoichiometry[component_index] = 1.0
             continue
         if component_role == SpeciesRole.ANION:
             continue
         if component_role == SpeciesRole.ADDITIVE:
             if component_name == active_additive_component_name:
-                stoichiometry[component_index] = _state_additive_stoichiometry(state_key)
+                stoichiometry[component_index] = _state_additive_stoichiometry(
+                    state_key
+                )
             continue
         raise ValueError(
             f"projected mass-balance component is not transport-active: {component_name}"
@@ -947,6 +1342,14 @@ def _state_additive_stoichiometry(state_key: tuple[str, ...]) -> float:
     if _state_requires_additive_component(state_key):
         return 1.0
     return 0.0
+
+
+def _state_requires_multiple_anions(state_key: tuple[str, ...]) -> bool:
+    partner_state = _state_key_base_value(state_key[STATE_KEY_PARTNER_INDEX])
+    cluster_state = _state_key_base_value(state_key[STATE_KEY_CLUSTER_INDEX])
+    return partner_state in {"partner_a", "partner_switching", "partner_b"} or (
+        cluster_state in {"aggregate", "bridge_network"}
+    )
 
 
 def _state_requires_additive_component(state_key: tuple[str, ...]) -> bool:
@@ -994,9 +1397,7 @@ def _state_key_component_name(state_key_value: str) -> str:
 
 
 def _active_additive_name_from_state_key(state_key: tuple[str, ...]) -> str:
-    ligand_component_name = _state_key_component_name(
-        state_key[STATE_KEY_LIGAND_INDEX]
-    )
+    ligand_component_name = _state_key_component_name(state_key[STATE_KEY_LIGAND_INDEX])
     if ligand_component_name:
         return ligand_component_name
     return NO_ACTIVE_ADDITIVE_COMPONENT
@@ -1008,7 +1409,9 @@ def _active_anion_name_from_state_key(state_key: tuple[str, ...]) -> str:
         return NO_ACTIVE_ANION_COMPONENT
     anion_component_name = _state_key_component_name(anion_field)
     if not anion_component_name:
-        raise ValueError(f"state anion field must be '<anion>:<feature>': {anion_field}")
+        raise ValueError(
+            f"state anion field must be '<anion>:<feature>': {anion_field}"
+        )
     return anion_component_name
 
 
@@ -1066,78 +1469,6 @@ def _transition_local_template_configuration(
     )
 
 
-def _configuration_with_active_anion_species(
-    records: PhysicalLibraryRecords,
-    configuration: SiteConfiguration,
-    active_anion_component_name: str,
-) -> SiteConfiguration:
-    if active_anion_component_name not in configuration.species_names:
-        raise ValueError(f"configuration has no active anion {active_anion_component_name}")
-    cation_index = _first_role_index(records, configuration, SpeciesRole.CATION)
-    positions = np.asarray(configuration.positions_m, dtype=float).copy()
-    cation_position = positions[cation_index].copy()
-    current_anion_indices = _first_molecule_indices_with_role(
-        records,
-        configuration,
-        SpeciesRole.ANION,
-    )
-    current_anion_center = np.mean(
-        positions[np.asarray(current_anion_indices, dtype=int)],
-        axis=0,
-    )
-    active_pair_distance_m = _positive_float(
-        float(np.linalg.norm(current_anion_center - cation_position)),
-        "active_pair_distance_m",
-    )
-    active_anion_indices = _first_molecule_indices_for_species(
-        configuration,
-        active_anion_component_name,
-    )
-    active_anion_center = np.mean(
-        positions[np.asarray(active_anion_indices, dtype=int)],
-        axis=0,
-    )
-    target_active_center = cation_position + np.asarray(
-        [active_pair_distance_m, 0.0, 0.0],
-        dtype=float,
-    )
-    active_shift = target_active_center - active_anion_center
-    for site_index in active_anion_indices:
-        positions[site_index] += active_shift
-    inactive_offset_index = 1
-    inactive_distance_m = _positive_float(
-        float(records.basis_record["pair_basins"]["r_free_m"]),
-        "pair_basins.r_free_m",
-    )
-    for species_name in sorted(set(configuration.species_names)):
-        if species_name == active_anion_component_name:
-            continue
-        if _species_role(records, species_name) != SpeciesRole.ANION:
-            continue
-        inactive_indices = _first_molecule_indices_for_species(configuration, species_name)
-        inactive_center = np.mean(positions[np.asarray(inactive_indices, dtype=int)], axis=0)
-        target_inactive_center = cation_position + np.asarray(
-            [
-                0.0,
-                inactive_distance_m * float(inactive_offset_index),
-                inactive_distance_m,
-            ],
-            dtype=float,
-        )
-        inactive_shift = target_inactive_center - inactive_center
-        for site_index in inactive_indices:
-            positions[site_index] += inactive_shift
-        inactive_offset_index += 1
-    return SiteConfiguration(
-        species_names=configuration.species_names,
-        molecule_ids=np.asarray(configuration.molecule_ids, dtype=int),
-        site_ids=np.asarray(configuration.site_ids, dtype=int),
-        positions_m=positions,
-        unwrapped_positions_m=positions,
-        box_lengths_m=np.asarray(configuration.box_lengths_m, dtype=float),
-    )
-
-
 def _state_local_transport_configuration(
     records: PhysicalLibraryRecords,
     configuration: SiteConfiguration,
@@ -1145,95 +1476,78 @@ def _state_local_transport_configuration(
     active_additive_component_name: str,
     state_key: tuple[str, ...],
 ) -> SiteConfiguration:
-    anion_resolved_configuration = _configuration_with_active_anion_species(
+    state_local_configuration = _configuration_with_state_local_species(
         records,
         configuration,
         active_anion_component_name,
-    )
-    additive_resolved_configuration = _configuration_with_active_additive_species(
-        records,
-        anion_resolved_configuration,
         active_additive_component_name,
         state_key,
     )
-    return _configuration_with_state_local_species(
+    return _configuration_with_active_anion_first(
         records,
-        additive_resolved_configuration,
+        state_local_configuration,
         active_anion_component_name,
-        active_additive_component_name,
     )
 
 
-def _configuration_with_active_additive_species(
+def _state_local_transport_configuration_from_coordinates(
     records: PhysicalLibraryRecords,
-    configuration: SiteConfiguration,
+    template_configuration: SiteConfiguration,
+    coordinate_values: dict[str, float],
+    active_anion_component_name: str,
     active_additive_component_name: str,
     state_key: tuple[str, ...],
 ) -> SiteConfiguration:
-    state_requires_additive = _state_requires_additive_component(state_key)
+    state_coordinate_values = dict(coordinate_values)
     if active_additive_component_name == NO_ACTIVE_ADDITIVE_COMPONENT:
-        if state_requires_additive:
-            raise ValueError("additive-consuming state missing active additive species")
-        return configuration
-    if not state_requires_additive:
-        raise ValueError("active additive species supplied for non-additive state")
-    if active_additive_component_name not in configuration.species_names:
-        raise ValueError(
-            f"configuration has no active additive {active_additive_component_name}"
-        )
-    cation_index = _first_role_index(records, configuration, SpeciesRole.CATION)
-    positions = np.asarray(configuration.positions_m, dtype=float).copy()
-    cation_position = positions[cation_index].copy()
-    active_additive_indices = _first_molecule_indices_for_species(
-        configuration,
+        state_coordinate_values[ReducedCoordinate.LI_LIGAND_COORDINATION.value] = 0.0
+    state_local_template = _configuration_with_state_local_species(
+        records,
+        template_configuration,
+        active_anion_component_name,
         active_additive_component_name,
+        state_key,
     )
-    active_additive_center = np.mean(
-        positions[np.asarray(active_additive_indices, dtype=int)],
-        axis=0,
+    active_anion_first_template = _configuration_with_active_anion_first(
+        records,
+        state_local_template,
+        active_anion_component_name,
     )
-    active_ligand_distance_m = _positive_float(
-        float(np.linalg.norm(active_additive_center - cation_position)),
-        "active_ligand_distance_m",
+    return _configuration_with_reduced_coordinate_values(
+        records,
+        active_anion_first_template,
+        state_coordinate_values,
     )
-    target_active_center = cation_position + np.asarray(
-        [0.0, active_ligand_distance_m, active_ligand_distance_m],
-        dtype=float,
+
+
+def _configuration_with_active_anion_first(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+    active_anion_component_name: str,
+) -> SiteConfiguration:
+    non_anion_indices = tuple(
+        site_index
+        for site_index, species_name in enumerate(configuration.species_names)
+        if _species_role(records, species_name) != SpeciesRole.ANION
     )
-    active_shift = target_active_center - active_additive_center
-    for site_index in active_additive_indices:
-        positions[site_index] += active_shift
-    inactive_offset_index = 1
-    inactive_distance_m = _positive_float(
-        float(records.basis_record["pair_basins"]["r_free_m"]),
-        "pair_basins.r_free_m",
+    active_anion_indices = tuple(
+        site_index
+        for site_index, species_name in enumerate(configuration.species_names)
+        if species_name == active_anion_component_name
     )
-    for species_name in sorted(set(configuration.species_names)):
-        if species_name == active_additive_component_name:
-            continue
-        if _species_role(records, species_name) != SpeciesRole.ADDITIVE:
-            continue
-        inactive_indices = _first_molecule_indices_for_species(configuration, species_name)
-        inactive_center = np.mean(positions[np.asarray(inactive_indices, dtype=int)], axis=0)
-        target_inactive_center = cation_position + np.asarray(
-            [
-                inactive_distance_m * float(inactive_offset_index),
-                inactive_distance_m,
-                0.0,
-            ],
-            dtype=float,
+    other_anion_indices = tuple(
+        site_index
+        for site_index, species_name in enumerate(configuration.species_names)
+        if _species_role(records, species_name) == SpeciesRole.ANION
+        and species_name != active_anion_component_name
+    )
+    if not active_anion_indices:
+        raise ValueError(
+            f"state-local configuration has no active anion {active_anion_component_name}"
         )
-        inactive_shift = target_inactive_center - inactive_center
-        for site_index in inactive_indices:
-            positions[site_index] += inactive_shift
-        inactive_offset_index += 1
-    return SiteConfiguration(
-        species_names=configuration.species_names,
-        molecule_ids=np.asarray(configuration.molecule_ids, dtype=int),
-        site_ids=np.asarray(configuration.site_ids, dtype=int),
-        positions_m=positions,
-        unwrapped_positions_m=positions,
-        box_lengths_m=np.asarray(configuration.box_lengths_m, dtype=float),
+    return _configuration_from_site_indices(
+        configuration,
+        non_anion_indices + active_anion_indices + other_anion_indices,
     )
 
 
@@ -1242,6 +1556,7 @@ def _configuration_with_state_local_species(
     configuration: SiteConfiguration,
     active_anion_component_name: str,
     active_additive_component_name: str,
+    state_key: tuple[str, ...],
 ) -> SiteConfiguration:
     molecule_keys_to_keep: set[tuple[str, int]] = set()
     for site_index, species_name in enumerate(configuration.species_names):
@@ -1252,7 +1567,10 @@ def _configuration_with_state_local_species(
                 molecule_keys_to_keep.add(molecule_key)
             continue
         if species_role == SpeciesRole.ANION:
-            if species_name == active_anion_component_name:
+            if (
+                species_name == active_anion_component_name
+                or _state_requires_multiple_anions(state_key)
+            ):
                 molecule_keys_to_keep.add(molecule_key)
             continue
         molecule_keys_to_keep.add(molecule_key)
@@ -1287,10 +1605,14 @@ def _configuration_from_site_indices(
             next_molecule_id += 1
         molecule_ids.append(molecule_id_by_original_key[molecule_key])
     return SiteConfiguration(
-        species_names=tuple(configuration.species_names[site_index] for site_index in site_indices),
+        species_names=tuple(
+            configuration.species_names[site_index] for site_index in site_indices
+        ),
         molecule_ids=np.asarray(molecule_ids, dtype=int),
         site_ids=np.asarray(configuration.site_ids, dtype=int)[site_index_array],
-        positions_m=np.asarray(configuration.positions_m, dtype=float)[site_index_array],
+        positions_m=np.asarray(configuration.positions_m, dtype=float)[
+            site_index_array
+        ],
         unwrapped_positions_m=np.asarray(
             configuration.unwrapped_positions_m,
             dtype=float,
@@ -1321,7 +1643,9 @@ def _state_log_partition_value(
             local_fields.local_packing_fraction,
         )
         if weight <= 0.0:
-            raise ValueError(f"{state_quadrature.label} has nonpositive quadrature weight")
+            raise ValueError(
+                f"{state_quadrature.label} has nonpositive quadrature weight"
+            )
         log_terms.append(
             np.log(float(weight))
             - physical_objects.potential_energy_J_mol / (R * temperature_K)
@@ -1344,7 +1668,8 @@ def build_self_current_projector(
     _ = state_key
     _ = records
     coordinate_count = (
-        len(configuration.species_names) * CARTESIAN_DIMENSION + LOCAL_FIELD_VECTOR_LENGTH
+        len(configuration.species_names) * CARTESIAN_DIMENSION
+        + LOCAL_FIELD_VECTOR_LENGTH
     )
     return np.eye(coordinate_count, dtype=float)
 
@@ -1357,7 +1682,18 @@ def _group_state_quadrature_nodes(
     coordinate_nodes: tuple[tuple[ReducedCoordinate, Array, Array], ...],
 ) -> dict[str, StateQuadratureGroup]:
     grouped_quadrature: dict[str, StateQuadratureGroup] = {}
-    for node_indices in _state_node_index_tuples(records, coordinate_nodes):
+    state_nodes = _state_node_index_tuples(records, coordinate_nodes)
+    state_node_weights = _state_node_quadrature_weights(
+        records,
+        coordinate_nodes,
+        state_nodes,
+    )
+    for state_node, coordinate_weight in zip(
+        state_nodes,
+        state_node_weights,
+        strict=True,
+    ):
+        node_indices = state_node.node_indices
         coordinate_values = {
             coordinate_name.value: float(values[node_index])
             for node_index, (coordinate_name, values, _weights) in zip(
@@ -1366,7 +1702,6 @@ def _group_state_quadrature_nodes(
                 strict=True,
             )
         }
-        coordinate_weight = _coordinate_product_weight(node_indices, coordinate_nodes)
         configuration = _configuration_with_reduced_coordinate_values(
             records,
             template_configuration,
@@ -1378,6 +1713,7 @@ def _group_state_quadrature_nodes(
             mixture,
             pair_label,
             coordinate_values,
+            state_node.active_coordinates,
         )
         state_label = "|".join(state_key)
         if state_label not in grouped_quadrature:
@@ -1391,20 +1727,90 @@ def _group_state_quadrature_nodes(
         grouped_quadrature[state_label].configurations.append(configuration)
         grouped_quadrature[state_label].coordinate_values.append(coordinate_values)
         grouped_quadrature[state_label].local_fields.append(
-            _local_fields_for_coordinate_values(records, configuration, coordinate_values)
+            _local_fields_for_coordinate_values(
+                records, configuration, coordinate_values
+            )
         )
         grouped_quadrature[state_label].weights.append(coordinate_weight)
     return grouped_quadrature
 
 
+def _state_node_quadrature_weights(
+    records: PhysicalLibraryRecords,
+    coordinate_nodes: tuple[tuple[ReducedCoordinate, Array, Array], ...],
+    state_nodes: tuple[StateQuadratureNode, ...],
+) -> Array:
+    raw_weights = np.asarray(
+        [
+            _coordinate_product_weight(state_node.node_indices, coordinate_nodes)
+            for state_node in state_nodes
+        ],
+        dtype=float,
+    )
+    if np.any(~np.isfinite(raw_weights)) or np.any(raw_weights <= 0.0):
+        raise ValueError("state quadrature weights must be positive and finite")
+    state_axis_generation = str(records.basis_record["state_axis_generation"])
+    if state_axis_generation == "full_tensor_product":
+        return raw_weights
+    if state_axis_generation != "sparse_single_axis_plus_pair":
+        raise ValueError(
+            f"unsupported basis.state_axis_generation {state_axis_generation}"
+        )
+    pair_coordinate_index = _coordinate_nodes_index(
+        coordinate_nodes,
+        ReducedCoordinate.LI_ANION_DISTANCE,
+    )
+    pair_weights = np.asarray(
+        coordinate_nodes[pair_coordinate_index][2],
+        dtype=float,
+    )
+    normalized_weights = np.zeros_like(raw_weights)
+    for pair_node_index, pair_weight in enumerate(pair_weights):
+        matching_node_indices = np.asarray(
+            [
+                state_node_index
+                for state_node_index, state_node in enumerate(state_nodes)
+                if state_node.node_indices[pair_coordinate_index] == pair_node_index
+            ],
+            dtype=int,
+        )
+        if matching_node_indices.size == 0:
+            raise ValueError(
+                f"sparse state quadrature omitted pair node {pair_node_index}"
+            )
+        matching_raw_weight = float(np.sum(raw_weights[matching_node_indices]))
+        normalized_weights[matching_node_indices] = (
+            raw_weights[matching_node_indices]
+            * float(pair_weight)
+            / matching_raw_weight
+        )
+        if not np.isclose(
+            float(np.sum(normalized_weights[matching_node_indices])),
+            float(pair_weight),
+            rtol=SUMMATION_ROUNDOFF_EPSILON_FACTOR * np.finfo(float).eps,
+            atol=np.finfo(float).tiny,
+        ):
+            raise ValueError(
+                f"sparse state quadrature does not conserve pair node {pair_node_index}"
+            )
+    return normalized_weights
+
+
 def _state_node_index_tuples(
     records: PhysicalLibraryRecords,
     coordinate_nodes: tuple[tuple[ReducedCoordinate, Array, Array], ...],
-) -> tuple[tuple[int, ...], ...]:
+) -> tuple[StateQuadratureNode, ...]:
     state_axis_generation = str(records.basis_record["state_axis_generation"])
     if state_axis_generation == "full_tensor_product":
         return tuple(
-            product(
+            StateQuadratureNode(
+                node_indices=node_indices,
+                active_coordinates=frozenset(
+                    coordinate_name
+                    for coordinate_name, _values, _weights in coordinate_nodes
+                ),
+            )
+            for node_indices in product(
                 *(
                     range(values.size)
                     for _coordinate_name, values, _weights in coordinate_nodes
@@ -1412,20 +1818,33 @@ def _state_node_index_tuples(
             )
         )
     if state_axis_generation != "sparse_single_axis_plus_pair":
-        raise ValueError(f"unsupported basis.state_axis_generation {state_axis_generation}")
+        raise ValueError(
+            f"unsupported basis.state_axis_generation {state_axis_generation}"
+        )
     pair_coordinate_index = _coordinate_nodes_index(
         coordinate_nodes,
         ReducedCoordinate.LI_ANION_DISTANCE,
+    )
+    ligand_coordinate_index = _coordinate_nodes_index(
+        coordinate_nodes,
+        ReducedCoordinate.LI_LIGAND_COORDINATION,
     )
     baseline_indices = tuple(
         _baseline_node_index_for_coordinate(coordinate_name, values)
         for coordinate_name, values, _weights in coordinate_nodes
     )
-    index_tuples: list[tuple[int, ...]] = []
+    state_nodes: list[StateQuadratureNode] = []
     for pair_node_index in range(coordinate_nodes[pair_coordinate_index][1].size):
         pair_baseline_indices = list(baseline_indices)
         pair_baseline_indices[pair_coordinate_index] = pair_node_index
-        index_tuples.append(tuple(pair_baseline_indices))
+        state_nodes.append(
+            StateQuadratureNode(
+                node_indices=tuple(pair_baseline_indices),
+                active_coordinates=frozenset(
+                    {ReducedCoordinate.LI_ANION_DISTANCE}
+                ),
+            )
+        )
         for coordinate_index, (_coordinate_name, values, _weights) in enumerate(
             coordinate_nodes
         ):
@@ -1433,7 +1852,16 @@ def _state_node_index_tuples(
                 continue
             baseline_node_index = baseline_indices[coordinate_index]
             for node_index in range(values.size):
-                if node_index == baseline_node_index:
+                coordinate = coordinate_nodes[coordinate_index][0]
+                if (
+                    coordinate in _bounded_memory_only_coordinates()
+                    and node_index == baseline_node_index
+                ):
+                    continue
+                if (
+                    node_index == baseline_node_index
+                    and coordinate not in _unit_interval_state_coordinates()
+                ):
                     continue
                 conditioning_indices = _transport_axis_conditioning_indices(
                     coordinate_nodes,
@@ -1443,8 +1871,24 @@ def _state_node_index_tuples(
                 for conditioned_indices in conditioning_indices:
                     varied_indices = list(conditioned_indices)
                     varied_indices[coordinate_index] = node_index
-                    index_tuples.append(tuple(varied_indices))
-    return tuple(dict.fromkeys(index_tuples))
+                    active_coordinates = {
+                        ReducedCoordinate.LI_ANION_DISTANCE,
+                    }
+                    if coordinate not in _bounded_memory_only_coordinates():
+                        active_coordinates.add(coordinate)
+                    if conditioned_indices[ligand_coordinate_index] != (
+                        pair_baseline_indices[ligand_coordinate_index]
+                    ):
+                        active_coordinates.add(
+                            ReducedCoordinate.LI_LIGAND_COORDINATION
+                        )
+                    state_nodes.append(
+                        StateQuadratureNode(
+                            node_indices=tuple(varied_indices),
+                            active_coordinates=frozenset(active_coordinates),
+                        )
+                    )
+    return tuple(dict.fromkeys(state_nodes))
 
 
 def _transport_axis_conditioning_indices(
@@ -1511,6 +1955,13 @@ def _unit_interval_state_coordinates() -> set[ReducedCoordinate]:
     }
 
 
+def _bounded_memory_only_coordinates() -> set[ReducedCoordinate]:
+    return {
+        ReducedCoordinate.ATMOSPHERE_POLARIZATION,
+        ReducedCoordinate.CAGE_COORDINATE,
+    }
+
+
 def _coordinate_product_weight(
     node_indices: tuple[int, ...],
     coordinate_nodes: tuple[tuple[ReducedCoordinate, Array, Array], ...],
@@ -1524,8 +1975,6 @@ def _coordinate_product_weight(
         ) in zip(node_indices, coordinate_nodes, strict=True)
     ]
     return float(np.prod(np.asarray(weights, dtype=float)))
-
-
 
 
 def build_all_transition_quadratures(
@@ -1543,7 +1992,9 @@ def build_all_transition_quadratures(
         temperature_K,
     )
     if not transition_edges and records.transition_record["families"]:
-        state_labels = tuple(state_quadrature.label for state_quadrature in state_quadratures)
+        state_labels = tuple(
+            state_quadrature.label for state_quadrature in state_quadratures
+        )
         raise ValueError(
             "physical-library recipe generated no transition edges for declared "
             f"transition families {tuple(records.transition_record['families'])}; "
@@ -1657,7 +2108,9 @@ def build_all_transition_quadratures(
                 right_state_index=reaction_coordinate_grid.size - 1,
             )
         )
-        committor_gradients = committor_result.committor_gradient[:, None] * flat_gradients
+        committor_gradients = (
+            committor_result.committor_gradient[:, None] * flat_gradients
+        )
         charge_polarization_by_grid = np.asarray(
             [
                 compute_charge_polarization_m(records, configuration)
@@ -1665,19 +2118,6 @@ def build_all_transition_quadratures(
             ],
             dtype=float,
         )
-        if (
-            str(transition_record["displacement_policy"]) != "zero"
-            and "endpoint_geometry" in transition_record
-        ):
-            endpoint_displacement_m = _endpoint_geometry_displacement_vector_m(
-                records,
-                configurations[0],
-                transition_record,
-                edge.family,
-            )
-            charge_polarization_by_grid[-1] = (
-                charge_polarization_by_grid[0] + endpoint_displacement_m
-            )
         reactive_exit_weights = np.zeros(reaction_coordinate_grid.size, dtype=float)
         reactive_exit_weights[0] = 1.0
         moment_input = MomentBoundaryValueInput(
@@ -1693,15 +2133,6 @@ def build_all_transition_quadratures(
             ),
             reactive_exit_weights=np.asarray(reactive_exit_weights, dtype=float),
             temperature_K=temperature_K,
-        )
-        first_displacement_moment_m, second_displacement_moment_m2 = (
-            _transition_displacement_moments(transition_record, moment_input)
-        )
-        _validate_transition_displacement_policy(
-            edge.family,
-            transition_record,
-            first_displacement_moment_m,
-            second_displacement_moment_m2,
         )
         uses_declared_rate_constant = _uses_declared_rate_constant(
             edge.family,
@@ -1722,10 +2153,35 @@ def build_all_transition_quadratures(
                 temperature_K,
             )
         )
+        first_displacement_moment_m, second_displacement_moment_m2 = (
+            _transition_displacement_moments(
+                transition_record,
+                moment_input,
+                _endpoint_geometry_displacement_vector_m(
+                    records,
+                    configurations[0],
+                    transition_record,
+                    edge.family,
+                )
+                if str(transition_record["moment_policy"])
+                != "zero_motif_exchange"
+                else np.zeros(CARTESIAN_DIMENSION, dtype=float),
+            )
+        )
+        _validate_transition_displacement_policy(
+            edge.family,
+            transition_record,
+            first_displacement_moment_m,
+            second_displacement_moment_m2,
+        )
         transitions.append(
             PhysicalTransitionQuadrature(
                 from_state_index=edge.from_state_index,
                 to_state_index=edge.to_state_index,
+                transition_family=edge.family,
+                transport_ownership=_transition_transport_ownership(
+                    transition_record
+                ),
                 configurations=configurations,
                 local_fields=local_fields,
                 weights=committor_result.quadrature_weights,
@@ -1787,7 +2243,13 @@ def _transition_reaction_coordinate(transition_record: dict) -> ReducedCoordinat
     for reduced_coordinate in ReducedCoordinate:
         if reduced_coordinate.value == reaction_coordinate_name:
             return reduced_coordinate
-    raise ValueError(f"unsupported transition reaction_coordinate {reaction_coordinate_name}")
+    raise ValueError(
+        f"unsupported transition reaction_coordinate {reaction_coordinate_name}"
+    )
+
+
+def _transition_transport_ownership(transition_record: dict) -> TransportOwnership:
+    return TransportOwnership(str(transition_record["transport_ownership"]))
 
 
 def _transition_coordinate_bounds(
@@ -1803,7 +2265,9 @@ def _transition_coordinate_bounds(
         return _transition_distance_bounds(records, from_pair_label, to_pair_label)
     if reaction_coordinate.value in records.basis_record["coordinate_domains"]:
         domain = records.basis_record["coordinate_domains"][reaction_coordinate.value]
-        return _domain_bounds(domain, f"basis.coordinate_domains.{reaction_coordinate.value}")
+        return _domain_bounds(
+            domain, f"basis.coordinate_domains.{reaction_coordinate.value}"
+        )
     if "coordinate_domain" not in transition_record:
         raise KeyError(
             f"transition record for {reaction_coordinate.value} missing coordinate_domain"
@@ -1833,13 +2297,19 @@ def _transition_base_coordinate_values(
     ]
     pair_label = from_state_quadrature.label.split("|")[0]
     to_pair_label = to_state_quadrature.label.split("|")[0]
-    if pair_label != to_pair_label and {pair_label, to_pair_label} != {
-        PairBasin.FREE.value,
-        PairBasin.SOLVENT_SEPARATED_ION_PAIR.value,
-    } and {pair_label, to_pair_label} != {
-        PairBasin.SOLVENT_SEPARATED_ION_PAIR.value,
-        PairBasin.CONTACT_ION_PAIR.value,
-    }:
+    if (
+        pair_label != to_pair_label
+        and {pair_label, to_pair_label}
+        != {
+            PairBasin.FREE.value,
+            PairBasin.SOLVENT_SEPARATED_ION_PAIR.value,
+        }
+        and {pair_label, to_pair_label}
+        != {
+            PairBasin.SOLVENT_SEPARATED_ION_PAIR.value,
+            PairBasin.CONTACT_ION_PAIR.value,
+        }
+    ):
         pair_label = PairBasin.SOLVENT_SEPARATED_ION_PAIR.value
     values = {
         ReducedCoordinate.LI_ANION_DISTANCE.value: _representative_pair_distance_m(
@@ -1909,7 +2379,9 @@ def _transition_free_energy_profile_J_mol(
         reduced_coordinate_value = (
             float(coordinate_value) - lower_coordinate_value
         ) / coordinate_span
-        barrier_shape = 4.0 * reduced_coordinate_value * (1.0 - reduced_coordinate_value)
+        barrier_shape = (
+            4.0 * reduced_coordinate_value * (1.0 - reduced_coordinate_value)
+        )
         free_energy_values.append(
             _reduced_coordinate_free_energy_J_mol(
                 records,
@@ -1942,8 +2414,11 @@ def _reduced_coordinate_free_energy_J_mol(
         to_state_label,
     )
     coordination_energy = _reduced_coordination_free_energy_J_mol(
+        records,
         free_energy_terms,
         coordinate_values,
+        from_state_label,
+        to_state_label,
     )
     competition_energy = _reduced_solvation_competition_energy_J_mol(
         free_energy_terms,
@@ -1994,13 +2469,10 @@ def _reduced_pair_free_energy_J_mol(
     span_m = free_cutoff_m - solvent_separated_cutoff_m
     if span_m <= 0.0:
         raise ValueError("free pair transition span must be positive")
-    normalized_coordinate = (
-        li_anion_distance_m - solvent_separated_cutoff_m
-    ) / span_m
-    linear_endpoint_energy = (
-        (1.0 - normalized_coordinate) * endpoint_energy_values[0]
-        + normalized_coordinate * endpoint_energy_values[1]
-    )
+    normalized_coordinate = (li_anion_distance_m - solvent_separated_cutoff_m) / span_m
+    linear_endpoint_energy = (1.0 - normalized_coordinate) * endpoint_energy_values[
+        0
+    ] + normalized_coordinate * endpoint_energy_values[1]
     barrier_shape = 4.0 * normalized_coordinate * (1.0 - normalized_coordinate)
     return float(
         linear_endpoint_energy
@@ -2016,9 +2488,36 @@ def _pair_energy_label(pair_label: str) -> str:
     return pair_label
 
 
+def _reduced_li_anion_feature_coordination_multiplier(
+    records: PhysicalLibraryRecords,
+    from_state_label: str,
+    to_state_label: str,
+) -> float:
+    from_anion_name = _active_anion_name_from_state_key(
+        _state_key_from_label(from_state_label)
+    )
+    to_anion_name = _active_anion_name_from_state_key(
+        _state_key_from_label(to_state_label)
+    )
+    if from_anion_name == NO_ACTIVE_ANION_COMPONENT:
+        if to_anion_name == NO_ACTIVE_ANION_COMPONENT:
+            return 1.0
+        return 1.0 + anion_internal_charge_separation_factor(records, to_anion_name)
+    if to_anion_name == NO_ACTIVE_ANION_COMPONENT:
+        return 1.0 + anion_internal_charge_separation_factor(records, from_anion_name)
+    if from_anion_name != to_anion_name:
+        raise ValueError(
+            f"reduced Li-anion coordination changed active anion: {from_anion_name} -> {to_anion_name}"
+        )
+    return 1.0 + anion_internal_charge_separation_factor(records, from_anion_name)
+
+
 def _reduced_coordination_free_energy_J_mol(
+    records: PhysicalLibraryRecords,
     free_energy_terms: dict,
     coordinate_values: dict[str, float],
+    from_state_label: str,
+    to_state_label: str,
 ) -> float:
     coordination_record = free_energy_terms["coordination_J_mol"]
     coordinate_map = {
@@ -2028,7 +2527,16 @@ def _reduced_coordination_free_energy_J_mol(
     }
     total_energy = 0.0
     for coordination_name, coordinate_name in coordinate_map.items():
-        total_energy += float(coordination_record[coordination_name]) * float(
+        coordination_coefficient_J_mol = float(coordination_record[coordination_name])
+        if coordination_name == "Li_anion":
+            coordination_coefficient_J_mol *= (
+                _reduced_li_anion_feature_coordination_multiplier(
+                    records,
+                    from_state_label,
+                    to_state_label,
+                )
+            )
+        total_energy += coordination_coefficient_J_mol * float(
             coordinate_values[coordinate_name]
         )
     return float(total_energy)
@@ -2052,10 +2560,7 @@ def _reduced_solvation_competition_energy_J_mol(
             targets[coordination_name]
         )
         total_energy += (
-            0.5
-            * float(stiffnesses[coordination_name])
-            * displacement
-            * displacement
+            0.5 * float(stiffnesses[coordination_name]) * displacement * displacement
         )
     return float(total_energy)
 
@@ -2088,10 +2593,7 @@ def _reduced_auxiliary_coordinate_energy_J_mol(
     for coordinate_name in auxiliary_coordinate_names:
         coordinate_value = float(coordinate_values[coordinate_name])
         total_energy += (
-            0.5
-            * auxiliary_stiffness_J_mol
-            * coordinate_value
-            * coordinate_value
+            0.5 * auxiliary_stiffness_J_mol * coordinate_value * coordinate_value
         )
     orientation = float(coordinate_values[ReducedCoordinate.ANION_ORIENTATION.value])
     total_energy += 0.5 * auxiliary_stiffness_J_mol * orientation * orientation
@@ -2127,7 +2629,10 @@ def _configuration_for_transition_coordinate(
     coordinate_value: float,
 ) -> SiteConfiguration:
     reaction_coordinate = _transition_reaction_coordinate(transition_record)
-    coordinate_values = {**base_coordinate_values, reaction_coordinate.value: coordinate_value}
+    coordinate_values = {
+        **base_coordinate_values,
+        reaction_coordinate.value: coordinate_value,
+    }
     builders = {
         ReducedCoordinate.LI_ANION_DISTANCE: _configuration_with_standard_coordinate,
         ReducedCoordinate.LI_SOLVENT_COORDINATION: _configuration_with_standard_coordinate,
@@ -2152,7 +2657,9 @@ def _configuration_for_transition_coordinate(
     if reaction_coordinate not in builders:
         raise ValueError(f"no transition builder for {reaction_coordinate.value}")
     builder = builders[reaction_coordinate]
-    return builder(records, template_configuration, coordinate_values, transition_record)
+    return builder(
+        records, template_configuration, coordinate_values, transition_record
+    )
 
 
 def _configuration_with_standard_coordinate(
@@ -2175,20 +2682,11 @@ def _configuration_with_identity_coordinate(
     coordinate_values: dict[str, float],
     transition_record: dict,
 ) -> SiteConfiguration:
-    configuration = _configuration_with_reduced_coordinate_values(
+    return _configuration_with_reduced_coordinate_values(
         records,
         template_configuration,
         coordinate_values,
     )
-    displacement_m = _endpoint_geometry_displacement_vector_m(
-        records,
-        configuration,
-        transition_record,
-        "identity_diffusion",
-    ) * float(
-        coordinate_values[ReducedCoordinate.IDENTITY_COORDINATE.value]
-    )
-    return _configuration_with_cation_displacement(records, configuration, displacement_m)
 
 
 def _configuration_with_structural_hop_coordinate(
@@ -2197,20 +2695,11 @@ def _configuration_with_structural_hop_coordinate(
     coordinate_values: dict[str, float],
     transition_record: dict,
 ) -> SiteConfiguration:
-    configuration = _configuration_with_reduced_coordinate_values(
+    return _configuration_with_reduced_coordinate_values(
         records,
         template_configuration,
         coordinate_values,
     )
-    displacement_m = _endpoint_geometry_displacement_vector_m(
-        records,
-        configuration,
-        transition_record,
-        "structural_hop",
-    ) * float(
-        coordinate_values[ReducedCoordinate.STRUCTURAL_HOP_COORDINATE.value]
-    )
-    return _configuration_with_cation_displacement(records, configuration, displacement_m)
 
 
 def _configuration_with_partner_residence_coordinate(
@@ -2219,20 +2708,11 @@ def _configuration_with_partner_residence_coordinate(
     coordinate_values: dict[str, float],
     transition_record: dict,
 ) -> SiteConfiguration:
-    configuration = _configuration_with_reduced_coordinate_values(
+    return _configuration_with_reduced_coordinate_values(
         records,
         template_configuration,
         coordinate_values,
     )
-    displacement_m = _endpoint_geometry_displacement_vector_m(
-        records,
-        configuration,
-        transition_record,
-        "partner_switch",
-    ) * float(
-        coordinate_values[ReducedCoordinate.PARTNER_RESIDENCE_COORDINATE.value]
-    )
-    return _configuration_with_cation_displacement(records, configuration, displacement_m)
 
 
 def _configuration_with_cage_coordinate(
@@ -2249,13 +2729,18 @@ def _configuration_with_cage_coordinate(
     if str(transition_record["displacement_policy"]) == "zero":
         return configuration
     cage_value = float(coordinate_values[ReducedCoordinate.CAGE_COORDINATE.value])
-    displacement_m = _endpoint_geometry_displacement_vector_m(
-        records,
-        configuration,
-        transition_record,
-        "cage_capture_release",
-    ) * cage_value
-    return _configuration_with_cation_displacement(records, configuration, displacement_m)
+    displacement_m = (
+        _endpoint_geometry_displacement_vector_m(
+            records,
+            configuration,
+            transition_record,
+            "cage_capture_release",
+        )
+        * cage_value
+    )
+    return _configuration_with_cation_displacement(
+        records, configuration, displacement_m
+    )
 
 
 def _configuration_with_cation_displacement(
@@ -2303,13 +2788,18 @@ def _configuration_with_cluster_coordinate(
     )
     if "endpoint_geometry" not in transition_record:
         return configuration
-    displacement_m = _endpoint_geometry_displacement_vector_m(
-        records,
-        configuration,
-        transition_record,
-        "bridge_network_formation_breakup",
-    ) * cluster_value
-    return _configuration_with_cation_displacement(records, configuration, displacement_m)
+    displacement_m = (
+        _endpoint_geometry_displacement_vector_m(
+            records,
+            configuration,
+            transition_record,
+            "bridge_network_formation_breakup",
+        )
+        * cluster_value
+    )
+    return _configuration_with_cation_displacement(
+        records, configuration, displacement_m
+    )
 
 
 def _local_fields_for_coordinate_values(
@@ -2321,7 +2811,9 @@ def _local_fields_for_coordinate_values(
         float(coordinate_values[ReducedCoordinate.LOCAL_PACKING_FRACTION.value]),
         ReducedCoordinate.LOCAL_PACKING_FRACTION.value,
     )
-    configuration_packing_fraction = compute_local_packing_fraction(records, configuration)
+    configuration_packing_fraction = compute_local_packing_fraction(
+        records, configuration
+    )
     local_packing_fraction = max(
         coordinate_packing_fraction,
         configuration_packing_fraction,
@@ -2413,7 +2905,9 @@ def _local_viscosity_Pa_s(
         + jones_dole_b * local_ionic_strength_mol_m3
     )
     packing_record = records.mixture_record["packing"]
-    phi_max = _positive_float(float(packing_record["phi_max"]), "mixture.packing.phi_max")
+    phi_max = _positive_float(
+        float(packing_record["phi_max"]), "mixture.packing.phi_max"
+    )
     if local_packing_fraction >= phi_max:
         raise ValueError("local_packing_fraction exceeds mixture.packing.phi_max")
     packing_exponent = _positive_float(
@@ -2424,7 +2918,6 @@ def _local_viscosity_Pa_s(
     additive_factor = 1.0 + _configuration_additive_fraction(
         records,
         configuration,
-        local_field_record["additive_microviscosity_coefficients"],
     )
     return _positive_float(
         base_viscosity_Pa_s * salt_factor * packing_factor * additive_factor,
@@ -2435,21 +2928,30 @@ def _local_viscosity_Pa_s(
 def _configuration_additive_fraction(
     records: PhysicalLibraryRecords,
     configuration: SiteConfiguration,
-    additive_coefficients: dict,
 ) -> float:
-    site_count = len(configuration.species_names)
-    if site_count == 0:
+    molecule_keys = tuple(
+        dict.fromkeys(
+            zip(
+                configuration.species_names,
+                np.asarray(configuration.molecule_ids, dtype=int),
+                strict=True,
+            )
+        )
+    )
+    if not molecule_keys:
         raise ValueError("configuration has no sites")
     additive_weight = 0.0
-    for species_name in configuration.species_names:
+    for species_name, _molecule_id in molecule_keys:
         if _species_role(records, species_name) != SpeciesRole.ADDITIVE:
             continue
-        if species_name not in additive_coefficients:
-            raise KeyError(
-                f"local_fields.additive_microviscosity_coefficients missing {species_name}"
-            )
-        additive_weight += float(additive_coefficients[species_name])
-    return additive_weight / float(site_count)
+        species_record = records.species_records[species_name]
+        if "local_microviscosity_coefficient" not in species_record:
+            raise KeyError(f"{species_name} missing local_microviscosity_coefficient")
+        additive_weight += _nonnegative_float(
+            float(species_record["local_microviscosity_coefficient"]),
+            f"{species_name}.local_microviscosity_coefficient",
+        )
+    return additive_weight / float(len(molecule_keys))
 
 
 def _reaction_coordinate_gradient(
@@ -2471,7 +2973,9 @@ def _reaction_coordinate_gradient(
     }
     if gradient_policy not in gradient_functions:
         raise ValueError(f"unsupported transition gradient_policy {gradient_policy}")
-    return gradient_functions[gradient_policy](records, configuration, transition_record)
+    return gradient_functions[gradient_policy](
+        records, configuration, transition_record
+    )
 
 
 def _pair_distance_gradient_from_record(
@@ -2512,12 +3016,20 @@ def _coordination_switch_gradient(
 ) -> Array:
     switch_record = records.basis_record["coordination_switches"][switch_name]
     center_role = SpeciesRole(str(switch_record["center_role"]))
-    ligand_roles = tuple(SpeciesRole(str(role)) for role in switch_record["ligand_roles"])
-    switch_radius_m = _positive_float(float(switch_record["r0_m"]), f"{switch_name}.r0_m")
-    exponent = _positive_float(float(switch_record["exponent"]), f"{switch_name}.exponent")
+    ligand_roles = tuple(
+        SpeciesRole(str(role)) for role in switch_record["ligand_roles"]
+    )
+    switch_radius_m = _positive_float(
+        float(switch_record["r0_m"]), f"{switch_name}.r0_m"
+    )
+    exponent = _positive_float(
+        float(switch_record["exponent"]), f"{switch_name}.exponent"
+    )
     center_index = _first_role_index(records, configuration, center_role)
     positions_m = np.asarray(configuration.positions_m, dtype=float)
-    gradient = np.zeros(len(configuration.species_names) * CARTESIAN_DIMENSION, dtype=float)
+    gradient = np.zeros(
+        len(configuration.species_names) * CARTESIAN_DIMENSION, dtype=float
+    )
     center_gradient = np.zeros(CARTESIAN_DIMENSION, dtype=float)
     for ligand_index, species_name in enumerate(configuration.species_names):
         if ligand_index == center_index:
@@ -2588,12 +3100,15 @@ def _identity_coordinate_gradient_from_record(
         transition_record,
         "identity_diffusion",
     )
-    return _cation_displacement_axis_gradient(
-        records,
-        configuration,
-        transition_record,
-        "identity_diffusion",
-    ) / displacement_m
+    return (
+        _cation_displacement_axis_gradient(
+            records,
+            configuration,
+            transition_record,
+            "identity_diffusion",
+        )
+        / displacement_m
+    )
 
 
 def _structural_hop_gradient_from_record(
@@ -2605,12 +3120,15 @@ def _structural_hop_gradient_from_record(
         transition_record,
         "structural_hop",
     )
-    return _cation_displacement_axis_gradient(
-        records,
-        configuration,
-        transition_record,
-        "structural_hop",
-    ) / displacement_m
+    return (
+        _cation_displacement_axis_gradient(
+            records,
+            configuration,
+            transition_record,
+            "structural_hop",
+        )
+        / displacement_m
+    )
 
 
 def _cage_coordinate_gradient_from_record(
@@ -2623,12 +3141,15 @@ def _cage_coordinate_gradient_from_record(
             transition_record,
             "cage_capture_release",
         )
-        return _cation_displacement_axis_gradient(
-            records,
-            configuration,
-            transition_record,
-            "cage_capture_release",
-        ) / displacement_norm_m
+        return (
+            _cation_displacement_axis_gradient(
+                records,
+                configuration,
+                transition_record,
+                "cage_capture_release",
+            )
+            / displacement_norm_m
+        )
     return _pair_distance_gradient(records, configuration) / _positive_float(
         float(records.basis_record["pair_basins"]["r_SSIP_m"]),
         "pair_basins.r_SSIP_m",
@@ -2666,7 +3187,9 @@ def _cation_x_gradient(
     configuration: SiteConfiguration,
 ) -> Array:
     cation_index = _first_role_index(records, configuration, SpeciesRole.CATION)
-    gradient = np.zeros(len(configuration.species_names) * CARTESIAN_DIMENSION, dtype=float)
+    gradient = np.zeros(
+        len(configuration.species_names) * CARTESIAN_DIMENSION, dtype=float
+    )
     gradient[cation_index * CARTESIAN_DIMENSION] = 1.0
     return gradient
 
@@ -2684,7 +3207,9 @@ def _cation_displacement_axis_gradient(
         transition_record,
         family,
     )
-    gradient = np.zeros(len(configuration.species_names) * CARTESIAN_DIMENSION, dtype=float)
+    gradient = np.zeros(
+        len(configuration.species_names) * CARTESIAN_DIMENSION, dtype=float
+    )
     start = cation_index * CARTESIAN_DIMENSION
     stop = start + CARTESIAN_DIMENSION
     gradient[start:stop] = axis
@@ -2744,7 +3269,9 @@ def _named_scalar_value(
     if scalar_name == "anion_orientation":
         return _anion_orientation_cosine(records, configuration)
     if scalar_name == "atmosphere_polarization":
-        return float(np.linalg.norm(compute_charge_polarization_m(records, configuration)))
+        return float(
+            np.linalg.norm(compute_charge_polarization_m(records, configuration))
+        )
     raise ValueError(f"unsupported scalar gradient value {scalar_name}")
 
 
@@ -2779,36 +3306,44 @@ def _anion_orientation_cosine(
         return 0.0
     anchor_index = anion_indices[0]
     orientation_index = anion_indices[1]
-    orientation_vector = (
-        np.asarray(configuration.positions_m[orientation_index], dtype=float)
-        - np.asarray(configuration.positions_m[anchor_index], dtype=float)
-    )
-    pair_vector = (
-        np.asarray(configuration.positions_m[anchor_index], dtype=float)
-        - np.asarray(configuration.positions_m[cation_index], dtype=float)
-    )
+    orientation_vector = np.asarray(
+        configuration.positions_m[orientation_index], dtype=float
+    ) - np.asarray(configuration.positions_m[anchor_index], dtype=float)
+    pair_vector = np.asarray(
+        configuration.positions_m[anchor_index], dtype=float
+    ) - np.asarray(configuration.positions_m[cation_index], dtype=float)
     orientation_norm = float(np.linalg.norm(orientation_vector))
     pair_norm = float(np.linalg.norm(pair_vector))
     if orientation_norm <= 0.0 or pair_norm <= 0.0:
         return 0.0
-    return float(np.dot(orientation_vector, pair_vector) / (orientation_norm * pair_norm))
+    return float(
+        np.dot(orientation_vector, pair_vector) / (orientation_norm * pair_norm)
+    )
 
 
 def _transition_displacement_moments(
     transition_record: dict,
     moment_input: MomentBoundaryValueInput,
+    endpoint_displacement_m: Array,
 ) -> tuple[Array, Array]:
     moment_policy = str(transition_record["moment_policy"])
-    moment_builders = {
-        "conditioned_endpoint_bvp": _conditioned_endpoint_moments,
-        "isotropic_endpoint_bvp": _isotropic_endpoint_moments,
-        "zero_motif_exchange": _zero_transition_moments,
-        "endpoint_geometry": _endpoint_geometry_moments,
-        "identity_diffusion": _endpoint_geometry_moments,
+    if moment_policy == "zero_motif_exchange":
+        return _zero_transition_moments(moment_input)
+    directed_policies = {
+        "conditioned_endpoint_bvp": True,
+        "isotropic_endpoint_bvp": False,
+        "endpoint_geometry": True,
+        "identity_diffusion": True,
     }
-    if moment_policy not in moment_builders:
+    if moment_policy not in directed_policies:
         raise ValueError(f"unsupported transition moment_policy {moment_policy}")
-    return moment_builders[moment_policy](moment_input)
+    endpoint_displacement = np.asarray(endpoint_displacement_m, dtype=float)
+    return build_endpoint_transport_moments(
+        EndpointTransportMomentInput(
+            endpoint_displacement_m=endpoint_displacement,
+            directed_endpoint=directed_policies[moment_policy],
+        )
+    )
 
 
 def _validate_transition_displacement_policy(
@@ -2821,7 +3356,9 @@ def _validate_transition_displacement_policy(
     first_moment = np.asarray(first_displacement_moment_m, dtype=float)
     second_moment = np.asarray(second_displacement_moment_m2, dtype=float)
     if first_moment.shape != (CARTESIAN_DIMENSION,):
-        raise ValueError(f"transition family {family} first moment must have shape (3,)")
+        raise ValueError(
+            f"transition family {family} first moment must have shape (3,)"
+        )
     if second_moment.shape != (CARTESIAN_DIMENSION, CARTESIAN_DIMENSION):
         raise ValueError(
             f"transition family {family} second moment must have shape (3,3)"
@@ -2846,31 +3383,6 @@ def _validate_transition_displacement_policy(
         )
 
 
-def _conditioned_endpoint_moments(
-    moment_input: MomentBoundaryValueInput,
-) -> tuple[Array, Array]:
-    result = solve_endpoint_moment_bvp(moment_input)
-    return _directed_transition_moments(
-        result.first_displacement_moment_m,
-        result.second_displacement_moment_m2,
-    )
-
-
-def _isotropic_endpoint_moments(
-    moment_input: MomentBoundaryValueInput,
-) -> tuple[Array, Array]:
-    result = solve_endpoint_moment_bvp(moment_input)
-    second_moment_trace_m2 = _nonnegative_float(
-        float(np.trace(result.second_displacement_moment_m2)),
-        "isotropic endpoint displacement second moment trace",
-    )
-    return (
-        np.zeros(CARTESIAN_DIMENSION, dtype=float),
-        np.eye(CARTESIAN_DIMENSION, dtype=float)
-        * (second_moment_trace_m2 / CARTESIAN_DIMENSION),
-    )
-
-
 def _zero_transition_moments(
     moment_input: MomentBoundaryValueInput,
 ) -> tuple[Array, Array]:
@@ -2879,33 +3391,6 @@ def _zero_transition_moments(
         (CARTESIAN_DIMENSION, CARTESIAN_DIMENSION),
         dtype=float,
     )
-
-
-def _endpoint_geometry_moments(
-    moment_input: MomentBoundaryValueInput,
-) -> tuple[Array, Array]:
-    displacement = (
-        np.asarray(moment_input.charge_polarization_by_grid[-1], dtype=float)
-        - np.asarray(moment_input.charge_polarization_by_grid[0], dtype=float)
-    )
-    return _directed_transition_moments(displacement, np.outer(displacement, displacement))
-
-
-def _directed_transition_moments(
-    displacement_m: Array,
-    second_moment_m2: Array,
-) -> tuple[Array, Array]:
-    displacement = np.asarray(displacement_m, dtype=float)
-    second_moment = np.asarray(second_moment_m2, dtype=float)
-    if displacement.shape != (CARTESIAN_DIMENSION,):
-        raise ValueError("transition displacement must have shape (3,)")
-    if second_moment.shape != (CARTESIAN_DIMENSION, CARTESIAN_DIMENSION):
-        raise ValueError("transition second moment must have shape (3,3)")
-    directed_second_moment = np.asarray(second_moment, dtype=float)
-    displacement_outer = np.outer(displacement, displacement)
-    if float(np.trace(directed_second_moment)) < float(displacement @ displacement):
-        directed_second_moment = displacement_outer
-    return displacement, 0.5 * (directed_second_moment + directed_second_moment.T)
 
 
 def _transition_family_record(records: PhysicalLibraryRecords, family: str) -> dict:
@@ -2921,6 +3406,7 @@ def _validate_transition_family_reaction_coordinate(
 ) -> None:
     _ = family
     _transition_reaction_coordinate(transition_record)
+    transport_ownership = _transition_transport_ownership(transition_record)
     gradient_policy = str(transition_record["gradient_policy"])
     moment_policy = str(transition_record["moment_policy"])
     displacement_policy = str(transition_record["displacement_policy"])
@@ -2958,13 +3444,24 @@ def _validate_transition_family_reaction_coordinate(
     if moment_policy not in allowed_moment_policies:
         raise ValueError(f"transition family {family} has unsupported moment policy")
     if displacement_policy not in allowed_displacement_policies:
-        raise ValueError(f"transition family {family} has unsupported displacement policy")
+        raise ValueError(
+            f"transition family {family} has unsupported displacement policy"
+        )
     _validate_transition_policy_geometry_consistency(
         family,
         transition_record,
         moment_policy,
         displacement_policy,
     )
+    if transport_ownership is TransportOwnership.TRANSITION_DISPLACEMENT:
+        if moment_policy == "zero_motif_exchange" or displacement_policy == "zero":
+            raise ValueError(
+                f"transition-normal family {family} must own a nonzero endpoint displacement"
+            )
+    elif moment_policy != "zero_motif_exchange" or displacement_policy != "zero":
+        raise ValueError(
+            f"{transport_ownership.value} family {family} cannot own transition moments"
+        )
     if displacement_policy in (
         "unwrapped_identity_displacement",
         "unwrapped_structural_hop",
@@ -3041,14 +3538,20 @@ def _validate_transition_endpoint_geometry(
         raise KeyError(f"transition family {family} missing endpoint_geometry")
     endpoint_geometry = transition_record["endpoint_geometry"]
     if not isinstance(endpoint_geometry, dict):
-        raise TypeError(f"transition family {family} endpoint_geometry must be a mapping")
+        raise TypeError(
+            f"transition family {family} endpoint_geometry must be a mapping"
+        )
     start_record = endpoint_geometry["start"]
     end_record = endpoint_geometry["end"]
     displacement_record = endpoint_geometry["displacement"]
     if not isinstance(start_record, dict):
-        raise TypeError(f"transition family {family} endpoint_geometry.start must be a mapping")
+        raise TypeError(
+            f"transition family {family} endpoint_geometry.start must be a mapping"
+        )
     if not isinstance(end_record, dict):
-        raise TypeError(f"transition family {family} endpoint_geometry.end must be a mapping")
+        raise TypeError(
+            f"transition family {family} endpoint_geometry.end must be a mapping"
+        )
     if not isinstance(displacement_record, dict):
         raise TypeError(
             f"transition family {family} endpoint_geometry.displacement must be a mapping"
@@ -3111,7 +3614,10 @@ def _validate_endpoint_geometry_family_keys(
     end_record: dict,
 ) -> None:
     required_key_map = {
-        "partner_switch": (("Li_partner", "Li_position"), ("Li_partner", "Li_position")),
+        "partner_switch": (
+            ("Li_partner", "Li_position"),
+            ("Li_partner", "Li_position"),
+        ),
         "identity_diffusion": (("carrier_identity",), ("carrier_identity",)),
         "structural_hop": (("hop_site",), ("hop_site",)),
         "bridge_network_formation_breakup": (
@@ -3140,7 +3646,9 @@ def _endpoint_geometry_displacement_m(transition_record: dict, family: str) -> f
         raise KeyError(f"transition family {family} missing endpoint_geometry")
     endpoint_geometry = transition_record["endpoint_geometry"]
     if "displacement" not in endpoint_geometry:
-        raise KeyError(f"transition family {family} missing endpoint_geometry.displacement")
+        raise KeyError(
+            f"transition family {family} missing endpoint_geometry.displacement"
+        )
     displacement_record = endpoint_geometry["displacement"]
     displacement_type = str(displacement_record["type"])
     allowed_types = {
@@ -3166,16 +3674,147 @@ def _endpoint_geometry_displacement_vector_m(
     transition_record: dict,
     family: str,
 ) -> Array:
-    length_m = _endpoint_geometry_displacement_m(transition_record, family)
-    return (
-        length_m
-        * _endpoint_geometry_direction_unit_vector_m(
+    if family == "partner_switch":
+        return _endpoint_geometry_displacement_m(
+            transition_record,
+            family,
+        ) * _endpoint_geometry_direction_unit_vector_m(
             records,
             configuration,
             transition_record,
             family,
         )
+    if family == "identity_diffusion":
+        return _same_role_molecule_center_displacement_m(
+            records,
+            configuration,
+            SpeciesRole.CATION,
+        )
+    if family == "bridge_network_formation_breakup":
+        return _cation_to_anion_bridge_midpoint_displacement_m(
+            records,
+            configuration,
+        )
+    length_m = _endpoint_geometry_displacement_m(transition_record, family)
+    return length_m * _endpoint_geometry_direction_unit_vector_m(
+        records,
+        configuration,
+        transition_record,
+        family,
     )
+
+
+def _same_role_molecule_center_displacement_m(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+    role: SpeciesRole,
+) -> Array:
+    molecule_keys = _charged_role_molecule_keys(records, configuration, role)
+    if len(molecule_keys) < 2:
+        raise ValueError(
+            f"{role.value} identity displacement requires two distinct molecules"
+        )
+    first_species_name, first_molecule_id = molecule_keys[0]
+    second_species_name, second_molecule_id = molecule_keys[1]
+    first_center_m = molecule_center_of_mass_m(
+        records,
+        configuration,
+        first_species_name,
+        first_molecule_id,
+    )
+    second_center_m = molecule_center_of_mass_m(
+        records,
+        configuration,
+        second_species_name,
+        second_molecule_id,
+    )
+    return _minimum_image_vector_m(
+        first_center_m,
+        second_center_m,
+        configuration.box_lengths_m,
+    )
+
+
+def _site_indices_for_configuration_molecule(
+    configuration: SiteConfiguration,
+    species_name: str,
+    molecule_id: int,
+) -> tuple[int, ...]:
+    site_indices = tuple(
+        site_index
+        for site_index, current_species_name in enumerate(configuration.species_names)
+        if current_species_name == species_name
+        and int(configuration.molecule_ids[site_index]) == molecule_id
+    )
+    if not site_indices:
+        raise ValueError("configuration molecule has no sites")
+    return site_indices
+
+
+def _cation_to_anion_bridge_midpoint_displacement_m(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+) -> Array:
+    anion_molecule_keys = _charged_role_molecule_keys(
+        records,
+        configuration,
+        SpeciesRole.ANION,
+    )
+    if len(anion_molecule_keys) < 2:
+        raise ValueError("bridge displacement requires two distinct anion molecules")
+    first_anion_species, first_anion_molecule_id = anion_molecule_keys[0]
+    second_anion_species, second_anion_molecule_id = anion_molecule_keys[1]
+    first_anion_center_m = molecule_center_of_mass_m(
+        records,
+        configuration,
+        first_anion_species,
+        first_anion_molecule_id,
+    )
+    second_anion_center_m = molecule_center_of_mass_m(
+        records,
+        configuration,
+        second_anion_species,
+        second_anion_molecule_id,
+    )
+    first_to_second_m = _minimum_image_vector_m(
+        first_anion_center_m,
+        second_anion_center_m,
+        configuration.box_lengths_m,
+    )
+    bridge_midpoint_m = first_anion_center_m + 0.5 * first_to_second_m
+    cation_species, cation_molecule_id = _charged_role_molecule_keys(
+        records,
+        configuration,
+        SpeciesRole.CATION,
+    )[0]
+    cation_center_m = molecule_center_of_mass_m(
+        records,
+        configuration,
+        cation_species,
+        cation_molecule_id,
+    )
+    return _minimum_image_vector_m(
+        cation_center_m,
+        bridge_midpoint_m,
+        configuration.box_lengths_m,
+    )
+
+
+def _charged_role_molecule_keys(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+    role: SpeciesRole,
+) -> tuple[tuple[str, int], ...]:
+    molecule_keys = []
+    for site_index, species_name in enumerate(configuration.species_names):
+        if _species_role(records, species_name) != role:
+            continue
+        molecule_key = (species_name, int(configuration.molecule_ids[site_index]))
+        if molecule_key not in molecule_keys:
+            molecule_keys.append(molecule_key)
+    if not molecule_keys:
+        raise ValueError(f"configuration has no charged {role.value} molecules")
+    return tuple(molecule_keys)
 
 
 def _endpoint_geometry_direction_unit_vector_m(
@@ -3233,7 +3872,16 @@ def _cation_to_anion_axis_m(
     configuration: SiteConfiguration,
 ) -> Array:
     cation_index = _charged_role_site_index(records, configuration, SpeciesRole.CATION)
-    anion_index = _charged_role_site_index(records, configuration, SpeciesRole.ANION)
+    anion_indices = _first_molecule_indices_with_role(
+        records,
+        configuration,
+        SpeciesRole.ANION,
+    )
+    anion_index = _molecule_coordination_site_index(
+        records,
+        configuration,
+        anion_indices,
+    )
     return _minimum_image_vector_m(
         configuration.positions_m[cation_index],
         configuration.positions_m[anion_index],
@@ -3246,7 +3894,9 @@ def _partner_switch_transport_axis_m(
     configuration: SiteConfiguration,
 ) -> Array:
     cation_index = _charged_role_site_index(records, configuration, SpeciesRole.CATION)
-    anion_indices = _charged_role_site_indices(records, configuration, SpeciesRole.ANION)
+    anion_indices = _charged_role_site_indices(
+        records, configuration, SpeciesRole.ANION
+    )
     if len(anion_indices) >= 2:
         return _nearest_distinct_role_site_axis_m(
             configuration,
@@ -3346,7 +3996,8 @@ def _charged_role_site_indices(
     indices = tuple(
         site_index
         for site_index, species_name in enumerate(configuration.species_names)
-        if _species_role(records, species_name) == role and abs(charges[site_index]) > 0.0
+        if _species_role(records, species_name) == role
+        and abs(charges[site_index]) > 0.0
     )
     if not indices:
         raise ValueError(f"configuration has no charged {role.value} sites")
@@ -3452,8 +4103,12 @@ def _validate_transition_rate_bounds(
             transition_quadrature,
             temperature_K,
         )
-        forward_rate_s_inv = float(generator[edge.from_state_index, edge.to_state_index])
-        reverse_rate_s_inv = float(generator[edge.to_state_index, edge.from_state_index])
+        forward_rate_s_inv = float(
+            generator[edge.from_state_index, edge.to_state_index]
+        )
+        reverse_rate_s_inv = float(
+            generator[edge.to_state_index, edge.from_state_index]
+        )
         for rate_label, rate_s_inv in (
             ("forward", forward_rate_s_inv),
             ("reverse", reverse_rate_s_inv),
@@ -3545,7 +4200,9 @@ def _transition_projected_diffusivity_profile(
                     local_fields.ionic_strength_mol_m3,
                     local_fields.local_packing_fraction,
                 ).mobility_tensor_m2_s,
-                _reaction_coordinate_gradient(records, configuration, transition_record),
+                _reaction_coordinate_gradient(
+                    records, configuration, transition_record
+                ),
             )
             for configuration, local_fields in zip(
                 transition_quadrature.configurations,
@@ -3610,7 +4267,9 @@ def _annotate_transition_generator_diagnostics(
 ) -> None:
     if len(transition_edges) != len(transition_quadratures):
         raise ValueError("transition edge/quadrature count mismatch")
-    generator = np.asarray(conductivity_result.reversible_generator_Q_ij_s_inv, dtype=float)
+    generator = np.asarray(
+        conductivity_result.reversible_generator_Q_ij_s_inv, dtype=float
+    )
     capacity_fluxes = np.asarray(
         conductivity_result.symmetric_capacity_fluxes_K_ij_mol_m3_s,
         dtype=float,
@@ -3634,9 +4293,9 @@ def _annotate_transition_generator_diagnostics(
     state_exit_rates_s_inv = -np.diag(generator)
     state_lifetimes_s = np.full(state_exit_rates_s_inv.shape, np.inf, dtype=float)
     active_state_mask = state_exit_rates_s_inv > 0.0
-    state_lifetimes_s[active_state_mask] = 1.0 / state_exit_rates_s_inv[
-        active_state_mask
-    ]
+    state_lifetimes_s[active_state_mask] = (
+        1.0 / state_exit_rates_s_inv[active_state_mask]
+    )
     edge_capacity_fluxes = np.asarray(
         [
             capacity_fluxes[edge.from_state_index, edge.to_state_index]
@@ -3665,6 +4324,13 @@ def _annotate_transition_generator_diagnostics(
         ],
         dtype=float,
     )
+    edge_first_moment_vectors_m = np.asarray(
+        [
+            first_moments[edge.from_state_index, edge.to_state_index]
+            for edge in transition_edges
+        ],
+        dtype=float,
+    )
     edge_second_moment_traces_m2 = np.asarray(
         [
             np.trace(second_moments[edge.from_state_index, edge.to_state_index])
@@ -3677,7 +4343,9 @@ def _annotate_transition_generator_diagnostics(
     )
     edge_coordinate_spans = np.asarray(
         [
-            _transition_coordinate_span(records, transition_record, transition_quadrature)
+            _transition_coordinate_span(
+                records, transition_record, transition_quadrature
+            )
             for transition_record, transition_quadrature in zip(
                 transition_records,
                 transition_quadratures,
@@ -3700,17 +4368,11 @@ def _annotate_transition_generator_diagnostics(
         )
     )
     edge_projected_diffusivity_min = np.asarray(
-        [
-            float(np.min(profile))
-            for profile in projected_diffusivity_profiles
-        ],
+        [float(np.min(profile)) for profile in projected_diffusivity_profiles],
         dtype=float,
     )
     edge_projected_diffusivity_max = np.asarray(
-        [
-            float(np.max(profile))
-            for profile in projected_diffusivity_profiles
-        ],
+        [float(np.max(profile)) for profile in projected_diffusivity_profiles],
         dtype=float,
     )
     thermal_energy_J_mol = R * _positive_float(temperature_K, "temperature_K")
@@ -3740,8 +4402,8 @@ def _annotate_transition_generator_diagnostics(
     edge_is_conductivity_carrying = _transition_edge_conductivity_carrying_mask(
         transition_records
     )
-    edge_is_active_conductivity_carrying = (
-        edge_is_conductivity_carrying & (edge_capacity_fluxes > 0.0)
+    edge_is_active_conductivity_carrying = edge_is_conductivity_carrying & (
+        edge_capacity_fluxes > 0.0
     )
     active_conductivity_carrying_second_moment_mask = (
         edge_is_active_conductivity_carrying & (edge_second_moment_traces_m2 > 0.0)
@@ -3796,6 +4458,7 @@ def _annotate_transition_generator_diagnostics(
     )
     edge_component_indices = _transition_edge_component_indices(
         transition_edges,
+        edge_capacity_fluxes,
         component_state_indices,
         generator.shape[0],
     )
@@ -3824,6 +4487,7 @@ def _annotate_transition_generator_diagnostics(
             "transition_edge_forward_rates_Q_ij_s_inv": edge_forward_rates_s_inv,
             "transition_edge_reverse_rates_Q_ji_s_inv": edge_reverse_rates_s_inv,
             "transition_edge_first_moment_norms_m": edge_first_moment_norms_m,
+            "transition_edge_first_moment_vectors_m": edge_first_moment_vectors_m,
             "transition_edge_second_moment_traces_m2": edge_second_moment_traces_m2,
             "transition_edge_K_trace_M_mol_m5_s": edge_direct_trace_contribution,
             "transition_edge_inactive_reasons": edge_inactive_reasons,
@@ -3889,9 +4553,9 @@ def _annotate_transition_generator_diagnostics(
                 finite_state_poisson_b_vector_norms_m_s
             ),
             "state_weighted_finite_state_drift_vectors_mol_m2_s": (
-                np.asarray(conductivity_result.state_concentrations_mol_m3, dtype=float)[
-                    :, np.newaxis
-                ]
+                np.asarray(
+                    conductivity_result.state_concentrations_mol_m3, dtype=float
+                )[:, np.newaxis]
                 * finite_state_drift_vectors_m_s
             ),
             "finite_state_component_state_indices": component_state_indices,
@@ -3970,7 +4634,10 @@ def _update_finite_process_transition_moment_completion(
             "active conductivity-carrying transition moment count is inconsistent with "
             "zero-second-moment edge diagnostics"
         )
-    if "finite_process_not_complete_reasons" not in conductivity_result.effect_attribution:
+    if (
+        "finite_process_not_complete_reasons"
+        not in conductivity_result.effect_attribution
+    ):
         raise KeyError("effect_attribution missing finite_process_not_complete_reasons")
     existing_reasons = tuple(
         str(reason)
@@ -4075,29 +4742,33 @@ def _finite_state_component_drift_diagnostics(
 
 def _transition_edge_component_indices(
     transition_edges: tuple[TransitionEdge, ...],
+    edge_capacity_fluxes_mol_m3_s: Array,
     component_state_indices: tuple[tuple[int, ...], ...],
     state_count: int,
 ) -> Array:
+    capacity_fluxes = np.asarray(edge_capacity_fluxes_mol_m3_s, dtype=float)
+    if capacity_fluxes.shape != (len(transition_edges),):
+        raise ValueError("edge capacity flux count does not match transition edges")
     state_component_indices = np.full(state_count, -1, dtype=int)
     for component_index, component_indices in enumerate(component_state_indices):
         for state_index in component_indices:
             state_component_indices[state_index] = component_index
-    edge_component_indices = np.asarray(
-        [
-            state_component_indices[edge.from_state_index]
-            for edge in transition_edges
-        ],
-        dtype=int,
-    )
-    for edge, component_index in zip(
-        transition_edges,
-        edge_component_indices,
-        strict=True,
+    edge_component_indices = np.full(len(transition_edges), -1, dtype=int)
+    for edge_index, (edge, capacity_flux) in enumerate(
+        zip(
+            transition_edges,
+            capacity_fluxes,
+            strict=True,
+        )
     ):
+        if capacity_flux == 0.0:
+            continue
+        component_index = state_component_indices[edge.from_state_index]
         if component_index < 0:
             raise ValueError("transition edge references a state without component")
         if state_component_indices[edge.to_state_index] != component_index:
             raise ValueError("transition edge crosses generator connected components")
+        edge_component_indices[edge_index] = component_index
     return edge_component_indices
 
 
@@ -4124,7 +4795,9 @@ def _transition_edge_weighted_drift_contributions(
     )
 
 
-def _generator_connected_components_for_diagnostics(generator_Q_ij_s_inv: Array) -> tuple[Array, ...]:
+def _generator_connected_components_for_diagnostics(
+    generator_Q_ij_s_inv: Array,
+) -> tuple[Array, ...]:
     generator = np.asarray(generator_Q_ij_s_inv, dtype=float)
     state_count = generator.shape[0]
     adjacency = (np.abs(generator) > 0.0) | (np.abs(generator.T) > 0.0)
@@ -4162,6 +4835,8 @@ def _validate_charge_carrying_transition_activity(
         if str(transition_record["displacement_policy"]) != "zero"
     )
     for edge_index in charge_carrying_indices:
+        if float(edge_capacity_fluxes[edge_index]) == 0.0:
+            continue
         inactive_reason = _transition_edge_activity_reason(
             transition_records[edge_index],
             float(edge_capacity_fluxes[edge_index]),
@@ -4349,10 +5024,6 @@ def _annotate_state_charge_mobility_diagnostics(
                 ],
                 dtype=float,
             ),
-            "state_resistance_shape_traces_kg_s": np.asarray(
-                [diagnostic.resistance_shape_trace_kg_s for diagnostic in diagnostics],
-                dtype=float,
-            ),
             "state_resistance_atmosphere_traces_kg_s": np.asarray(
                 [
                     diagnostic.resistance_atmosphere_trace_kg_s
@@ -4451,6 +5122,7 @@ def _state_charge_mobility_diagnostics(
             strict=True,
         )
     )
+
     normalized_weights = _normalized_boltzmann_quadrature_weights(
         state_quadrature.weights,
         tuple(diagnostic.potential_energy_J_mol for diagnostic in point_diagnostics),
@@ -4498,7 +5170,9 @@ def _state_charge_mobility_diagnostics(
             )
         ),
         charged_center_labels=point_diagnostics[0].charged_center_labels,
-        charged_center_charge_numbers=point_diagnostics[0].charged_center_charge_numbers,
+        charged_center_charge_numbers=point_diagnostics[
+            0
+        ].charged_center_charge_numbers,
         charged_center_mobility_matrix_m2_s=_matrix_to_nested_tuple(
             weighted_center_mobility_matrix
         ),
@@ -4561,15 +5235,6 @@ def _state_charge_mobility_diagnostics(
                 normalized_weights,
                 [
                     diagnostic.resistance_charge_cloud_trace_kg_s
-                    for diagnostic in point_diagnostics
-                ],
-            )
-        ),
-        resistance_shape_trace_kg_s=float(
-            np.dot(
-                normalized_weights,
-                [
-                    diagnostic.resistance_shape_trace_kg_s
                     for diagnostic in point_diagnostics
                 ],
             )
@@ -4676,6 +5341,111 @@ def _state_charge_mobility_diagnostics(
     )
 
 
+def _state_relative_displacement_descriptor(
+    records: PhysicalLibraryRecords,
+    configurations: tuple[SiteConfiguration, ...],
+    local_fields: tuple[PhysicalLocalFields, ...],
+    quadrature_weights: Array,
+    temperature_K: float,
+    active_anion_name: str,
+    state_key: tuple[str, ...],
+) -> tuple[Array, Array, Array]:
+    if state_key[STATE_KEY_PAIR_INDEX] == PairBasin.FREE.value:
+        return (
+            np.empty((0, CARTESIAN_DIMENSION), dtype=float),
+            np.empty((0, 0), dtype=float),
+            np.empty(0, dtype=float),
+        )
+    point_terms = tuple(
+        _relative_displacement_point_terms(
+            records,
+            configuration,
+            current_local_fields,
+            temperature_K,
+            active_anion_name,
+        )
+        for configuration, current_local_fields in zip(
+            configurations, local_fields, strict=True
+        )
+    )
+    if any(term[2].size == 0 for term in point_terms):
+        return (
+            np.empty((0, CARTESIAN_DIMENSION), dtype=float),
+            np.empty((0, 0), dtype=float),
+            np.empty(0, dtype=float),
+        )
+    normalized_weights = _normalized_boltzmann_quadrature_weights(
+        quadrature_weights,
+        tuple(float(term[3]) for term in point_terms),
+        temperature_K,
+    )
+    positions = np.asarray([term[0] for term in point_terms], dtype=float)
+    fluctuations = positions - np.einsum("i,ia->a", normalized_weights, positions)
+    relative_mobility = np.einsum(
+        "i,iab->ab",
+        normalized_weights,
+        np.asarray([term[1] for term in point_terms], dtype=float),
+    )
+    weighted_fluctuations = np.sqrt(normalized_weights)[:, None] * fluctuations
+    return (
+        weighted_fluctuations,
+        0.5 * (relative_mobility + relative_mobility.T),
+        point_terms[0][2],
+    )
+
+
+def _relative_displacement_point_terms(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+    local_fields: PhysicalLocalFields,
+    temperature_K: float,
+    active_anion_name: str,
+) -> tuple[Array, Array, Array, float]:
+    cation_indices, cation_charges = _formal_charge_center_indices_for_role(
+        records, configuration, SpeciesRole.CATION, ""
+    )
+    anion_indices, anion_charges = _formal_charge_center_indices_for_role(
+        records, configuration, SpeciesRole.ANION, active_anion_name
+    )
+    if len(cation_indices) != 1 or len(anion_indices) != 1:
+        return (
+            np.empty(0, dtype=float),
+            np.empty((0, 0), dtype=float),
+            np.empty(0, dtype=float),
+            0.0,
+        )
+    physical_objects = build_physical_objects(
+        records,
+        configuration,
+        temperature_K,
+        local_fields.dielectric_constant,
+        local_fields.viscosity_Pa_s,
+        local_fields.ionic_strength_mol_m3,
+        local_fields.local_packing_fraction,
+    )
+    cation_index = cation_indices[0]
+    anion_index = anion_indices[0]
+    relative_projection = np.zeros(
+        (CARTESIAN_DIMENSION, physical_objects.mobility_tensor_m2_s.shape[0]),
+        dtype=float,
+    )
+    relative_projection[
+        :, cation_index * CARTESIAN_DIMENSION : (cation_index + 1) * CARTESIAN_DIMENSION
+    ] = np.eye(CARTESIAN_DIMENSION)
+    relative_projection[
+        :, anion_index * CARTESIAN_DIMENSION : (anion_index + 1) * CARTESIAN_DIMENSION
+    ] = -np.eye(CARTESIAN_DIMENSION)
+    return (
+        np.asarray(configuration.positions_m[cation_index], dtype=float)
+        - np.asarray(configuration.positions_m[anion_index], dtype=float),
+        relative_projection
+        @ np.asarray(physical_objects.mobility_tensor_m2_s, dtype=float)
+        @ relative_projection.T,
+        np.asarray([cation_charges[0], anion_charges[0]], dtype=float),
+        float(physical_objects.potential_energy_J_mol),
+    )
+
+
 def _state_charge_mobility_point_terms(
     records: PhysicalLibraryRecords,
     configuration: SiteConfiguration,
@@ -4730,6 +5500,7 @@ def _state_charge_mobility_point_terms(
         local_fields.dielectric_constant,
         local_fields.ionic_strength_mol_m3,
         temperature_K,
+        local_fields.viscosity_Pa_s,
     )
     resistance_diagnostics = compute_resistance_component_diagnostics(
         records,
@@ -4767,7 +5538,8 @@ def _state_charge_mobility_point_terms(
             anion_indices,
         ),
         charged_center_labels=tuple(
-            configuration.species_names[site_index] for site_index in charged_center_indices
+            configuration.species_names[site_index]
+            for site_index in charged_center_indices
         ),
         charged_center_charge_numbers=charged_center_charge_numbers,
         charged_center_mobility_matrix_m2_s=_matrix_to_nested_tuple(
@@ -4794,7 +5566,6 @@ def _state_charge_mobility_point_terms(
         resistance_charge_cloud_trace_kg_s=float(
             resistance_diagnostics.charge_cloud_trace_kg_s
         ),
-        resistance_shape_trace_kg_s=float(resistance_diagnostics.shape_trace_kg_s),
         resistance_atmosphere_trace_kg_s=float(
             resistance_diagnostics.atmosphere_trace_kg_s
         ),
@@ -4851,7 +5622,9 @@ def _normalized_boltzmann_quadrature_weights(
         ],
         dtype=float,
     )
-    log_reference = _finite_float(float(np.max(log_terms)), "state diagnostic log weight")
+    log_reference = _finite_float(
+        float(np.max(log_terms)), "state diagnostic log weight"
+    )
     shifted_weights = np.exp(log_terms - log_reference)
     normalized_weight_sum = _positive_float(
         float(np.sum(shifted_weights)),
@@ -4870,7 +5643,11 @@ def _configuration_charge_numbers(
 ) -> Array:
     return np.asarray(
         [
-            float(records.species_records[species_name]["sites"][int(site_id)]["charge_number"])
+            float(
+                records.species_records[species_name]["sites"][int(site_id)][
+                    "charge_number"
+                ]
+            )
             for species_name, site_id in zip(
                 configuration.species_names,
                 configuration.site_ids,
@@ -4900,7 +5677,9 @@ def _formal_charge_center_indices_for_role(
             continue
         if _species_role(records, species_name) != role:
             continue
-        formal_charge_number = float(records.species_records[species_name]["formal_charge_e"])
+        formal_charge_number = float(
+            records.species_records[species_name]["formal_charge_e"]
+        )
         if formal_charge_number == 0.0:
             continue
         center_indices.append(
@@ -4931,7 +5710,13 @@ def _formal_charge_center_site_index_for_molecule(
         raise ValueError("formal charge center molecule has no sites")
     absolute_partial_charge_numbers = np.asarray(
         [
-            abs(float(records.species_records[species_name]["sites"][int(site_id)]["charge_number"]))
+            abs(
+                float(
+                    records.species_records[species_name]["sites"][int(site_id)][
+                        "charge_number"
+                    ]
+                )
+            )
             for site_id in np.asarray(configuration.site_ids, dtype=int)[
                 list(molecule_site_indices)
             ]
@@ -4940,9 +5725,7 @@ def _formal_charge_center_site_index_for_molecule(
     )
     if float(np.max(absolute_partial_charge_numbers)) == 0.0:
         raise ValueError("formally charged molecule has no charged force-field site")
-    return int(
-        molecule_site_indices[int(np.argmax(absolute_partial_charge_numbers))]
-    )
+    return int(molecule_site_indices[int(np.argmax(absolute_partial_charge_numbers))])
 
 
 def _charged_subset_pair_scalar_mobility(
@@ -5059,7 +5842,9 @@ def charge_covariance_mobility_from_center_matrix(
     center_mobility = np.asarray(charged_center_mobility_matrix_m2_s, dtype=float)
     if center_mobility.shape != (charge_vector.size, charge_vector.size):
         raise ValueError("charged center mobility matrix shape does not match charges")
-    if not np.all(np.isfinite(center_mobility)) or not np.all(np.isfinite(charge_vector)):
+    if not np.all(np.isfinite(center_mobility)) or not np.all(
+        np.isfinite(charge_vector)
+    ):
         raise ValueError("charged center covariance inputs must be finite")
     return float(charge_vector @ center_mobility @ charge_vector)
 
@@ -5164,7 +5949,9 @@ def enumerate_transition_edges(
     state_quadratures: tuple[PhysicalStateQuadrature, ...],
     records: PhysicalLibraryRecords,
 ) -> tuple[TransitionEdge, ...]:
-    declared_families = tuple(str(family) for family in records.transition_record["families"])
+    declared_families = tuple(
+        str(family) for family in records.transition_record["families"]
+    )
     supported_families = (
         "free_to_SSIP",
         "SSIP_to_CIP",
@@ -5189,7 +5976,9 @@ def enumerate_transition_edges(
         )
     edges: list[TransitionEdge] = []
     generated_edge_counts = {family: 0 for family in declared_families}
-    state_keys = tuple(_state_key_from_label(state.label) for state in state_quadratures)
+    state_keys = tuple(
+        _state_key_from_label(state.label) for state in state_quadratures
+    )
     for from_state_index, from_key in enumerate(state_keys):
         for to_state_index, to_key in enumerate(state_keys):
             if from_state_index == to_state_index:
@@ -5224,48 +6013,101 @@ def finite_generator_transition_edges(
     state_quadratures: tuple[PhysicalStateQuadrature, ...],
     temperature_K: float,
 ) -> tuple[TransitionEdge, ...]:
+    _positive_float(temperature_K, "temperature_K")
     transition_edges = enumerate_transition_edges(state_quadratures, records)
-    if not transition_edges:
-        return transition_edges
-    log_partition_values = np.asarray(
-        [
-            _state_log_partition_value(records, state_quadrature, temperature_K)
-            for state_quadrature in state_quadratures
-        ],
-        dtype=float,
-    )
-    reference_log_partition = _finite_float(
-        float(
-            np.max(
-                [
-                    min(
-                        float(log_partition_values[edge.from_state_index]),
-                        float(log_partition_values[edge.to_state_index]),
-                    )
-                    for edge in transition_edges
-                ]
-            )
-        ),
-        "finite_generator_reference_edge_log_partition",
-    )
-    log_partition_span = _positive_float(
-        float(records.basis_record["finite_generator_log_partition_span"]),
-        "basis.finite_generator_log_partition_span",
-    )
-    retained_edges = tuple(
+    transition_edges = tuple(
         edge
         for edge in transition_edges
-        if log_partition_values[edge.from_state_index]
-        >= reference_log_partition - log_partition_span
-        and log_partition_values[edge.to_state_index]
-        >= reference_log_partition - log_partition_span
-    )
-    if not retained_edges:
-        raise ValueError(
-            "finite-generator partition filter removed every transition edge; "
-            "increase basis.finite_generator_log_partition_span or fix generated state energies"
+        if _transition_family_has_required_molecular_multiplicity(
+            records,
+            state_quadratures[edge.from_state_index].configurations[0],
+            edge.family,
         )
-    return retained_edges
+    )
+    return transition_edges
+
+
+def _transition_family_has_required_molecular_multiplicity(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+    family: str,
+) -> bool:
+    required_counts = {
+        "partner_switch": ("anion", 2),
+        "identity_diffusion": ("cation", 2),
+        "bridge_network_formation_breakup": ("anion", 2),
+    }
+    if family not in required_counts:
+        return True
+    molecule_keys_by_role: dict[str, set[tuple[str, int]]] = {
+        "cation": set(),
+        "anion": set(),
+    }
+    for species_name, molecule_id in zip(
+        configuration.species_names,
+        np.asarray(configuration.molecule_ids, dtype=int),
+        strict=True,
+    ):
+        role = str(records.species_records[species_name]["role"])
+        if role in molecule_keys_by_role:
+            molecule_keys_by_role[role].add((species_name, int(molecule_id)))
+    role, required_count = required_counts[family]
+    return len(molecule_keys_by_role[role]) >= required_count
+
+
+def _validate_transport_graph_closure(
+    records: PhysicalLibraryRecords,
+    state_quadratures: tuple[PhysicalStateQuadrature, ...],
+    declared_edges: tuple[TransitionEdge, ...],
+    retained_edges: tuple[TransitionEdge, ...],
+) -> None:
+    retained_edge_set = set(retained_edges)
+    displacement_edges = tuple(
+        edge
+        for edge in declared_edges
+        if _transition_transport_ownership(
+            _transition_family_record(records, edge.family)
+        )
+        is TransportOwnership.TRANSITION_DISPLACEMENT
+        and _transition_family_has_required_molecular_multiplicity(
+            records,
+            state_quadratures[edge.from_state_index].configurations[0],
+            edge.family,
+        )
+    )
+    missing_displacement_edges = tuple(
+        edge for edge in displacement_edges if edge not in retained_edge_set
+    )
+
+    retained_degrees = np.zeros(len(state_quadratures), dtype=int)
+    for edge in retained_edges:
+        retained_degrees[edge.from_state_index] += 1
+        retained_degrees[edge.to_state_index] += 1
+    displacement_incident_state_indices = {
+        state_index
+        for edge in displacement_edges
+        for state_index in (edge.from_state_index, edge.to_state_index)
+    }
+    isolated_displacement_state_labels = tuple(
+        state_quadratures[state_index].label
+        for state_index in sorted(displacement_incident_state_indices)
+        if retained_degrees[state_index] == 0
+    )
+    if missing_displacement_edges or isolated_displacement_state_labels:
+        missing_edge_labels = tuple(
+            (
+                state_quadratures[edge.from_state_index].label,
+                state_quadratures[edge.to_state_index].label,
+                edge.family,
+            )
+            for edge in missing_displacement_edges
+        )
+        raise ValueError(
+            "finite-generator transport graph is not closed before readout: "
+            f"missing transition_displacement edges={missing_edge_labels}; "
+            "zero-degree transition_displacement incident states="
+            f"{isolated_displacement_state_labels}"
+        )
 
 
 def _state_key_from_label(label: str) -> tuple[str, ...]:
@@ -5345,48 +6187,46 @@ def _transition_family_for_state_keys(
         and to_cluster == "bridge_network"
     ):
         return "bridge_network_formation_breakup"
-    if (
-        _state_keys_match_on_indices(from_key, to_key, PARTNER_TRANSITION_KEY_INDICES)
-        and _ordered_label_transition(
-            from_partner,
-            to_partner,
-            ("partner_a", "partner_switching", "partner_b"),
-        )
+    if _state_keys_match_on_indices(
+        from_key, to_key, PARTNER_TRANSITION_KEY_INDICES
+    ) and _ordered_label_transition(
+        from_partner,
+        to_partner,
+        ("partner_a", "partner_switching", "partner_b"),
     ):
         return "partner_switch"
-    if (
-        _state_keys_match_on_indices(from_key, to_key, IDENTITY_TRANSITION_KEY_INDICES)
-        and _ordered_label_transition(
-            from_identity,
-            to_identity,
-            (
-                "carrier_identity_a",
-                "carrier_identity_transition",
-                "carrier_identity_b",
-            ),
-        )
+    if _state_keys_match_on_indices(
+        from_key, to_key, IDENTITY_TRANSITION_KEY_INDICES
+    ) and _ordered_label_transition(
+        from_identity,
+        to_identity,
+        (
+            "carrier_identity_a",
+            "carrier_identity_transition",
+            "carrier_identity_b",
+        ),
     ):
         return "identity_diffusion"
-    if (
-        _state_keys_match_on_indices(from_key, to_key, HOP_TRANSITION_KEY_INDICES)
-        and _ordered_label_transition(
-            from_hop,
-            to_hop,
-            ("hop_source", "hop_transition", "hop_target"),
-        )
+    if _state_keys_match_on_indices(
+        from_key, to_key, HOP_TRANSITION_KEY_INDICES
+    ) and _ordered_label_transition(
+        from_hop,
+        to_hop,
+        ("hop_source", "hop_transition", "hop_target"),
     ):
         return "structural_hop"
-    if (
-        _state_keys_match_on_indices(from_key, to_key, CAGE_TRANSITION_KEY_INDICES)
-        and _ordered_label_transition(
-            from_cage,
-            to_cage,
-            ("cage_released", "cage_boundary", "cage_captured"),
-        )
+    if _state_keys_match_on_indices(
+        from_key, to_key, CAGE_TRANSITION_KEY_INDICES
+    ) and _ordered_label_transition(
+        from_cage,
+        to_cage,
+        ("cage_released", "cage_boundary", "cage_captured"),
     ):
         return "cage_capture_release"
     if (
-        _state_keys_match_on_indices(from_key, to_key, ATMOSPHERE_TRANSITION_KEY_INDICES)
+        _state_keys_match_on_indices(
+            from_key, to_key, ATMOSPHERE_TRANSITION_KEY_INDICES
+        )
         and from_atmosphere != to_atmosphere
     ):
         return "atmosphere_capture_release"
@@ -5398,7 +6238,9 @@ def _ordered_label_transition(
     to_label: str,
     ordered_labels: tuple[str, ...],
 ) -> bool:
-    label_rank = {label: label_index for label_index, label in enumerate(ordered_labels)}
+    label_rank = {
+        label: label_index for label_index, label in enumerate(ordered_labels)
+    }
     if from_label not in label_rank or to_label not in label_rank:
         return False
     return label_rank[to_label] == label_rank[from_label] + 1
@@ -5446,13 +6288,33 @@ def build_all_memory_coordinate_gradients(
     records: PhysicalLibraryRecords,
     template_configuration: SiteConfiguration,
     state_quadratures: tuple[PhysicalStateQuadrature, ...],
+    transition_edges: tuple[TransitionEdge, ...],
     mixture: MixtureClosureResult,
     numerical_options: NumericalOptions,
 ):
     _ = state_quadratures
     _ = mixture
     _validate_numerical_options(numerical_options)
-    memory_coordinates = build_default_memory_coordinates(records, template_configuration)
+    selected_memory_coordinates = _selected_memory_coordinates(
+        records,
+        template_configuration,
+        transition_edges,
+    )
+
+    return tuple(
+        _bind_memory_gradient(memory_coordinate)
+        for memory_coordinate in selected_memory_coordinates
+    )
+
+
+def _selected_memory_coordinates(
+    records: PhysicalLibraryRecords,
+    template_configuration: SiteConfiguration,
+    transition_edges: tuple[TransitionEdge, ...],
+) -> tuple[MemoryCoordinate, ...]:
+    memory_coordinates = build_default_memory_coordinates(
+        records, template_configuration
+    )
     implemented_family_map = {
         "atmosphere_polarization": {"atmosphere_polarization"},
         "charge_density_relaxation": {
@@ -5470,7 +6332,7 @@ def build_all_memory_coordinate_gradients(
         memory_coordinate.family.value for memory_coordinate in memory_coordinates
     }
     missing_families = []
-    for declared_family in records.memory_record["families"]:
+    for declared_family in records.memory_record["memory_records"]:
         declared_family_name = str(declared_family)
         if declared_family_name not in implemented_family_map:
             missing_families.append(declared_family_name)
@@ -5484,19 +6346,32 @@ def build_all_memory_coordinate_gradients(
             f"{tuple(missing_families)}"
         )
     allowed_implementation_families: set[str] = set()
-    for declared_family in records.memory_record["families"]:
+    for declared_family in records.memory_record["memory_records"]:
         allowed_implementation_families.update(
             implemented_family_map[str(declared_family)]
         )
-    selected_memory_coordinates = tuple(
-        memory_coordinate
-        for memory_coordinate in memory_coordinates
-        if memory_coordinate.family.value in allowed_implementation_families
-    )
-    return tuple(
-        _bind_memory_gradient(memory_coordinate)
-        for memory_coordinate in selected_memory_coordinates
-    )
+    retained_transition_families = {edge.family for edge in transition_edges}
+    selected_coordinates = []
+    for memory_coordinate in memory_coordinates:
+        if memory_coordinate.family.value not in allowed_implementation_families:
+            continue
+        ownership, matching_transition_families = _memory_transport_ownership(
+            records,
+            memory_coordinate.family.value,
+        )
+        if ownership is TransportOwnership.DIAGNOSTIC:
+            continue
+        active_matching_families = retained_transition_families.intersection(
+            matching_transition_families
+        )
+        if (
+            ownership is TransportOwnership.TRANSITION_DISPLACEMENT
+            and matching_transition_families
+        ):
+            if not active_matching_families:
+                continue
+        selected_coordinates.append(memory_coordinate)
+    return tuple(selected_coordinates)
 
 
 def build_default_memory_coordinates(
@@ -5510,38 +6385,58 @@ def build_default_memory_coordinates(
         MemoryCoordinate(
             family=MemoryCoordinateFamily.CAGE_BACKJUMP,
             records=records,
+            required_roles=(SpeciesRole.CATION, SpeciesRole.ANION),
             value_function=_cage_backjump_memory_value,
             gradient_function=_memory_pair_distance_gradient,
         ),
         MemoryCoordinate(
             family=MemoryCoordinateFamily.PARTNER_RESIDENCE,
             records=records,
+            required_roles=(SpeciesRole.CATION, SpeciesRole.ANION),
             value_function=_partner_residence_memory_value,
             gradient_function=_memory_li_anion_coordination_gradient,
         ),
         MemoryCoordinate(
             family=MemoryCoordinateFamily.LIGAND_SHELL,
             records=records,
+            required_roles=(SpeciesRole.CATION, SpeciesRole.ADDITIVE),
             value_function=_ligand_shell_memory_value,
             gradient_function=_memory_li_ligand_coordination_gradient,
         ),
         MemoryCoordinate(
             family=MemoryCoordinateFamily.ANION_ORIENTATION,
             records=records,
+            required_roles=(SpeciesRole.ANION,),
             value_function=_anion_orientation_memory_value,
             gradient_function=_zero_memory_gradient,
         ),
         MemoryCoordinate(
             family=MemoryCoordinateFamily.FREE_VOLUME_STRESS,
             records=records,
+            required_roles=(),
             value_function=_free_volume_stress_memory_value,
             gradient_function=_zero_memory_gradient,
         ),
         MemoryCoordinate(
             family=MemoryCoordinateFamily.BOUNDED_INTERNAL_POLARIZATION,
             records=records,
-            value_function=_bounded_internal_polarization_memory_value,
-            gradient_function=_bounded_internal_polarization_memory_gradient,
+            required_roles=(SpeciesRole.CATION, SpeciesRole.ANION),
+            value_function=_bounded_internal_polarization_x_memory_value,
+            gradient_function=_bounded_internal_polarization_x_memory_gradient,
+        ),
+        MemoryCoordinate(
+            family=MemoryCoordinateFamily.BOUNDED_INTERNAL_POLARIZATION,
+            records=records,
+            required_roles=(SpeciesRole.CATION, SpeciesRole.ANION),
+            value_function=_bounded_internal_polarization_y_memory_value,
+            gradient_function=_bounded_internal_polarization_y_memory_gradient,
+        ),
+        MemoryCoordinate(
+            family=MemoryCoordinateFamily.BOUNDED_INTERNAL_POLARIZATION,
+            records=records,
+            required_roles=(SpeciesRole.CATION, SpeciesRole.ANION),
+            value_function=_bounded_internal_polarization_z_memory_value,
+            gradient_function=_bounded_internal_polarization_z_memory_gradient,
         ),
     )
 
@@ -5553,6 +6448,8 @@ def combine_memory_values(
     return np.asarray(
         [
             coordinate.value_function(coordinate.records, configuration)
+            if _memory_coordinate_is_supported(coordinate, configuration)
+            else 0.0
             for coordinate in coordinates
         ],
         dtype=float,
@@ -5571,6 +6468,11 @@ def combine_memory_gradients(
             _memory_gradient_row(
                 coordinate.gradient_function(coordinate.records, configuration)
             )
+            if _memory_coordinate_is_supported(coordinate, configuration)
+            else np.zeros(
+                (1, len(configuration.species_names) * CARTESIAN_DIMENSION),
+                dtype=float,
+            )
             for coordinate in coordinates
         )
     )
@@ -5580,6 +6482,11 @@ def _bind_memory_gradient(
     memory_coordinate: MemoryCoordinate,
 ) -> Callable[[SiteConfiguration], Array]:
     def gradient(configuration: SiteConfiguration) -> Array:
+        if not _memory_coordinate_is_supported(memory_coordinate, configuration):
+            return np.zeros(
+                (1, len(configuration.species_names) * CARTESIAN_DIMENSION),
+                dtype=float,
+            )
         return _memory_gradient_row(
             memory_coordinate.gradient_function(
                 memory_coordinate.records,
@@ -5588,6 +6495,17 @@ def _bind_memory_gradient(
         )
 
     return gradient
+
+
+def _memory_coordinate_is_supported(
+    memory_coordinate: MemoryCoordinate,
+    configuration: SiteConfiguration,
+) -> bool:
+    present_roles = {
+        _species_role(memory_coordinate.records, species_name)
+        for species_name in configuration.species_names
+    }
+    return all(role in present_roles for role in memory_coordinate.required_roles)
 
 
 def _memory_gradient_row(gradient: Array) -> Array:
@@ -5648,25 +6566,93 @@ def _memory_li_anion_coordination_gradient(
     return _coordination_switch_gradient(records, configuration, "Li_anion")
 
 
-def _bounded_internal_polarization_memory_value(
+def _bounded_internal_polarization_x_memory_value(
     records: PhysicalLibraryRecords,
     configuration: SiteConfiguration,
 ) -> float:
-    cation_index = _first_role_index(records, configuration, SpeciesRole.CATION)
-    anion_index = _first_role_index(records, configuration, SpeciesRole.ANION)
-    pair_vector = (
-        np.asarray(configuration.positions_m[anion_index], dtype=float)
-        - np.asarray(configuration.positions_m[cation_index], dtype=float)
-    )
-    charge_numbers = _configuration_charge_numbers(records, configuration)
-    return float(
-        (charge_numbers[cation_index] - charge_numbers[anion_index]) * pair_vector[0]
+    return _bounded_internal_polarization_memory_value_for_axis(
+        records,
+        configuration,
+        0,
     )
 
 
-def _bounded_internal_polarization_memory_gradient(
+def _bounded_internal_polarization_y_memory_value(
     records: PhysicalLibraryRecords,
     configuration: SiteConfiguration,
+) -> float:
+    return _bounded_internal_polarization_memory_value_for_axis(
+        records,
+        configuration,
+        1,
+    )
+
+
+def _bounded_internal_polarization_z_memory_value(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+) -> float:
+    return _bounded_internal_polarization_memory_value_for_axis(
+        records,
+        configuration,
+        2,
+    )
+
+
+def _bounded_internal_polarization_memory_value_for_axis(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+    cartesian_axis: int,
+) -> float:
+    cation_index = _first_role_index(records, configuration, SpeciesRole.CATION)
+    anion_index = _first_role_index(records, configuration, SpeciesRole.ANION)
+    pair_vector = np.asarray(
+        configuration.positions_m[anion_index], dtype=float
+    ) - np.asarray(configuration.positions_m[cation_index], dtype=float)
+    charge_numbers = _configuration_charge_numbers(records, configuration)
+    return float(
+        (charge_numbers[cation_index] - charge_numbers[anion_index])
+        * pair_vector[cartesian_axis]
+    )
+
+
+def _bounded_internal_polarization_x_memory_gradient(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+) -> Array:
+    return _bounded_internal_polarization_memory_gradient_for_axis(
+        records,
+        configuration,
+        0,
+    )
+
+
+def _bounded_internal_polarization_y_memory_gradient(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+) -> Array:
+    return _bounded_internal_polarization_memory_gradient_for_axis(
+        records,
+        configuration,
+        1,
+    )
+
+
+def _bounded_internal_polarization_z_memory_gradient(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+) -> Array:
+    return _bounded_internal_polarization_memory_gradient_for_axis(
+        records,
+        configuration,
+        2,
+    )
+
+
+def _bounded_internal_polarization_memory_gradient_for_axis(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+    cartesian_axis: int,
 ) -> Array:
     cation_index = _first_role_index(records, configuration, SpeciesRole.CATION)
     anion_index = _first_role_index(records, configuration, SpeciesRole.ANION)
@@ -5676,8 +6662,14 @@ def _bounded_internal_polarization_memory_gradient(
         (1, len(configuration.species_names) * CARTESIAN_DIMENSION),
         dtype=float,
     )
-    gradient[0, cation_index * CARTESIAN_DIMENSION] = -charge_difference
-    gradient[0, anion_index * CARTESIAN_DIMENSION] = charge_difference
+    gradient[
+        0,
+        cation_index * CARTESIAN_DIMENSION + cartesian_axis,
+    ] = -charge_difference
+    gradient[
+        0,
+        anion_index * CARTESIAN_DIMENSION + cartesian_axis,
+    ] = charge_difference
     return gradient
 
 
@@ -5744,6 +6736,7 @@ def _declared_reduced_coordinates(
 
 def _state_coordinate_nodes(
     records: PhysicalLibraryRecords,
+    template_configuration: SiteConfiguration,
     declared_coordinates: tuple[ReducedCoordinate, ...],
     lower_distance_m: float,
     upper_distance_m: float,
@@ -5763,6 +6756,7 @@ def _state_coordinate_nodes(
             continue
         coordinate_values, coordinate_weights = _non_distance_coordinate_nodes(
             records,
+            template_configuration,
             coordinate,
             recipe_context,
             mixture,
@@ -5773,10 +6767,23 @@ def _state_coordinate_nodes(
 
 def _non_distance_coordinate_nodes(
     records: PhysicalLibraryRecords,
+    template_configuration: SiteConfiguration,
     coordinate: ReducedCoordinate,
     recipe_context: RecipeBuildResult,
     mixture: MixtureClosureResult,
 ) -> tuple[Array, Array]:
+    required_role_multiplicity = {
+        ReducedCoordinate.PARTNER_RESIDENCE_COORDINATE: (SpeciesRole.ANION, 2),
+        ReducedCoordinate.IDENTITY_COORDINATE: (SpeciesRole.CATION, 2),
+        ReducedCoordinate.CLUSTER_COORDINATE: (SpeciesRole.ANION, 2),
+    }
+    if coordinate in required_role_multiplicity:
+        role, required_molecule_count = required_role_multiplicity[coordinate]
+        molecule_count = len(
+            _charged_role_molecule_keys(records, template_configuration, role)
+        )
+        if molecule_count < required_molecule_count:
+            return np.asarray([0.0], dtype=float), np.asarray([1.0], dtype=float)
     if coordinate == ReducedCoordinate.LI_LIGAND_COORDINATION:
         return _ligand_coordination_nodes(records, coordinate, recipe_context)
     if coordinate == ReducedCoordinate.LI_SOLVENT_COORDINATION:
@@ -5938,7 +6945,9 @@ def _coordination_basin_representative_nodes(
         "basis.coordination_high_bin_interior_fraction",
     )
     if interior_fraction >= 1.0:
-        raise ValueError("basis.coordination_high_bin_interior_fraction must be below one")
+        raise ValueError(
+            "basis.coordination_high_bin_interior_fraction must be below one"
+        )
     above_value = cutoff + min(cutoff - lower, upper - cutoff) * interior_fraction
     if not cutoff < above_value < upper:
         raise ValueError(f"{switch_name} high-bin representative is outside domain")
@@ -5984,14 +6993,56 @@ def _configuration_with_reduced_coordinate_values(
     template_configuration: SiteConfiguration,
     coordinate_values: dict[str, float],
 ) -> SiteConfiguration:
-    configuration = _configuration_with_pair_distance(
+    configuration = _configuration_with_anion_orientation(
         records,
         template_configuration,
+        float(coordinate_values[ReducedCoordinate.ANION_ORIENTATION.value]),
+    )
+    configuration = _configuration_with_pair_distance(
+        records,
+        configuration,
         _positive_float(
             coordinate_values[ReducedCoordinate.LI_ANION_DISTANCE.value],
             ReducedCoordinate.LI_ANION_DISTANCE.value,
         ),
     )
+    configuration = _configuration_with_secondary_anion_geometry(
+        records,
+        configuration,
+        _positive_float(
+            coordinate_values[ReducedCoordinate.LI_ANION_DISTANCE.value],
+            ReducedCoordinate.LI_ANION_DISTANCE.value,
+        ),
+    )
+    displacement_coordinates = (
+        ("identity_diffusion", ReducedCoordinate.IDENTITY_COORDINATE),
+        ("structural_hop", ReducedCoordinate.STRUCTURAL_HOP_COORDINATE),
+    )
+    for transition_family, coordinate in displacement_coordinates:
+        coordinate_value = float(coordinate_values[coordinate.value])
+        if coordinate_value == 0.0:
+            continue
+        if not _transition_family_has_required_molecular_multiplicity(
+            records,
+            configuration,
+            transition_family,
+        ):
+            continue
+        transition_record = _transition_family_record(records, transition_family)
+        displacement_m = (
+            _endpoint_geometry_displacement_vector_m(
+                records,
+                configuration,
+                transition_record,
+                transition_family,
+            )
+            * coordinate_value
+        )
+        configuration = _configuration_with_cation_displacement(
+            records,
+            configuration,
+            displacement_m,
+        )
     configuration = _configuration_with_role_coordination(
         records,
         configuration,
@@ -6005,11 +7056,6 @@ def _configuration_with_reduced_coordinate_values(
         SpeciesRole.ADDITIVE,
         "Li_ligand",
         float(coordinate_values[ReducedCoordinate.LI_LIGAND_COORDINATION.value]),
-    )
-    configuration = _configuration_with_anion_orientation(
-        records,
-        configuration,
-        float(coordinate_values[ReducedCoordinate.ANION_ORIENTATION.value]),
     )
     return configuration
 
@@ -6047,18 +7093,64 @@ def _configuration_with_role_coordination(
     molecule_ids = tuple(
         sorted({int(configuration.molecule_ids[index]) for index in ligand_indices})
     )
+    solvent_directions = (
+        np.asarray([0.0, 1.0, 0.0], dtype=float),
+        np.asarray([0.0, -1.0, 0.0], dtype=float),
+        np.asarray([0.0, 0.0, 1.0], dtype=float),
+        np.asarray([0.0, 0.0, -1.0], dtype=float),
+    )
+    additive_directions = (
+        np.asarray([-1.0, 0.0, 0.0], dtype=float),
+        np.asarray([-1.0, 1.0, 0.0], dtype=float) / np.sqrt(2.0),
+        np.asarray([-1.0, -1.0, 0.0], dtype=float) / np.sqrt(2.0),
+        np.asarray([-1.0, 0.0, 1.0], dtype=float) / np.sqrt(2.0),
+    )
+    radial_directions = (
+        solvent_directions
+        if ligand_role is SpeciesRole.SOLVENT
+        else additive_directions
+    )
+    if len(molecule_ids) > len(radial_directions):
+        raise ValueError(
+            f"{ligand_role.value} coordination supports at most "
+            f"{len(radial_directions)} molecules"
+        )
     for molecule_offset, molecule_id in enumerate(molecule_ids):
         molecule_site_indices = tuple(
             site_index
             for site_index in ligand_indices
             if int(configuration.molecule_ids[site_index]) == molecule_id
         )
-        anchor_index = molecule_site_indices[0]
-        target_position = cation_position + np.asarray(
-            [0.0, distance_m, (molecule_offset + 1) * distance_m],
-            dtype=float,
+        coordination_site_index = _molecule_coordination_site_index(
+            records,
+            configuration,
+            molecule_site_indices,
         )
-        shift = target_position - positions[anchor_index]
+        molecule_center_position = np.mean(
+            positions[np.asarray(molecule_site_indices, dtype=int)],
+            axis=0,
+        )
+        center_to_coordination_site = (
+            positions[coordination_site_index] - molecule_center_position
+        )
+        center_to_coordination_site_norm = float(
+            np.linalg.norm(center_to_coordination_site)
+        )
+        radial_direction = radial_directions[molecule_offset]
+        if center_to_coordination_site_norm > 0.0:
+            target_center_to_coordination_site = (
+                -center_to_coordination_site_norm * radial_direction
+            )
+            radial_alignment = _rotation_matrix_between_unit_vectors(
+                center_to_coordination_site / center_to_coordination_site_norm,
+                target_center_to_coordination_site / center_to_coordination_site_norm,
+            )
+            for site_index in molecule_site_indices:
+                positions[site_index] = molecule_center_position + radial_alignment @ (
+                    positions[site_index] - molecule_center_position
+                )
+        target_coordination_site = cation_position + distance_m * radial_direction
+        shift = target_coordination_site - positions[coordination_site_index]
         for site_index in molecule_site_indices:
             positions[site_index] += shift
     return SiteConfiguration(
@@ -6078,7 +7170,9 @@ def _coordination_switch_inverse_distance_m(
     minimum_value: float,
 ) -> float:
     if minimum_value <= 0.0 or minimum_value >= 1.0:
-        raise ValueError("coordination switch minimum_value must be between zero and one")
+        raise ValueError(
+            "coordination switch minimum_value must be between zero and one"
+        )
     if exponent <= 0.0:
         raise ValueError("coordination switch exponent must be positive")
     if coordination_value <= 0.0:
@@ -6108,7 +7202,9 @@ def _configuration_with_anion_orientation(
     anion_anchor = anion_indices[0]
     anion_orient_site = anion_indices[1]
     positions = np.asarray(configuration.positions_m, dtype=float).copy()
-    unwrapped_positions = np.asarray(configuration.unwrapped_positions_m, dtype=float).copy()
+    unwrapped_positions = np.asarray(
+        configuration.unwrapped_positions_m, dtype=float
+    ).copy()
     pair_axis = positions[anion_anchor] - positions[cation_index]
     pair_axis_norm = _positive_float(float(np.linalg.norm(pair_axis)), "pair_axis_norm")
     unit_pair_axis = pair_axis / pair_axis_norm
@@ -6130,7 +7226,9 @@ def _configuration_with_anion_orientation(
         float(np.linalg.norm(original_vector)),
         "anion_orientation_vector_length",
     )
-    sine_component = float(np.sqrt(max(0.0, 1.0 - orientation_cosine * orientation_cosine)))
+    sine_component = float(
+        np.sqrt(max(0.0, 1.0 - orientation_cosine * orientation_cosine))
+    )
     target_vector = original_length * (
         orientation_cosine * unit_pair_axis + sine_component * perpendicular_axis
     )
@@ -6144,8 +7242,10 @@ def _configuration_with_anion_orientation(
         positions[site_index] = anchor_position + rotation_matrix @ (
             positions[site_index] - anchor_position
         )
-        unwrapped_positions[site_index] = unwrapped_anchor_position + rotation_matrix @ (
-            unwrapped_positions[site_index] - unwrapped_anchor_position
+        unwrapped_positions[site_index] = (
+            unwrapped_anchor_position
+            + rotation_matrix
+            @ (unwrapped_positions[site_index] - unwrapped_anchor_position)
         )
     return SiteConfiguration(
         species_names=configuration.species_names,
@@ -6163,8 +7263,12 @@ def _rotation_matrix_between_unit_vectors(
 ) -> Array:
     source_vector = np.asarray(source_unit_vector, dtype=float)
     target_vector = np.asarray(target_unit_vector, dtype=float)
-    source_norm = _positive_float(float(np.linalg.norm(source_vector)), "source_unit_norm")
-    target_norm = _positive_float(float(np.linalg.norm(target_vector)), "target_unit_norm")
+    source_norm = _positive_float(
+        float(np.linalg.norm(source_vector)), "source_unit_norm"
+    )
+    target_norm = _positive_float(
+        float(np.linalg.norm(target_vector)), "target_unit_norm"
+    )
     source_unit = source_vector / source_norm
     target_unit = target_vector / target_norm
     cosine_angle = float(np.dot(source_unit, target_unit))
@@ -6188,7 +7292,9 @@ def _rotation_matrix_between_unit_vectors(
         ):
             perpendicular_axis = np.asarray([0.0, 1.0, 0.0], dtype=float)
         cross_vector = np.cross(source_unit, perpendicular_axis)
-        cross_norm = _positive_float(float(np.linalg.norm(cross_vector)), "rotation_axis_norm")
+        cross_norm = _positive_float(
+            float(np.linalg.norm(cross_vector)), "rotation_axis_norm"
+        )
         unit_axis = cross_vector / cross_norm
         return -np.eye(CARTESIAN_DIMENSION, dtype=float) + 2.0 * np.outer(
             unit_axis,
@@ -6218,7 +7324,9 @@ def _state_distance_bounds(
     contact_cutoff_m = float(pair_basins["r_CIP_m"])
     solvent_separated_cutoff_m = float(pair_basins["r_SSIP_m"])
     free_cutoff_m = float(pair_basins["r_free_m"])
-    free_outer_factor = float(records.basis_record["quadrature"]["free_outer_distance_factor"])
+    free_outer_factor = float(
+        records.basis_record["quadrature"]["free_outer_distance_factor"]
+    )
     specs = [
         (PairBasin.CONTACT_ION_PAIR.value, contact_cutoff_m / 2.0, contact_cutoff_m),
         (
@@ -6250,7 +7358,9 @@ def _normalize_potential_energy_reference(
     if transition_state_indices:
         reference_state_indices = transition_state_indices
     else:
-        reference_state_indices = set(range(len(reduced_specification.state_quadratures)))
+        reference_state_indices = set(
+            range(len(reduced_specification.state_quadratures))
+        )
     non_reference_point_keys = {
         _reduced_point_cache_key(point)
         for state_index, state_quadrature in enumerate(
@@ -6259,7 +7369,9 @@ def _normalize_potential_energy_reference(
         if state_index not in reference_state_indices
         for point in state_quadrature.points
     }
-    for state_index, state_quadrature in enumerate(reduced_specification.state_quadratures):
+    for state_index, state_quadrature in enumerate(
+        reduced_specification.state_quadratures
+    ):
         if state_index not in reference_state_indices:
             continue
         for point in state_quadrature.points:
@@ -6291,10 +7403,14 @@ def _reduced_point_cache_key(point: Array) -> tuple[float, ...]:
 
 def _projected_mass_balance_components(recipe_context: RecipeBuildResult):
     components = tuple(
-        _component_with_active_recipe_loading(recipe_context, component)
+        active_component
         for component in recipe_context.components
+        for active_component in (
+            _component_with_active_recipe_loading(recipe_context, component),
+        )
         if _species_role(recipe_context.library_records, component.name)
         in (SpeciesRole.CATION, SpeciesRole.ANION, SpeciesRole.ADDITIVE)
+        and active_component.concentration_mol_m3 > 0.0
     )
     if not components:
         raise ValueError("projected conductivity mass balance needs charged components")
@@ -6305,8 +7421,13 @@ def _component_with_active_recipe_loading(
     recipe_context: RecipeBuildResult,
     component: RecipeComponentLoading,
 ) -> RecipeComponentLoading:
-    if _species_role(recipe_context.library_records, component.name) != SpeciesRole.ADDITIVE:
+    if (
+        _species_role(recipe_context.library_records, component.name)
+        != SpeciesRole.ADDITIVE
+    ):
         return component
+    if component.name not in recipe_context.additive_weight_fractions:
+        return replace(component, concentration_mol_m3=0.0)
     additive_weight_fraction = recipe_context.additive_weight_fractions[component.name]
     species_record = recipe_context.library_records.species_records[component.name]
     molecular_weight_kg_mol = _positive_float(
@@ -6344,7 +7465,9 @@ def _transition_distance_bounds(
         return contact_cutoff_m, solvent_separated_cutoff_m
     if labels == {PairBasin.SOLVENT_SEPARATED_ION_PAIR.value, "addSSIP"}:
         return contact_cutoff_m, solvent_separated_cutoff_m
-    raise ValueError(f"unsupported transition labels {from_pair_label}, {to_pair_label}")
+    raise ValueError(
+        f"unsupported transition labels {from_pair_label}, {to_pair_label}"
+    )
 
 
 def _gauss_legendre_interval(
@@ -6373,14 +7496,41 @@ def _configuration_with_pair_distance(
         configuration,
         SpeciesRole.ANION,
     )
+    coordination_site_index = _molecule_coordination_site_index(
+        records,
+        configuration,
+        anion_indices,
+    )
     positions = np.asarray(configuration.positions_m, dtype=float).copy()
     cation_position = positions[cation_index].copy()
+    anion_center_position = np.mean(
+        positions[np.asarray(anion_indices, dtype=int)],
+        axis=0,
+    )
+    center_to_coordination_site = (
+        positions[coordination_site_index] - anion_center_position
+    )
+    center_to_coordination_site_norm = float(
+        np.linalg.norm(center_to_coordination_site)
+    )
+    if center_to_coordination_site_norm > 0.0:
+        target_center_to_coordination_site = np.asarray(
+            [-center_to_coordination_site_norm, 0.0, 0.0],
+            dtype=float,
+        )
+        radial_alignment = _rotation_matrix_between_unit_vectors(
+            center_to_coordination_site / center_to_coordination_site_norm,
+            target_center_to_coordination_site / center_to_coordination_site_norm,
+        )
+        for site_index in anion_indices:
+            positions[site_index] = anion_center_position + radial_alignment @ (
+                positions[site_index] - anion_center_position
+            )
     target_anion_position = cation_position + np.asarray(
         [pair_distance_m, 0.0, 0.0],
         dtype=float,
     )
-    anion_center_position = np.mean(positions[np.asarray(anion_indices, dtype=int)], axis=0)
-    shift = target_anion_position - anion_center_position
+    shift = target_anion_position - positions[coordination_site_index]
     for site_index in anion_indices:
         positions[site_index] += shift
     return SiteConfiguration(
@@ -6390,6 +7540,100 @@ def _configuration_with_pair_distance(
         positions_m=positions,
         unwrapped_positions_m=positions,
         box_lengths_m=np.asarray(configuration.box_lengths_m, dtype=float),
+    )
+
+
+def _configuration_with_secondary_anion_geometry(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+    pair_distance_m: float,
+) -> SiteConfiguration:
+    anion_molecules = _molecule_site_index_groups_with_role(
+        records,
+        configuration,
+        SpeciesRole.ANION,
+    )
+    if len(anion_molecules) < 2:
+        return configuration
+    cation_index = _first_role_index(records, configuration, SpeciesRole.CATION)
+    positions = np.asarray(configuration.positions_m, dtype=float).copy()
+    cation_position = positions[cation_index].copy()
+    transport_directions = (
+        np.asarray([0.0, 0.0, 1.0], dtype=float),
+        np.asarray([0.0, 0.0, -1.0], dtype=float),
+        np.asarray([0.0, 1.0, 0.0], dtype=float),
+        np.asarray([0.0, -1.0, 0.0], dtype=float),
+    )
+    if len(anion_molecules) - 1 > len(transport_directions):
+        raise ValueError("secondary-anion geometry supports at most four partners")
+    for partner_offset, anion_indices in enumerate(anion_molecules[1:]):
+        coordination_site_index = _molecule_coordination_site_index(
+            records,
+            configuration,
+            anion_indices,
+        )
+        anion_center_position = np.mean(
+            positions[np.asarray(anion_indices, dtype=int)],
+            axis=0,
+        )
+        center_to_coordination_site = (
+            positions[coordination_site_index] - anion_center_position
+        )
+        center_to_coordination_site_norm = _positive_float(
+            float(np.linalg.norm(center_to_coordination_site)),
+            "secondary anion center-to-coordination-site distance",
+        )
+        transport_direction = transport_directions[partner_offset]
+        target_center_to_coordination_site = (
+            -center_to_coordination_site_norm * transport_direction
+        )
+        radial_alignment = _rotation_matrix_between_unit_vectors(
+            center_to_coordination_site / center_to_coordination_site_norm,
+            target_center_to_coordination_site / center_to_coordination_site_norm,
+        )
+        for site_index in anion_indices:
+            positions[site_index] = anion_center_position + radial_alignment @ (
+                positions[site_index] - anion_center_position
+            )
+        target_coordination_site = (
+            cation_position + pair_distance_m * transport_direction
+        )
+        shift = target_coordination_site - positions[coordination_site_index]
+        for site_index in anion_indices:
+            positions[site_index] += shift
+    return SiteConfiguration(
+        species_names=configuration.species_names,
+        molecule_ids=np.asarray(configuration.molecule_ids, dtype=int),
+        site_ids=np.asarray(configuration.site_ids, dtype=int),
+        positions_m=positions,
+        unwrapped_positions_m=positions,
+        box_lengths_m=np.asarray(configuration.box_lengths_m, dtype=float),
+    )
+
+
+def _molecule_site_index_groups_with_role(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+    role: SpeciesRole,
+) -> tuple[tuple[int, ...], ...]:
+    molecule_keys: list[tuple[str, int]] = []
+    for site_index, species_name in enumerate(configuration.species_names):
+        if _species_role(records, species_name) != role:
+            continue
+        molecule_key = (species_name, int(configuration.molecule_ids[site_index]))
+        if molecule_key not in molecule_keys:
+            molecule_keys.append(molecule_key)
+    return tuple(
+        tuple(
+            site_index
+            for site_index, species_name in enumerate(configuration.species_names)
+            if (
+                species_name,
+                int(configuration.molecule_ids[site_index]),
+            )
+            == molecule_key
+        )
+        for molecule_key in molecule_keys
     )
 
 
@@ -6403,24 +7647,94 @@ def _pair_distance_gradient(
         configuration,
         SpeciesRole.ANION,
     )
+    coordination_site_index = _molecule_coordination_site_index(
+        records,
+        configuration,
+        anion_indices,
+    )
     positions = np.asarray(configuration.positions_m, dtype=float)
-    anion_center_position = np.mean(positions[np.asarray(anion_indices, dtype=int)], axis=0)
-    displacement = (
-        anion_center_position
-        - np.asarray(configuration.positions_m[cation_index], dtype=float)
+    displacement = positions[coordination_site_index] - np.asarray(
+        configuration.positions_m[cation_index], dtype=float
     )
     distance_m = _positive_float(float(np.linalg.norm(displacement)), "pair distance")
     unit_vector = displacement / distance_m
-    gradient = np.zeros(len(configuration.species_names) * CARTESIAN_DIMENSION, dtype=float)
+    gradient = np.zeros(
+        len(configuration.species_names) * CARTESIAN_DIMENSION, dtype=float
+    )
     cation_start = cation_index * CARTESIAN_DIMENSION
     gradient[cation_start : cation_start + CARTESIAN_DIMENSION] = -unit_vector
-    anion_weight = 1.0 / float(len(anion_indices))
-    for anion_index in anion_indices:
-        anion_start = anion_index * CARTESIAN_DIMENSION
-        gradient[anion_start : anion_start + CARTESIAN_DIMENSION] = (
-            anion_weight * unit_vector
-        )
+    anion_start = coordination_site_index * CARTESIAN_DIMENSION
+    gradient[anion_start : anion_start + CARTESIAN_DIMENSION] = unit_vector
     return gradient
+
+
+def _molecule_coordination_site_index(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+    anion_site_indices: tuple[int, ...],
+) -> int:
+    if not anion_site_indices:
+        raise ValueError("coordination site selection requires a molecule")
+    acceptor_indices = tuple(
+        site_index
+        for site_index in anion_site_indices
+        if bool(
+            _configuration_site_record(records, configuration, site_index)[
+                "acceptor_flag"
+            ]
+        )
+    )
+    candidate_indices = acceptor_indices or anion_site_indices
+    selected_site_index = candidate_indices[0]
+    selected_key = _anion_coordination_site_sort_key(
+        records,
+        configuration,
+        selected_site_index,
+    )
+    for candidate_site_index in candidate_indices[1:]:
+        candidate_key = _anion_coordination_site_sort_key(
+            records,
+            configuration,
+            candidate_site_index,
+        )
+        if candidate_key < selected_key:
+            selected_site_index = candidate_site_index
+            selected_key = candidate_key
+    return selected_site_index
+
+
+def _anion_coordination_site_sort_key(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+    site_index: int,
+) -> tuple[float, int]:
+    return (
+        float(
+            _configuration_site_record(records, configuration, site_index)[
+                "charge_number"
+            ]
+        ),
+        int(configuration.site_ids[site_index]),
+    )
+
+
+def _configuration_site_record(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+    site_index: int,
+) -> dict:
+    species_name = configuration.species_names[site_index]
+    site_id = int(configuration.site_ids[site_index])
+    matching_records = tuple(
+        site_record
+        for site_record in records.species_records[species_name]["sites"]
+        if int(site_record["site_id"]) == site_id
+    )
+    if len(matching_records) != 1:
+        raise ValueError(
+            f"species {species_name} must have one site record for site_id {site_id}"
+        )
+    return matching_records[0]
 
 
 def _li_anion_distance_m(
@@ -6433,12 +7747,13 @@ def _li_anion_distance_m(
         configuration,
         SpeciesRole.ANION,
     )
-    positions = np.asarray(configuration.positions_m, dtype=float)
-    anion_center_position = np.mean(
-        positions[np.asarray(anion_indices, dtype=int)],
-        axis=0,
+    coordination_site_index = _molecule_coordination_site_index(
+        records,
+        configuration,
+        anion_indices,
     )
-    displacement = anion_center_position - positions[cation_index]
+    positions = np.asarray(configuration.positions_m, dtype=float)
+    displacement = positions[coordination_site_index] - positions[cation_index]
     return _positive_float(float(np.linalg.norm(displacement)), "Li_anion_distance_m")
 
 
@@ -6465,7 +7780,9 @@ def _state_key_for_configuration(
 ) -> tuple[str, ...]:
     cation_index = _first_role_index(records, configuration, SpeciesRole.CATION)
     anion_index = _first_role_index(records, configuration, SpeciesRole.ANION)
-    orientation = assign_orientation_basin(records, configuration, cation_index, anion_index)
+    orientation = assign_orientation_basin(
+        records, configuration, cation_index, anion_index
+    )
     environment_label = _environment_label(records, configuration, mixture)
     return (
         pair_label,
@@ -6489,6 +7806,7 @@ def _state_key_from_reduced_coordinates(
     mixture: MixtureClosureResult,
     pair_label: str,
     coordinate_values: dict[str, float],
+    active_coordinates: frozenset[ReducedCoordinate],
 ) -> tuple[str, ...]:
     _ = mixture
     return (
@@ -6497,13 +7815,25 @@ def _state_key_from_reduced_coordinates(
         _ligand_state_label_from_coordinates(records, coordinate_values),
         _anion_feature_label(records, configuration),
         _orientation_label_from_coordinates(records, coordinate_values),
-        _cluster_label_from_coordinates(records, pair_label, coordinate_values),
-        _partner_label_from_coordinates(records, coordinate_values),
-        _identity_label_from_coordinates(records, coordinate_values),
-        _structural_hop_label_from_coordinates(records, coordinate_values),
-        _cage_label_from_coordinates(records, coordinate_values),
+        _cluster_label_from_coordinates(records, pair_label, coordinate_values)
+        if ReducedCoordinate.CLUSTER_COORDINATE in active_coordinates
+        else _cluster_label(pair_label),
+        _partner_label_from_coordinates(records, coordinate_values)
+        if ReducedCoordinate.PARTNER_RESIDENCE_COORDINATE in active_coordinates
+        else "partner_inactive",
+        _identity_label_from_coordinates(records, coordinate_values)
+        if ReducedCoordinate.IDENTITY_COORDINATE in active_coordinates
+        else "identity_inactive",
+        _structural_hop_label_from_coordinates(records, coordinate_values)
+        if ReducedCoordinate.STRUCTURAL_HOP_COORDINATE in active_coordinates
+        else "hop_inactive",
+        _cage_label_from_coordinates(records, coordinate_values)
+        if ReducedCoordinate.CAGE_COORDINATE in active_coordinates
+        else "cage_inactive",
         _environment_label_from_coordinates(records, coordinate_values),
-        _atmosphere_label_from_coordinates(records, coordinate_values),
+        _atmosphere_label_from_coordinates(records, coordinate_values)
+        if ReducedCoordinate.ATMOSPHERE_POLARIZATION in active_coordinates
+        else "atmosphere_inactive",
     )
 
 
@@ -6524,6 +7854,7 @@ def sparse_state_key_from_reduced_observation(
         mixture,
         pair_label,
         coordinate_values,
+        frozenset(_declared_reduced_coordinates(records)),
     )
     return _state_key_with_active_anion(state_key, active_anion_component_name)
 
@@ -6591,7 +7922,9 @@ def _orientation_label_from_coordinates(
     records: PhysicalLibraryRecords,
     coordinate_values: dict[str, float],
 ) -> str:
-    orientation_value = float(coordinate_values[ReducedCoordinate.ANION_ORIENTATION.value])
+    orientation_value = float(
+        coordinate_values[ReducedCoordinate.ANION_ORIENTATION.value]
+    )
     bins = records.basis_record["orientation_bins"]
     if orientation_value > float(bins["radial_min"]):
         return "radial"
@@ -6660,7 +7993,9 @@ def _identity_label_from_coordinates(
     records: PhysicalLibraryRecords,
     coordinate_values: dict[str, float],
 ) -> str:
-    identity_value = float(coordinate_values[ReducedCoordinate.IDENTITY_COORDINATE.value])
+    identity_value = float(
+        coordinate_values[ReducedCoordinate.IDENTITY_COORDINATE.value]
+    )
     return _label_from_unit_interval_bins(
         records,
         identity_value,
@@ -6676,7 +8011,9 @@ def _structural_hop_label_from_coordinates(
     records: PhysicalLibraryRecords,
     coordinate_values: dict[str, float],
 ) -> str:
-    hop_value = float(coordinate_values[ReducedCoordinate.STRUCTURAL_HOP_COORDINATE.value])
+    hop_value = float(
+        coordinate_values[ReducedCoordinate.STRUCTURAL_HOP_COORDINATE.value]
+    )
     return _label_from_unit_interval_bins(
         records,
         hop_value,
@@ -6719,7 +8056,9 @@ def _label_from_unit_interval_bins(
     coordinate_value: float,
     labels: tuple[str, ...],
 ) -> str:
-    bin_index = _threshold_bin_index(coordinate_value, _unit_interval_thresholds(records))
+    bin_index = _threshold_bin_index(
+        coordinate_value, _unit_interval_thresholds(records)
+    )
     if bin_index >= len(labels):
         raise ValueError("unit interval coordinate produced unsupported state bin")
     return labels[bin_index]
@@ -6864,7 +8203,9 @@ def _first_molecule_indices_for_species(
         and int(configuration.molecule_ids[site_index]) == molecule_id
     )
     if not indices:
-        raise ValueError(f"configuration has no molecule indices for species {species_name}")
+        raise ValueError(
+            f"configuration has no molecule indices for species {species_name}"
+        )
     return indices
 
 

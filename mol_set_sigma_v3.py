@@ -11,12 +11,11 @@ Entry point: python -m conductivity.mol_set_sigma_v3
 """
 
 import logging
-import math
 import os
 import pickle
 import time
 import sys
-from typing import Dict, List, Tuple
+from typing import Dict
 from collections import defaultdict
 
 import numpy as np
@@ -31,12 +30,16 @@ from jax import random
 import optax
 
 from constants import (
-    T_REF_K, F, K_B, N_A, EPS_0, E_CHARGE, BJERRUM_LENGTH_NM,
+    T_REF_K,
+    K_B,
+    N_A,
+    EPS_0,
+    E_CHARGE,
+    BJERRUM_LENGTH_NM,
     MS_CM_TO_S_M as _MS_CM_TO_S_M,
 )
 
 from conductivity.mol_set_sigma import (
-    PROPERTY_KEYS,
     D_INPUT,
     D_PROP,
     N_MAX_SPECIES,
@@ -44,13 +47,9 @@ from conductivity.mol_set_sigma import (
     IDX_DENSITY,
     IDX_EPSILON,
     IDX_VISCOSITY,
-    IDX_DONOR,
-    IDX_ACCEPTOR,
     IDX_LAMBDA0,
     IDX_ANION_R,
-    IDX_ION_PAIR_BINDING,
     IDX_DIPOLE,
-    IDX_COORD_AFFINITY,
     IDX_JONES_DOLE,
     IDX_CATION_R,
     SEED_MAIN,
@@ -63,11 +62,8 @@ from conductivity.mol_set_sigma import (
     SWA_START_FRAC,
     SWA_COLLECT_EVERY,
     ATTN_DROPOUT_RATE,
-    FFN_DROPOUT_RATE,
-    RESID_DROPOUT_RATE,
     PROP_BIAS_ALPHA_INIT,
     USE_PROP_BIAS,
-    USE_ATTN_DROPOUT,
     N_MIX_PHYSICS,
     EXP_OVERFLOW_GUARD,
     MolSetBatch,
@@ -77,8 +73,6 @@ from conductivity.mol_set_sigma import (
     prepare_molset_data,
     compute_mix_physics_stats,
     _compute_mixture_physics,
-    _multihead_attention,
-    _layer_norm,
     _load_all_sources,
     _recipe_key,
     _extract_species_fracs,
@@ -88,23 +82,12 @@ from conductivity.mol_set_sigma import (
 
 from conductivity.mol_set_sigma_v2 import (
     D_HIDDEN,
-    N_HEADS,
     D_FFN,
     D_ATTN_OUT,
     D_MIX_PROJ,
     N_PAIRWISE_V2,
     D_PAIR_PROJ,
-    N_ATTN_LAYERS,
-    N_DROPOUT_KEYS_PER_LAYER,
-    SOFTPLUS_FLOOR,
     IONIC_GATE_ALPHA_INIT,
-    MIX_IDX_EPS_MIX,
-    MIX_IDX_ETA_MIX,
-    MIX_IDX_LAMBDA0_AVG,
-    MIX_IDX_BINDING_AVG,
-    MIX_IDX_ANION_R_AVG,
-    MIX_IDX_JONES_DOLE_B_AVG,
-    MIX_IDX_IONIC_STRENGTH,
     _compute_pairwise_v2,
     _hierarchical_attention,
 )
@@ -124,13 +107,23 @@ DEBYE_TO_CM = 3.33564e-30  # Explicit constant: NIST CODATA 2018
 
 # Onsager limiting law prefactors (CGS-practical units, from Robinson & Stokes Table 6.1)
 # Reused from v1 for consistency — these are universal electrolyte theory constants
-ONSAGER_S1_PREFACTOR = 82.501       # Explicit constant: F²√2/(12π√(ε₀·R·Nₐ)), electrophoretic slope
-ONSAGER_S2_Q_FACTOR = 0.2929        # Explicit constant: q/(1+√q) for q=0.5, symmetric 1:1 electrolyte
-ONSAGER_S2_PREFACTOR = 8.2487e5     # Explicit constant: eF√2/(24π·ε₀·kT·√(ε₀·R·Nₐ)), relaxation slope
-ONSAGER_EPS_T_EXPONENT = 1.5        # Explicit constant: (ε·T)^(3/2) from Onsager limiting law
+ONSAGER_S1_PREFACTOR = (
+    82.501  # Explicit constant: F²√2/(12π√(ε₀·R·Nₐ)), electrophoretic slope
+)
+ONSAGER_S2_Q_FACTOR = (
+    0.2929  # Explicit constant: q/(1+√q) for q=0.5, symmetric 1:1 electrolyte
+)
+ONSAGER_S2_PREFACTOR = (
+    8.2487e5  # Explicit constant: eF√2/(24π·ε₀·kT·√(ε₀·R·Nₐ)), relaxation slope
+)
+ONSAGER_EPS_T_EXPONENT = 1.5  # Explicit constant: (ε·T)^(3/2) from Onsager limiting law
 
-LAMBDA0_SCALE = 1.0  # Explicit constant: Michaelis-Menten half-max for ionic weight (S·cm²/mol)
-LAMBDA_CORRECTION = 0.01  # Explicit constant: L2 penalty weight on NN correction magnitude
+LAMBDA0_SCALE = (
+    1.0  # Explicit constant: Michaelis-Menten half-max for ionic weight (S·cm²/mol)
+)
+LAMBDA_CORRECTION = (
+    0.01  # Explicit constant: L2 penalty weight on NN correction magnitude
+)
 OOD_PROXY_SPECIES = "LiTFSI"  # Explicit constant: held-out species for OOD early stopping (75 recipes, salt)
 
 
@@ -146,6 +139,7 @@ def _ionic_weight(lam0):
 # =============================================================================
 # MOLE FRACTION → MOLARITY CONVERSION
 # =============================================================================
+
 
 def _mole_frac_to_molarity(species_props, fracs, mask):
     """Convert salt mole fractions to molarity (mol/L) using mixture molar volume.
@@ -174,6 +168,7 @@ def _mole_frac_to_molarity(species_props, fracs, mask):
 # =============================================================================
 # MSA PHYSICS BASELINE — MODEL 1: KIRKWOOD-FRÖHLICH MIXTURE DIELECTRIC
 # =============================================================================
+
 
 def _kirkwood_mixture_epsilon(species_props, fracs, mask, T_K):
     """Compute effective mixture dielectric constant with Kirkwood dipolar
@@ -217,13 +212,13 @@ def _kirkwood_mixture_epsilon(species_props, fracs, mask, T_K):
     # Dipole-dipole correlation: μᵢ·μⱼ / μ_ref²
     # μ_ref derived from mixture mean dipole (data-dependent, not hardcoded)
     mu_mean = jnp.sum(w * mu_per) / w_sum
-    mu_ref_sq = jnp.maximum(mu_mean ** 2, 1.0)  # floor at 1 D² for zero-dipole mixtures
+    mu_ref_sq = jnp.maximum(mu_mean**2, 1.0)  # floor at 1 D² for zero-dipole mixtures
     mu_corr = mu_per[:, None] * mu_per[None, :] / mu_ref_sq
 
     # Composition-weighted cross-term sum
     ww = w[:, None] * w[None, :]
     mask_2d = mask[:, None] * mask[None, :]
-    g_correction = jnp.sum(ww * mask_2d * mu_corr * f_cav) / jnp.maximum(w_sum ** 2, 1e-8)
+    g_correction = jnp.sum(ww * mask_2d * mu_corr * f_cav) / jnp.maximum(w_sum**2, 1e-8)
 
     eps_dipolar = eps_linear * (1.0 + g_correction)
 
@@ -249,6 +244,7 @@ def _kirkwood_mixture_epsilon(species_props, fracs, mask, T_K):
 # =============================================================================
 # MSA PHYSICS BASELINE — MODEL 2: FUOSS ION PAIRING
 # =============================================================================
+
 
 def _fuoss_ion_pairing(eps_eff, species_props, fracs, mask, T_K):
     """Compute free-ion fraction α from Fuoss association equilibrium.
@@ -297,7 +293,9 @@ def _fuoss_ion_pairing(eps_eff, species_props, fracs, mask, T_K):
     lambda_B_vac = BJERRUM_LENGTH_NM * (T_REF_K / T_K)
 
     # Fuoss equation: K_A [L/mol] = (4π·Nₐ/3)·a³·1000·exp(λ_B/(ε·a_nm))
-    prefactor = (4.0 * jnp.pi * N_A / 3.0) * (a_m ** 3) * 1000.0  # unit conversion: m³ to L
+    prefactor = (
+        (4.0 * jnp.pi * N_A / 3.0) * (a_m**3) * 1000.0
+    )  # unit conversion: m³ to L
     exponent = lambda_B_vac / (eps_eff * jnp.maximum(a_nm, 1e-3))
     exponent = jnp.minimum(exponent, EXP_OVERFLOW_GUARD)
     K_A_per = prefactor * jnp.exp(exponent)
@@ -317,6 +315,7 @@ def _fuoss_ion_pairing(eps_eff, species_props, fracs, mask, T_K):
 # =============================================================================
 # MSA PHYSICS BASELINE — MODEL 3: MSA-CORRECTED CONDUCTIVITY
 # =============================================================================
+
 
 def _msa_corrected_conductivity(eps_eff, alpha, species_props, fracs, mask, T_K):
     """Compute MSA-corrected molar conductivity with electrophoretic and
@@ -363,14 +362,20 @@ def _msa_corrected_conductivity(eps_eff, alpha, species_props, fracs, mask, T_K)
 
     # Debye screening: κ_D² = 2·e²·Nₐ·c_free·1000 / (ε₀·ε·k_B·T)
     # c_free = α·c in mol/L; factor 1000 converts L⁻¹ to m⁻³ (1 L = 10⁻³ m³)
-    kappa_D_sq = 2.0 * E_CHARGE ** 2 * N_A * (alpha * c_mol_L * 1000.0) / (
-        EPS_0 * eps_eff * K_B * T_K
+    kappa_D_sq = (
+        2.0
+        * E_CHARGE**2
+        * N_A
+        * (alpha * c_mol_L * 1000.0)
+        / (EPS_0 * eps_eff * K_B * T_K)
     )
     kappa_D = jnp.sqrt(jnp.maximum(kappa_D_sq, 0.0))
 
     # MSA screening parameter Γ
     sigma_kappa = sigma_avg_m * kappa_D
-    Gamma = (-1.0 + jnp.sqrt(1.0 + 2.0 * sigma_kappa)) / (2.0 * jnp.maximum(sigma_avg_m, 1e-12))
+    Gamma = (-1.0 + jnp.sqrt(1.0 + 2.0 * sigma_kappa)) / (
+        2.0 * jnp.maximum(sigma_avg_m, 1e-12)
+    )
 
     f_MSA = kappa_D / jnp.maximum(kappa_D + 2.0 * Gamma, 1e-12)
 
@@ -380,7 +385,7 @@ def _msa_corrected_conductivity(eps_eff, alpha, species_props, fracs, mask, T_K)
     delta_Lambda_e = S_e * sqrt_c
 
     # Onsager relaxation: ΔΛ_r = S₂·Λ₀/(ε·T)^(3/2) · √c
-    S_r = ONSAGER_S2_Q_FACTOR * ONSAGER_S2_PREFACTOR / eps_T ** ONSAGER_EPS_T_EXPONENT
+    S_r = ONSAGER_S2_Q_FACTOR * ONSAGER_S2_PREFACTOR / eps_T**ONSAGER_EPS_T_EXPONENT
     delta_Lambda_r = S_r * Lambda_0_avg * sqrt_c
 
     Lambda_MSA = Lambda_0_avg - (delta_Lambda_e + delta_Lambda_r) * f_MSA
@@ -404,19 +409,31 @@ def _msa_corrected_conductivity(eps_eff, alpha, species_props, fracs, mask, T_K)
 # MSA PHYSICS BASELINE — TOP-LEVEL CHAIN
 # =============================================================================
 
+
 def _msa_baseline_conductivity(species_props, fracs, mask, T_K):
     """Kirkwood dielectric → full dissociation → MSA corrections → log(σ)."""
     eps_eff = _kirkwood_mixture_epsilon(species_props, fracs, mask, T_K)
     ALPHA_FULL_DISSOCIATION = 1.0  # Explicit constant: Fuoss removed — overestimates pairing at concentrated conditions
-    return _msa_corrected_conductivity(eps_eff, ALPHA_FULL_DISSOCIATION, species_props, fracs, mask, T_K)
+    return _msa_corrected_conductivity(
+        eps_eff, ALPHA_FULL_DISSOCIATION, species_props, fracs, mask, T_K
+    )
 
 
 # =============================================================================
 # FORWARD PASS
 # =============================================================================
 
-def forward_single_v3(params, species_props, raw_props, fracs, mask, temperature_K,
-                      dropout_key, dropout_rate):
+
+def forward_single_v3(
+    params,
+    species_props,
+    raw_props,
+    fracs,
+    mask,
+    temperature_K,
+    dropout_key,
+    dropout_rate,
+):
     """Full v3 forward pass: encoder → hierarchical attention → MSA baseline → gated readout.
 
     Architecture identical to v2 except the baseline:
@@ -441,27 +458,34 @@ def forward_single_v3(params, species_props, raw_props, fracs, mask, temperature
 
     # --- Encoder ---
     log_fracs = jnp.log(jnp.maximum(fracs, 1e-8))
-    aug = jnp.concatenate([
-        species_props,
-        log_fracs[:, None],
-        fracs[:, None],
-        jnp.full((n_max, 1), T_scaled),
-    ], axis=-1)
+    aug = jnp.concatenate(
+        [
+            species_props,
+            log_fracs[:, None],
+            fracs[:, None],
+            jnp.full((n_max, 1), T_scaled),
+        ],
+        axis=-1,
+    )
     z = jax.nn.gelu(aug @ params["enc_w"] + params["enc_b"]) * mask[:, None]
 
     # --- Property-distance attention bias ---
     if USE_PROP_BIAS:
         phys = species_props[:, :D_PROP]
-        norms = jnp.maximum(jnp.sqrt(jnp.sum(phys ** 2, axis=-1, keepdims=True)), 1e-8)
+        norms = jnp.maximum(jnp.sqrt(jnp.sum(phys**2, axis=-1, keepdims=True)), 1e-8)
         phys_normed = phys / norms
         cos_sim = phys_normed @ phys_normed.T
-        prop_bias = params["prop_bias_alpha"] * cos_sim * (mask[:, None] * mask[None, :])
+        prop_bias = (
+            params["prop_bias_alpha"] * cos_sim * (mask[:, None] * mask[None, :])
+        )
     else:
         prop_bias = jnp.zeros((n_max, n_max))
 
     # --- Hierarchical attention (from v2) ---
     key1, key2 = random.split(dropout_key)
-    z = _hierarchical_attention(z, mask, params, raw_props, prop_bias, key1, dropout_rate)
+    z = _hierarchical_attention(
+        z, mask, params, raw_props, prop_bias, key1, dropout_rate
+    )
 
     # --- Composition-weighted pooling ---
     frac_weights = fracs * mask
@@ -470,14 +494,18 @@ def forward_single_v3(params, species_props, raw_props, fracs, mask, temperature
     z_max = jnp.where(mask[:, None] > 0, z, -1e9).max(axis=0)
 
     # --- Mixture physics (from v1, for gate input) ---
-    mix_raw, _log_sigma_wjd = _compute_mixture_physics(raw_props, fracs, mask, temperature_K)
+    mix_raw, _log_sigma_wjd = _compute_mixture_physics(
+        raw_props, fracs, mask, temperature_K
+    )
     mix_norm = (mix_raw - params["mix_mean"]) / params["mix_std"]
     mix_proj = jax.nn.gelu(mix_norm @ params["mix_proj_w"] + params["mix_proj_b"])
 
     # --- Bounded pairwise features (from v2) ---
     pair_params = {k: params[k] for k in params if k.startswith("pair_ref_")}
     pair_features = _compute_pairwise_v2(raw_props, fracs, mask, pair_params)
-    pair_proj = jax.nn.gelu(pair_features @ params["pair_proj_w"] + params["pair_proj_b"])
+    pair_proj = jax.nn.gelu(
+        pair_features @ params["pair_proj_w"] + params["pair_proj_b"]
+    )
 
     # --- MSA physics baseline (v3 replaces v2 dome) ---
     log_sigma_base = _msa_baseline_conductivity(raw_props, fracs, mask, temperature_K)
@@ -496,19 +524,24 @@ forward_batch_v3 = jax.vmap(forward_single_v3, in_axes=(None, 0, 0, 0, 0, 0, 0, 
 
 @jax.jit
 def _forward_batch_eval_v3(params, props, raw, fracs, mask, temps, keys):
-    log_sigma, _correction = forward_batch_v3(params, props, raw, fracs, mask, temps, keys, 0.0)
+    log_sigma, _correction = forward_batch_v3(
+        params, props, raw, fracs, mask, temps, keys, 0.0
+    )
     return log_sigma
 
 
 @jax.jit
 def _forward_single_eval_v3(params, props, raw, fracs, mask, temp):
-    log_sigma, _correction = forward_single_v3(params, props, raw, fracs, mask, temp, random.PRNGKey(0), 0.0)
+    log_sigma, _correction = forward_single_v3(
+        params, props, raw, fracs, mask, temp, random.PRNGKey(0), 0.0
+    )
     return log_sigma
 
 
 # =============================================================================
 # PARAMETER INITIALIZATION
 # =============================================================================
+
 
 def init_params_v3(key, mix_mean, mix_std):
     """Initialize v3 model parameters. Identical to v2 EXCEPT no dome MLP params."""
@@ -525,41 +558,64 @@ def init_params_v3(key, mix_mean, mix_std):
         params[f"{name}_w"] = random.normal(k1, (d_in, d_out)) * scale
         params[f"{name}_b"] = jnp.zeros(d_out)
 
-    n_keys = 1 + 12 + 1 + 1 + 1  # enc + 2 attn layers (6 each) + mix_proj + pair_proj + gate
+    n_keys = (
+        1 + 12 + 1 + 1 + 1
+    )  # enc + 2 attn layers (6 each) + mix_proj + pair_proj + gate
     n_spare = 3  # Explicit constant: spare keys for future extensions
     keys = random.split(key, n_keys + n_spare)
     ki = 0
 
     # --- Encoder ---
     d_enc_in = D_INPUT + 3
-    linear_init(keys[ki], d_enc_in, D_HIDDEN, "enc"); ki += 1
+    linear_init(keys[ki], d_enc_in, D_HIDDEN, "enc")
+    ki += 1
 
     # --- Hierarchical attention: 2 layers ---
     for layer in range(2):
-        linear_init(keys[ki], D_HIDDEN, D_HIDDEN, f"attn{layer}_q"); ki += 1
-        linear_init(keys[ki], D_HIDDEN, D_HIDDEN, f"attn{layer}_k"); ki += 1
-        linear_init(keys[ki], D_HIDDEN, D_HIDDEN, f"attn{layer}_v"); ki += 1
-        linear_init(keys[ki], D_HIDDEN, D_HIDDEN, f"attn{layer}_out"); ki += 1
+        linear_init(keys[ki], D_HIDDEN, D_HIDDEN, f"attn{layer}_q")
+        ki += 1
+        linear_init(keys[ki], D_HIDDEN, D_HIDDEN, f"attn{layer}_k")
+        ki += 1
+        linear_init(keys[ki], D_HIDDEN, D_HIDDEN, f"attn{layer}_v")
+        ki += 1
+        linear_init(keys[ki], D_HIDDEN, D_HIDDEN, f"attn{layer}_out")
+        ki += 1
         params[f"ln{layer}_attn_scale"] = jnp.ones(D_HIDDEN)
         params[f"ln{layer}_attn_bias"] = jnp.zeros(D_HIDDEN)
-        linear_init(keys[ki], D_HIDDEN, D_FFN, f"ffn{layer}_1"); ki += 1
-        linear_init(keys[ki], D_FFN, D_HIDDEN, f"ffn{layer}_2"); ki += 1
+        linear_init(keys[ki], D_HIDDEN, D_FFN, f"ffn{layer}_1")
+        ki += 1
+        linear_init(keys[ki], D_FFN, D_HIDDEN, f"ffn{layer}_2")
+        ki += 1
         params[f"ln{layer}_ffn_scale"] = jnp.ones(D_HIDDEN)
         params[f"ln{layer}_ffn_bias"] = jnp.zeros(D_HIDDEN)
 
     # --- Mix physics projection ---
-    linear_init(keys[ki], N_MIX_PHYSICS, D_MIX_PROJ, "mix_proj"); ki += 1
+    linear_init(keys[ki], N_MIX_PHYSICS, D_MIX_PROJ, "mix_proj")
+    ki += 1
 
     # --- Pairwise reference scales ---
-    params["pair_ref_dn_an"] = jnp.array(5.0)    # Explicit constant: softplus(5)+1≈6; DN~15×AN~20=300, /6→tanh active
-    params["pair_ref_eps"] = jnp.array(3.0)       # Explicit constant: softplus(3)+1≈4; eps_diff≤90, /4→Cauchy active
-    params["pair_ref_eta"] = jnp.array(1.0)       # Explicit constant: softplus(1)+1≈2.3; eta_diff≤2, /2.3→Cauchy active
-    params["pair_ref_binding"] = jnp.array(3.0)   # Explicit constant: softplus(3)+1≈4; binding sum≤90, /4→sigmoid active
-    params["pair_ref_coord"] = jnp.array(1.0)     # Explicit constant: softplus(1)+0.1≈1.4; coord product≤6, /1.96→tanh active
-    params["pair_ref_mob"] = jnp.array(4.0)       # Explicit constant: softplus(4)+1≈5; Λ₀×ε/η≈1800, /5→tanh saturated
+    params["pair_ref_dn_an"] = jnp.array(
+        5.0
+    )  # Explicit constant: softplus(5)+1≈6; DN~15×AN~20=300, /6→tanh active
+    params["pair_ref_eps"] = jnp.array(
+        3.0
+    )  # Explicit constant: softplus(3)+1≈4; eps_diff≤90, /4→Cauchy active
+    params["pair_ref_eta"] = jnp.array(
+        1.0
+    )  # Explicit constant: softplus(1)+1≈2.3; eta_diff≤2, /2.3→Cauchy active
+    params["pair_ref_binding"] = jnp.array(
+        3.0
+    )  # Explicit constant: softplus(3)+1≈4; binding sum≤90, /4→sigmoid active
+    params["pair_ref_coord"] = jnp.array(
+        1.0
+    )  # Explicit constant: softplus(1)+0.1≈1.4; coord product≤6, /1.96→tanh active
+    params["pair_ref_mob"] = jnp.array(
+        4.0
+    )  # Explicit constant: softplus(4)+1≈5; Λ₀×ε/η≈1800, /5→tanh saturated
 
     # --- Pairwise projection ---
-    linear_init(keys[ki], N_PAIRWISE_V2, D_PAIR_PROJ, "pair_proj"); ki += 1
+    linear_init(keys[ki], N_PAIRWISE_V2, D_PAIR_PROJ, "pair_proj")
+    ki += 1
 
     # --- NO dome MLP params (v3: MSA baseline is parameter-free) ---
 
@@ -567,7 +623,8 @@ def init_params_v3(key, mix_mean, mix_std):
     params["ionic_gate_alpha"] = jnp.array(IONIC_GATE_ALPHA_INIT)
 
     # --- Gated readout ---
-    linear_init(keys[ki], D_GATE_IN_V3, D_ATTN_OUT, "gate"); ki += 1
+    linear_init(keys[ki], D_GATE_IN_V3, D_ATTN_OUT, "gate")
+    ki += 1
     params["corr_w"] = jnp.zeros((D_ATTN_OUT, 1))
     params["corr_b"] = jnp.zeros(1)
 
@@ -578,12 +635,14 @@ def init_params_v3(key, mix_mean, mix_std):
 # LOSS AND TRAINING
 # =============================================================================
 
+
 def loss_fn_v3(params, batch_tuple, dropout_key):
     props, raw, fracs, mask, temps, log_sigma, weights = batch_tuple
     n_batch = props.shape[0]
     dropout_keys = random.split(dropout_key, n_batch)
-    pred_log_sigma, nn_corrections = forward_batch_v3(params, props, raw, fracs, mask, temps,
-                                                       dropout_keys, ATTN_DROPOUT_RATE)
+    pred_log_sigma, nn_corrections = forward_batch_v3(
+        params, props, raw, fracs, mask, temps, dropout_keys, ATTN_DROPOUT_RATE
+    )
     residuals = pred_log_sigma - log_sigma
     recon_loss = jnp.sum(weights * residuals**2) / jnp.sum(weights)
     correction_penalty = jnp.mean(nn_corrections**2)
@@ -597,6 +656,7 @@ def make_train_step_v3(opt):
         updates, new_opt_state = opt.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
         return new_params, new_opt_state, loss
+
     return step
 
 
@@ -609,7 +669,9 @@ def compute_val_mae_v3(params, batch):
     temps_j = jnp.array(batch.temperature_K)
     log_sigma_true = jnp.array(batch.log_sigma)
     dummy_keys = random.split(random.PRNGKey(0), n)
-    pred_log = _forward_batch_eval_v3(params, props, raw, fracs_j, mask_j, temps_j, dummy_keys)
+    pred_log = _forward_batch_eval_v3(
+        params, props, raw, fracs_j, mask_j, temps_j, dummy_keys
+    )
     pred = jnp.exp(pred_log)
     true = jnp.exp(log_sigma_true)
     return float(jnp.mean(jnp.abs(pred - true)))
@@ -624,12 +686,14 @@ def compute_metrics_v3(params, batch):
     temps_j = jnp.array(batch.temperature_K)
     log_sigma_true = jnp.array(batch.log_sigma)
     dummy_keys = random.split(random.PRNGKey(0), n)
-    pred_log = _forward_batch_eval_v3(params, props, raw, fracs_j, mask_j, temps_j, dummy_keys)
+    pred_log = _forward_batch_eval_v3(
+        params, props, raw, fracs_j, mask_j, temps_j, dummy_keys
+    )
     pred = jnp.exp(pred_log)
     true = jnp.exp(log_sigma_true)
     errors = pred - true
     mae = float(jnp.mean(jnp.abs(errors)))
-    rmse = float(jnp.sqrt(jnp.mean(errors ** 2)))
+    rmse = float(jnp.sqrt(jnp.mean(errors**2)))
     bias = float(jnp.mean(errors))
     mape = float(jnp.mean(jnp.abs(errors) / jnp.maximum(true, 0.01)) * 100)
     return {"mae": mae, "rmse": rmse, "bias": bias, "mape": mape}
@@ -639,11 +703,12 @@ def compute_metrics_v3(params, batch):
 # OOD EVALUATION
 # =============================================================================
 
+
 def evaluate_species_ood_v3(species_name, norm_mean, norm_std):
     """Hold out all recipes containing species_name, retrain v3 from scratch, evaluate OOD."""
-    logger.info(f"\n{'='*60}")
+    logger.info(f"\n{'=' * 60}")
     logger.info(f"OOD EVALUATION (v3): holding out '{species_name}'")
-    logger.info(f"{'='*60}")
+    logger.info(f"{'=' * 60}")
 
     all_entries = _load_all_sources()
     recipe_groups: Dict[tuple, list] = defaultdict(list)
@@ -651,7 +716,9 @@ def evaluate_species_ood_v3(species_name, norm_mean, norm_std):
         key = (_recipe_key(recipe), round(temp, 0))
         recipe_groups[key].append((sigma, temp, recipe, source))
 
-    CV_REJECT_THRESHOLD = 0.3  # Explicit constant: 30% CV cutoff (same as main training)
+    CV_REJECT_THRESHOLD = (
+        0.3  # Explicit constant: 30% CV cutoff (same as main training)
+    )
     train_rows = []
     ood_rows = []
     for (rkey, T_round), measurements in recipe_groups.items():
@@ -662,12 +729,20 @@ def evaluate_species_ood_v3(species_name, norm_mean, norm_std):
             if cv > CV_REJECT_THRESHOLD:
                 continue
         recipe = measurements[0][2]
-        all_sp = (list(recipe["salts"].keys()) +
-                  list(recipe["solvents"].keys()) +
-                  list(recipe["additives"].keys()))
+        all_sp = (
+            list(recipe["salts"].keys())
+            + list(recipe["solvents"].keys())
+            + list(recipe["additives"].keys())
+        )
         avg_sigma = np.mean(sigmas)
         avg_temp = np.mean([m[1] for m in measurements])
-        row = {"recipe": recipe, "sigma": avg_sigma, "temp": avg_temp, "species": all_sp, "key": rkey}
+        row = {
+            "recipe": recipe,
+            "sigma": avg_sigma,
+            "temp": avg_temp,
+            "species": all_sp,
+            "key": rkey,
+        }
         if species_name in all_sp:
             ood_rows.append(row)
         else:
@@ -678,7 +753,12 @@ def evaluate_species_ood_v3(species_name, norm_mean, norm_std):
 
     if len(ood_rows) < 5:
         logger.warning(f"Too few OOD recipes ({len(ood_rows)}), skipping")
-        return {"species": species_name, "n_ood": len(ood_rows), "ood_mae": None, "train_mae": None}
+        return {
+            "species": species_name,
+            "n_ood": len(ood_rows),
+            "ood_mae": None,
+            "train_mae": None,
+        }
 
     def rows_to_batch(rows_list) -> MolSetBatch:
         n = len(rows_list)
@@ -692,16 +772,23 @@ def evaluate_species_ood_v3(species_name, norm_mean, norm_std):
         for i, row in enumerate(rows_list):
             species_fracs = _extract_species_fracs(row["recipe"])
             for j, (sp_name, frac) in enumerate(species_fracs[:N_MAX_SPECIES]):
-                props[i, j] = get_normalized_property_vector(sp_name, norm_mean, norm_std)
+                props[i, j] = get_normalized_property_vector(
+                    sp_name, norm_mean, norm_std
+                )
                 raw[i, j] = get_raw_property_vector(sp_name)
                 fracs_arr[i, j] = frac
                 mask_arr[i, j] = 1.0
             temps_arr[i] = row["temp"]
             log_sigmas[i] = np.log(row["sigma"])
         return MolSetBatch(
-            species_props=props, raw_props=raw, fracs=fracs_arr, mask=mask_arr,
-            temperature_K=temps_arr, log_sigma=log_sigmas,
-            weights=weights_arr, recipe_keys=[r["key"] for r in rows_list],
+            species_props=props,
+            raw_props=raw,
+            fracs=fracs_arr,
+            mask=mask_arr,
+            temperature_K=temps_arr,
+            log_sigma=log_sigmas,
+            weights=weights_arr,
+            recipe_keys=[r["key"] for r in rows_list],
         )
 
     train_batch = rows_to_batch(train_rows)
@@ -729,7 +816,15 @@ def evaluate_species_ood_v3(species_name, norm_mean, norm_std):
     jit_temps = jnp.array(train_batch.temperature_K)
     jit_log_sigma = jnp.array(train_batch.log_sigma)
     jit_weights = jnp.array(train_batch.weights)
-    batch_tuple = (jit_props, jit_raw, jit_fracs, jit_mask, jit_temps, jit_log_sigma, jit_weights)
+    batch_tuple = (
+        jit_props,
+        jit_raw,
+        jit_fracs,
+        jit_mask,
+        jit_temps,
+        jit_log_sigma,
+        jit_weights,
+    )
 
     LOG_EVERY_OOD = 500  # Explicit constant: OOD training progress log interval
     ood_rng = random.PRNGKey(SEED_OOD + 1)
@@ -752,17 +847,23 @@ def evaluate_species_ood_v3(species_name, norm_mean, norm_std):
 
     final_ood_mae = compute_val_mae_v3(params, ood_batch)
     final_train_mae = compute_val_mae_v3(params, train_batch)
-    logger.info(f"OOD {species_name}: train={final_train_mae:.3f}, OOD={final_ood_mae:.3f}, best={best_ood_mae:.3f}@{best_step}")
+    logger.info(
+        f"OOD {species_name}: train={final_train_mae:.3f}, OOD={final_ood_mae:.3f}, best={best_ood_mae:.3f}@{best_step}"
+    )
     return {
-        "species": species_name, "n_ood": len(ood_rows),
-        "ood_mae": final_ood_mae, "train_mae": final_train_mae,
-        "best_ood_mae": best_ood_mae, "best_step": best_step,
+        "species": species_name,
+        "n_ood": len(ood_rows),
+        "ood_mae": final_ood_mae,
+        "train_mae": final_train_mae,
+        "best_ood_mae": best_ood_mae,
+        "best_step": best_step,
     }
 
 
 # =============================================================================
 # INFERENCE API
 # =============================================================================
+
 
 def predict_sigma_v3(params, norm_mean, norm_std, recipe, temperature_K):
     """Predict conductivity (mS/cm) for a single recipe dict."""
@@ -777,8 +878,12 @@ def predict_sigma_v3(params, norm_mean, norm_std, recipe, temperature_K):
         fracs[j] = frac
         mask_arr[j] = 1.0
     log_sigma = _forward_single_eval_v3(
-        params, jnp.array(props), jnp.array(raw),
-        jnp.array(fracs), jnp.array(mask_arr), jnp.array(temperature_K),
+        params,
+        jnp.array(props),
+        jnp.array(raw),
+        jnp.array(fracs),
+        jnp.array(mask_arr),
+        jnp.array(temperature_K),
     )
     return float(jnp.exp(log_sigma))
 
@@ -786,8 +891,14 @@ def predict_sigma_v3(params, norm_mean, norm_std, recipe, temperature_K):
 def molset_conductivity_s_m_v3(params, species_props_norm, species_props_raw, X, T_K):
     """Pure-JAX optimizer interface: conductivity in S/m."""
     log_sigma_mS_cm, _corr = forward_single_v3(
-        params, species_props_norm, species_props_raw, X,
-        jnp.ones(N_MAX_SPECIES), T_K, random.PRNGKey(0), 0.0,
+        params,
+        species_props_norm,
+        species_props_raw,
+        X,
+        jnp.ones(N_MAX_SPECIES),
+        T_K,
+        random.PRNGKey(0),
+        0.0,
     )
     return jnp.exp(log_sigma_mS_cm) * _MS_CM_TO_S_M
 
@@ -796,9 +907,12 @@ def molset_conductivity_s_m_v3(params, species_props_norm, species_props_raw, X,
 # MAIN
 # =============================================================================
 
+
 def main():
     logger.info("=" * 70)
-    logger.info("MolSet v3 — MSA Physics Baseline + Hierarchical Attention + Bounded Pairwise")
+    logger.info(
+        "MolSet v3 — MSA Physics Baseline + Hierarchical Attention + Bounded Pairwise"
+    )
     logger.info("=" * 70)
 
     # --- Species enumeration ---
@@ -824,13 +938,21 @@ def main():
         recipe_groups_proxy[(key, round(temp, 0))].append(recipe)
     for (rkey, T_round), recipes in recipe_groups_proxy.items():
         recipe = recipes[0]
-        all_sp = list(recipe["salts"].keys()) + list(recipe["solvents"].keys()) + list(recipe["additives"].keys())
+        all_sp = (
+            list(recipe["salts"].keys())
+            + list(recipe["solvents"].keys())
+            + list(recipe["additives"].keys())
+        )
         if OOD_PROXY_SPECIES in all_sp:
             proxy_recipe_keys.add(rkey)
 
     train_keys = train_batch.recipe_keys
-    proxy_idx = np.array([i for i, k in enumerate(train_keys) if k in proxy_recipe_keys])
-    core_idx = np.array([i for i, k in enumerate(train_keys) if k not in proxy_recipe_keys])
+    proxy_idx = np.array(
+        [i for i, k in enumerate(train_keys) if k in proxy_recipe_keys]
+    )
+    core_idx = np.array(
+        [i for i, k in enumerate(train_keys) if k not in proxy_recipe_keys]
+    )
 
     def _subset_batch(batch, idx):
         return MolSetBatch(
@@ -845,14 +967,18 @@ def main():
         )
 
     train_core = _subset_batch(train_batch, core_idx)
-    ood_proxy_batch = _subset_batch(train_batch, proxy_idx) if len(proxy_idx) > 0 else None
+    ood_proxy_batch = (
+        _subset_batch(train_batch, proxy_idx) if len(proxy_idx) > 0 else None
+    )
     mix_mean, mix_std = compute_mix_physics_stats(train_core)
 
-    logger.info(f"Train core (no {OOD_PROXY_SPECIES}): {len(train_core.recipe_keys)}, "
-                f"OOD proxy ({OOD_PROXY_SPECIES}): {len(proxy_idx)}, Val: {len(val_batch.recipe_keys)}")
+    logger.info(
+        f"Train core (no {OOD_PROXY_SPECIES}): {len(train_core.recipe_keys)}, "
+        f"OOD proxy ({OOD_PROXY_SPECIES}): {len(proxy_idx)}, Val: {len(val_batch.recipe_keys)}"
+    )
 
     # --- MSA baseline standalone evaluation (before any NN training) ---
-    logger.info(f"\n--- MSA Baseline Standalone Evaluation ---")
+    logger.info("\n--- MSA Baseline Standalone Evaluation ---")
     msa_errors_train = []
     for i in range(len(train_core.recipe_keys)):
         raw_i = jnp.array(train_core.raw_props[i])
@@ -877,11 +1003,13 @@ def main():
 
     logger.info(f"MSA baseline train MAE: {np.mean(msa_errors_train):.3f} mS/cm")
     logger.info(f"MSA baseline val MAE:   {np.mean(msa_errors_val):.3f} mS/cm")
-    logger.info(f"MSA baseline train median AE: {np.median(msa_errors_train):.3f} mS/cm")
+    logger.info(
+        f"MSA baseline train median AE: {np.median(msa_errors_train):.3f} mS/cm"
+    )
     logger.info(f"MSA baseline val median AE:   {np.median(msa_errors_val):.3f} mS/cm")
 
     # Sample some predictions for sanity check
-    logger.info(f"\n--- MSA Baseline Sample Predictions ---")
+    logger.info("\n--- MSA Baseline Sample Predictions ---")
     for i in range(min(10, len(val_batch.recipe_keys))):
         raw_i = jnp.array(val_batch.raw_props[i])
         fracs_i = jnp.array(val_batch.fracs[i])
@@ -889,7 +1017,9 @@ def main():
         temp_i = jnp.array(val_batch.temperature_K[i])
 
         eps_eff = _kirkwood_mixture_epsilon(raw_i, fracs_i, mask_i, temp_i)
-        log_sigma_msa = _msa_corrected_conductivity(eps_eff, 1.0, raw_i, fracs_i, mask_i, temp_i)
+        log_sigma_msa = _msa_corrected_conductivity(
+            eps_eff, 1.0, raw_i, fracs_i, mask_i, temp_i
+        )
 
         sigma_msa = float(jnp.exp(log_sigma_msa))
         sigma_true = float(jnp.exp(val_batch.log_sigma[i]))
@@ -922,7 +1052,15 @@ def main():
     jit_temps = jnp.array(train_core.temperature_K)
     jit_log_sigma = jnp.array(train_core.log_sigma)
     jit_weights = jnp.array(train_core.weights)
-    batch_tuple = (jit_props, jit_raw, jit_fracs, jit_mask, jit_temps, jit_log_sigma, jit_weights)
+    batch_tuple = (
+        jit_props,
+        jit_raw,
+        jit_fracs,
+        jit_mask,
+        jit_temps,
+        jit_log_sigma,
+        jit_weights,
+    )
 
     rng = random.PRNGKey(SEED_MAIN + 1)
     best_val_mae = float("inf")
@@ -948,7 +1086,11 @@ def main():
         if step % LOG_EVERY == 0 or step == 1:
             train_mae = compute_val_mae_v3(params, train_core)
             val_mae = compute_val_mae_v3(params, val_batch)
-            ood_proxy_mae = compute_val_mae_v3(params, ood_proxy_batch) if ood_proxy_batch is not None else float("nan")
+            ood_proxy_mae = (
+                compute_val_mae_v3(params, ood_proxy_batch)
+                if ood_proxy_batch is not None
+                else float("nan")
+            )
             elapsed = time.time() - t0
             marker = ""
             if val_mae < best_val_mae:
@@ -976,7 +1118,9 @@ def main():
             if swa_params_sum is None:
                 swa_params_sum = jax.tree.map(lambda x: x.copy(), params)
             else:
-                swa_params_sum = jax.tree.map(lambda s, p: s + p, swa_params_sum, params)
+                swa_params_sum = jax.tree.map(
+                    lambda s, p: s + p, swa_params_sum, params
+                )
             swa_count += 1
 
     # SWA averaging
@@ -985,38 +1129,48 @@ def main():
         swa_val_mae = compute_val_mae_v3(swa_params, val_batch)
         swa_train_mae = compute_val_mae_v3(swa_params, train_core)
         logger.info(f"\nSWA ({swa_count} checkpoints from step {swa_start}):")
-        logger.info(f"  SWA val MAE = {swa_val_mae:.3f} mS/cm (best single = {best_val_mae:.3f})")
+        logger.info(
+            f"  SWA val MAE = {swa_val_mae:.3f} mS/cm (best single = {best_val_mae:.3f})"
+        )
         logger.info(f"  SWA train MAE = {swa_train_mae:.3f} mS/cm")
 
     # --- Final metrics (best-val params) ---
     train_metrics = compute_metrics_v3(best_params, train_core)
     val_metrics = compute_metrics_v3(best_params, val_batch)
 
-    logger.info(f"\n{'='*60}")
+    logger.info(f"\n{'=' * 60}")
     logger.info(f"FINAL RESULTS — best-val params (step {best_step})")
-    logger.info(f"{'='*60}")
-    logger.info(f"Train: MAE={train_metrics['mae']:.3f} mS/cm, RMSE={train_metrics['rmse']:.3f}, "
-                f"bias={train_metrics['bias']:.3f}, MAPE={train_metrics['mape']:.1f}%")
-    logger.info(f"Val:   MAE={val_metrics['mae']:.3f} mS/cm, RMSE={val_metrics['rmse']:.3f}, "
-                f"bias={val_metrics['bias']:.3f}, MAPE={val_metrics['mape']:.1f}%")
-    logger.info(f"Train/Val ratio: {train_metrics['mae']/max(val_metrics['mae'], 0.001):.2f}")
+    logger.info(f"{'=' * 60}")
+    logger.info(
+        f"Train: MAE={train_metrics['mae']:.3f} mS/cm, RMSE={train_metrics['rmse']:.3f}, "
+        f"bias={train_metrics['bias']:.3f}, MAPE={train_metrics['mape']:.1f}%"
+    )
+    logger.info(
+        f"Val:   MAE={val_metrics['mae']:.3f} mS/cm, RMSE={val_metrics['rmse']:.3f}, "
+        f"bias={val_metrics['bias']:.3f}, MAPE={val_metrics['mape']:.1f}%"
+    )
+    logger.info(
+        f"Train/Val ratio: {train_metrics['mae'] / max(val_metrics['mae'], 0.001):.2f}"
+    )
 
     # --- Final metrics (OOD-best params) ---
     if ood_proxy_batch is not None:
         ood_val_metrics = compute_metrics_v3(best_ood_params, val_batch)
         ood_proxy_metrics = compute_metrics_v3(best_ood_params, ood_proxy_batch)
-        logger.info(f"\n{'='*60}")
+        logger.info(f"\n{'=' * 60}")
         logger.info(f"FINAL RESULTS — OOD-proxy-best params (step {best_ood_step})")
-        logger.info(f"{'='*60}")
+        logger.info(f"{'=' * 60}")
         logger.info(f"Val:       MAE={ood_val_metrics['mae']:.3f} mS/cm")
-        logger.info(f"OOD proxy: MAE={ood_proxy_metrics['mae']:.3f} mS/cm ({OOD_PROXY_SPECIES})")
+        logger.info(
+            f"OOD proxy: MAE={ood_proxy_metrics['mae']:.3f} mS/cm ({OOD_PROXY_SPECIES})"
+        )
 
     # Baselines
-    logger.info(f"\n--- Baselines ---")
-    logger.info(f"XGB (in-distribution only): 0.26 mS/cm")
-    logger.info(f"MLP (fixed 52-d features):  0.591 mS/cm")
-    logger.info(f"MolSet v1 (Run 8):          0.458 mS/cm")
-    logger.info(f"MolSet v2 (dome baseline):  0.333 mS/cm")
+    logger.info("\n--- Baselines ---")
+    logger.info("XGB (in-distribution only): 0.26 mS/cm")
+    logger.info("MLP (fixed 52-d features):  0.591 mS/cm")
+    logger.info("MolSet v1 (Run 8):          0.458 mS/cm")
+    logger.info("MolSet v2 (dome baseline):  0.333 mS/cm")
     logger.info(f"MolSet v3 (MSA+corr pen):   {val_metrics['mae']:.3f} mS/cm")
 
     # Save model (OOD-best params for OOD evaluation)
@@ -1024,20 +1178,23 @@ def main():
     use_step = best_ood_step if ood_proxy_batch is not None else best_step
     model_path = os.path.join(os.path.dirname(__file__), "mol_set_sigma_v3.pkl")
     with open(model_path, "wb") as f:
-        pickle.dump({
-            "params": jax.tree.map(np.array, use_params),
-            "norm_mean": np.array(norm_mean),
-            "norm_std": np.array(norm_std),
-            "mix_mean": np.array(mix_mean),
-            "mix_std": np.array(mix_std),
-            "val_mae": val_metrics["mae"],
-            "best_step": use_step,
-            "version": "v3_msa_corrpen_oodstop",
-        }, f)
+        pickle.dump(
+            {
+                "params": jax.tree.map(np.array, use_params),
+                "norm_mean": np.array(norm_mean),
+                "norm_std": np.array(norm_std),
+                "mix_mean": np.array(mix_mean),
+                "mix_std": np.array(mix_std),
+                "val_mae": val_metrics["mae"],
+                "best_step": use_step,
+                "version": "v3_msa_corrpen_oodstop",
+            },
+            f,
+        )
     logger.info(f"Model saved (OOD-best@{use_step}): {model_path}")
 
     # --- Gradient check ---
-    logger.info(f"\n--- Gradient Check ---")
+    logger.info("\n--- Gradient Check ---")
     test_idx = 0
     test_props = jnp.array(val_batch.species_props[test_idx])
     test_raw = jnp.array(val_batch.raw_props[test_idx])
@@ -1045,21 +1202,33 @@ def main():
     test_mask = jnp.array(val_batch.mask[test_idx])
     test_temp = jnp.array(val_batch.temperature_K[test_idx])
 
-    grad_fn = jax.grad(lambda f: forward_single_v3(
-        use_params, test_props, test_raw, f, test_mask, test_temp, random.PRNGKey(0), 0.0
-    )[0])
+    grad_fn = jax.grad(
+        lambda f: forward_single_v3(
+            use_params,
+            test_props,
+            test_raw,
+            f,
+            test_mask,
+            test_temp,
+            random.PRNGKey(0),
+            0.0,
+        )[0]
+    )
     grads = grad_fn(test_fracs)
-    logger.info(f"d_log(sigma)/d_x_i for first val recipe:")
+    logger.info("d_log(sigma)/d_x_i for first val recipe:")
     species_fracs = _extract_species_fracs(
         {"salts": {}, "solvents": {}, "additives": {}}
     )
     # Reconstruct species names from val batch
-    all_sp_names = sorted(set(
-        sp for entry in _DATA_ORIGINAL + _DATA_CALISOL
-        if "conductivity_mS_cm" in entry["properties"]
-        for k in ["salts", "solvents", "additives"]
-        for sp in entry["recipe"][k].keys()
-    ))
+    all_sp_names = sorted(
+        set(
+            sp
+            for entry in _DATA_ORIGINAL + _DATA_CALISOL
+            if "conductivity_mS_cm" in entry["properties"]
+            for k in ["salts", "solvents", "additives"]
+            for sp in entry["recipe"][k].keys()
+        )
+    )
 
     # Print gradient for each active species
     for j in range(N_MAX_SPECIES):
@@ -1068,24 +1237,26 @@ def main():
             logger.info(f"  species[{j}] : grad = {g:+.4f}")
 
     # --- Speed test ---
-    logger.info(f"\n--- Speed Test ---")
+    logger.info("\n--- Speed Test ---")
     warmup_result = _forward_single_eval_v3(
-        use_params, test_props, test_raw, test_fracs, test_mask, test_temp)
+        use_params, test_props, test_raw, test_fracs, test_mask, test_temp
+    )
     warmup_result.block_until_ready()
 
     n_calls = 10000
     t0 = time.time()
     for _ in range(n_calls):
         result = _forward_single_eval_v3(
-            use_params, test_props, test_raw, test_fracs, test_mask, test_temp)
+            use_params, test_props, test_raw, test_fracs, test_mask, test_temp
+        )
     result.block_until_ready()
     elapsed_jit = (time.time() - t0) / n_calls * 1000
     logger.info(f"JIT single-recipe: {elapsed_jit:.4f} ms/recipe ({n_calls} calls)")
 
     # --- OOD Evaluation ---
-    logger.info(f"\n{'='*60}")
-    logger.info(f"OUT-OF-DISTRIBUTION EVALUATION (v3)")
-    logger.info(f"{'='*60}")
+    logger.info(f"\n{'=' * 60}")
+    logger.info("OUT-OF-DISTRIBUTION EVALUATION (v3)")
+    logger.info(f"{'=' * 60}")
 
     ood_species = ["FEC", "VC", "LiFSI"]
     ood_results = []
@@ -1093,20 +1264,26 @@ def main():
         r = evaluate_species_ood_v3(sp, norm_mean, norm_std)
         ood_results.append(r)
 
-    logger.info(f"\n{'='*60}")
-    logger.info(f"OOD SUMMARY (v3 vs v2 vs v1)")
-    logger.info(f"{'='*60}")
+    logger.info(f"\n{'=' * 60}")
+    logger.info("OOD SUMMARY (v3 vs v2 vs v1)")
+    logger.info(f"{'=' * 60}")
     logger.info(f"{'Species':<10} {'v3 OOD':>10} {'v2 OOD':>10} {'v1 OOD':>10}")
-    logger.info(f"{'-'*44}")
+    logger.info(f"{'-' * 44}")
     # Explicit constants: measured OOD MAE from prior runs (plan_molset_v2.md §5)
     v1_baselines = {"FEC": 0.603, "VC": 0.462, "LiFSI": 2.496}
-    v2_baselines = {"FEC": 0.845, "VC": None, "LiFSI": None}  # pending v2 OOD completion
+    v2_baselines = {
+        "FEC": 0.845,
+        "VC": None,
+        "LiFSI": None,
+    }  # pending v2 OOD completion
     for r in ood_results:
         if r["ood_mae"] is not None:
             v1 = v1_baselines[r["species"]]
             v2 = v2_baselines.get(r["species"])
             v2_str = f"{v2:.3f}" if v2 is not None else "pending"
-            logger.info(f"{r['species']:<10} {r['ood_mae']:>10.3f} {v2_str:>10} {v1:>10.3f}")
+            logger.info(
+                f"{r['species']:<10} {r['ood_mae']:>10.3f} {v2_str:>10} {v1:>10.3f}"
+            )
 
 
 if __name__ == "__main__":

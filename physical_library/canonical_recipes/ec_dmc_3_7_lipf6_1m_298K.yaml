@@ -1,0 +1,8 @@
+temperature_K: 298.15
+solvents_vv:
+  EC: 0.3
+  DMC: 0.7
+salts_mol_l:
+  Li+: 1.0
+  PF6-: 1.0
+additives_weight_fraction: {}

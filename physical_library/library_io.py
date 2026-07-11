@@ -6,10 +6,10 @@ import argparse
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import yaml
 
 from constants import MOL_M3_PER_MOL_L
-from data.electrolyte_property_db import DATA
 
 SPECIES_REQUIRED_FIELDS = (
     "schema",
@@ -67,6 +67,15 @@ TOP_LEVEL_REQUIRED_FILES = (
     "transitions.yaml",
     "memory.yaml",
 )
+FIRST_PRINCIPLES_ALLOWED_PARAMETER_PROVENANCE = (
+    "universal_constant",
+    "geometry_derived",
+    "measured_pure_property",
+    "measured_mixture_property",
+    "continuum_theory",
+    "fitted_to_primitive",
+)
+FIRST_PRINCIPLES_REJECTED_PARAMETER_PROVENANCE = "fitted_to_scalar_sigma"
 
 
 @dataclass(frozen=True)
@@ -135,6 +144,13 @@ def build_recipe_library_context(
     library_root: Path,
 ) -> RecipeBuildResult:
     recipe_record = _load_recipe_mapping(recipe_yaml_path)
+    return build_recipe_library_context_from_record(recipe_record, library_root)
+
+
+def build_recipe_library_context_from_record(
+    recipe_record: dict,
+    library_root: Path,
+) -> RecipeBuildResult:
     library_records = load_physical_library(library_root)
     temperature_K = _positive_float(recipe_record["temperature_K"], "temperature_K")
     solvent_volume_fractions = _positive_float_mapping(
@@ -166,7 +182,9 @@ def build_recipe_library_context(
             ),
             role="solvent",
         )
-        for solvent_name, volume_fraction in solvent_volume_fractions.items()
+        for solvent_name, volume_fraction in sorted(
+            solvent_volume_fractions.items()
+        )
     )
     salt_loadings = tuple(
         RecipeComponentLoading(
@@ -174,7 +192,10 @@ def build_recipe_library_context(
             concentration_mol_m3=concentration_mol_l * MOL_M3_PER_MOL_L,
             role="salt_component",
         )
-        for salt_component_name, concentration_mol_l in salt_molarities_mol_l.items()
+        for salt_component_name, concentration_mol_l in sorted(
+            salt_molarities_mol_l.items(),
+            key=_salt_component_sort_key(library_records),
+        )
     )
     additive_loadings = tuple(
         RecipeComponentLoading(
@@ -186,15 +207,24 @@ def build_recipe_library_context(
             ),
             role="additive",
         )
-        for additive_name, weight_fraction in additive_weight_fractions.items()
+        for additive_name, weight_fraction in sorted(additive_weight_fractions.items())
     )
     return RecipeBuildResult(
         temperature_K=temperature_K,
         components=solvent_loadings + salt_loadings + additive_loadings,
-        solvent_volume_fractions=solvent_volume_fractions,
-        additive_weight_fractions=additive_weight_fractions,
+        solvent_volume_fractions=dict(sorted(solvent_volume_fractions.items())),
+        additive_weight_fractions=dict(sorted(additive_weight_fractions.items())),
         library_records=library_records,
     )
+
+
+def _salt_component_sort_key(records: PhysicalLibraryRecords):
+    def component_key(item: tuple[str, float]) -> tuple[bool, str]:
+        species_name, _concentration_mol_l = item
+        species_role = str(records.species_records[species_name]["role"])
+        return species_role != "cation", species_name
+
+    return component_key
 
 
 def validate_physical_library_records(records: PhysicalLibraryRecords) -> None:
@@ -205,9 +235,18 @@ def validate_physical_library_records(records: PhysicalLibraryRecords) -> None:
         _validate_pair_record(pair_key, pair_record, records.species_records)
     _require_mapping_keys(
         records.mixture_record,
-        ("schema", "species", "dielectric", "viscosity", "packing", "atmosphere"),
+        (
+            "schema",
+            "species",
+            "dielectric",
+            "viscosity",
+            "packing",
+            "atmosphere",
+            "parameter_provenance",
+        ),
         "mixture.yaml",
     )
+    _validate_mixture_parameter_provenance(records.mixture_record)
     _require_mapping_keys(
         records.basis_record,
         ("schema", "coordinates", "threshold_source"),
@@ -220,29 +259,44 @@ def validate_physical_library_records(records: PhysicalLibraryRecords) -> None:
     )
     _require_mapping_keys(
         records.memory_record,
-        ("schema", "families", "orthogonalization"),
+        ("schema", "memory_records", "orthogonalization"),
         "memory.yaml",
     )
+    _validate_memory_records(records.memory_record, records.transition_record)
 
 
-def validate_projected_property_db() -> dict[str, int]:
-    source_labeled_rows = 0
-    evaluated_rows = 0
-    failed_rows = 0
-    for row in DATA:
-        properties = row["properties"]
-        if "conductivity_mS_cm" not in properties:
-            continue
-        source_labeled_rows += 1
-        if _has_projected_inputs(properties):
-            evaluated_rows += 1
-            continue
-        failed_rows += 1
-    return {
-        "source_labeled_rows": source_labeled_rows,
-        "evaluated_rows": evaluated_rows,
-        "failed_rows": failed_rows,
-    }
+def _validate_memory_records(memory_record: dict, transition_record: dict) -> None:
+    memory_records = memory_record["memory_records"]
+    if not isinstance(memory_records, dict) or not memory_records:
+        raise ValueError("memory.memory_records must be a non-empty mapping")
+    transition_families = set(transition_record["families"])
+    for family, family_record in memory_records.items():
+        _require_mapping_keys(
+            family_record,
+            ("transport_ownership", "matching_transition_families"),
+            f"memory.memory_records.{family}",
+        )
+        if family_record["transport_ownership"] not in (
+            "bounded_memory",
+            "diagnostic",
+        ):
+            raise ValueError(
+                f"memory family {family} has invalid transport ownership"
+            )
+        matching_families = family_record["matching_transition_families"]
+        if not isinstance(matching_families, list):
+            raise TypeError(
+                f"memory family {family} matching_transition_families must be a list"
+            )
+        missing_families = tuple(
+            matching_family
+            for matching_family in matching_families
+            if matching_family not in transition_families
+        )
+        if missing_families:
+            raise ValueError(
+                f"memory family {family} references missing transitions {missing_families}"
+            )
 
 
 def main() -> int:
@@ -256,11 +310,40 @@ def main() -> int:
         type=Path,
         default=Path("conductivity/physical_library"),
     )
+    parser.add_argument("--reference-box-length-m", type=float)
+    parser.add_argument("--volume-m3", type=float)
+    parser.add_argument("--state-quadrature-order", type=int)
+    parser.add_argument("--transition-grid-count", type=int)
     parsed_arguments = parser.parse_args()
     if parsed_arguments.command == "validate-library":
         return _main_validate_library(parsed_arguments.library_root)
     if parsed_arguments.command == "validate-property-db":
-        return _main_validate_property_db()
+        required_numerical_arguments = {
+            "reference_box_length_m": parsed_arguments.reference_box_length_m,
+            "volume_m3": parsed_arguments.volume_m3,
+            "state_quadrature_order": parsed_arguments.state_quadrature_order,
+            "transition_grid_count": parsed_arguments.transition_grid_count,
+        }
+        missing_argument_names = tuple(
+            argument_name
+            for argument_name, argument_value in required_numerical_arguments.items()
+            if argument_value is None
+        )
+        if missing_argument_names:
+            parser.error(
+                "validate-property-db requires explicit numerical arguments: "
+                + ", ".join(
+                    f"--{argument_name.replace('_', '-')}"
+                    for argument_name in missing_argument_names
+                )
+            )
+        return _main_validate_property_db(
+            library_root=parsed_arguments.library_root,
+            reference_box_length_m=parsed_arguments.reference_box_length_m,
+            volume_m3=parsed_arguments.volume_m3,
+            state_quadrature_order=parsed_arguments.state_quadrature_order,
+            transition_grid_count=parsed_arguments.transition_grid_count,
+        )
     raise ValueError(f"unsupported command {parsed_arguments.command}")
 
 
@@ -273,13 +356,44 @@ def _main_validate_library(library_root: Path) -> int:
     return 0
 
 
-def _main_validate_property_db() -> int:
-    result = validate_projected_property_db()
-    print(f"source_labeled_rows={result['source_labeled_rows']}")
-    print(f"evaluated_rows={result['evaluated_rows']}")
-    print(f"failed_rows={result['failed_rows']}")
-    if result["failed_rows"] > 0:
-        print("missing executable physical generator inputs")
+def _main_validate_property_db(
+    library_root: Path,
+    reference_box_length_m: float,
+    volume_m3: float,
+    state_quadrature_order: int,
+    transition_grid_count: int,
+) -> int:
+    from conductivity.physical_library.generator_construction import NumericalOptions
+    from conductivity.physical_library.property_db_validation import (
+        validate_property_db_supported_conductivity_rows,
+    )
+    from data.electrolyte_property_db import DATA
+
+    numerical_options = NumericalOptions(
+        reference_box_lengths_m=np.full(3, reference_box_length_m, dtype=float),
+        volume_m3=volume_m3,
+        state_quadrature_order=state_quadrature_order,
+        transition_grid_count=transition_grid_count,
+    )
+    summary = validate_property_db_supported_conductivity_rows(
+        property_db_entries=DATA,
+        physical_library_root=library_root,
+        numerical_options=numerical_options,
+    )
+    print(f"total_entry_count={summary.total_entry_count}")
+    print(f"evaluated_entry_count={summary.evaluated_entry_count}")
+    print(f"skipped_entry_count={summary.skipped_entry_count}")
+    print(f"mean_error_mS_cm={summary.mean_error_mS_cm:.12g}")
+    print(f"mean_absolute_error_mS_cm={summary.mean_absolute_error_mS_cm:.12g}")
+    print(
+        "root_mean_square_error_mS_cm="
+        f"{summary.root_mean_square_error_mS_cm:.12g}"
+    )
+    print(
+        "mean_absolute_percent_error="
+        f"{summary.mean_absolute_percent_error:.12g}"
+    )
+    print(f"max_absolute_error_mS_cm={summary.max_absolute_error_mS_cm:.12g}")
     return 0
 
 
@@ -384,6 +498,51 @@ def _validate_pair_record(
         )
 
 
+def _validate_mixture_parameter_provenance(mixture_record: dict) -> None:
+    parameter_provenance = mixture_record["parameter_provenance"]
+    if not isinstance(parameter_provenance, dict):
+        raise TypeError("mixture.parameter_provenance must be a mapping")
+    active_parameter_paths = _active_mixture_parameter_paths(mixture_record)
+    missing_parameter_paths = tuple(
+        parameter_path
+        for parameter_path in active_parameter_paths
+        if parameter_path not in parameter_provenance
+    )
+    if missing_parameter_paths:
+        raise KeyError(
+            "mixture.parameter_provenance missing active first-principles parameters: "
+            f"{missing_parameter_paths}"
+        )
+    allowed_provenance = set(FIRST_PRINCIPLES_ALLOWED_PARAMETER_PROVENANCE)
+    for parameter_path in active_parameter_paths:
+        provenance_label = str(parameter_provenance[parameter_path])
+        if provenance_label == FIRST_PRINCIPLES_REJECTED_PARAMETER_PROVENANCE:
+            raise ValueError(
+                "first-principles physical library rejects scalar-sigma-fitted "
+                f"parameter {parameter_path}"
+            )
+        if provenance_label not in allowed_provenance:
+            raise ValueError(
+                f"mixture.parameter_provenance[{parameter_path}] has unsupported "
+                f"label {provenance_label}"
+            )
+
+
+def _active_mixture_parameter_paths(mixture_record: dict) -> tuple[str, ...]:
+    active_parameter_paths: list[str] = []
+    mobility_record = mixture_record["mobility"]
+    resistance_terms = tuple(str(term) for term in mobility_record["resistance_terms"])
+    if "free_volume" in resistance_terms:
+        active_parameter_paths.append("mobility.free_volume_exponent")
+    if "free_volume" in resistance_terms:
+        active_parameter_paths.append("packing.phi_max")
+    if "local_fields" in mixture_record:
+        local_field_record = mixture_record["local_fields"]
+        for local_field_key in sorted(local_field_record):
+            active_parameter_paths.append(f"local_fields.{local_field_key}")
+    return tuple(active_parameter_paths)
+
+
 def _load_recipe_mapping(path: Path) -> dict:
     record = yaml.safe_load(path.read_text())
     if not isinstance(record, dict):
@@ -474,14 +633,6 @@ def _require_mapping_keys(record: dict, required_keys: tuple[str, ...], label: s
     missing = [required_key for required_key in required_keys if required_key not in record]
     if missing:
         raise KeyError(f"{label} missing required keys: {missing}")
-
-
-def _has_projected_inputs(properties: dict) -> bool:
-    if "projected_primitives" in properties:
-        return True
-    if "projected_generator_inputs" in properties:
-        return True
-    return False
 
 
 if __name__ == "__main__":
