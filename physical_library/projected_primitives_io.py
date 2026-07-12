@@ -162,6 +162,10 @@ def read_projected_primitive_yaml(path: Path) -> ProjectedPrimitiveArtifact:
         ),
         mori_memory_matrix_A=memory_matrix_A,
         mori_current_coupling_matrix_h=current_coupling_matrix_h,
+        state_memory_value_matrix=_array(
+            primitives["state_memory_value_matrix"],
+            "state_memory_value_matrix",
+        ).reshape((len(state_labels), memory_matrix_A.shape[0])),
         temperature_K=float(record["temperature_K"]),
         volume_m3=float(record["volume_m3"]),
     )
@@ -174,6 +178,7 @@ def read_projected_primitive_yaml(path: Path) -> ProjectedPrimitiveArtifact:
         primitive_input.self_current_tensors_D_self_i_m2_s,
         primitive_input.mori_memory_matrix_A,
         primitive_input.mori_current_coupling_matrix_h,
+        primitive_input.state_memory_value_matrix,
         primitive_input.temperature_K,
         primitive_input.volume_m3,
     )
@@ -204,6 +209,7 @@ def validate_projected_primitive_artifact_input(
         _self_current_tensors_D_self_i_m2_s,
         _mori_memory_matrix_A,
         _mori_current_coupling_matrix_h,
+        _state_memory_value_matrix,
     ) = validate_primitive_input(primitive_input)
     reversible_generator_Q_ij_s_inv = compute_reversible_generator(
         symmetric_capacity_fluxes_K_ij_mol_m3_s,
@@ -284,6 +290,10 @@ def write_projected_primitive_yaml(
             ).tolist(),
             "mori_current_coupling_matrix_h": np.asarray(
                 primitive_input.mori_current_coupling_matrix_h,
+                dtype=float,
+            ).tolist(),
+            "state_memory_value_matrix": np.asarray(
+                primitive_input.state_memory_value_matrix,
                 dtype=float,
             ).tolist(),
         },
@@ -381,6 +391,7 @@ def compute_conductivity_from_primitive_yaml(path: Path) -> ProjectedConductivit
         primitive_input.self_current_tensors_D_self_i_m2_s,
         primitive_input.mori_memory_matrix_A,
         primitive_input.mori_current_coupling_matrix_h,
+        primitive_input.state_memory_value_matrix,
         primitive_input.temperature_K,
         primitive_input.volume_m3,
     )
@@ -465,6 +476,7 @@ def _primitive_artifact_diagnostics(
         _self_current_tensors_D_self_i_m2_s,
         _mori_memory_matrix_A,
         _mori_current_coupling_matrix_h,
+        _state_memory_value_matrix,
     ) = validate_primitive_input(primitive_input)
     finite_process_legality = diagnose_finite_process_legality(
         state_labels,
@@ -655,6 +667,13 @@ def interpolate_primitive_closure(
             weights,
             tuple(
                 primitive_input.mori_current_coupling_matrix_h
+                for primitive_input in primitive_inputs
+            ),
+        ),
+        state_memory_value_matrix=_weighted_sum(
+            weights,
+            tuple(
+                primitive_input.state_memory_value_matrix
                 for primitive_input in primitive_inputs
             ),
         ),
@@ -924,6 +943,7 @@ def _primitive_norms(primitive_input: ProjectedPrimitiveInput) -> PrimitiveTenso
         self_current_tensors_D_self_i_m2_s,
         mori_memory_matrix_A,
         mori_current_coupling_matrix_h,
+        _state_memory_value_matrix,
     ) = validate_primitive_input(primitive_input)
     reversible_generator_Q_ij_s_inv = compute_reversible_generator(
         symmetric_capacity_fluxes_K_ij_mol_m3_s,
@@ -956,6 +976,7 @@ def _primitive_gaps(
         first_self_current_tensors_D_self_i_m2_s,
         first_mori_memory_matrix_A,
         first_mori_current_coupling_matrix_h,
+        _first_state_memory_value_matrix,
     ) = validate_primitive_input(first_input)
     (
         second_state_concentrations_mol_m3,
@@ -965,6 +986,7 @@ def _primitive_gaps(
         second_self_current_tensors_D_self_i_m2_s,
         second_mori_memory_matrix_A,
         second_mori_current_coupling_matrix_h,
+        _second_state_memory_value_matrix,
     ) = validate_primitive_input(second_input)
     first_generator_Q_ij_s_inv = compute_reversible_generator(
         first_symmetric_capacity_fluxes_K_ij_mol_m3_s,
@@ -1032,6 +1054,7 @@ def _scalar_readout(
             primitive_input.self_current_tensors_D_self_i_m2_s,
             primitive_input.mori_memory_matrix_A,
             primitive_input.mori_current_coupling_matrix_h,
+            primitive_input.state_memory_value_matrix,
             primitive_input.temperature_K,
             primitive_input.volume_m3,
         ).sigma_mS_cm

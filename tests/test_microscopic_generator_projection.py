@@ -110,6 +110,7 @@ def test_projected_primitive_input_returns_c_k_q_m_and_self_current() -> None:
         ),
         mori_memory_matrix_A=np.zeros((0, 0), dtype=float),
         mori_current_coupling_matrix_h=np.zeros((0, 3), dtype=float),
+        state_memory_value_matrix=np.zeros((2, 0), dtype=float),
         temperature_K=T_REF_K,
         volume_m3=1.0,
     )
@@ -122,6 +123,7 @@ def test_projected_primitive_input_returns_c_k_q_m_and_self_current() -> None:
         primitive_input.self_current_tensors_D_self_i_m2_s,
         primitive_input.mori_memory_matrix_A,
         primitive_input.mori_current_coupling_matrix_h,
+        primitive_input.state_memory_value_matrix,
         primitive_input.temperature_K,
         primitive_input.volume_m3,
     )

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import copy
+import os
+import pickle
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from enum import Enum
 from itertools import product
 from pathlib import Path
-from threading import RLock
+from threading import RLock, get_ident
 
 import numpy as np
 
@@ -41,6 +43,7 @@ from conductivity.physical_library.physical_objects import (
     build_physical_objects,
     compute_atmosphere_resistance_diagnostics,
     compute_charge_polarization_m,
+    compute_born_energy_J_mol,
     compute_local_packing_fraction,
     compute_resistance_component_diagnostics,
 )
@@ -59,6 +62,7 @@ from conductivity.physical_library.library_io import (
     build_recipe_library_context,
 )
 from utils.config_loader import content_hash_files
+from utils.typed_sqlite import sha256_text
 from conductivity.physical_library.reduced_generator import (
     build_projected_generator_input,
 )
@@ -77,6 +81,8 @@ from conductivity.physical_library.transition_moment_bvp import (
 
 Array = np.ndarray
 SUMMATION_ROUNDOFF_EPSILON_FACTOR = 64.0  # Numerical epsilon factor for accumulated sparse-sum roundoff.
+CHAIN_OUTER_CENTER_OFFSET_MULTIPLIER = 3.0 / 2.0  # Four-center chain spacing places outer centers at three half-bonds.
+CHAIN_INNER_CENTER_OFFSET_MULTIPLIER = 1.0 / 2.0  # Four-center chain spacing places inner centers at one half-bond.
 __all__ = ("NumericalOptions", "compute_conductivity_from_recipe")
 NO_TRANSITION_FAMILY = ""
 STATE_KEY_PAIR_FIELD = "pair"
@@ -322,9 +328,11 @@ class NumericalOptions:
 
 @dataclass(frozen=True)
 class MemoryCoordinate:
+    label: str
     family: MemoryCoordinateFamily
     records: PhysicalLibraryRecords
     required_roles: tuple[SpeciesRole, ...]
+    required_species_names: tuple[str, ...]
     value_function: Callable[[PhysicalLibraryRecords, SiteConfiguration], float]
     gradient_function: Callable[[PhysicalLibraryRecords, SiteConfiguration], Array]
 
@@ -367,6 +375,11 @@ class StateChargeMobilityDiagnostics:
     resistance_free_volume_trace_kg_s: float
     resistance_charge_cloud_trace_kg_s: float
     resistance_atmosphere_trace_kg_s: float
+    resistance_cage_constraint_trace_kg_s: float
+    resistance_ligand_shell_obstruction_trace_kg_s: float
+    resistance_aggregate_constraint_trace_kg_s: float
+    resistance_bridge_constraint_trace_kg_s: float
+    resistance_orientation_denticity_trace_kg_s: float
     resistance_total_trace_kg_s: float
     atmosphere_electrophoretic_trace_kg_s: float
     atmosphere_relaxation_trace_kg_s: float
@@ -419,7 +432,18 @@ def compute_conductivity_from_recipe(
     with _CONDUCTIVITY_RESULT_CACHE_LOCK:
         cached_result = _CONDUCTIVITY_RESULT_CACHE.get(cache_key)
     if cached_result is not None:
+        _validate_cached_conductivity_result(cached_result)
         return copy.deepcopy(cached_result)
+    persistent_cache_path = _persistent_conductivity_cache_path(cache_key)
+    if persistent_cache_path.exists():
+        with persistent_cache_path.open("rb") as cache_file:
+            persistent_result = pickle.load(cache_file)
+        if not isinstance(persistent_result, ProjectedConductivityResult):
+            raise TypeError("persistent conductivity cache has wrong result type")
+        _validate_cached_conductivity_result(persistent_result)
+        with _CONDUCTIVITY_RESULT_CACHE_LOCK:
+            _CONDUCTIVITY_RESULT_CACHE[cache_key] = copy.deepcopy(persistent_result)
+        return persistent_result
     conductivity_result = _compute_conductivity_from_recipe_uncached(
         recipe,
         library_root,
@@ -427,7 +451,32 @@ def compute_conductivity_from_recipe(
     )
     with _CONDUCTIVITY_RESULT_CACHE_LOCK:
         _CONDUCTIVITY_RESULT_CACHE[cache_key] = copy.deepcopy(conductivity_result)
+    persistent_cache_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_cache_path = persistent_cache_path.with_suffix(
+        f".{os.getpid()}.{get_ident()}.tmp"
+    )
+    with temporary_cache_path.open("wb") as cache_file:
+        pickle.dump(conductivity_result, cache_file)
+    temporary_cache_path.replace(persistent_cache_path)
     return conductivity_result
+
+
+def _validate_cached_conductivity_result(
+    conductivity_result: ProjectedConductivityResult,
+) -> None:
+    attribution = conductivity_result.effect_attribution
+    if attribution["primitive_prediction_readiness_status"] != "complete":
+        raise ValueError("cached conductivity result is not primitive-ready")
+    if attribution["basis_refinement_convergence_status"] != "converged":
+        raise ValueError("cached conductivity result has unconverged basis")
+    owner_table = tuple(attribution["state_primitive_owner_table"])
+    state_count = len(conductivity_result.state_concentrations_mol_m3)
+    if len(owner_table) != state_count:
+        raise ValueError("cached conductivity owner table length mismatch")
+    ownership_records = tuple(attribution["transport_ownership_state_tensors"])
+    if len(ownership_records) != state_count:
+        raise ValueError("cached conductivity ownership tensor length mismatch")
+    _validate_state_charge_mobility_invariants(conductivity_result)
 
 
 def _conductivity_result_cache_key(
@@ -435,7 +484,13 @@ def _conductivity_result_cache_key(
     library_root: Path,
     numerical_options: NumericalOptions,
 ) -> tuple:
-    library_paths = tuple(sorted(library_root.rglob("*.yaml")))
+    library_paths = tuple(
+        sorted(
+            path
+            for path in library_root.rglob("*")
+            if path.suffix in {".py", ".yaml"}
+        )
+    )
     if not library_paths:
         raise ValueError("physical library contains no YAML records")
     return (
@@ -451,6 +506,11 @@ def _conductivity_result_cache_key(
         int(numerical_options.state_quadrature_order),
         int(numerical_options.transition_grid_count),
     )
+
+
+def _persistent_conductivity_cache_path(cache_key: tuple) -> Path:
+    cache_digest = sha256_text(repr(cache_key))
+    return Path(".conductivity_cache") / f"projected_conductivity_{cache_digest}.pkl"
 
 
 def _compute_conductivity_from_recipe_uncached(
@@ -525,6 +585,10 @@ def _compute_conductivity_from_recipe_uncached(
             state_quadratures=state_quadratures,
             transition_quadratures=transition_quadratures,
             memory_coordinate_gradient_functions=memory_gradient_functions,
+            state_memory_value_matrix=_state_family_memory_value_matrix(
+                state_quadratures,
+                transition_edges,
+            ),
             total_component_concentrations_mol_m3=component_concentrations,
             temperature_K=recipe_context.temperature_K,
             volume_m3=numerical_options.volume_m3,
@@ -556,6 +620,7 @@ def _compute_conductivity_from_recipe_uncached(
         state_quadratures,
         recipe_context.temperature_K,
     )
+    _validate_state_charge_mobility_invariants(conductivity_result)
     _annotate_component_mass_balance_diagnostics(
         conductivity_result,
         projected_components,
@@ -565,7 +630,11 @@ def _compute_conductivity_from_recipe_uncached(
         conductivity_result=conductivity_result,
         records=records,
         template_configuration=template_configuration,
-        reduced_specification=reduced_specification,
+        state_quadratures=state_quadratures,
+        transition_edges=transition_edges,
+    )
+    _annotate_state_primitive_owner_table(
+        conductivity_result=conductivity_result,
         state_quadratures=state_quadratures,
         transition_edges=transition_edges,
     )
@@ -574,6 +643,206 @@ def _compute_conductivity_from_recipe_uncached(
         state_quadratures=state_quadratures,
     )
     return conductivity_result
+
+
+def _validate_state_charge_mobility_invariants(
+    conductivity_result: ProjectedConductivityResult,
+) -> None:
+    attribution = conductivity_result.effect_attribution
+    charge_diffusivities = np.asarray(
+        attribution["state_charged_center_D_Q_zDz_m2_s"], dtype=float
+    )
+    lithium_diffusivities = np.asarray(
+        attribution["state_charged_center_D_Li_m2_s"], dtype=float
+    )
+    anion_diffusivities = np.asarray(
+        attribution["state_charged_center_D_anion_m2_s"], dtype=float
+    )
+    lithium_anion_covariances = np.asarray(
+        attribution["state_charged_center_D_Li_anion_m2_s"], dtype=float
+    )
+    state_labels = tuple(str(label) for label in attribution["state_labels"])
+    expected_shape = (len(state_labels),)
+    diagnostic_arrays = (
+        charge_diffusivities,
+        lithium_diffusivities,
+        anion_diffusivities,
+        lithium_anion_covariances,
+    )
+    if any(array.shape != expected_shape for array in diagnostic_arrays):
+        raise ValueError("state charged-center diagnostic length mismatch")
+    if any(np.any(~np.isfinite(array)) for array in diagnostic_arrays):
+        raise ValueError("state charged-center diagnostics must be finite")
+    if np.any(charge_diffusivities < 0.0):
+        invalid_state_indices = tuple(
+            int(index) for index in np.flatnonzero(charge_diffusivities < 0.0)
+        )
+        raise ValueError(
+            "state charge diffusivity z^T D z must be nonnegative for states "
+            f"{invalid_state_indices}"
+        )
+    reconstructed_charge_diffusivities = (
+        lithium_diffusivities
+        + anion_diffusivities
+        - 2.0 * lithium_anion_covariances
+    )
+    comparison_scale = np.maximum(
+        np.maximum(
+            np.abs(charge_diffusivities),
+            np.abs(reconstructed_charge_diffusivities),
+        ),
+        np.finfo(float).tiny,
+    )
+    invariant_residuals = np.abs(
+        charge_diffusivities - reconstructed_charge_diffusivities
+    )
+    invariant_tolerance = (
+        SUMMATION_ROUNDOFF_EPSILON_FACTOR
+        * np.finfo(float).eps
+        * comparison_scale
+    )
+    invalid_state_indices = tuple(
+        int(index)
+        for index in np.flatnonzero(invariant_residuals > invariant_tolerance)
+    )
+    if invalid_state_indices:
+        invalid_state_labels = tuple(
+            state_labels[index] for index in invalid_state_indices
+        )
+        raise ValueError(
+            "state charged-center mobility violates "
+            "D_Q = D_Li + D_anion - 2 D_Li_anion for states "
+            f"{invalid_state_labels}"
+        )
+
+
+def _annotate_state_primitive_owner_table(
+    conductivity_result: ProjectedConductivityResult,
+    state_quadratures: tuple[PhysicalStateQuadrature, ...],
+    transition_edges: tuple[TransitionEdge, ...],
+) -> None:
+    attribution = conductivity_result.effect_attribution
+    state_count = len(state_quadratures)
+    concentrations = np.asarray(
+        conductivity_result.state_concentrations_mol_m3,
+        dtype=float,
+    )
+    self_current_tensors = np.asarray(
+        conductivity_result.self_current_tensors_D_self_i_m2_s,
+        dtype=float,
+    )
+    ownership_records = tuple(attribution["transport_ownership_state_tensors"])
+    mori_mode_ledger = tuple(attribution["mori_mode_ledger"])
+    if concentrations.size != state_count or self_current_tensors.shape[0] != state_count:
+        raise ValueError("state primitive owner table input length mismatch")
+    incident_transition_indices = tuple(
+        tuple(
+            edge_index
+            for edge_index, edge in enumerate(transition_edges)
+            if state_index in (edge.from_state_index, edge.to_state_index)
+        )
+        for state_index in range(state_count)
+    )
+    state_primitive_owner_table = tuple(
+        {
+            "state_index": state_index,
+            "state_label": state_quadrature.label,
+            "component_stoichiometry": np.asarray(
+                state_quadrature.stoichiometry,
+                dtype=float,
+            ).copy(),
+            "concentration_mol_m3": float(concentrations[state_index]),
+            "owner_classes": _state_primitive_owner_classes(
+                ownership_records[state_index]
+            ),
+            "D_Q_zDz_m2_s": float(
+                attribution["state_charged_center_D_Q_zDz_m2_s"][state_index]
+            ),
+            "D_Li_m2_s": float(
+                attribution["state_charged_center_D_Li_m2_s"][state_index]
+            ),
+            "D_anion_m2_s": float(
+                attribution["state_charged_center_D_anion_m2_s"][state_index]
+            ),
+            "D_Li_anion_m2_s": float(
+                attribution["state_charged_center_D_Li_anion_m2_s"][state_index]
+            ),
+            "c_i_trace_D_self_mol_m_s": float(
+                concentrations[state_index]
+                * np.trace(self_current_tensors[state_index])
+            ),
+            "R_hydro_RPY_trace_kg_s": float(
+                attribution["state_resistance_stokes_traces_kg_s"][state_index]
+            ),
+            "R_shape_trace_kg_s": 0.0,
+            "R_cloud_short_k_trace_kg_s": float(
+                attribution["state_resistance_charge_cloud_traces_kg_s"][state_index]
+            ),
+            "R_atmosphere_electrophoretic_trace_kg_s": float(
+                attribution["state_atmosphere_electrophoretic_traces_kg_s"][
+                    state_index
+                ]
+            ),
+            "R_atmosphere_relaxation_trace_kg_s": float(
+                attribution["state_atmosphere_relaxation_traces_kg_s"][state_index]
+            ),
+            "R_atmosphere_cross_trace_kg_s": float(
+                attribution["state_atmosphere_cation_anion_cross_traces_kg_s"][
+                    state_index
+                ]
+            ),
+            "R_free_volume_trace_kg_s": float(
+                attribution["state_resistance_free_volume_traces_kg_s"][state_index]
+            ),
+            "R_cage_constraint_trace_kg_s": float(
+                attribution["state_resistance_cage_constraint_traces_kg_s"][
+                    state_index
+                ]
+            ),
+            "R_ligand_shell_obstruction_trace_kg_s": float(
+                attribution["state_resistance_ligand_shell_obstruction_traces_kg_s"][
+                    state_index
+                ]
+            ),
+            "R_aggregate_constraint_trace_kg_s": float(
+                attribution["state_resistance_aggregate_constraint_traces_kg_s"][
+                    state_index
+                ]
+            ),
+            "R_bridge_constraint_trace_kg_s": float(
+                attribution["state_resistance_bridge_constraint_traces_kg_s"][
+                    state_index
+                ]
+            ),
+            "R_orientation_denticity_trace_kg_s": float(
+                attribution["state_resistance_orientation_denticity_traces_kg_s"][
+                    state_index
+                ]
+            ),
+            "mori_mode_labels": tuple(
+                str(mode_record["mode_label"])
+                for mode_record in mori_mode_ledger
+                if state_quadrature.label in mode_record["state_support"]
+            ),
+            "incident_transition_edge_indices": incident_transition_indices[state_index],
+        }
+        for state_index, state_quadrature in enumerate(state_quadratures)
+    )
+    attribution["state_primitive_owner_table"] = state_primitive_owner_table
+
+
+def _state_primitive_owner_classes(ownership_record: dict) -> tuple[str, ...]:
+    owner_tensor_fields = (
+        (TransportOwnership.DC_SELF.value, "D_Q_dc_self"),
+        (TransportOwnership.TRANSITION_DISPLACEMENT.value, "D_Q_transition_owned"),
+        (TransportOwnership.BOUNDED_MEMORY.value, "D_Q_bounded_memory"),
+        (TransportOwnership.DIAGNOSTIC.value, "D_Q_diagnostic"),
+    )
+    return tuple(
+        owner_name
+        for owner_name, tensor_field in owner_tensor_fields
+        if float(np.linalg.norm(np.asarray(ownership_record[tensor_field]), ord=2)) > 0.0
+    )
 
 
 def _state_quadratures_with_transport_ownership_bases(
@@ -725,7 +994,6 @@ def _annotate_mori_mode_diagnostics(
     conductivity_result: ProjectedConductivityResult,
     records: PhysicalLibraryRecords,
     template_configuration: SiteConfiguration,
-    reduced_specification: ReducedGeneratorSpecification,
     state_quadratures: tuple[PhysicalStateQuadrature, ...],
     transition_edges: tuple[TransitionEdge, ...],
 ) -> None:
@@ -734,9 +1002,7 @@ def _annotate_mori_mode_diagnostics(
         template_configuration,
         transition_edges,
     )
-    candidate_labels = tuple(
-        coordinate.family.value for coordinate in selected_coordinates
-    )
+    candidate_labels = tuple(coordinate.label for coordinate in selected_coordinates)
     selected_indices = np.asarray(
         conductivity_result.effect_attribution[
             "mori_filter_accepted_candidate_indices"
@@ -751,33 +1017,47 @@ def _annotate_mori_mode_diagnostics(
         conductivity_result.mori_current_coupling_matrix_h,
         dtype=float,
     )
-    if selected_indices.size != memory_matrix.shape[0]:
-        raise ValueError("selected Mori coordinate count does not match final matrix")
-    if current_coupling.shape != (selected_indices.size, CARTESIAN_DIMENSION):
+    state_family_memory_values = _state_family_memory_value_matrix(
+        state_quadratures,
+        transition_edges,
+    )
+    retained_state_family_mode_indices = np.asarray(
+        conductivity_result.effect_attribution[
+            "state_family_memory_retained_indices"
+        ],
+        dtype=int,
+    )
+    state_family_memory_values = state_family_memory_values[
+        :, retained_state_family_mode_indices
+    ]
+    expected_memory_count = selected_indices.size + state_family_memory_values.shape[1]
+    if expected_memory_count != memory_matrix.shape[0]:
+        raise ValueError("continuous and discrete Mori mode counts do not match final matrix")
+    if current_coupling.shape != (expected_memory_count, CARTESIAN_DIMENSION):
         raise ValueError("selected Mori current coupling shape mismatch")
-    if selected_indices.size == 0:
+    if expected_memory_count == 0:
         conductivity_result.effect_attribution["mori_mode_ledger"] = ()
         return
 
-    maximum_candidate_index = int(np.max(selected_indices))
-    if maximum_candidate_index >= len(candidate_labels):
-        raise ValueError("selected Mori coordinate index exceeds candidate labels")
+    if selected_indices.size:
+        maximum_candidate_index = int(np.max(selected_indices))
+        if maximum_candidate_index >= len(candidate_labels):
+            raise ValueError("selected Mori coordinate index exceeds candidate labels")
     memory_solution = symmetric_psd_pseudoinverse(memory_matrix) @ current_coupling
     mode_contributions = np.einsum("ia,ia->i", current_coupling, memory_solution)
     mode_ledger = []
     for selected_position, candidate_index in enumerate(selected_indices):
         supported_state_labels = []
         for state_index, state_quadrature in enumerate(
-            reduced_specification.state_quadratures
+            state_quadratures
         ):
             coordinate_is_active = any(
-                np.linalg.norm(
-                    reduced_specification.memory_coordinate_gradient(point)[
-                        candidate_index
-                    ]
+                candidate_index
+                in np.asarray(
+                    ownership_basis.bounded_memory_mode_indices,
+                    dtype=int,
                 )
-                > 0.0
-                for point in np.asarray(state_quadrature.points, dtype=float)
+                for ownership_basis in state_quadrature.transport_ownership_bases
             )
             if coordinate_is_active:
                 supported_state_labels.append(state_quadratures[state_index].label)
@@ -799,6 +1079,28 @@ def _annotate_mori_mode_diagnostics(
                 "matching_transition_families": matching_transition_families,
             }
         )
+    for family_position in range(state_family_memory_values.shape[1]):
+        matrix_index = selected_indices.size + family_position
+        supported_state_labels = tuple(
+            state_quadrature.label
+            for state_index, state_quadrature in enumerate(state_quadratures)
+            if abs(state_family_memory_values[state_index, family_position])
+            > np.finfo(float).eps
+        )
+        mode_ledger.append(
+            {
+                "mode_label": f"state_family_residence_subspace[{family_position}]",
+                "A_mu_mu": float(memory_matrix[matrix_index, matrix_index]),
+                "h_mu_norm": float(np.linalg.norm(current_coupling[matrix_index])),
+                "h_mu_A_pseudoinverse_h_contribution": float(
+                    mode_contributions[matrix_index]
+                ),
+                "state_support": supported_state_labels,
+                "physical_owner": "state_conditioned_residence_memory",
+                "transport_ownership": TransportOwnership.BOUNDED_MEMORY.value,
+                "matching_transition_families": (),
+            }
+        )
     if not np.isclose(
         float(np.sum(mode_contributions)),
         float(np.trace(conductivity_result.continuous_mori_correction_tensor)),
@@ -817,11 +1119,12 @@ def _memory_coordinate_physical_owner(coordinate_label: str) -> str:
             "bounded_internal_polarization_memory"
         ),
     }
-    if coordinate_label not in owner_by_coordinate:
+    coordinate_family_label = coordinate_label.split("[", maxsplit=1)[0]
+    if coordinate_family_label not in owner_by_coordinate:
         raise ValueError(
             f"missing physical owner for Mori coordinate {coordinate_label}"
         )
-    return owner_by_coordinate[coordinate_label]
+    return owner_by_coordinate[coordinate_family_label]
 
 
 def _memory_transport_ownership(
@@ -837,9 +1140,10 @@ def _memory_transport_ownership(
             "bounded_internal_polarization"
         ),
     }
-    if coordinate_label not in record_key_by_coordinate:
+    coordinate_family_label = coordinate_label.split("[", maxsplit=1)[0]
+    if coordinate_family_label not in record_key_by_coordinate:
         return TransportOwnership.BOUNDED_MEMORY, ()
-    memory_record_key = record_key_by_coordinate[coordinate_label]
+    memory_record_key = record_key_by_coordinate[coordinate_family_label]
     memory_family_record = records.memory_record["memory_records"][memory_record_key]
     ownership = TransportOwnership(str(memory_family_record["transport_ownership"]))
     if ownership not in (
@@ -932,7 +1236,7 @@ def mixture_composition_from_recipe_context(
     recipe_context: RecipeBuildResult,
 ) -> MixtureComposition:
     ion_concentrations_mol_m3: dict[str, float] = {}
-    for component in recipe_context.components:
+    for component in recipe_context.resolved_species:
         role = _species_role(recipe_context.library_records, component.name)
         if role in (SpeciesRole.CATION, SpeciesRole.ANION):
             ion_concentrations_mol_m3[component.name] = component.concentration_mol_m3
@@ -956,7 +1260,7 @@ def build_template_site_configuration(
     site_ids: list[int] = []
     positions: list[Array] = []
     molecule_id = 0
-    for component in recipe_context.components:
+    for component in recipe_context.resolved_species:
         active_component = _component_with_active_recipe_loading(
             recipe_context, component
         )
@@ -1057,11 +1361,31 @@ def build_all_state_quadratures(
                     active_additive_component_names = additive_component_names
                 else:
                     active_additive_component_names = (NO_ACTIVE_ADDITIVE_COMPONENT,)
-                for active_additive_component_name in active_additive_component_names:
+                topology_records = _aggregate_topology_records_for_state(
+                    records,
+                    state_key,
+                )
+                for active_additive_component_name, topology_record in product(
+                    active_additive_component_names,
+                    topology_records,
+                ):
                     additive_state_key = _state_key_with_active_additive(
                         state_key,
                         active_additive_component_name,
                     )
+                    additive_state_key = _state_key_with_aggregate_topology(
+                        additive_state_key,
+                        topology_record,
+                    )
+                    if (
+                        topology_record
+                        and _state_requires_additive_component(additive_state_key)
+                        and int(
+                            topology_record["component_stoichiometry"]["ligand"]
+                        )
+                        == 0
+                    ):
+                        continue
                     state_label_with_components = "|".join(additive_state_key)
                     configurations = _feasible_state_local_transport_configurations(
                         records=records,
@@ -1072,6 +1396,7 @@ def build_all_state_quadratures(
                             active_additive_component_name
                         ),
                         state_key=additive_state_key,
+                        topology_record=topology_record,
                     )
                     if not configurations:
                         continue
@@ -1137,11 +1462,60 @@ def build_all_state_quadratures(
             additive_component_names,
         )
     )
-    return _filter_state_quadratures_by_partition_weight(
+    state_quadratures = _state_quadratures_with_equilibrium_attribution(
         records,
         tuple(quadratures),
         recipe_context.temperature_K,
     )
+    return _filter_state_quadratures_by_partition_weight(
+        records,
+        state_quadratures,
+        recipe_context.temperature_K,
+    )
+
+
+def _state_quadratures_with_equilibrium_attribution(
+    records: PhysicalLibraryRecords,
+    state_quadratures: tuple[PhysicalStateQuadrature, ...],
+    temperature_K: float,
+) -> tuple[PhysicalStateQuadrature, ...]:
+    thermal_energy_J_mol = R * _positive_float(temperature_K, "temperature_K")
+    attributed_quadratures = []
+    for state_quadrature in state_quadratures:
+        attributed_weights = []
+        for configuration, local_fields, weight in zip(
+            state_quadrature.configurations,
+            state_quadrature.local_fields,
+            state_quadrature.weights,
+            strict=True,
+        ):
+            base_potential = build_physical_objects(
+                records,
+                configuration,
+                temperature_K,
+                local_fields.dielectric_constant,
+                local_fields.viscosity_Pa_s,
+                local_fields.ionic_strength_mol_m3,
+                local_fields.local_packing_fraction,
+            ).potential_energy_J_mol
+            attributed_potential = _state_equilibrium_potential_energy_J_mol(
+                records,
+                state_quadrature.label,
+                configuration,
+                local_fields.dielectric_constant,
+                base_potential,
+            )
+            attribution_energy = attributed_potential - base_potential
+            attributed_weights.append(
+                float(weight) * float(np.exp(-attribution_energy / thermal_energy_J_mol))
+            )
+        attributed_quadratures.append(
+            replace(
+                state_quadrature,
+                weights=np.asarray(attributed_weights, dtype=float),
+            )
+        )
+    return tuple(attributed_quadratures)
 
 
 def _state_key_has_valid_transport_topology(state_key: tuple[str, ...]) -> bool:
@@ -1154,6 +1528,37 @@ def _state_key_has_valid_transport_topology(state_key: tuple[str, ...]) -> bool:
         "neutral_ligand_bound",
         "mixed_ligand_anion",
     }
+
+
+def _aggregate_topology_records_for_state(
+    records: PhysicalLibraryRecords,
+    state_key: tuple[str, ...],
+) -> tuple[dict, ...]:
+    cluster_state = _state_key_base_value(state_key[STATE_KEY_CLUSTER_INDEX])
+    if cluster_state not in {"aggregate", "bridge_network"}:
+        return ({},)
+    topology_records = tuple(
+        topology_record
+        for topology_record in records.association_record["aggregate_topologies"].values()
+        if str(topology_record["cluster_family"]) == cluster_state
+    )
+    if not topology_records:
+        raise ValueError(f"aggregate_topology_missing: {cluster_state}")
+    return topology_records
+
+
+def _state_key_with_aggregate_topology(
+    state_key: tuple[str, ...],
+    topology_record: dict,
+) -> tuple[str, ...]:
+    if not topology_record:
+        return state_key
+    key_parts = list(state_key)
+    cluster_family = str(topology_record["cluster_family"])
+    key_parts[STATE_KEY_CLUSTER_INDEX] = (
+        f'{cluster_family}{STATE_KEY_COMPONENT_SEPARATOR}{topology_record["topology_id"]}'
+    )
+    return tuple(key_parts)
 
 
 def _additive_reservoir_state_quadratures(
@@ -1382,10 +1787,16 @@ def _transport_state_stoichiometry(
     is_additive_reservoir_state = (
         state_key[STATE_KEY_PAIR_INDEX] == PAIR_STATE_FREE_ADDITIVE_RESERVOIR
     )
+    topology_record = _aggregate_topology_record_from_state_key(records, state_key)
+    topology_stoichiometry = (
+        topology_record["component_stoichiometry"] if topology_record else {}
+    )
     for component_index, component_name in enumerate(component_names):
         component_role = _species_role(records, component_name)
         if component_role == SpeciesRole.CATION and not is_additive_reservoir_state:
-            stoichiometry[component_index] = 1.0
+            stoichiometry[component_index] = float(
+                topology_stoichiometry.get("Li", 1)
+            )
             continue
         if component_role == SpeciesRole.CATION:
             continue
@@ -1393,7 +1804,9 @@ def _transport_state_stoichiometry(
             component_role == SpeciesRole.ANION
             and component_name == active_anion_component_name
         ):
-            stoichiometry[component_index] = 1.0
+            stoichiometry[component_index] = float(
+                topology_stoichiometry.get("A", 1)
+            )
             continue
         if component_role == SpeciesRole.ANION:
             continue
@@ -1409,6 +1822,25 @@ def _transport_state_stoichiometry(
     if float(np.sum(stoichiometry)) <= 0.0:
         raise ValueError("transport state stoichiometry is empty")
     return stoichiometry
+
+
+def _aggregate_topology_record_from_state_key(
+    records: PhysicalLibraryRecords,
+    state_key: tuple[str, ...],
+) -> dict:
+    cluster_value = state_key[STATE_KEY_CLUSTER_INDEX]
+    if STATE_KEY_COMPONENT_SEPARATOR not in cluster_value:
+        return {}
+    cluster_family, topology_id = cluster_value.split(
+        STATE_KEY_COMPONENT_SEPARATOR,
+        maxsplit=1,
+    )
+    if cluster_family not in {"aggregate", "bridge_network"}:
+        return {}
+    topology_records = records.association_record["aggregate_topologies"]
+    if topology_id not in topology_records:
+        raise ValueError(f"aggregate_topology_missing: {topology_id}")
+    return topology_records[topology_id]
 
 
 def _state_additive_stoichiometry(state_key: tuple[str, ...]) -> float:
@@ -1616,7 +2048,25 @@ def _feasible_state_local_transport_configurations(
     active_anion_component_name: str,
     active_additive_component_name: str,
     state_key: tuple[str, ...],
+    topology_record: dict,
 ) -> tuple[SiteConfiguration, ...]:
+    if topology_record:
+        return tuple(
+            _configuration_for_aggregate_topology(
+                records,
+                _state_local_transport_configuration_from_coordinates(
+                    records=records,
+                    template_configuration=template_configuration,
+                    coordinate_values=coordinate_values,
+                    active_anion_component_name=active_anion_component_name,
+                    active_additive_component_name=active_additive_component_name,
+                    state_key=state_key,
+                ),
+                topology_record,
+                float(coordinate_values[ReducedCoordinate.LI_ANION_DISTANCE.value]),
+            )
+            for coordinate_values in coordinate_values_by_node
+        )
     if _state_key_base_value(state_key[STATE_KEY_PAIR_INDEX]) == "addSSIP":
         unseparated_configurations = tuple(
             _configured_state_from_reduced_coordinates(
@@ -1649,6 +2099,210 @@ def _feasible_state_local_transport_configurations(
         )
         for coordinate_values in coordinate_values_by_node
     )
+
+
+def _configuration_for_aggregate_topology(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+    topology_record: dict,
+    pair_distance_m: float,
+) -> SiteConfiguration:
+    pair_distance = _positive_float(pair_distance_m, "aggregate topology distance")
+    component_stoichiometry = topology_record["component_stoichiometry"]
+    cation_count = int(component_stoichiometry["Li"])
+    anion_count = int(component_stoichiometry["A"])
+    ligand_count = int(component_stoichiometry["ligand"])
+    if cation_count < int(topology_record["minimum_cation_count"]):
+        raise ValueError("aggregate_multiplicity_mismatch: cation count")
+    if anion_count < int(topology_record["minimum_anion_count"]):
+        raise ValueError("aggregate_multiplicity_mismatch: anion count")
+    if ligand_count < int(topology_record["minimum_ligand_count"]):
+        raise ValueError("aggregate_multiplicity_mismatch: ligand count")
+
+    cation_indices = _first_molecule_indices_with_role(
+        records, configuration, SpeciesRole.CATION
+    )
+    anion_indices = _first_molecule_indices_with_role(
+        records, configuration, SpeciesRole.ANION
+    )
+    pair_axis = _aggregate_pair_axis(
+        records,
+        configuration,
+        cation_indices,
+        anion_indices,
+    )
+    center_positions = _aggregate_topology_center_positions(
+        topology_record,
+        pair_distance,
+        pair_axis,
+    )
+    retained_indices = tuple(
+        site_index
+        for site_index, species_name in enumerate(configuration.species_names)
+        if _species_role(records, species_name)
+        not in (SpeciesRole.CATION, SpeciesRole.ANION)
+    )
+    species_names = [configuration.species_names[index] for index in retained_indices]
+    site_ids = [int(configuration.site_ids[index]) for index in retained_indices]
+    positions_m = [
+        np.asarray(configuration.unwrapped_positions_m[index], dtype=float)
+        for index in retained_indices
+    ]
+    molecule_ids = [int(configuration.molecule_ids[index]) for index in retained_indices]
+    next_molecule_id = max(molecule_ids, default=-1) + 1
+    source_indices_by_role = {
+        "Li": cation_indices,
+        "A": anion_indices,
+    }
+    formal_charge_number = 0.0
+    for center_id, target_center_m in center_positions:
+        center_role = "Li" if center_id.startswith("Li") else "A"
+        source_indices = source_indices_by_role[center_role]
+        species_name = configuration.species_names[source_indices[0]]
+        source_molecule_id = int(configuration.molecule_ids[source_indices[0]])
+        source_center_m = molecule_center_of_mass_m(
+            records,
+            configuration,
+            species_name,
+            source_molecule_id,
+        )
+        for source_index in source_indices:
+            species_names.append(species_name)
+            site_ids.append(int(configuration.site_ids[source_index]))
+            positions_m.append(
+                np.asarray(configuration.unwrapped_positions_m[source_index], dtype=float)
+                - source_center_m
+                + target_center_m
+            )
+            molecule_ids.append(next_molecule_id)
+        formal_charge_number += float(
+            records.species_records[species_name]["formal_charge_e"]
+        )
+        next_molecule_id += 1
+    if formal_charge_number != float(topology_record["net_formal_charge_e"]):
+        raise ValueError("aggregate_charge_mismatch")
+    unwrapped_positions_m = np.asarray(positions_m, dtype=float)
+    box_lengths_m = np.asarray(configuration.box_lengths_m, dtype=float)
+    wrapped_positions_m = unwrapped_positions_m - box_lengths_m * np.floor(
+        unwrapped_positions_m / box_lengths_m
+    )
+    aggregate_configuration = SiteConfiguration(
+        species_names=tuple(species_names),
+        molecule_ids=np.asarray(molecule_ids, dtype=int),
+        site_ids=np.asarray(site_ids, dtype=int),
+        positions_m=wrapped_positions_m,
+        unwrapped_positions_m=unwrapped_positions_m,
+        box_lengths_m=box_lengths_m,
+    )
+    _validate_aggregate_graph_distances(
+        records,
+        aggregate_configuration,
+        topology_record,
+        pair_distance,
+    )
+    return aggregate_configuration
+
+
+def _aggregate_pair_axis(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+    cation_indices: tuple[int, ...],
+    anion_indices: tuple[int, ...],
+) -> Array:
+    cation_species_name = configuration.species_names[cation_indices[0]]
+    anion_species_name = configuration.species_names[anion_indices[0]]
+    cation_center_m = molecule_center_of_mass_m(
+        records,
+        configuration,
+        cation_species_name,
+        int(configuration.molecule_ids[cation_indices[0]]),
+    )
+    anion_center_m = molecule_center_of_mass_m(
+        records,
+        configuration,
+        anion_species_name,
+        int(configuration.molecule_ids[anion_indices[0]]),
+    )
+    pair_axis = _minimum_image_vector_m(
+        cation_center_m, anion_center_m, configuration.box_lengths_m
+    )
+    return pair_axis / _positive_float(float(np.linalg.norm(pair_axis)), "aggregate pair axis")
+
+
+def _aggregate_topology_center_positions(
+    topology_record: dict,
+    pair_distance_m: float,
+    pair_axis: Array,
+) -> tuple[tuple[str, Array], ...]:
+    topology_id = str(topology_record["topology_id"])
+    if topology_id == "Li2A_positive":
+        return (
+            ("Li0", -pair_distance_m * pair_axis),
+            ("A0", np.zeros(CARTESIAN_DIMENSION)),
+            ("Li1", pair_distance_m * pair_axis),
+        )
+    if topology_id == "LiA2_negative":
+        return (
+            ("Li0", np.zeros(CARTESIAN_DIMENSION)),
+            ("A0", -pair_distance_m * pair_axis),
+            ("A1", pair_distance_m * pair_axis),
+        )
+    if topology_id == "Li2A2_neutral":
+        return tuple(
+            (center_id, multiplier * pair_distance_m * pair_axis)
+            for center_id, multiplier in (
+                ("Li0", -CHAIN_OUTER_CENTER_OFFSET_MULTIPLIER),
+                ("A0", -CHAIN_INNER_CENTER_OFFSET_MULTIPLIER),
+                ("Li1", CHAIN_INNER_CENTER_OFFSET_MULTIPLIER),
+                ("A1", CHAIN_OUTER_CENTER_OFFSET_MULTIPLIER),
+            )
+        )
+    if str(topology_record["cluster_family"]) == "bridge_network":
+        basis_axes = np.eye(CARTESIAN_DIMENSION)
+        basis_axis = basis_axes[int(np.argmin(np.abs(basis_axes @ pair_axis)))]
+        second_axis = basis_axis - float(np.dot(basis_axis, pair_axis)) * pair_axis
+        second_axis /= _positive_float(float(np.linalg.norm(second_axis)), "bridge second axis")
+        radial_offset_m = pair_distance_m / np.sqrt(2.0)
+        return (
+            ("Li0", radial_offset_m * pair_axis),
+            ("A0", radial_offset_m * second_axis),
+            ("Li1", -radial_offset_m * pair_axis),
+            ("A1", -radial_offset_m * second_axis),
+        )
+    raise ValueError(f"aggregate_topology_missing: {topology_id}")
+
+
+def _validate_aggregate_graph_distances(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+    topology_record: dict,
+    pair_distance_m: float,
+) -> None:
+    center_positions = {}
+    role_molecules = {
+        "Li": _molecule_site_index_groups_with_role(records, configuration, SpeciesRole.CATION),
+        "A": _molecule_site_index_groups_with_role(records, configuration, SpeciesRole.ANION),
+    }
+    for role_name, molecule_groups in role_molecules.items():
+        for molecule_index, molecule_indices in enumerate(molecule_groups):
+            species_name = configuration.species_names[molecule_indices[0]]
+            center_positions[f"{role_name}{molecule_index}"] = molecule_center_of_mass_m(
+                records, configuration, species_name, int(configuration.molecule_ids[molecule_indices[0]])
+            )
+    tolerance_m = (
+        np.finfo(float).eps
+        * pair_distance_m
+        * SUMMATION_ROUNDOFF_EPSILON_FACTOR
+    )
+    for first_center_id, second_center_id in topology_record["graph_edges"]:
+        distance_m = float(
+            np.linalg.norm(
+                center_positions[second_center_id]
+                - center_positions[first_center_id]
+            )
+        )
+        if abs(distance_m - pair_distance_m) > tolerance_m:
+            raise ValueError("aggregate_multiplicity_mismatch: graph-edge distance")
 
 
 def _ligand_separator_geometry_is_feasible(
@@ -1901,18 +2555,134 @@ def _state_log_partition_value(
     )
 
 
+def _state_equilibrium_potential_energy_J_mol(
+    records: PhysicalLibraryRecords,
+    state_label: str,
+    configuration: SiteConfiguration,
+    dielectric_constant: float,
+    base_potential_energy_J_mol: float,
+) -> float:
+    state_key = _state_key_from_label(state_label)
+    association_energy_J_mol = _state_feature_sum(
+        records.association_record["association_residual"],
+        state_key,
+        "population_operator_missing",
+    )
+    occluded_fraction = _state_feature_sum(
+        records.association_record["state_resolved_born"],
+        state_key,
+        "state_resolved_born_missing",
+    )
+    if occluded_fraction < 0.0 or occluded_fraction >= 1.0:
+        raise ValueError("state-resolved Born occlusion fraction must be in [0, 1)")
+    born_energy_J_mol = compute_born_energy_J_mol(
+        records,
+        configuration,
+        dielectric_constant,
+    )
+    desolvation_energy_J_mol = -born_energy_J_mol * occluded_fraction
+    return _finite_float(
+        base_potential_energy_J_mol
+        + association_energy_J_mol
+        + desolvation_energy_J_mol,
+        f"{state_label}.state_equilibrium_potential_energy_J_mol",
+    )
+
+
+def _state_feature_sum(
+    operator_record: dict,
+    state_key: tuple[str, ...],
+    failure_class: str,
+) -> float:
+    state_index_by_feature = {
+        "pair": STATE_KEY_PAIR_INDEX,
+        "shell": STATE_KEY_SHELL_INDEX,
+        "ligand": STATE_KEY_LIGAND_INDEX,
+        "cluster": STATE_KEY_CLUSTER_INDEX,
+        "orientation": STATE_KEY_ORIENTATION_INDEX,
+    }
+    total = 0.0
+    for feature_name, coefficients in operator_record["state_features"].items():
+        if feature_name not in state_index_by_feature:
+            raise ValueError(f"{failure_class}: unsupported state feature {feature_name}")
+        state_value = _state_key_base_value(
+            state_key[state_index_by_feature[feature_name]]
+        )
+        if state_value not in coefficients:
+            raise KeyError(
+                f"{failure_class}: missing {feature_name} record for {state_value}"
+            )
+        total += float(coefficients[state_value])
+    return _finite_float(total, f"{failure_class}.state_feature_sum")
+
+
 def build_self_current_projector(
     state_key: tuple[str, ...],
     configuration: SiteConfiguration,
     records: PhysicalLibraryRecords,
 ) -> Array:
-    _ = state_key
-    _ = records
     coordinate_count = (
         len(configuration.species_names) * CARTESIAN_DIMENSION
         + LOCAL_FIELD_VECTOR_LENGTH
     )
-    return np.eye(coordinate_count, dtype=float)
+    projector = np.zeros((coordinate_count, coordinate_count), dtype=float)
+    molecule_site_indices: dict[tuple[str, int], list[int]] = {}
+    for site_index, (species_name, molecule_id) in enumerate(
+        zip(
+            configuration.species_names,
+            np.asarray(configuration.molecule_ids, dtype=int),
+            strict=True,
+        )
+    ):
+        molecule_site_indices.setdefault(
+            (species_name, int(molecule_id)), []
+        ).append(site_index)
+    topology_record = _aggregate_topology_record_from_state_key(records, state_key)
+    if topology_record:
+        charged_cluster_site_indices = tuple(
+            site_index
+            for (species_name, _molecule_id), site_indices in molecule_site_indices.items()
+            if float(records.species_records[species_name]["formal_charge_e"]) != 0.0
+            for site_index in site_indices
+        )
+        _assign_translation_projector_block(
+            projector,
+            charged_cluster_site_indices,
+        )
+    else:
+        for (species_name, _molecule_id), site_indices in molecule_site_indices.items():
+            formal_charge_number = float(
+                records.species_records[species_name]["formal_charge_e"]
+            )
+            if formal_charge_number == 0.0:
+                continue
+            _assign_translation_projector_block(projector, tuple(site_indices))
+    if not np.allclose(projector, projector.T):
+        raise ValueError("self-current coordinate projector must be symmetric")
+    if not np.allclose(projector @ projector, projector):
+        raise ValueError("self-current coordinate projector must be idempotent")
+    return projector
+
+
+def _assign_translation_projector_block(
+    projector: Array,
+    site_indices: tuple[int, ...],
+) -> None:
+    if not site_indices:
+        raise ValueError("self-current translation projector requires molecular sites")
+    translation_weight = 1.0 / len(site_indices)
+    for first_site_index in site_indices:
+        for second_site_index in site_indices:
+            for cartesian_index in range(CARTESIAN_DIMENSION):
+                first_coordinate_index = (
+                    first_site_index * CARTESIAN_DIMENSION + cartesian_index
+                )
+                second_coordinate_index = (
+                    second_site_index * CARTESIAN_DIMENSION + cartesian_index
+                )
+                projector[first_coordinate_index, second_coordinate_index] = (
+                    translation_weight
+                )
 
 
 def _group_state_quadrature_nodes(
@@ -1956,6 +2726,7 @@ def _group_state_quadrature_nodes(
             coordinate_values,
             state_node.active_coordinates,
         )
+        state_key = _population_basin_state_key(state_key)
         state_label = "|".join(state_key)
         if state_label not in grouped_quadrature:
             grouped_quadrature[state_label] = StateQuadratureGroup(
@@ -1974,6 +2745,17 @@ def _group_state_quadrature_nodes(
         )
         grouped_quadrature[state_label].weights.append(coordinate_weight)
     return grouped_quadrature
+
+
+def _population_basin_state_key(state_key: tuple[str, ...]) -> tuple[str, ...]:
+    if len(state_key) != STATE_KEY_LENGTH:
+        raise ValueError("state key has wrong length")
+    population_key = list(state_key)
+    population_key[STATE_KEY_ORIENTATION_INDEX] = "free_rotating"
+    population_key[STATE_KEY_PARTNER_INDEX] = "partner_inactive"
+    population_key[STATE_KEY_CAGE_INDEX] = "cage_inactive"
+    population_key[STATE_KEY_ATMOSPHERE_INDEX] = "atmosphere_inactive"
+    return tuple(population_key)
 
 
 def _state_node_quadrature_weights(
@@ -4929,8 +5711,15 @@ def _validate_state_transport_owner_closure(
                 diagnostic_tensor,
             )
         )
+        maximum_coordinate_support_rank = max(
+            point_tensor.coordinate_support_rank
+            for point_tensor in conductivity_result.state_transport_ownership_quadratures[
+                state_index
+            ].point_tensors
+        )
         ownership_tolerance = max(
             len(state_quadrature.configurations)
+            * maximum_coordinate_support_rank
             * np.sqrt(np.finfo(float).eps)
             * ownership_subtraction_scale,
             float(
@@ -5353,7 +6142,7 @@ def _annotate_state_charge_mobility_diagnostics(
             ),
             "state_charged_center_D_Li_anion_m2_s": np.asarray(
                 [
-                    diagnostic.cation_anion_cross_mobility_m2_s
+                    diagnostic.cation_anion_center_mobility_m2_s
                     for diagnostic in diagnostics
                 ],
                 dtype=float,
@@ -5420,6 +6209,35 @@ def _annotate_state_charge_mobility_diagnostics(
             "state_resistance_atmosphere_traces_kg_s": np.asarray(
                 [
                     diagnostic.resistance_atmosphere_trace_kg_s
+                    for diagnostic in diagnostics
+                ],
+                dtype=float,
+            ),
+            "state_resistance_cage_constraint_traces_kg_s": np.asarray(
+                [diagnostic.resistance_cage_constraint_trace_kg_s for diagnostic in diagnostics],
+                dtype=float,
+            ),
+            "state_resistance_ligand_shell_obstruction_traces_kg_s": np.asarray(
+                [
+                    diagnostic.resistance_ligand_shell_obstruction_trace_kg_s
+                    for diagnostic in diagnostics
+                ],
+                dtype=float,
+            ),
+            "state_resistance_aggregate_constraint_traces_kg_s": np.asarray(
+                [
+                    diagnostic.resistance_aggregate_constraint_trace_kg_s
+                    for diagnostic in diagnostics
+                ],
+                dtype=float,
+            ),
+            "state_resistance_bridge_constraint_traces_kg_s": np.asarray(
+                [diagnostic.resistance_bridge_constraint_trace_kg_s for diagnostic in diagnostics],
+                dtype=float,
+            ),
+            "state_resistance_orientation_denticity_traces_kg_s": np.asarray(
+                [
+                    diagnostic.resistance_orientation_denticity_trace_kg_s
                     for diagnostic in diagnostics
                 ],
                 dtype=float,
@@ -5637,6 +6455,45 @@ def _state_charge_mobility_diagnostics(
                 normalized_weights,
                 [
                     diagnostic.resistance_atmosphere_trace_kg_s
+                    for diagnostic in point_diagnostics
+                ],
+            )
+        ),
+        resistance_cage_constraint_trace_kg_s=float(
+            np.dot(
+                normalized_weights,
+                [diagnostic.resistance_cage_constraint_trace_kg_s for diagnostic in point_diagnostics],
+            )
+        ),
+        resistance_ligand_shell_obstruction_trace_kg_s=float(
+            np.dot(
+                normalized_weights,
+                [
+                    diagnostic.resistance_ligand_shell_obstruction_trace_kg_s
+                    for diagnostic in point_diagnostics
+                ],
+            )
+        ),
+        resistance_aggregate_constraint_trace_kg_s=float(
+            np.dot(
+                normalized_weights,
+                [
+                    diagnostic.resistance_aggregate_constraint_trace_kg_s
+                    for diagnostic in point_diagnostics
+                ],
+            )
+        ),
+        resistance_bridge_constraint_trace_kg_s=float(
+            np.dot(
+                normalized_weights,
+                [diagnostic.resistance_bridge_constraint_trace_kg_s for diagnostic in point_diagnostics],
+            )
+        ),
+        resistance_orientation_denticity_trace_kg_s=float(
+            np.dot(
+                normalized_weights,
+                [
+                    diagnostic.resistance_orientation_denticity_trace_kg_s
                     for diagnostic in point_diagnostics
                 ],
             )
@@ -5956,6 +6813,21 @@ def _state_charge_mobility_point_terms(
         ),
         resistance_atmosphere_trace_kg_s=float(
             resistance_diagnostics.atmosphere_trace_kg_s
+        ),
+        resistance_cage_constraint_trace_kg_s=float(
+            resistance_diagnostics.cage_constraint_trace_kg_s
+        ),
+        resistance_ligand_shell_obstruction_trace_kg_s=float(
+            resistance_diagnostics.ligand_shell_obstruction_trace_kg_s
+        ),
+        resistance_aggregate_constraint_trace_kg_s=float(
+            resistance_diagnostics.aggregate_constraint_trace_kg_s
+        ),
+        resistance_bridge_constraint_trace_kg_s=float(
+            resistance_diagnostics.bridge_constraint_trace_kg_s
+        ),
+        resistance_orientation_denticity_trace_kg_s=float(
+            resistance_diagnostics.orientation_denticity_trace_kg_s
         ),
         resistance_total_trace_kg_s=float(resistance_diagnostics.total_trace_kg_s),
         atmosphere_electrophoretic_trace_kg_s=float(
@@ -6710,11 +7582,27 @@ def _selected_memory_coordinates(
     implemented_coordinate_families = {
         memory_coordinate.family.value for memory_coordinate in memory_coordinates
     }
+    present_roles = {
+        _species_role(records, species_name)
+        for species_name in template_configuration.species_names
+    }
+    required_role_by_declared_family = {
+        "atmosphere_polarization": SpeciesRole.ANION,
+        "charge_density_relaxation": SpeciesRole.ANION,
+        "cage_backjump": SpeciesRole.ANION,
+        "partner_residence": SpeciesRole.ANION,
+        "ligand_shell_residence": SpeciesRole.ADDITIVE,
+        "anion_orientation": SpeciesRole.ANION,
+        "bounded_internal_polarization": SpeciesRole.ANION,
+    }
     missing_families = []
     for declared_family in records.memory_record["memory_records"]:
         declared_family_name = str(declared_family)
         if declared_family_name not in implemented_family_map:
             missing_families.append(declared_family_name)
+            continue
+        required_role = required_role_by_declared_family[declared_family_name]
+        if required_role not in present_roles:
             continue
         implementation_names = implemented_family_map[declared_family_name]
         if implemented_coordinate_families.isdisjoint(implementation_names):
@@ -6758,58 +7646,164 @@ def build_default_memory_coordinates(
     template_configuration: SiteConfiguration,
 ) -> tuple[MemoryCoordinate, ...]:
     """Build current-coupled memory coordinates from physical records."""
+    active_species_names = tuple(dict.fromkeys(template_configuration.species_names))
+    anion_species_names = tuple(
+        species_name
+        for species_name in active_species_names
+        if _species_role(records, species_name) == SpeciesRole.ANION
+    )
+    additive_species_names = tuple(
+        species_name
+        for species_name in active_species_names
+        if _species_role(records, species_name) == SpeciesRole.ADDITIVE
+    )
+    coordinates: list[MemoryCoordinate] = []
+    for anion_species_name in anion_species_names:
+        coordinates.extend(
+            (
+                MemoryCoordinate(
+                    label=f"cage_backjump[{anion_species_name}]",
+                    family=MemoryCoordinateFamily.CAGE_BACKJUMP,
+                    records=records,
+                    required_roles=(SpeciesRole.CATION, SpeciesRole.ANION),
+                    required_species_names=(anion_species_name,),
+                    value_function=_cage_backjump_memory_value,
+                    gradient_function=_memory_pair_distance_gradient,
+                ),
+                MemoryCoordinate(
+                    label=f"partner_residence[{anion_species_name}]",
+                    family=MemoryCoordinateFamily.PARTNER_RESIDENCE,
+                    records=records,
+                    required_roles=(SpeciesRole.CATION, SpeciesRole.ANION),
+                    required_species_names=(anion_species_name,),
+                    value_function=_partner_residence_memory_value,
+                    gradient_function=_memory_li_anion_coordination_gradient,
+                ),
+                MemoryCoordinate(
+                    label=f"anion_orientation[{anion_species_name}]",
+                    family=MemoryCoordinateFamily.ANION_ORIENTATION,
+                    records=records,
+                    required_roles=(SpeciesRole.ANION,),
+                    required_species_names=(anion_species_name,),
+                    value_function=_anion_orientation_memory_value,
+                    gradient_function=_anion_orientation_memory_gradient,
+                ),
+            )
+        )
+        for axis_name, value_function, gradient_function in (
+            (
+                "x",
+                _bounded_internal_polarization_x_memory_value,
+                _bounded_internal_polarization_x_memory_gradient,
+            ),
+            (
+                "y",
+                _bounded_internal_polarization_y_memory_value,
+                _bounded_internal_polarization_y_memory_gradient,
+            ),
+            (
+                "z",
+                _bounded_internal_polarization_z_memory_value,
+                _bounded_internal_polarization_z_memory_gradient,
+            ),
+        ):
+            coordinates.append(
+                MemoryCoordinate(
+                    label=(
+                        "bounded_internal_polarization"
+                        f"[{anion_species_name},{axis_name}]"
+                    ),
+                    family=MemoryCoordinateFamily.BOUNDED_INTERNAL_POLARIZATION,
+                    records=records,
+                    required_roles=(SpeciesRole.CATION, SpeciesRole.ANION),
+                    required_species_names=(anion_species_name,),
+                    value_function=value_function,
+                    gradient_function=gradient_function,
+                )
+            )
+    for additive_species_name in additive_species_names:
+        coordinates.append(
+            MemoryCoordinate(
+                label=f"ligand_shell[{additive_species_name}]",
+                family=MemoryCoordinateFamily.LIGAND_SHELL,
+                records=records,
+                required_roles=(SpeciesRole.CATION, SpeciesRole.ADDITIVE),
+                required_species_names=(additive_species_name,),
+                value_function=_ligand_shell_memory_value,
+                gradient_function=_memory_li_ligand_coordination_gradient,
+            )
+        )
+    return tuple(coordinates)
 
-    _ = template_configuration
-    return (
-        MemoryCoordinate(
-            family=MemoryCoordinateFamily.CAGE_BACKJUMP,
-            records=records,
-            required_roles=(SpeciesRole.CATION, SpeciesRole.ANION),
-            value_function=_cage_backjump_memory_value,
-            gradient_function=_memory_pair_distance_gradient,
-        ),
-        MemoryCoordinate(
-            family=MemoryCoordinateFamily.PARTNER_RESIDENCE,
-            records=records,
-            required_roles=(SpeciesRole.CATION, SpeciesRole.ANION),
-            value_function=_partner_residence_memory_value,
-            gradient_function=_memory_li_anion_coordination_gradient,
-        ),
-        MemoryCoordinate(
-            family=MemoryCoordinateFamily.LIGAND_SHELL,
-            records=records,
-            required_roles=(SpeciesRole.CATION, SpeciesRole.ADDITIVE),
-            value_function=_ligand_shell_memory_value,
-            gradient_function=_memory_li_ligand_coordination_gradient,
-        ),
-        MemoryCoordinate(
-            family=MemoryCoordinateFamily.ANION_ORIENTATION,
-            records=records,
-            required_roles=(SpeciesRole.ANION,),
-            value_function=_anion_orientation_memory_value,
-            gradient_function=_anion_orientation_memory_gradient,
-        ),
-        MemoryCoordinate(
-            family=MemoryCoordinateFamily.BOUNDED_INTERNAL_POLARIZATION,
-            records=records,
-            required_roles=(SpeciesRole.CATION, SpeciesRole.ANION),
-            value_function=_bounded_internal_polarization_x_memory_value,
-            gradient_function=_bounded_internal_polarization_x_memory_gradient,
-        ),
-        MemoryCoordinate(
-            family=MemoryCoordinateFamily.BOUNDED_INTERNAL_POLARIZATION,
-            records=records,
-            required_roles=(SpeciesRole.CATION, SpeciesRole.ANION),
-            value_function=_bounded_internal_polarization_y_memory_value,
-            gradient_function=_bounded_internal_polarization_y_memory_gradient,
-        ),
-        MemoryCoordinate(
-            family=MemoryCoordinateFamily.BOUNDED_INTERNAL_POLARIZATION,
-            records=records,
-            required_roles=(SpeciesRole.CATION, SpeciesRole.ANION),
-            value_function=_bounded_internal_polarization_z_memory_value,
-            gradient_function=_bounded_internal_polarization_z_memory_gradient,
-        ),
+
+def _state_family_memory_keys(
+    state_quadratures: tuple[PhysicalStateQuadrature, ...],
+) -> tuple[tuple[str, ...], ...]:
+    family_indices = (
+        STATE_KEY_ANION_INDEX,
+        STATE_KEY_PAIR_INDEX,
+        STATE_KEY_LIGAND_INDEX,
+        STATE_KEY_CLUSTER_INDEX,
+        STATE_KEY_CAGE_INDEX,
+        STATE_KEY_ORIENTATION_INDEX,
+    )
+    return tuple(
+        tuple(_state_key_from_label(state_quadrature.label)[index] for index in family_indices)
+        for state_quadrature in state_quadratures
+    )
+
+
+def _state_family_memory_value_matrix(
+    state_quadratures: tuple[PhysicalStateQuadrature, ...],
+    transition_edges: tuple[TransitionEdge, ...],
+) -> Array:
+    state_family_keys = _state_family_memory_keys(state_quadratures)
+    unique_family_keys = _active_state_family_memory_keys(
+        state_family_keys,
+        transition_edges,
+    )
+    indicator_matrix = np.asarray(
+        [
+            [float(state_family_key == candidate_key) for candidate_key in unique_family_keys]
+            for state_family_key in state_family_keys
+        ],
+        dtype=float,
+    )
+    if indicator_matrix.size == 0:
+        return np.zeros((len(state_quadratures), 0), dtype=float)
+    centered_matrix = indicator_matrix - np.mean(indicator_matrix, axis=0, keepdims=True)
+    left_vectors, singular_values, _right_vectors = np.linalg.svd(
+        centered_matrix,
+        full_matrices=False,
+    )
+    if singular_values.size == 0:
+        return np.zeros((len(state_quadratures), 0), dtype=float)
+    rank_tolerance = (
+        max(centered_matrix.shape)
+        * np.finfo(float).eps
+        * float(singular_values[0])
+    )
+    retained_rank = int(np.count_nonzero(singular_values > rank_tolerance))
+    return left_vectors[:, :retained_rank]
+
+
+def _active_state_family_memory_keys(
+    state_family_keys: tuple[tuple[str, ...], ...],
+    transition_edges: tuple[TransitionEdge, ...],
+) -> tuple[tuple[str, ...], ...]:
+    crossed_family_keys = {
+        state_family_keys[state_index]
+        for transition_edge in transition_edges
+        for state_index, other_state_index in (
+            (transition_edge.from_state_index, transition_edge.to_state_index),
+            (transition_edge.to_state_index, transition_edge.from_state_index),
+        )
+        if state_family_keys[state_index] != state_family_keys[other_state_index]
+    }
+    return tuple(
+        family_key
+        for family_key in dict.fromkeys(state_family_keys)
+        if family_key in crossed_family_keys
     )
 
 
@@ -6877,7 +7871,13 @@ def _memory_coordinate_is_supported(
         _species_role(memory_coordinate.records, species_name)
         for species_name in configuration.species_names
     }
-    return all(role in present_roles for role in memory_coordinate.required_roles)
+    present_species_names = set(configuration.species_names)
+    return all(
+        role in present_roles for role in memory_coordinate.required_roles
+    ) and all(
+        species_name in present_species_names
+        for species_name in memory_coordinate.required_species_names
+    )
 
 
 def _memory_gradient_row(gradient: Array) -> Array:
@@ -7352,7 +8352,7 @@ def _recipe_has_role(
     recipe_context: RecipeBuildResult,
     role: SpeciesRole,
 ) -> bool:
-    for component in recipe_context.components:
+    for component in recipe_context.resolved_species:
         if _species_role(recipe_context.library_records, component.name) == role:
             return True
     return False
@@ -7708,7 +8708,7 @@ def _state_distance_bounds(
     ]
     if any(
         _species_role(records, component.name) == SpeciesRole.ADDITIVE
-        for component in recipe_context.components
+        for component in recipe_context.resolved_species
     ):
         specs.append(("addSSIP", contact_cutoff_m, solvent_separated_cutoff_m))
     return tuple(specs)
@@ -7746,9 +8746,9 @@ def _normalize_potential_energy_reference(
 
 
 def _projected_mass_balance_components(recipe_context: RecipeBuildResult):
-    components = tuple(
+    unsorted_components = tuple(
         active_component
-        for component in recipe_context.components
+        for component in recipe_context.resolved_species
         for active_component in (
             _component_with_active_recipe_loading(recipe_context, component),
         )
@@ -7756,9 +8756,28 @@ def _projected_mass_balance_components(recipe_context: RecipeBuildResult):
         in (SpeciesRole.CATION, SpeciesRole.ANION, SpeciesRole.ADDITIVE)
         and active_component.concentration_mol_m3 > 0.0
     )
+    components = tuple(
+        sorted(
+            unsorted_components,
+            key=_projected_component_sort_key(recipe_context.library_records),
+        )
+    )
     if not components:
         raise ValueError("projected conductivity mass balance needs charged components")
     return components
+
+
+def _projected_component_sort_key(records: PhysicalLibraryRecords):
+    role_rank = {
+        SpeciesRole.CATION: 0,
+        SpeciesRole.ANION: 1,
+        SpeciesRole.ADDITIVE: 2,
+    }
+
+    def component_key(component: RecipeComponentLoading) -> tuple[int, str]:
+        return role_rank[_species_role(records, component.name)], component.name
+
+    return component_key
 
 
 def _component_with_active_recipe_loading(

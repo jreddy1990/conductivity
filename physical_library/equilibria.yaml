@@ -1,0 +1,26 @@
+schema: conductivity_speciation_equilibria_v1
+standard_concentration_mol_m3: 1000.0
+relative_residual_tolerance: 1.0e-9
+maximum_function_evaluations: 2000
+recipe_component_formulas:
+  Li+: {lithium: 1.0}
+  PF6-: {hexafluorophosphate: 1.0}
+  FSI-: {fluorosulfonylimide: 1.0}
+  TFSI-: {bis_trifluoromethanesulfonylimide: 1.0}
+  DFOB-: {difluoro_oxalatoborate: 1.0}
+  LiDFOB: {lithium: 1.0, difluoro_oxalatoborate: 1.0}
+equilibrium_species_formulas:
+  Li+: {lithium: 1.0}
+  PF6-: {hexafluorophosphate: 1.0}
+  FSI-: {fluorosulfonylimide: 1.0}
+  TFSI-: {bis_trifluoromethanesulfonylimide: 1.0}
+  DFOB-: {difluoro_oxalatoborate: 1.0}
+  LiDFOB: {lithium: 1.0, difluoro_oxalatoborate: 1.0}
+reactions:
+- id: lidfob_dissociation
+  stoichiometry: {LiDFOB: -1.0, Li+: 1.0, DFOB-: 1.0}
+  equilibrium_constant_at_reference: 10.0
+  reference_temperature_K: 298.15
+  reaction_enthalpy_J_mol: 0.0
+  source: curated carbonate-electrolyte dissociation equilibrium
+  parameter_provenance: fitted_to_primitive

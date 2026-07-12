@@ -142,12 +142,14 @@ def test_chemical_potential_mass_balance_shares_conserved_components() -> None:
         ],
         dtype=float,
     )
-    restricted_partitions = np.asarray([1.0, 0.9, 0.8, 0.25, 0.35], dtype=float)
+    restricted_log_partitions = np.log(
+        np.asarray([1.0, 0.9, 0.8, 0.25, 0.35], dtype=float)
+    )
 
     populations = model.compute_equilibrium_populations_from_stoichiometry(
         component_totals_mol_m3,
         basin_stoichiometry,
-        restricted_partitions,
+        restricted_log_partitions,
     )
 
     assert np.allclose(basin_stoichiometry.T @ populations, component_totals_mol_m3)
@@ -167,7 +169,7 @@ def test_density_weights_reproduce_basin_concentrations() -> None:
     def potential_energy_J_mol(point: np.ndarray) -> float:
         return float(point[0] * R * 300.0)
 
-    restricted_partitions = model.compute_restricted_partition_values(
+    restricted_log_partitions = model.compute_restricted_log_partition_values(
         potential_energy_J_mol,
         basin_points,
         basin_weights,
@@ -177,7 +179,7 @@ def test_density_weights_reproduce_basin_concentrations() -> None:
         potential_energy_J_mol,
         basin_points,
         basin_weights,
-        restricted_partitions,
+        restricted_log_partitions,
         np.asarray([9.0], dtype=float),
         np.asarray([[1.0], [1.0]], dtype=float),
         300.0,
@@ -366,30 +368,30 @@ def test_generator_path_uses_mass_balance_density_weights_for_conductivity() -> 
     assert result.sigma_S_m == pytest.approx(expected_sigma_S_m)
 
 
-def test_full_generator_rejects_legacy_nonidentity_self_current_projector() -> None:
+def test_full_generator_applies_nonidentity_self_current_projector() -> None:
     inputs = _one_state_generator_inputs()
-    with pytest.raises(ValueError, match="LEGACY_SELF_CURRENT_PROJECTOR_FORBIDDEN"):
-        model.compute_projected_analytical_conductivity(
-            _zero_potential_J_mol,
-            _unit_mobility_tensor_m2_s,
-            _single_axis_charge_gradient,
-            _empty_memory_gradient,
-            inputs["basin_quadrature_points"],
-            inputs["basin_quadrature_weights"],
-            inputs["transition_pair_indices"],
-            inputs["transition_quadrature_points"],
-            inputs["transition_quadrature_weights"],
-            inputs["transition_committor_gradients"],
-            inputs["transition_surface_state_indices"],
-            inputs["transition_path_displacements_m"],
-            inputs["transition_path_weights"],
-            inputs["total_component_concentrations_mol_m3"],
-            inputs["basin_stoichiometry"],
-            300.0,
-            1.0,
+    result = model.compute_projected_analytical_conductivity(
+        _zero_potential_J_mol,
+        _unit_mobility_tensor_m2_s,
+        _single_axis_charge_gradient,
+        _empty_memory_gradient,
+        inputs["basin_quadrature_points"],
+        inputs["basin_quadrature_weights"],
+        inputs["transition_pair_indices"],
+        inputs["transition_quadrature_points"],
+        inputs["transition_quadrature_weights"],
+        inputs["transition_committor_gradients"],
+        inputs["transition_surface_state_indices"],
+        inputs["transition_path_displacements_m"],
+        inputs["transition_path_weights"],
+        inputs["total_component_concentrations_mol_m3"],
+        inputs["basin_stoichiometry"],
+        300.0,
+        1.0,
         (np.zeros((1, 1), dtype=float),),
     )
 
+    assert np.allclose(result.self_current_tensors_D_self_i_m2_s, 0.0)
 
 
 def test_zero_charge_gradient_produces_zero_conductivity() -> None:
@@ -525,6 +527,7 @@ def test_poisson_memory_corrector_subtracts_correlated_jump_drift() -> None:
         self_current,
         np.zeros((0, 0), dtype=float),
         np.zeros((0, 3), dtype=float),
+        np.zeros((2, 0), dtype=float),
         300.0,
     )
 
@@ -598,6 +601,7 @@ def test_three_state_transition_chain_has_nonzero_finite_state_drift() -> None:
         self_current,
         np.zeros((0, 0), dtype=float),
         np.zeros((0, 3), dtype=float),
+        np.zeros((3, 0), dtype=float),
         300.0,
     )
 
@@ -726,6 +730,7 @@ def test_primitive_ownership_scores_assign_largest_response() -> None:
         np.asarray([np.diag([1.0e-10, 0.0, 0.0])], dtype=float),
         np.zeros((0, 0), dtype=float),
         np.zeros((0, 3), dtype=float),
+        np.zeros((1, 0), dtype=float),
         300.0,
     )
     perturbed = model.compute_projected_analytical_conductivity_from_primitives(
@@ -736,6 +741,7 @@ def test_primitive_ownership_scores_assign_largest_response() -> None:
         np.asarray([np.diag([3.0e-10, 0.0, 0.0])], dtype=float),
         np.zeros((0, 0), dtype=float),
         np.zeros((0, 3), dtype=float),
+        np.zeros((1, 0), dtype=float),
         300.0,
     )
 
@@ -1057,6 +1063,7 @@ def test_direct_primitive_audit_closes_tensor_and_drift_identities() -> None:
         self_tensors,
         np.zeros((0, 0), dtype=float),
         np.zeros((0, 3), dtype=float),
+        np.zeros((2, 0), dtype=float),
         T_REF_K,
         model.PROJECTED_REFERENCE_VOLUME_M3,
     )

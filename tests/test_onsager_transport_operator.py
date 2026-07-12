@@ -90,6 +90,7 @@ def test_projection_closure_audit_fails_on_illegal_primitive_process() -> None:
         mori_current_coupling_matrix_h=(
             illegal_recipe_primitives.mori_current_coupling_matrix_h
         ),
+        state_memory_value_matrix=illegal_recipe_primitives.state_memory_value_matrix,
         temperature_K=illegal_recipe_primitives.temperature_K,
         volume_m3=illegal_recipe_primitives.volume_m3,
     )
@@ -148,6 +149,7 @@ def _two_state_primitives(
         ),
         mori_memory_matrix_A=np.zeros((0, 0), dtype=float),
         mori_current_coupling_matrix_h=np.zeros((0, 3), dtype=float),
+        state_memory_value_matrix=np.zeros((2, 0), dtype=float),
         temperature_K=T_REF_K,
         volume_m3=1.0,
     )

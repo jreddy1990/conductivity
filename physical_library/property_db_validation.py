@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import math
+import os
 from operator import attrgetter
 import tempfile
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,6 +22,21 @@ from conductivity.physical_library.generator_construction import (
 from conductivity.physical_library.library_io import load_physical_library
 
 MISSING_CONDUCTIVITY_KEY = "missing_conductivity"
+EVALUATED_CLASSIFICATION = "evaluated"
+MISSING_CONDUCTIVITY_CLASSIFICATION = "missing_conductivity"
+UNSUPPORTED_SPECIES_CLASSIFICATION = "unsupported_species"
+EVALUATION_FAILURE_CLASSIFICATION = "evaluation_failure"
+PROPERTY_VALIDATION_OWNER_CLASSIFICATIONS = frozenset(
+    {
+        "population_operator_missing",
+        "state_mobility_operator_missing",
+        "memory_dirichlet_operator_missing",
+        "transition_moment_operator_missing",
+        "dissociation_operator_missing",
+        "state_resolved_born_missing",
+        UNSUPPORTED_SPECIES_CLASSIFICATION,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -38,11 +55,32 @@ class PropertyDbConductivityValidationRow:
 
 
 @dataclass(frozen=True)
+class PropertyDbConductivityValidationProgress:
+    entry_index: int
+    classification: str
+    detail: str
+
+
+@dataclass(frozen=True)
+class _EvaluatedPropertyDbConductivityValidationOutcome:
+    progress: PropertyDbConductivityValidationProgress
+    validation_row: PropertyDbConductivityValidationRow
+
+
+@dataclass(frozen=True)
+class _ClassifiedPropertyDbConductivityValidationOutcome:
+    progress: PropertyDbConductivityValidationProgress
+
+
+@dataclass(frozen=True)
 class PropertyDbConductivityValidationSummary:
     total_entry_count: int
     evaluated_entry_count: int
     skipped_entry_count: int
     skip_counts_by_unsupported_species: dict[str, int]
+    failed_entry_count: int
+    classification_counts: dict[str, int]
+    progress: tuple[PropertyDbConductivityValidationProgress, ...]
     rows: tuple[PropertyDbConductivityValidationRow, ...]
     mean_error_mS_cm: float
     mean_absolute_error_mS_cm: float
@@ -117,12 +155,14 @@ def validate_property_db_supported_conductivity_rows(
     physical_library_records = load_physical_library(physical_library_root)
     supported_species_names = frozenset(physical_library_records.species_records)
     validation_rows: list[PropertyDbConductivityValidationRow] = []
+    progress_rows: list[PropertyDbConductivityValidationProgress] = []
     skip_counts_by_unsupported_species: Counter[str] = Counter()
 
     with tempfile.TemporaryDirectory(
         prefix="conductivity_property_db_validation_"
     ) as temporary_directory_name:
         temporary_directory = Path(temporary_directory_name)
+        supported_work = []
         for entry_index, property_db_entry in enumerate(property_db_entries):
             if "recipe" not in property_db_entry:
                 raise KeyError(f"property DB entry {entry_index} missing recipe")
@@ -138,6 +178,11 @@ def validate_property_db_supported_conductivity_rows(
             )
             if "conductivity_mS_cm" not in properties_record:
                 skip_counts_by_unsupported_species[MISSING_CONDUCTIVITY_KEY] += 1
+                progress_rows.append(
+                    PropertyDbConductivityValidationProgress(
+                        entry_index, MISSING_CONDUCTIVITY_CLASSIFICATION, ""
+                    )
+                )
                 continue
 
             supported_recipe = _supported_recipe_from_property_db_entry(
@@ -149,31 +194,63 @@ def validate_property_db_supported_conductivity_rows(
                 skip_counts_by_unsupported_species[
                     supported_recipe.unsupported_species_key
                 ] += 1
+                progress_rows.append(
+                    PropertyDbConductivityValidationProgress(
+                        entry_index,
+                        UNSUPPORTED_SPECIES_CLASSIFICATION,
+                        supported_recipe.unsupported_species_key,
+                    )
+                )
                 continue
-
-            recipe_yaml_path = temporary_directory / f"property_db_{entry_index}.yaml"
-            _write_recipe_yaml(recipe_yaml_path, supported_recipe)
-            conductivity_result = compute_conductivity_from_recipe(
-                recipe=recipe_yaml_path,
-                library_root=physical_library_root,
-                numerical_options=numerical_options,
-            )
             measured_conductivity_mS_cm = _finite_float(
                 properties_record["conductivity_mS_cm"],
                 f"property DB entry {entry_index} conductivity_mS_cm",
             )
-            validation_rows.append(
-                _validation_row_from_result(
-                    entry_index=entry_index,
-                    supported_recipe=supported_recipe,
-                    measured_conductivity_mS_cm=measured_conductivity_mS_cm,
-                    conductivity_result=conductivity_result,
-                )
+            supported_work.append(
+                (entry_index, supported_recipe, measured_conductivity_mS_cm)
             )
 
-    validation_row_tuple = tuple(validation_rows)
+        worker_count = min(len(supported_work), os.cpu_count() or 1)
+        with ThreadPoolExecutor(max_workers=max(1, worker_count)) as executor:
+            future_to_entry_index = {
+                executor.submit(
+                    _evaluate_supported_validation_row,
+                    entry_index,
+                    supported_recipe,
+                    measured_conductivity_mS_cm,
+                    temporary_directory,
+                    physical_library_root,
+                    numerical_options,
+                ): entry_index
+                for entry_index, supported_recipe, measured_conductivity_mS_cm in supported_work
+            }
+            for future in as_completed(future_to_entry_index):
+                entry_index = future_to_entry_index[future]
+                worker_error = future.exception()
+                if worker_error is not None:
+                    progress_rows.append(
+                        PropertyDbConductivityValidationProgress(
+                            entry_index,
+                            EVALUATION_FAILURE_CLASSIFICATION,
+                            f"{type(worker_error).__name__}: {worker_error}",
+                        )
+                    )
+                    continue
+                outcome = future.result()
+                progress_rows.append(outcome.progress)
+                if isinstance(
+                    outcome, _EvaluatedPropertyDbConductivityValidationOutcome
+                ):
+                    validation_rows.append(outcome.validation_row)
+
+    validation_row_tuple = tuple(sorted(validation_rows, key=attrgetter("entry_index")))
+    progress_tuple = tuple(sorted(progress_rows, key=attrgetter("entry_index")))
     if not validation_row_tuple:
         raise ValueError("property DB validation found no supported conductivity rows")
+
+    classification_counts = Counter(
+        progress.classification for progress in progress_tuple
+    )
 
     errors_mS_cm = np.asarray(
         [validation_row.error_mS_cm for validation_row in validation_row_tuple],
@@ -187,10 +264,16 @@ def validate_property_db_supported_conductivity_rows(
     return PropertyDbConductivityValidationSummary(
         total_entry_count=len(property_db_entries),
         evaluated_entry_count=len(validation_row_tuple),
-        skipped_entry_count=len(property_db_entries) - len(validation_row_tuple),
+        skipped_entry_count=(
+            classification_counts[MISSING_CONDUCTIVITY_CLASSIFICATION]
+            + classification_counts[UNSUPPORTED_SPECIES_CLASSIFICATION]
+        ),
         skip_counts_by_unsupported_species=dict(
             sorted(skip_counts_by_unsupported_species.items())
         ),
+        failed_entry_count=classification_counts[EVALUATION_FAILURE_CLASSIFICATION],
+        classification_counts=dict(sorted(classification_counts.items())),
+        progress=progress_tuple,
         rows=validation_row_tuple,
         mean_error_mS_cm=float(np.mean(errors_mS_cm)),
         mean_absolute_error_mS_cm=float(np.mean(absolute_errors_mS_cm)),
@@ -199,6 +282,88 @@ def validate_property_db_supported_conductivity_rows(
         ),
         mean_absolute_percent_error=float(np.mean(absolute_percent_errors)),
         max_absolute_error_mS_cm=float(np.max(absolute_errors_mS_cm)),
+    )
+
+
+def _evaluate_supported_validation_row(
+    entry_index: int,
+    supported_recipe: _SupportedRecipe,
+    measured_conductivity_mS_cm: float,
+    temporary_directory: Path,
+    physical_library_root: Path,
+    numerical_options: NumericalOptions,
+) -> (
+    _EvaluatedPropertyDbConductivityValidationOutcome
+    | _ClassifiedPropertyDbConductivityValidationOutcome
+):
+    recipe_yaml_path = temporary_directory / f"property_db_{entry_index}.yaml"
+    _write_recipe_yaml(recipe_yaml_path, supported_recipe)
+    conductivity_result = compute_conductivity_from_recipe(
+        recipe=recipe_yaml_path,
+        library_root=physical_library_root,
+        numerical_options=numerical_options,
+    )
+    classification = _property_validation_classification_from_result(
+        conductivity_result=conductivity_result,
+    )
+    if classification != EVALUATED_CLASSIFICATION:
+        reasons = tuple(
+            str(reason)
+            for reason in conductivity_result.effect_attribution[
+                "primitive_prediction_not_complete_reasons"
+            ]
+        )
+        return _ClassifiedPropertyDbConductivityValidationOutcome(
+            progress=PropertyDbConductivityValidationProgress(
+                entry_index=entry_index,
+                classification=classification,
+                detail=",".join(reasons),
+            )
+        )
+    validation_row = _validation_row_from_result(
+        entry_index=entry_index,
+        supported_recipe=supported_recipe,
+        measured_conductivity_mS_cm=measured_conductivity_mS_cm,
+        conductivity_result=conductivity_result,
+    )
+    return _EvaluatedPropertyDbConductivityValidationOutcome(
+        progress=PropertyDbConductivityValidationProgress(
+            entry_index=entry_index,
+            classification=EVALUATED_CLASSIFICATION,
+            detail=f"primitive_residual_mS_cm={validation_row.error_mS_cm:.12g}",
+        ),
+        validation_row=validation_row,
+    )
+
+
+def _property_validation_classification_from_result(conductivity_result) -> str:
+    """Classify primitive ownership from the production readiness ledger."""
+
+    effect_attribution = conductivity_result.effect_attribution
+    readiness_status = str(effect_attribution["primitive_prediction_readiness_status"])
+    scalar_label = str(effect_attribution["primitive_prediction_scalar_label"])
+    if readiness_status == "complete" and scalar_label == "primitive_prediction":
+        return EVALUATED_CLASSIFICATION
+    reasons = tuple(
+        str(reason)
+        for reason in effect_attribution["primitive_prediction_not_complete_reasons"]
+    )
+    owner_classifications = tuple(
+        reason
+        for reason in reasons
+        if reason in PROPERTY_VALIDATION_OWNER_CLASSIFICATIONS
+    )
+    if len(owner_classifications) > 1:
+        raise ValueError(
+            "property DB validation result has multiple primitive owner failures: "
+            + ",".join(owner_classifications)
+        )
+    if owner_classifications:
+        return owner_classifications[0]
+    raise ValueError(
+        "property DB validation requires a complete primitive prediction; "
+        f"readiness_status={readiness_status}; scalar_label={scalar_label}; "
+        f"reasons={reasons}"
     )
 
 

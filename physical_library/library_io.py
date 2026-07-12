@@ -9,7 +9,11 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-from constants import MOL_M3_PER_MOL_L
+from constants import MOL_M3_PER_MOL_L, R, T_REF_K
+from conductivity.physical_library.speciation_equilibrium import (
+    SpeciationEquilibriumResult,
+    solve_speciation_equilibrium,
+)
 
 SPECIES_REQUIRED_FIELDS = (
     "schema",
@@ -66,6 +70,8 @@ TOP_LEVEL_REQUIRED_FILES = (
     "basis.yaml",
     "transitions.yaml",
     "memory.yaml",
+    "association.yaml",
+    "equilibria.yaml",
 )
 FIRST_PRINCIPLES_ALLOWED_PARAMETER_PROVENANCE = (
     "universal_constant",
@@ -74,7 +80,18 @@ FIRST_PRINCIPLES_ALLOWED_PARAMETER_PROVENANCE = (
     "measured_mixture_property",
     "continuum_theory",
     "fitted_to_primitive",
+    "initialized_estimate",
 )
+
+ASSOCIATION_INITIALIZATION_MULTIPLIERS = {
+    ("pair", "CIP"): -0.25,  # Plan-defined quarter-RT favorable CIP residual.
+    ("pair", "SSIP"): -0.125,  # Plan-defined eighth-RT favorable SSIP residual.
+    ("pair", "addSSIP"): -0.1875,  # Plan-defined three-sixteenths-RT addSSIP residual.
+    ("cluster", "Li2A_positive"): 0.5,
+    ("cluster", "LiA2_negative"): 0.5,
+    ("cluster", "Li2A2_neutral"): 1.0,
+    ("cluster", "bridge_network"): 5.0 / 4.0,
+}
 FIRST_PRINCIPLES_REJECTED_PARAMETER_PROVENANCE = "fitted_to_scalar_sigma"
 
 
@@ -88,6 +105,8 @@ class PhysicalLibraryRecords:
     basis_record: dict
     transition_record: dict
     memory_record: dict
+    association_record: dict
+    equilibria_record: dict
 
 
 @dataclass(frozen=True)
@@ -100,7 +119,9 @@ class RecipeComponentLoading:
 @dataclass(frozen=True)
 class RecipeBuildResult:
     temperature_K: float
-    components: tuple[RecipeComponentLoading, ...]
+    conserved_components: tuple[RecipeComponentLoading, ...]
+    resolved_species: tuple[RecipeComponentLoading, ...]
+    speciation_equilibrium: SpeciationEquilibriumResult
     solvent_volume_fractions: dict[str, float]
     additive_weight_fractions: dict[str, float]
     library_records: PhysicalLibraryRecords
@@ -119,6 +140,8 @@ def load_physical_library(root: Path) -> PhysicalLibraryRecords:
         basis_record=_load_yaml_mapping(library_root / "basis.yaml"),
         transition_record=_load_yaml_mapping(library_root / "transitions.yaml"),
         memory_record=_load_yaml_mapping(library_root / "memory.yaml"),
+        association_record=_load_yaml_mapping(library_root / "association.yaml"),
+        equilibria_record=_load_yaml_mapping(library_root / "equilibria.yaml"),
     )
     validate_physical_library_records(records)
     return records
@@ -209,9 +232,40 @@ def build_recipe_library_context_from_record(
         )
         for additive_name, weight_fraction in sorted(additive_weight_fractions.items())
     )
+    conserved_components = solvent_loadings + salt_loadings + additive_loadings
+    equilibrium_recipe_concentrations = {
+        component.name: component.concentration_mol_m3
+        for component in salt_loadings + additive_loadings
+        if component.name in library_records.equilibria_record["recipe_component_formulas"]
+    }
+    speciation_equilibrium = solve_speciation_equilibrium(
+        recipe_concentrations_mol_m3=equilibrium_recipe_concentrations,
+        species_charges_e={
+            name: float(record["formal_charge_e"])
+            for name, record in library_records.species_records.items()
+        },
+        equilibrium_record=library_records.equilibria_record,
+        temperature_K=temperature_K,
+    )
+    equilibrium_recipe_names = set(equilibrium_recipe_concentrations)
+    inert_components = tuple(
+        component
+        for component in conserved_components
+        if component.name not in equilibrium_recipe_names
+    )
+    resolved_equilibrium_species = tuple(
+        RecipeComponentLoading(
+            name=species.name,
+            concentration_mol_m3=species.concentration_mol_m3,
+            role=str(library_records.species_records[species.name]["role"]),
+        )
+        for species in speciation_equilibrium.species
+    )
     return RecipeBuildResult(
         temperature_K=temperature_K,
-        components=solvent_loadings + salt_loadings + additive_loadings,
+        conserved_components=conserved_components,
+        resolved_species=inert_components + resolved_equilibrium_species,
+        speciation_equilibrium=speciation_equilibrium,
         solvent_volume_fractions=dict(sorted(solvent_volume_fractions.items())),
         additive_weight_fractions=dict(sorted(additive_weight_fractions.items())),
         library_records=library_records,
@@ -266,6 +320,128 @@ def validate_physical_library_records(records: PhysicalLibraryRecords) -> None:
         "memory.yaml",
     )
     _validate_memory_records(records.memory_record, records.transition_record)
+    _validate_association_record(records.association_record)
+    _validate_equilibria_record(records.equilibria_record, records.species_records)
+
+
+def _validate_equilibria_record(equilibria_record: dict, species_records: dict) -> None:
+    _require_mapping_keys(
+        equilibria_record,
+        (
+            "schema",
+            "standard_concentration_mol_m3",
+            "relative_residual_tolerance",
+            "maximum_function_evaluations",
+            "recipe_component_formulas",
+            "equilibrium_species_formulas",
+            "reactions",
+        ),
+        "equilibria.yaml",
+    )
+    for species_name in equilibria_record["equilibrium_species_formulas"]:
+        if species_name not in species_records:
+            raise KeyError(f"equilibria.yaml references missing species {species_name}")
+    for reaction_record in equilibria_record["reactions"]:
+        _require_mapping_keys(
+            reaction_record,
+            (
+                "id",
+                "stoichiometry",
+                "equilibrium_constant_at_reference",
+                "reference_temperature_K",
+                "reaction_enthalpy_J_mol",
+                "source",
+                "parameter_provenance",
+            ),
+            "equilibria.yaml reaction",
+        )
+        if reaction_record["parameter_provenance"] not in FIRST_PRINCIPLES_ALLOWED_PARAMETER_PROVENANCE:
+            raise ValueError(f"equilibria reaction {reaction_record['id']} has forbidden provenance")
+
+
+def _validate_association_record(association_record: dict) -> None:
+    _require_mapping_keys(
+        association_record,
+        ("schema", "association_residual", "state_resolved_born", "aggregate_topologies"),
+        "association.yaml",
+    )
+    for operator_name in ("association_residual", "state_resolved_born"):
+        operator_record = association_record[operator_name]
+        _require_mapping_keys(
+            operator_record,
+            ("equation", "source", "parameter_provenance", "initialization_basis", "reference_temperature_K", "state_features"),
+            f"association.yaml.{operator_name}",
+        )
+        provenance = str(operator_record["parameter_provenance"])
+        if provenance not in FIRST_PRINCIPLES_ALLOWED_PARAMETER_PROVENANCE:
+            raise ValueError(
+                f"association.yaml.{operator_name} has forbidden provenance {provenance}"
+            )
+        reference_temperature_K = float(operator_record["reference_temperature_K"])
+        if not np.isfinite(reference_temperature_K) or reference_temperature_K <= 0.0:
+            raise ValueError(f"association.yaml.{operator_name}.reference_temperature_K must be positive")
+        if provenance == "initialized_estimate":
+            if operator_record["initialization_basis"] != "user_authorized_pre_validation_physical_initialization":
+                raise ValueError(f"association.yaml.{operator_name} initialized_estimate requires user-authorized initialization_basis")
+            if reference_temperature_K != T_REF_K:
+                raise ValueError(f"association.yaml.{operator_name} initialized_estimate must use T_REF_K")
+        state_features = operator_record["state_features"]
+        if not isinstance(state_features, dict) or not state_features:
+            raise ValueError(
+                f"association.yaml.{operator_name}.state_features must be non-empty"
+            )
+        for feature_name, feature_values in state_features.items():
+            if not isinstance(feature_values, dict) or not feature_values:
+                raise ValueError(
+                    f"association.yaml.{operator_name}.{feature_name} must be non-empty"
+                )
+            for state_value, coefficient in feature_values.items():
+                coefficient_value = float(coefficient)
+                if not np.isfinite(coefficient_value):
+                    raise ValueError(
+                        f"association.yaml.{operator_name}.{feature_name}.{state_value} "
+                        "must be finite"
+                    )
+                if operator_name == "state_resolved_born" and not 0.0 <= coefficient_value <= 1.0:
+                    raise ValueError(f"association.yaml.{operator_name}.{feature_name}.{state_value} must be in [0, 1]")
+
+    residual_record = association_record["association_residual"]
+    if residual_record["parameter_provenance"] == "initialized_estimate":
+        residual_features = residual_record["state_features"]
+        for feature_key, multiplier in ASSOCIATION_INITIALIZATION_MULTIPLIERS.items():
+            feature_name, state_value = feature_key
+            if feature_name not in residual_features or state_value not in residual_features[feature_name]:
+                raise KeyError(f"missing_state_free_energy_operator: association_residual.{feature_name}.{state_value}")
+            expected_J_mol = multiplier * R * T_REF_K
+            if float(residual_features[feature_name][state_value]) != expected_J_mol:
+                raise ValueError(f"association.yaml association_residual.{feature_name}.{state_value} must equal its exact R*T_REF_K initialization")
+    _validate_aggregate_topologies(association_record["aggregate_topologies"])
+
+
+def _validate_aggregate_topologies(aggregate_topologies: dict) -> None:
+    expected_topologies = {
+        "Li2A_positive": ("aggregate", {"Li": 2, "A": 1, "ligand": 0}, 1, (("Li0", "A0"), ("Li1", "A0"))),
+        "LiA2_negative": ("aggregate", {"Li": 1, "A": 2, "ligand": 0}, -1, (("Li0", "A0"), ("Li0", "A1"))),
+        "Li2A2_neutral": ("aggregate", {"Li": 2, "A": 2, "ligand": 0}, 0, (("Li0", "A0"), ("A0", "Li1"), ("Li1", "A1"))),
+        "bridge_network": ("bridge_network", {"Li": 2, "A": 2, "ligand": 0}, 0, (("Li0", "A0"), ("A0", "Li1"), ("Li1", "A1"), ("A1", "Li0"))),
+    }
+    if not isinstance(aggregate_topologies, dict) or set(aggregate_topologies) != set(expected_topologies):
+        raise ValueError("association.yaml.aggregate_topologies must contain the exact required topology inventory")
+    required_fields = ("topology_id", "cluster_family", "graph_edges", "component_stoichiometry", "net_formal_charge_e", "minimum_cation_count", "minimum_anion_count", "minimum_ligand_count", "source", "parameter_provenance")
+    for topology_id, expected in expected_topologies.items():
+        topology_record = aggregate_topologies[topology_id]
+        _require_mapping_keys(topology_record, required_fields, f"association.yaml.aggregate_topologies.{topology_id}")
+        expected_family, expected_stoichiometry, expected_charge, expected_edges = expected
+        actual_edges = tuple(tuple(edge) for edge in topology_record["graph_edges"])
+        actual_identity = (topology_record["cluster_family"], topology_record["component_stoichiometry"], int(topology_record["net_formal_charge_e"]), actual_edges)
+        if topology_record["topology_id"] != topology_id or actual_identity != expected:
+            raise ValueError(f"association topology {topology_id} does not match the plan-defined record")
+        minimum_counts = (int(topology_record["minimum_cation_count"]), int(topology_record["minimum_anion_count"]), int(topology_record["minimum_ligand_count"]))
+        expected_counts = (expected_stoichiometry["Li"], expected_stoichiometry["A"], expected_stoichiometry["ligand"])
+        if minimum_counts != expected_counts:
+            raise ValueError(f"association topology {topology_id} has inconsistent minimum multiplicity")
+        if topology_record["source"] != "user_authorized_initialized_topology" or topology_record["parameter_provenance"] != "initialized_estimate":
+            raise ValueError(f"association topology {topology_id} requires initialized_estimate provenance")
 
 
 def _validate_trajectory_projection_record(trajectory_projection_record: dict) -> None:
@@ -494,6 +670,8 @@ def _validate_manifest(manifest: dict) -> None:
             "basis_record",
             "transition_record",
             "memory_record",
+            "association_record",
+            "equilibria_record",
         ),
         "manifest.yaml",
     )

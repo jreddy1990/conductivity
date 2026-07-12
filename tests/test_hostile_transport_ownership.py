@@ -292,6 +292,7 @@ def test_energy_reference_preserves_disconnected_basin_energy_difference() -> No
         state_quadratures=state_quadratures,
         transition_quadratures=(),
         total_component_concentrations_mol_m3=np.asarray([1.0], dtype=float),
+        state_memory_value_matrix=np.zeros((2, 0), dtype=float),
         temperature_K=300.0,
         volume_m3=1.0,
     )
@@ -342,6 +343,7 @@ def _primitive_readout(
         self_current_tensors_m2_s,
         np.zeros((0, 0), dtype=float),
         np.zeros((0, 3), dtype=float),
+        np.zeros((concentrations_mol_m3.size, 0), dtype=float),
         300.0,
     )
 
@@ -516,6 +518,7 @@ def _two_state_family_specification() -> ReducedGeneratorSpecification:
         state_quadratures=states,
         transition_quadratures=(transition,),
         total_component_concentrations_mol_m3=np.asarray([2.0], dtype=float),
+        state_memory_value_matrix=np.zeros((2, 0), dtype=float),
         temperature_K=300.0,
         volume_m3=1.0,
     )
@@ -561,6 +564,9 @@ def test_production_transition_family_closes_transport_ownership_ledger(
         model.compute_state_transport_ownership_quadratures(
             mobility_tensor_m2_s=projected_input.mobility_tensor_m2_s,
             charge_polarization_gradient=projected_input.charge_polarization_gradient,
+            self_current_coordinate_projectors=(
+                projected_input.self_current_coordinate_projectors
+            ),
             basin_quadrature_points=projected_input.basin_quadrature_points,
             basin_density_weights_mol_m3=(np.asarray([1.0]), np.asarray([1.0])),
             basin_concentrations_mol_m3=np.asarray([1.0, 1.0]),
@@ -570,10 +576,10 @@ def test_production_transition_family_closes_transport_ownership_ledger(
         )
     )
     assert full_self_tensors == pytest.approx(
-        np.asarray([np.diag([1.0, 1.0, 0.0])] * 2)
+        np.asarray([np.diag([1.0, 0.0, 0.0])] * 2)
     )
     assert tangent_self_tensors == pytest.approx(
-        np.asarray([np.diag([0.0, 1.0, 0.0])] * 2)
+        np.zeros((2, 3, 3), dtype=float)
     )
 
     concentrations = np.asarray([1.0, 1.0])
@@ -661,6 +667,7 @@ def test_constructor_preserves_ill_scaled_independent_normal_row_space() -> None
         total_component_concentrations_mol_m3=(
             specification.total_component_concentrations_mol_m3
         ),
+        state_memory_value_matrix=specification.state_memory_value_matrix,
         temperature_K=specification.temperature_K,
         volume_m3=specification.volume_m3,
     )
@@ -806,6 +813,7 @@ def test_reduced_generator_projection_owns_explicit_transition_moments() -> None
         state_quadratures=states,
         transition_quadratures=(transition,),
         total_component_concentrations_mol_m3=np.asarray([2.0], dtype=float),
+        state_memory_value_matrix=np.zeros((2, 0), dtype=float),
         temperature_K=300.0,
         volume_m3=1.0,
     )

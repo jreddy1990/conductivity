@@ -79,6 +79,7 @@ class PhysicalGeneratorBuildInput:
     state_quadratures: tuple[PhysicalStateQuadrature, ...]
     transition_quadratures: tuple[PhysicalTransitionQuadrature, ...]
     memory_coordinate_gradient_functions: tuple[Callable[[SiteConfiguration], Array], ...]
+    state_memory_value_matrix: Array
     total_component_concentrations_mol_m3: Array
     temperature_K: float
     volume_m3: float
@@ -136,6 +137,9 @@ def build_reduced_generator_specification_from_physical_objects(
         total_component_concentrations_mol_m3=np.asarray(
             build_input.total_component_concentrations_mol_m3,
             dtype=float,
+        ),
+        state_memory_value_matrix=np.asarray(
+            build_input.state_memory_value_matrix, dtype=float
         ),
         temperature_K=build_input.temperature_K,
         volume_m3=build_input.volume_m3,
@@ -256,12 +260,22 @@ def _build_reduced_state_quadrature(
             f"{state_quadrature.label}.self_current_projector must have "
             f"at most {common_coordinate_count} coordinates"
         )
-    if not np.allclose(projector, np.eye(physical_coordinate_count, dtype=float)):
+    if np.any(~np.isfinite(projector)):
         raise ValueError(
-            f"{state_quadrature.label}.self_current_projector must be identity "
-            "in the full-generator path"
+            f"{state_quadrature.label}.self_current_projector must be finite"
         )
-    padded_projector = np.eye(common_coordinate_count, dtype=float)
+    if not np.allclose(projector, projector.T):
+        raise ValueError(
+            f"{state_quadrature.label}.self_current_projector must be symmetric"
+        )
+    if not np.allclose(projector @ projector, projector):
+        raise ValueError(
+            f"{state_quadrature.label}.self_current_projector must be idempotent"
+        )
+    padded_projector = np.zeros(
+        (common_coordinate_count, common_coordinate_count), dtype=float
+    )
+    padded_projector[:physical_coordinate_count, :physical_coordinate_count] = projector
     transport_ownership_bases = tuple(
         _pad_transport_ownership_basis(
             ownership_basis,

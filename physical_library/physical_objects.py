@@ -86,7 +86,31 @@ class ResistanceComponentDiagnostics:
     free_volume_trace_kg_s: float
     charge_cloud_trace_kg_s: float
     atmosphere_trace_kg_s: float
+    cage_constraint_trace_kg_s: float
+    ligand_shell_obstruction_trace_kg_s: float
+    aggregate_constraint_trace_kg_s: float
+    bridge_constraint_trace_kg_s: float
+    orientation_denticity_trace_kg_s: float
     total_trace_kg_s: float
+
+
+@dataclass(frozen=True)
+class StateFeatureResistanceComponents:
+    cage_constraint_tensor_kg_s: Array
+    ligand_shell_obstruction_tensor_kg_s: Array
+    aggregate_constraint_tensor_kg_s: Array
+    bridge_constraint_tensor_kg_s: Array
+    orientation_denticity_tensor_kg_s: Array
+
+    @property
+    def total_tensor_kg_s(self) -> Array:
+        return (
+            self.cage_constraint_tensor_kg_s
+            + self.ligand_shell_obstruction_tensor_kg_s
+            + self.aggregate_constraint_tensor_kg_s
+            + self.bridge_constraint_tensor_kg_s
+            + self.orientation_denticity_tensor_kg_s
+        )
 
 
 def build_physical_objects(
@@ -950,6 +974,11 @@ def compute_resistance_tensor_kg_s(
         viscosity_Pa_s,
     )
     resistance += atmosphere_diagnostics.atmosphere_resistance_tensor_kg_s
+    resistance += compute_state_feature_resistance_components(
+        records,
+        configuration,
+        viscosity_Pa_s,
+    ).total_tensor_kg_s
     return resistance
 
 
@@ -1007,18 +1036,284 @@ def compute_resistance_component_diagnostics(
     atmosphere_trace_kg_s = float(
         np.trace(atmosphere_diagnostics.atmosphere_resistance_tensor_kg_s)
     )
+    feature_components = compute_state_feature_resistance_components(
+        records,
+        configuration,
+        viscosity_Pa_s,
+    )
+    cage_constraint_trace_kg_s = float(
+        np.trace(feature_components.cage_constraint_tensor_kg_s)
+    )
+    ligand_shell_obstruction_trace_kg_s = float(
+        np.trace(feature_components.ligand_shell_obstruction_tensor_kg_s)
+    )
+    aggregate_constraint_trace_kg_s = float(
+        np.trace(feature_components.aggregate_constraint_tensor_kg_s)
+    )
+    bridge_constraint_trace_kg_s = float(
+        np.trace(feature_components.bridge_constraint_tensor_kg_s)
+    )
+    orientation_denticity_trace_kg_s = float(
+        np.trace(feature_components.orientation_denticity_tensor_kg_s)
+    )
     return ResistanceComponentDiagnostics(
         stokes_trace_kg_s=stokes_trace_kg_s,
         free_volume_trace_kg_s=free_volume_trace_kg_s,
         charge_cloud_trace_kg_s=charge_cloud_trace_kg_s,
         atmosphere_trace_kg_s=atmosphere_trace_kg_s,
+        cage_constraint_trace_kg_s=cage_constraint_trace_kg_s,
+        ligand_shell_obstruction_trace_kg_s=ligand_shell_obstruction_trace_kg_s,
+        aggregate_constraint_trace_kg_s=aggregate_constraint_trace_kg_s,
+        bridge_constraint_trace_kg_s=bridge_constraint_trace_kg_s,
+        orientation_denticity_trace_kg_s=orientation_denticity_trace_kg_s,
         total_trace_kg_s=(
             stokes_trace_kg_s
             + free_volume_trace_kg_s
             + charge_cloud_trace_kg_s
             + atmosphere_trace_kg_s
+            + cage_constraint_trace_kg_s
+            + ligand_shell_obstruction_trace_kg_s
+            + aggregate_constraint_trace_kg_s
+            + bridge_constraint_trace_kg_s
+            + orientation_denticity_trace_kg_s
         ),
     )
+
+
+def compute_state_feature_resistance_components(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+    viscosity_Pa_s: float,
+) -> StateFeatureResistanceComponents:
+    """Build local PSD resistance operators from coordination and ionic geometry."""
+
+    if viscosity_Pa_s <= 0.0:
+        raise ValueError("viscosity_Pa_s must be positive")
+    coordinate_count = CARTESIAN_DIMENSION * len(configuration.species_names)
+    components = [np.zeros((coordinate_count, coordinate_count), dtype=float) for _ in range(5)]
+    cage_tensor, ligand_tensor, aggregate_tensor, bridge_tensor, orientation_tensor = components
+    molecule_records = _state_feature_molecule_records(
+        records, configuration, viscosity_Pa_s
+    )
+    cation_keys = tuple(
+        key for key, molecule_record in molecule_records.items() if molecule_record[0] == "cation"
+    )
+    anion_keys = tuple(
+        key for key, molecule_record in molecule_records.items() if molecule_record[0] == "anion"
+    )
+    for cation_key in cation_keys:
+        for neighbor_key, neighbor_record in molecule_records.items():
+            neighbor_role = neighbor_record[0]
+            if neighbor_role not in ("solvent", "additive"):
+                continue
+            switch_name = "Li_ligand" if neighbor_role == "additive" else "Li_solvent"
+            coordination, direction = _molecule_coordination_and_direction(
+                records,
+                configuration,
+                molecule_records[cation_key][1],
+                neighbor_record[1],
+                switch_name,
+            )
+            pair_drag = _harmonic_mean_values(
+                molecule_records[cation_key][4], neighbor_record[4]
+            )
+            _add_center_relative_resistance(
+                cage_tensor,
+                molecule_records[cation_key],
+                neighbor_record,
+                pair_drag * coordination,
+                np.outer(direction, direction),
+            )
+            if neighbor_role == "additive":
+                _add_center_relative_resistance(
+                    ligand_tensor,
+                    molecule_records[cation_key],
+                    neighbor_record,
+                    pair_drag * coordination,
+                    np.eye(CARTESIAN_DIMENSION) - np.outer(direction, direction),
+                )
+
+    anion_contacted_cations: dict[tuple[str, int], list[tuple[tuple[str, int], float, Array]]] = {}
+    cation_contact_counts = {cation_key: 0 for cation_key in cation_keys}
+    for cation_key in cation_keys:
+        for anion_key in anion_keys:
+            coordination, direction = _molecule_coordination_and_direction(
+                records,
+                configuration,
+                molecule_records[cation_key][1],
+                molecule_records[anion_key][1],
+                "Li_anion",
+            )
+            anion_contacted_cations.setdefault(anion_key, []).append(
+                (cation_key, coordination, direction)
+            )
+            cation_contact_counts[cation_key] += 1
+    for anion_key, contacts in anion_contacted_cations.items():
+        contact_count = len(contacts)
+        for cation_key, coordination, direction in contacts:
+            pair_drag = _harmonic_mean_values(
+                molecule_records[cation_key][4], molecule_records[anion_key][4]
+            )
+            bridge_degree = max(contact_count, cation_contact_counts[cation_key])
+            if bridge_degree > 1:
+                _add_center_relative_resistance(
+                    aggregate_tensor,
+                    molecule_records[cation_key],
+                    molecule_records[anion_key],
+                    pair_drag * coordination * (bridge_degree - UNITY),
+                    np.eye(CARTESIAN_DIMENSION),
+                )
+            if contact_count > 1:
+                _add_center_relative_resistance(
+                    bridge_tensor,
+                    molecule_records[cation_key],
+                    molecule_records[anion_key],
+                    pair_drag * coordination * (contact_count - UNITY),
+                    np.outer(direction, direction),
+                )
+            acceptor_count = sum(
+                bool(_site_record(records, configuration, site_index)["acceptor_flag"])
+                for site_index in molecule_records[anion_key][2]
+            )
+            _add_center_relative_resistance(
+                orientation_tensor,
+                molecule_records[cation_key],
+                molecule_records[anion_key],
+                pair_drag * coordination * float(acceptor_count),
+                np.eye(CARTESIAN_DIMENSION) - np.outer(direction, direction),
+            )
+    return StateFeatureResistanceComponents(*components)
+
+
+def _state_feature_molecule_records(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+    viscosity_Pa_s: float,
+) -> dict[tuple[str, int], tuple[str, Array, tuple[int, ...], Array, float]]:
+    molecule_records = {}
+    for species_name, molecule_id in _configuration_molecule_keys(configuration):
+        site_indices, mass_fractions = molecule_site_indices_and_mass_fractions(
+            records,
+            configuration,
+            species_name,
+            molecule_id,
+        )
+        molecular_drag_kg_s = sum(
+            _stokes_drag_kg_s(
+                _site_record(records, configuration, site_index),
+                viscosity_Pa_s,
+            )
+            for site_index in site_indices
+        )
+        molecule_records[(species_name, molecule_id)] = (
+            str(records.species_records[species_name]["role"]),
+            molecule_center_of_mass_m(
+                records,
+                configuration,
+                species_name,
+                molecule_id,
+            ),
+            site_indices,
+            mass_fractions,
+            molecular_drag_kg_s,
+        )
+    return molecule_records
+
+
+def _molecule_coordination_and_direction(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+    first_center_m: Array,
+    second_center_m: Array,
+    switch_name: str,
+) -> tuple[float, Array]:
+    switch_record = records.basis_record["coordination_switches"][switch_name]
+    displacement_m = _minimum_image_vector_m(
+        first_center_m,
+        second_center_m,
+        configuration.box_lengths_m,
+    )
+    distance_m = float(np.linalg.norm(displacement_m))
+    if distance_m <= ZERO_DISTANCE_TOLERANCE_M:
+        raise ValueError("coordination distance is zero")
+    coordination = UNITY / (
+        UNITY
+        + (distance_m / float(switch_record["r0_m"])) ** float(switch_record["exponent"])
+    )
+    return coordination, displacement_m / distance_m
+
+
+def _harmonic_mean_values(first_drag: float, second_drag: float) -> float:
+    return 2.0 * first_drag * second_drag / (first_drag + second_drag)
+
+
+def _add_center_relative_resistance(
+    tensor_kg_s: Array,
+    first_molecule_record: tuple[str, Array, tuple[int, ...], Array, float],
+    second_molecule_record: tuple[str, Array, tuple[int, ...], Array, float],
+    drag_kg_s: float,
+    projector: Array,
+) -> None:
+    block = drag_kg_s * np.asarray(projector, dtype=float)
+    _add_weighted_center_block(
+        tensor_kg_s,
+        first_molecule_record[2],
+        first_molecule_record[3],
+        first_molecule_record[2],
+        first_molecule_record[3],
+        block,
+    )
+    _add_weighted_center_block(
+        tensor_kg_s,
+        second_molecule_record[2],
+        second_molecule_record[3],
+        second_molecule_record[2],
+        second_molecule_record[3],
+        block,
+    )
+    _add_weighted_center_block(
+        tensor_kg_s,
+        first_molecule_record[2],
+        first_molecule_record[3],
+        second_molecule_record[2],
+        second_molecule_record[3],
+        -block,
+    )
+    _add_weighted_center_block(
+        tensor_kg_s,
+        second_molecule_record[2],
+        second_molecule_record[3],
+        first_molecule_record[2],
+        first_molecule_record[3],
+        -block,
+    )
+
+
+def _add_weighted_center_block(
+    tensor_kg_s: Array,
+    row_site_indices: tuple[int, ...],
+    row_weights: Array,
+    column_site_indices: tuple[int, ...],
+    column_weights: Array,
+    block_kg_s: Array,
+) -> None:
+    for row_site_index, row_weight in zip(
+        row_site_indices, row_weights, strict=True
+    ):
+        row_slice = slice(
+            CARTESIAN_DIMENSION * row_site_index,
+            CARTESIAN_DIMENSION * (row_site_index + 1),
+        )
+        for column_site_index, column_weight in zip(
+            column_site_indices, column_weights, strict=True
+        ):
+            column_slice = slice(
+                CARTESIAN_DIMENSION * column_site_index,
+                CARTESIAN_DIMENSION * (column_site_index + 1),
+            )
+            tensor_kg_s[row_slice, column_slice] += (
+                row_weight * column_weight * block_kg_s
+            )
 
 
 def compute_atmosphere_resistance_diagnostics(

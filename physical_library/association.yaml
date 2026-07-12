@@ -1,0 +1,115 @@
+schema: conductivity_state_association_thermodynamics_v1
+association_residual:
+  equation: delta_G_assoc_residual = sum_f g_f(state_f)
+  source: user-authorized state-conditioned PMF residual initialization after Coulomb, LJ, Born, packing, activity, coordination, and solvation-competition subtraction
+  parameter_provenance: initialized_estimate
+  initialization_basis: user_authorized_pre_validation_physical_initialization
+  reference_temperature_K: 298.15
+  state_features:
+    pair:
+      free: 0.0
+      CIP: -619.739257389175
+      SSIP: -309.8696286945875
+      addSSIP: -464.80444304188126
+      free_additive_reservoir: 0.0
+    shell:
+      solvent_only: 0.0
+      solvent_poor: 0.0
+      anion_coordinated: 0.0
+      mixed_ligand_anion: 0.0
+      neutral_ligand_bound: 0.0
+      free_additive_reservoir: 0.0
+    ligand:
+      none: 0.0
+      monodentate: 0.0
+      multidentate: 0.0
+      additive_separator: 0.0
+      free_ligand_reservoir: 0.0
+    cluster:
+      Li+: 0.0
+      free_ions: 0.0
+      LiA: 0.0
+      Li_ligand_anion: 0.0
+      Li2A_positive: 1239.47851477835
+      LiA2_negative: 1239.47851477835
+      Li2A2_neutral: 2478.9570295567
+      bridge_network: 3098.696286945875
+    orientation:
+      radial: 0.0
+      tangential: 0.0
+      bridging: 0.0
+      free_rotating: 0.0
+state_resolved_born:
+  equation: delta_G_desolv = -U_Born_charged_sites * sum_f occlusion_f(state_f)
+  source: geometry-derived loss of charged-site solvent exposure using basin and coordination-shell occlusion fractions
+  parameter_provenance: geometry_derived
+  initialization_basis: geometry_resolved_solvent_occlusion
+  reference_temperature_K: 298.15
+  state_features:
+    pair:
+      free: 0.0
+      CIP: 0.0001
+      SSIP: 0.000025
+      addSSIP: 0.00004
+      free_additive_reservoir: 0.0
+    shell:
+      solvent_only: 0.0
+      solvent_poor: 0.00002
+      anion_coordinated: 0.00003
+      mixed_ligand_anion: 0.00002
+      neutral_ligand_bound: 0.00001
+      free_additive_reservoir: 0.0
+    cluster:
+      Li+: 0.0
+      free_ions: 0.0
+      LiA: 0.00001
+      Li_ligand_anion: 0.00002
+      Li2A_positive: 0.00004
+      LiA2_negative: 0.00004
+      Li2A2_neutral: 0.00004
+      bridge_network: 0.00006
+aggregate_topologies:
+  Li2A_positive:
+    topology_id: Li2A_positive
+    cluster_family: aggregate
+    graph_edges: [[Li0, A0], [Li1, A0]]
+    component_stoichiometry: {Li: 2, A: 1, ligand: 0}
+    net_formal_charge_e: 1
+    minimum_cation_count: 2
+    minimum_anion_count: 1
+    minimum_ligand_count: 0
+    source: user_authorized_initialized_topology
+    parameter_provenance: initialized_estimate
+  LiA2_negative:
+    topology_id: LiA2_negative
+    cluster_family: aggregate
+    graph_edges: [[Li0, A0], [Li0, A1]]
+    component_stoichiometry: {Li: 1, A: 2, ligand: 0}
+    net_formal_charge_e: -1
+    minimum_cation_count: 1
+    minimum_anion_count: 2
+    minimum_ligand_count: 0
+    source: user_authorized_initialized_topology
+    parameter_provenance: initialized_estimate
+  Li2A2_neutral:
+    topology_id: Li2A2_neutral
+    cluster_family: aggregate
+    graph_edges: [[Li0, A0], [A0, Li1], [Li1, A1]]
+    component_stoichiometry: {Li: 2, A: 2, ligand: 0}
+    net_formal_charge_e: 0
+    minimum_cation_count: 2
+    minimum_anion_count: 2
+    minimum_ligand_count: 0
+    source: user_authorized_initialized_topology
+    parameter_provenance: initialized_estimate
+  bridge_network:
+    topology_id: bridge_network
+    cluster_family: bridge_network
+    graph_edges: [[Li0, A0], [A0, Li1], [Li1, A1], [A1, Li0]]
+    component_stoichiometry: {Li: 2, A: 2, ligand: 0}
+    net_formal_charge_e: 0
+    minimum_cation_count: 2
+    minimum_anion_count: 2
+    minimum_ligand_count: 0
+    source: user_authorized_initialized_topology
+    parameter_provenance: initialized_estimate

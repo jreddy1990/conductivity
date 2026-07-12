@@ -364,6 +364,7 @@ def test_succeeded_primitive_artifact_input_rejects_nonreciprocal_first_moments(
         self_current_tensors_D_self_i_m2_s=np.zeros((2, 3, 3), dtype=float),
         mori_memory_matrix_A=np.zeros((0, 0), dtype=float),
         mori_current_coupling_matrix_h=np.zeros((0, 3), dtype=float),
+        state_memory_value_matrix=np.zeros((1, 0), dtype=float),
         temperature_K=T_REF_K,
         volume_m3=1.0,
     )
@@ -560,6 +561,7 @@ def test_reduced_generator_assembles_projected_input() -> None:
         ),
         transition_quadratures=(),
         total_component_concentrations_mol_m3=np.asarray([1.0]),
+        state_memory_value_matrix=np.zeros((1, 0), dtype=float),
         temperature_K=300.0,
         volume_m3=1.0,
     )
@@ -698,6 +700,7 @@ def test_physical_generator_builder_exposes_physical_functions() -> None:
             ),
             transition_quadratures=(),
             memory_coordinate_gradient_functions=(),
+            state_memory_value_matrix=np.zeros((1, 0), dtype=float),
             total_component_concentrations_mol_m3=np.asarray([1.0], dtype=float),
             temperature_K=T_REF_K,
             volume_m3=1.0,
@@ -910,6 +913,7 @@ def test_mixture_basin_memory_and_transition_builders_are_executable() -> None:
             ),
             transition_quadratures=(transition.transition_quadrature,),
             memory_coordinate_gradient_functions=(),
+            state_memory_value_matrix=np.zeros((1, 0), dtype=float),
             total_component_concentrations_mol_m3=np.asarray([1.0, 1.0], dtype=float),
             temperature_K=T_REF_K,
             volume_m3=1.0,
@@ -1027,6 +1031,92 @@ def test_physical_generator_registry_keeps_species_distinct_at_identical_coordin
     } == {("Li+", "PF6-"), ("Li+", "FSI-")}
 
 
+@pytest.mark.parametrize(
+    "topology_id",
+    ("Li2A_positive", "LiA2_negative", "Li2A2_neutral", "bridge_network"),
+)
+def test_aggregate_topology_records_duplicate_complete_conformers(
+    topology_id: str,
+) -> None:
+    recipe_context = generator_construction.build_recipe_library_context(
+        PHYSICAL_LIBRARY_ROOT / "recipe_ec_dmc_lipf6_1m.yaml",
+        PHYSICAL_LIBRARY_ROOT,
+    )
+    records = recipe_context.library_records
+    topology_record = records.association_record["aggregate_topologies"][topology_id]
+    stoichiometry = topology_record["component_stoichiometry"]
+    mixture = generator_construction.compute_mixture_closures(
+        records=records,
+        composition=generator_construction.mixture_composition_from_recipe_context(
+            recipe_context
+        ),
+        temperature_K=recipe_context.temperature_K,
+    )
+    numerical_options = generator_construction.NumericalOptions(
+        reference_box_lengths_m=(2.0e-8, 2.0e-8, 2.0e-8),
+        volume_m3=8.0e-24,
+        state_quadrature_order=1,
+        transition_grid_count=3,
+    )
+    template = generator_construction.build_template_site_configuration(
+        records,
+        recipe_context,
+        mixture,
+        numerical_options,
+    )
+    aggregate = generator_construction._configuration_for_aggregate_topology(
+        records,
+        template,
+        topology_record,
+        pair_distance_m=4.0e-10,
+    )
+
+    ionic_molecules = generator_construction._molecule_site_index_groups_with_role(
+        records, aggregate, generator_construction.SpeciesRole.CATION
+    ) + generator_construction._molecule_site_index_groups_with_role(
+        records, aggregate, generator_construction.SpeciesRole.ANION
+    )
+    assert len(ionic_molecules) == stoichiometry["Li"] + stoichiometry["A"]
+    for molecule_indices in ionic_molecules:
+        species_name = aggregate.species_names[molecule_indices[0]]
+        species_sites = records.species_records[species_name]["sites"]
+        assert len(molecule_indices) == len(species_sites)
+        assert tuple(aggregate.site_ids[index] for index in molecule_indices) == tuple(
+            site_record["site_id"] for site_record in species_sites
+        )
+    aggregate_state_key = (
+        "CIP",
+        "anion_coordinated",
+        "none",
+        "PF6-:anion_localized",
+        "free_rotating",
+        f"{topology_record['cluster_family']}:{topology_id}",
+        "partner_inactive",
+        "identity_inactive",
+        "hop_inactive",
+        "cage_inactive",
+        "bulk_environment",
+        "atmosphere_relaxed",
+    )
+    self_projector = generator_construction.build_self_current_projector(
+        aggregate_state_key,
+        aggregate,
+        records,
+    )
+    assert np.linalg.matrix_rank(self_projector) == 3
+    if topology_record["net_formal_charge_e"] == 0:
+        charge_gradient = physical_objects.compute_charge_polarization_gradient(
+            records,
+            aggregate,
+        )
+        site_coordinate_count = aggregate.positions_m.size
+        assert np.allclose(
+            charge_gradient @ self_projector[:site_coordinate_count, :site_coordinate_count],
+            0.0,
+            atol=1.0e-12,
+        )
+
+
 def test_mixed_salt_recipe_keeps_additive_stoichiometry_and_transition_channel() -> None:
     recipe_context = generator_construction.build_recipe_library_context(
         PHYSICAL_LIBRARY_ROOT / "recipe_ec_dmc_lipf6_lifsi_fec.yaml",
@@ -1075,14 +1165,34 @@ def test_mixed_salt_recipe_keeps_additive_stoichiometry_and_transition_channel()
         component_names.index(anion_name) for anion_name in ("FSI-", "PF6-")
     )
     ionic_state_mask = state_stoichiometry[:, lithium_component_index] > 0.0
-    assert np.all(state_stoichiometry[ionic_state_mask, lithium_component_index] == 1.0)
-    assert np.all(
-        np.sum(
-            state_stoichiometry[ionic_state_mask][:, anion_component_indices],
-            axis=1,
+    for state_quadrature in np.asarray(state_quadratures, dtype=object)[
+        ionic_state_mask
+    ]:
+        state_key = generator_construction._state_key_from_label(
+            state_quadrature.label
         )
-        == 1.0
-    )
+        topology_record = (
+            generator_construction._aggregate_topology_record_from_state_key(
+                records,
+                state_key,
+            )
+        )
+        expected_lithium_count = float(
+            topology_record["component_stoichiometry"]["Li"]
+            if topology_record
+            else 1
+        )
+        expected_anion_count = float(
+            topology_record["component_stoichiometry"]["A"]
+            if topology_record
+            else 1
+        )
+        assert state_quadrature.stoichiometry[
+            lithium_component_index
+        ] == expected_lithium_count
+        assert np.sum(
+            state_quadrature.stoichiometry[list(anion_component_indices)]
+        ) == expected_anion_count
     assert np.any(state_stoichiometry[:, active_additive_component_index] == 1.0)
     assert np.any(state_stoichiometry[:, active_additive_component_index] == 0.0)
     assert any(
@@ -1268,6 +1378,16 @@ def _compute_conductivity_from_recipe_context(
                 state_quadratures=state_quadratures,
                 transition_quadratures=transition_quadratures,
                 memory_coordinate_gradient_functions=memory_gradient_functions,
+                state_memory_value_matrix=(
+                    generator_construction._state_family_memory_value_matrix(
+                        state_quadratures,
+                        generator_construction.finite_generator_transition_edges(
+                            records,
+                            state_quadratures,
+                            recipe_context.temperature_K,
+                        ),
+                    )
+                ),
                 total_component_concentrations_mol_m3=component_concentrations,
                 temperature_K=recipe_context.temperature_K,
                 volume_m3=numerical_options.volume_m3,
@@ -1326,7 +1446,16 @@ def test_recipe_context_is_invariant_to_mapping_order() -> None:
         PHYSICAL_LIBRARY_ROOT,
     )
 
-    assert forward_context.components == reverse_context.components
+    assert forward_context.conserved_components == reverse_context.conserved_components
+    assert forward_context.resolved_species == reverse_context.resolved_species
+    assert (
+        forward_context.speciation_equilibrium.species
+        == reverse_context.speciation_equilibrium.species
+    )
+    assert np.allclose(
+        forward_context.speciation_equilibrium.conserved_component_totals_mol_m3,
+        reverse_context.speciation_equilibrium.conserved_component_totals_mol_m3,
+    )
     assert forward_context.solvent_volume_fractions == (
         reverse_context.solvent_volume_fractions
     )
@@ -1372,6 +1501,42 @@ def test_reference_recipe_primitive_owner_audit_table() -> None:
         assert tuple(row.primitive_owner for row in owner_rows) == expected_owners
         assert tuple(row.correctness_status for row in owner_rows) == expected_statuses
         assert owner_rows[3].detail == "primitive_prediction"
+        primitive_owner_table = conductivity_result.effect_attribution[
+            "state_primitive_owner_table"
+        ]
+        assert len(primitive_owner_table) == len(
+            conductivity_result.state_concentrations_mol_m3
+        )
+        required_primitive_owner_fields = {
+            "state_index",
+            "state_label",
+            "component_stoichiometry",
+            "concentration_mol_m3",
+            "owner_classes",
+            "D_Q_zDz_m2_s",
+            "D_Li_m2_s",
+            "D_anion_m2_s",
+            "D_Li_anion_m2_s",
+            "c_i_trace_D_self_mol_m_s",
+            "R_hydro_RPY_trace_kg_s",
+            "R_shape_trace_kg_s",
+            "R_cloud_short_k_trace_kg_s",
+            "R_atmosphere_electrophoretic_trace_kg_s",
+            "R_atmosphere_relaxation_trace_kg_s",
+            "R_atmosphere_cross_trace_kg_s",
+            "R_free_volume_trace_kg_s",
+            "R_cage_constraint_trace_kg_s",
+            "R_ligand_shell_obstruction_trace_kg_s",
+            "R_aggregate_constraint_trace_kg_s",
+            "R_bridge_constraint_trace_kg_s",
+            "R_orientation_denticity_trace_kg_s",
+            "mori_mode_labels",
+            "incident_transition_edge_indices",
+        }
+        assert all(
+            set(primitive_owner_record) == required_primitive_owner_fields
+            for primitive_owner_record in primitive_owner_table
+        )
         assert expected_min_mS_cm <= conductivity_result.sigma_mS_cm <= expected_max_mS_cm
         ownership_state_tensors = conductivity_result.effect_attribution[
             "transport_ownership_state_tensors"
@@ -2530,7 +2695,8 @@ def test_atmosphere_resistance_diagnostics_cloud_and_ionic_strength_response() -
 
 def test_resistance_component_diagnostics_expose_finite_thickness_shape_drag() -> None:
     recipe_context = generator_construction.build_recipe_library_context(
-        PHYSICAL_LIBRARY_ROOT / "recipe_ec_dmc_lipf6_1m.yaml",
+        PHYSICAL_LIBRARY_ROOT
+        / "recipe_ec_dmc_34_66_lipf6_0p8_lifsi_0p3_tpp_2wt_ps_1wt_vc_0p5wt_lidfob_0p5wt.yaml",
         PHYSICAL_LIBRARY_ROOT,
     )
     records = recipe_context.library_records
@@ -2553,13 +2719,14 @@ def test_resistance_component_diagnostics_expose_finite_thickness_shape_drag() -
         mixture,
         numerical_options,
     )
-    state_quadrature = generator_construction.build_all_state_quadratures(
+    state_quadratures = generator_construction.build_all_state_quadratures(
         records,
         template_configuration,
         mixture,
         recipe_context,
         numerical_options,
-    )[0]
+    )
+    state_quadrature = state_quadratures[0]
     local_fields = state_quadrature.local_fields[0]
 
     diagnostics = compute_resistance_component_diagnostics(
@@ -2574,18 +2741,57 @@ def test_resistance_component_diagnostics_expose_finite_thickness_shape_drag() -
 
     assert 0.0 < diagnostics.free_volume_trace_kg_s < diagnostics.stokes_trace_kg_s
     assert diagnostics.charge_cloud_trace_kg_s > 0.0
+    state_feature_traces_kg_s = (
+        diagnostics.cage_constraint_trace_kg_s,
+        diagnostics.ligand_shell_obstruction_trace_kg_s,
+        diagnostics.aggregate_constraint_trace_kg_s,
+        diagnostics.bridge_constraint_trace_kg_s,
+        diagnostics.orientation_denticity_trace_kg_s,
+    )
+    assert all(trace_kg_s >= 0.0 for trace_kg_s in state_feature_traces_kg_s)
+    assert sum(state_feature_traces_kg_s) > 0.0
     assert diagnostics.total_trace_kg_s == pytest.approx(
         diagnostics.stokes_trace_kg_s
         + diagnostics.free_volume_trace_kg_s
         + diagnostics.charge_cloud_trace_kg_s
         + diagnostics.atmosphere_trace_kg_s
+        + sum(state_feature_traces_kg_s)
     )
-    assert diagnostics.total_trace_kg_s == pytest.approx(
-        diagnostics.stokes_trace_kg_s
-        + diagnostics.free_volume_trace_kg_s
-        + diagnostics.charge_cloud_trace_kg_s
-        + diagnostics.atmosphere_trace_kg_s
+    maximum_feature_traces_kg_s = np.max(
+        np.asarray(
+            [
+                (
+                    state_diagnostics.cage_constraint_trace_kg_s,
+                    state_diagnostics.ligand_shell_obstruction_trace_kg_s,
+                    state_diagnostics.aggregate_constraint_trace_kg_s,
+                    state_diagnostics.bridge_constraint_trace_kg_s,
+                    state_diagnostics.orientation_denticity_trace_kg_s,
+                )
+                for candidate_quadrature in state_quadratures
+                for candidate_configuration, candidate_fields in zip(
+                    candidate_quadrature.configurations,
+                    candidate_quadrature.local_fields,
+                    strict=True,
+                )
+                for state_diagnostics in (
+                    compute_resistance_component_diagnostics(
+                        records,
+                        candidate_configuration,
+                        candidate_fields.viscosity_Pa_s,
+                        candidate_fields.dielectric_constant,
+                        candidate_fields.ionic_strength_mol_m3,
+                        recipe_context.temperature_K,
+                        candidate_fields.local_packing_fraction,
+                    ),
+                )
+            ],
+            dtype=float,
+        ),
+        axis=0,
     )
+    assert np.all(maximum_feature_traces_kg_s[[0, 1, 4]] > 0.0)
+    assert maximum_feature_traces_kg_s[2] == pytest.approx(0.0)
+    assert maximum_feature_traces_kg_s[3] == pytest.approx(0.0)
 
 
 def test_charged_center_covariance_controls_neutral_pair_charge_mobility() -> None:
@@ -2666,6 +2872,7 @@ def _compute_from_primitive_input(primitive_input: ProjectedPrimitiveInput):
         primitive_input.self_current_tensors_D_self_i_m2_s,
         primitive_input.mori_memory_matrix_A,
         primitive_input.mori_current_coupling_matrix_h,
+        primitive_input.state_memory_value_matrix,
         primitive_input.temperature_K,
         primitive_input.volume_m3,
     )
@@ -2715,6 +2922,12 @@ def _complete_artifact_result(
         mori_memory_matrix_A=conductivity_result.mori_memory_matrix_A,
         mori_current_coupling_matrix_h=(
             conductivity_result.mori_current_coupling_matrix_h
+        ),
+        discrete_state_memory_matrix_A_Q=(
+            conductivity_result.discrete_state_memory_matrix_A_Q
+        ),
+        discrete_state_current_coupling_matrix_h_Q=(
+            conductivity_result.discrete_state_current_coupling_matrix_h_Q
         ),
         state_transport_ownership_quadratures=(
             conductivity_result.state_transport_ownership_quadratures
@@ -3147,6 +3360,7 @@ def _primitive_input(
         ),
         mori_memory_matrix_A=np.zeros((0, 0), dtype=float),
         mori_current_coupling_matrix_h=np.zeros((0, 3), dtype=float),
+        state_memory_value_matrix=np.zeros((1, 0), dtype=float),
         temperature_K=temperature_K,
         volume_m3=1.0,
     )
@@ -3212,6 +3426,7 @@ def _two_state_primitive_input(
         ),
         mori_memory_matrix_A=np.zeros((0, 0), dtype=float),
         mori_current_coupling_matrix_h=np.zeros((0, 3), dtype=float),
+        state_memory_value_matrix=np.zeros((2, 0), dtype=float),
         temperature_K=T_REF_K,
         volume_m3=1.0,
     )

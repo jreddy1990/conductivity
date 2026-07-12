@@ -37,3 +37,5 @@ mixture_record: mixture.yaml
 basis_record: basis.yaml
 transition_record: transitions.yaml
 memory_record: memory.yaml
+association_record: association.yaml
+equilibria_record: equilibria.yaml

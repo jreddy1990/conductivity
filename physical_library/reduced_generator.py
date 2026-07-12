@@ -87,6 +87,7 @@ class ReducedGeneratorSpecification:
     state_quadratures: tuple[ReducedStateQuadrature, ...]
     transition_quadratures: tuple[ReducedTransitionQuadrature, ...]
     total_component_concentrations_mol_m3: Array
+    state_memory_value_matrix: Array
     temperature_K: float
     volume_m3: float
 
@@ -335,6 +336,9 @@ def build_projected_generator_input(
             relative_displacement_mobilities
         ),
         state_relative_center_charge_numbers=tuple(relative_center_charge_numbers),
+        state_memory_value_matrix=np.asarray(
+            specification.state_memory_value_matrix, dtype=float
+        ),
     )
 
 
