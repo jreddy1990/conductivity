@@ -1134,7 +1134,7 @@ def compute_state_feature_resistance_components(
                 )
 
     anion_contacted_cations: dict[tuple[str, int], list[tuple[tuple[str, int], float, Array]]] = {}
-    cation_contact_counts = {cation_key: 0 for cation_key in cation_keys}
+    cation_coordination_degrees = {cation_key: 0.0 for cation_key in cation_keys}
     for cation_key in cation_keys:
         for anion_key in anion_keys:
             coordination, direction = _molecule_coordination_and_direction(
@@ -1147,28 +1147,34 @@ def compute_state_feature_resistance_components(
             anion_contacted_cations.setdefault(anion_key, []).append(
                 (cation_key, coordination, direction)
             )
-            cation_contact_counts[cation_key] += 1
+            cation_coordination_degrees[cation_key] += coordination
     for anion_key, contacts in anion_contacted_cations.items():
-        contact_count = len(contacts)
+        anion_coordination_degree = sum(
+            coordination for _cation_key, coordination, _direction in contacts
+        )
         for cation_key, coordination, direction in contacts:
             pair_drag = _harmonic_mean_values(
                 molecule_records[cation_key][4], molecule_records[anion_key][4]
             )
-            bridge_degree = max(contact_count, cation_contact_counts[cation_key])
-            if bridge_degree > 1:
+            aggregate_excess_degree = max(
+                anion_coordination_degree,
+                cation_coordination_degrees[cation_key],
+            ) - UNITY
+            if aggregate_excess_degree > 0.0:
                 _add_center_relative_resistance(
                     aggregate_tensor,
                     molecule_records[cation_key],
                     molecule_records[anion_key],
-                    pair_drag * coordination * (bridge_degree - UNITY),
+                    pair_drag * coordination * aggregate_excess_degree,
                     np.eye(CARTESIAN_DIMENSION),
                 )
-            if contact_count > 1:
+            bridge_excess_degree = anion_coordination_degree - UNITY
+            if bridge_excess_degree > 0.0:
                 _add_center_relative_resistance(
                     bridge_tensor,
                     molecule_records[cation_key],
                     molecule_records[anion_key],
-                    pair_drag * coordination * (contact_count - UNITY),
+                    pair_drag * coordination * bridge_excess_degree,
                     np.outer(direction, direction),
                 )
             acceptor_count = sum(
@@ -1235,7 +1241,7 @@ def _molecule_coordination_and_direction(
     )
     distance_m = float(np.linalg.norm(displacement_m))
     if distance_m <= ZERO_DISTANCE_TOLERANCE_M:
-        raise ValueError("coordination distance is zero")
+        return UNITY, np.zeros_like(displacement_m)
     coordination = UNITY / (
         UNITY
         + (distance_m / float(switch_record["r0_m"])) ** float(switch_record["exponent"])

@@ -173,12 +173,14 @@ def test_density_weights_reproduce_basin_concentrations() -> None:
         potential_energy_J_mol,
         basin_points,
         basin_weights,
+        np.asarray([0.0, R * 300.0], dtype=float),
         300.0,
     )
     density_result = model.compute_basin_density_weights(
         potential_energy_J_mol,
         basin_points,
         basin_weights,
+        np.asarray([0.0, R * 300.0], dtype=float),
         restricted_log_partitions,
         np.asarray([9.0], dtype=float),
         np.asarray([[1.0], [1.0]], dtype=float),

@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import os
 import pickle
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -49,9 +50,11 @@ from conductivity.physical_library.physical_objects import (
 )
 from conductivity.physical_library.projected_analytical_conductivity import (
     ProjectedConductivityResult,
+    ProjectedGeneratorInput,
     StateTransportOwnershipBasis,
     TransportOwnership,
     _compute_projected_analytical_conductivity_from_input,
+    compute_restricted_log_partition_values,
     primitive_prediction_readiness_as_effect_attribution,
     symmetric_psd_pseudoinverse,
 )
@@ -600,6 +603,12 @@ def _compute_conductivity_from_recipe_uncached(
     conductivity_result = _compute_projected_analytical_conductivity_from_input(
         generator_input
     )
+    _annotate_partition_measure_diagnostics(
+        conductivity_result,
+        records,
+        state_quadratures,
+        generator_input,
+    )
     _validate_transition_rate_bounds(
         records,
         transition_edges,
@@ -643,6 +652,75 @@ def _compute_conductivity_from_recipe_uncached(
         state_quadratures=state_quadratures,
     )
     return conductivity_result
+
+
+def _annotate_partition_measure_diagnostics(
+    conductivity_result: ProjectedConductivityResult,
+    records: PhysicalLibraryRecords,
+    state_quadratures: tuple[PhysicalStateQuadrature, ...],
+    generator_input: ProjectedGeneratorInput,
+) -> None:
+    log_partitions = compute_restricted_log_partition_values(
+        generator_input.potential_energy_J_mol,
+        generator_input.basin_quadrature_points,
+        generator_input.basin_quadrature_weights,
+        generator_input.basin_energy_references_J_mol,
+        generator_input.temperature_K,
+    )
+    relative_log_partitions = log_partitions - float(np.max(log_partitions))
+    maximum_span = float(
+        records.association_record["association_residual"][
+            "maximum_relative_log_partition_span"
+        ]
+    )
+    observed_span = float(np.max(log_partitions) - np.min(log_partitions))
+    if observed_span > maximum_span:
+        raise ValueError(
+            "STATE_RELATIVE_LOG_PARTITION_SPAN_EXCEEDED: "
+            f"observed={observed_span:.9g}; configured={maximum_span:.9g}"
+        )
+    thermal_energy_J_mol = R * float(generator_input.temperature_K)
+    state_free_energies_over_RT = np.asarray(
+        [
+            _state_feature_sum(
+                records.association_record["association_residual"],
+                _state_key_from_label(state.label),
+                "population_operator_missing",
+            )
+            / thermal_energy_J_mol
+            for state in state_quadratures
+        ],
+        dtype=float,
+    )
+    relative_energy_ranges_over_RT = np.asarray(
+        [
+            (
+                max(
+                    float(generator_input.potential_energy_J_mol(point))
+                    for point in points
+                )
+                - float(reference_J_mol)
+            )
+            / thermal_energy_J_mol
+            for points, reference_J_mol in zip(
+                generator_input.basin_quadrature_points,
+                generator_input.basin_energy_references_J_mol,
+                strict=True,
+            )
+        ],
+        dtype=float,
+    )
+    conductivity_result.effect_attribution.update(
+        {
+            "state_relative_log_partition_values": relative_log_partitions,
+            "state_free_energies_over_RT": state_free_energies_over_RT,
+            "state_relative_internal_energy_ranges_over_RT": (
+                relative_energy_ranges_over_RT
+            ),
+            "relative_log_partition_span": observed_span,
+            "maximum_relative_log_partition_span": maximum_span,
+        }
+    )
 
 
 def _validate_state_charge_mobility_invariants(
@@ -870,6 +948,7 @@ def _state_quadratures_with_transport_ownership_bases(
             transport_ownership_bases=tuple(
                 _transport_ownership_basis_for_state_point(
                     records=records,
+                    state_key=_state_key_from_label(state_quadrature.label),
                     configuration=configuration,
                     incident_edges=incident_edges_by_state[state_index],
                     selected_memory_coordinates=selected_memory_coordinates,
@@ -883,6 +962,7 @@ def _state_quadratures_with_transport_ownership_bases(
 
 def _transport_ownership_basis_for_state_point(
     records: PhysicalLibraryRecords,
+    state_key: tuple[str, ...],
     configuration: SiteConfiguration,
     incident_edges: list[tuple[int, TransitionEdge]],
     selected_memory_coordinates: tuple[MemoryCoordinate, ...],
@@ -914,6 +994,11 @@ def _transport_ownership_basis_for_state_point(
         )[0]
         is TransportOwnership.BOUNDED_MEMORY
         and _memory_coordinate_is_supported(memory_coordinate, configuration)
+        and _memory_coordinate_is_active_for_state(
+            memory_coordinate,
+            state_key,
+            configuration,
+        )
     )
     diagnostic_records = tuple(
         (memory_mode_index, memory_coordinate)
@@ -957,6 +1042,37 @@ def _transport_ownership_basis_for_state_point(
             memory_coordinate.family.value
             for _memory_mode_index, memory_coordinate in diagnostic_records
         ),
+    )
+
+
+def _memory_coordinate_is_active_for_state(
+    memory_coordinate: MemoryCoordinate,
+    state_key: tuple[str, ...],
+    configuration: SiteConfiguration,
+) -> bool:
+    if memory_coordinate.family is not MemoryCoordinateFamily.PARTNER_RESIDENCE:
+        return True
+    ligand_state = _state_key_base_value(state_key[STATE_KEY_LIGAND_INDEX])
+    shell_state = _state_key_base_value(state_key[STATE_KEY_SHELL_INDEX])
+    pair_state = _state_key_base_value(state_key[STATE_KEY_PAIR_INDEX])
+    cluster_state = _state_key_base_value(state_key[STATE_KEY_CLUSTER_INDEX])
+    coordinating_additive_is_present = any(
+        _species_role(memory_coordinate.records, species_name)
+        is SpeciesRole.ADDITIVE
+        for species_name in configuration.species_names
+    )
+    pair_has_continuous_residence = (
+        pair_state == PairBasin.CONTACT_ION_PAIR.value
+        or (
+            pair_state == PairBasin.SOLVENT_SEPARATED_ION_PAIR.value
+            and not coordinating_additive_is_present
+        )
+    )
+    return (
+        ligand_state == "none"
+        and shell_state not in {"neutral_ligand_bound", "mixed_ligand_anion"}
+        and pair_has_continuous_residence
+        and cluster_state == "LiA"
     )
 
 
@@ -1462,9 +1578,16 @@ def build_all_state_quadratures(
             additive_component_names,
         )
     )
+    state_quadratures = _normalize_transport_equivalent_partition_weights(
+        tuple(quadratures)
+    )
+    state_quadratures = _apply_state_symmetry_and_degeneracy_factors(
+        records,
+        state_quadratures,
+    )
     state_quadratures = _state_quadratures_with_equilibrium_attribution(
         records,
-        tuple(quadratures),
+        state_quadratures,
         recipe_context.temperature_K,
     )
     return _filter_state_quadratures_by_partition_weight(
@@ -1516,6 +1639,73 @@ def _state_quadratures_with_equilibrium_attribution(
             )
         )
     return tuple(attributed_quadratures)
+
+
+def _normalize_transport_equivalent_partition_weights(
+    state_quadratures: tuple[PhysicalStateQuadrature, ...],
+) -> tuple[PhysicalStateQuadrature, ...]:
+    thermodynamic_group_by_state = tuple(
+        _thermodynamic_state_group(_state_key_from_label(state.label))
+        for state in state_quadratures
+    )
+    group_weight = Counter()
+    for state, thermodynamic_group in zip(
+        state_quadratures,
+        thermodynamic_group_by_state,
+        strict=True,
+    ):
+        group_weight[thermodynamic_group] += float(np.sum(state.weights))
+    return tuple(
+        replace(
+            state,
+            weights=np.asarray(state.weights, dtype=float)
+            / float(group_weight[thermodynamic_group]),
+        )
+        for state, thermodynamic_group in zip(
+            state_quadratures,
+            thermodynamic_group_by_state,
+            strict=True,
+        )
+    )
+
+
+def _thermodynamic_state_group(state_key: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(
+        state_key[state_index]
+        for state_index in (
+            STATE_KEY_PAIR_INDEX,
+            STATE_KEY_SHELL_INDEX,
+            STATE_KEY_LIGAND_INDEX,
+            STATE_KEY_ANION_INDEX,
+            STATE_KEY_CLUSTER_INDEX,
+        )
+    )
+
+
+def _apply_state_symmetry_and_degeneracy_factors(
+    records: PhysicalLibraryRecords,
+    state_quadratures: tuple[PhysicalStateQuadrature, ...],
+) -> tuple[PhysicalStateQuadrature, ...]:
+    adjusted_states = []
+    for state in state_quadratures:
+        topology_record = _aggregate_topology_record_from_state_key(
+            records,
+            _state_key_from_label(state.label),
+        )
+        if not topology_record:
+            adjusted_states.append(state)
+            continue
+        symmetry_number = int(topology_record["symmetry_number"])
+        degeneracy = int(topology_record["degeneracy"])
+        adjusted_states.append(
+            replace(
+                state,
+                weights=np.asarray(state.weights, dtype=float)
+                * float(degeneracy)
+                / float(symmetry_number),
+            )
+        )
+    return tuple(adjusted_states)
 
 
 def _state_key_has_valid_transport_topology(state_key: tuple[str, ...]) -> bool:
@@ -2521,7 +2711,8 @@ def _state_log_partition_value(
     state_quadrature: PhysicalStateQuadrature,
     temperature_K: float,
 ) -> float:
-    log_terms = []
+    potential_energies_J_mol = []
+    positive_weights = []
     for configuration, local_fields, weight in zip(
         state_quadrature.configurations,
         state_quadrature.local_fields,
@@ -2541,10 +2732,13 @@ def _state_log_partition_value(
             raise ValueError(
                 f"{state_quadrature.label} has nonpositive quadrature weight"
             )
-        log_terms.append(
-            np.log(float(weight))
-            - physical_objects.potential_energy_J_mol / (R * temperature_K)
-        )
+        positive_weights.append(float(weight))
+        potential_energies_J_mol.append(physical_objects.potential_energy_J_mol)
+    energy_array = np.asarray(potential_energies_J_mol, dtype=float)
+    state_energy_reference_J_mol = float(np.min(energy_array))
+    log_terms = np.log(np.asarray(positive_weights, dtype=float)) - (
+        energy_array - state_energy_reference_J_mol
+    ) / (R * temperature_K)
     term_array = np.asarray(log_terms, dtype=float)
     maximum_log_term = _finite_float(
         float(np.max(term_array)),
@@ -5109,6 +5303,7 @@ def _validate_transition_rate_bounds(
         raise ValueError("reversible_generator_Q_ij_s_inv must be square")
     if len(transition_edges) != len(transition_quadratures):
         raise ValueError("transition edge/quadrature count mismatch")
+    mobility_cache_m2_s: dict[tuple, Array] = {}
     for edge, transition_quadrature in zip(
         transition_edges,
         transition_quadratures,
@@ -5125,6 +5320,7 @@ def _validate_transition_rate_bounds(
             transition_record,
             transition_quadrature,
             temperature_K,
+            mobility_cache_m2_s,
         )
         forward_rate_s_inv = float(
             generator[edge.from_state_index, edge.to_state_index]
@@ -5161,6 +5357,7 @@ def _derived_transition_rate_bounds_s_inv(
     transition_record: dict,
     transition_quadrature: PhysicalTransitionQuadrature,
     temperature_K: float,
+    mobility_cache_m2_s: dict[tuple, Array],
 ) -> tuple[float, float]:
     if _uses_declared_rate_constant(family, transition_record):
         return _transition_rate_bounds_s_inv(transition_record, family)
@@ -5169,6 +5366,7 @@ def _derived_transition_rate_bounds_s_inv(
         transition_record,
         transition_quadrature,
         temperature_K,
+        mobility_cache_m2_s,
     )
     positive_projected_diffusivities = projected_diffusivities[
         projected_diffusivities > 0.0
@@ -5210,11 +5408,23 @@ def _transition_projected_diffusivity_profile(
     transition_record: dict,
     transition_quadrature: PhysicalTransitionQuadrature,
     temperature_K: float,
+    mobility_cache_m2_s: dict[tuple, Array],
 ) -> Array:
-    return np.asarray(
-        [
-            project_diffusivity_onto_reaction_coordinate(
-                build_physical_objects(
+    projected_diffusivities = []
+    for configuration, local_fields in zip(
+        transition_quadrature.configurations,
+        transition_quadrature.local_fields,
+        strict=True,
+    ):
+        cache_key = (
+            configuration.species_names,
+            tuple(np.asarray(configuration.molecule_ids, dtype=int)),
+            tuple(np.asarray(configuration.site_ids, dtype=int)),
+            tuple(np.asarray(configuration.positions_m, dtype=float).reshape(-1)),
+            local_fields,
+        )
+        if cache_key not in mobility_cache_m2_s:
+            mobility_cache_m2_s[cache_key] = build_physical_objects(
                     records,
                     configuration,
                     temperature_K,
@@ -5222,19 +5432,14 @@ def _transition_projected_diffusivity_profile(
                     local_fields.viscosity_Pa_s,
                     local_fields.ionic_strength_mol_m3,
                     local_fields.local_packing_fraction,
-                ).mobility_tensor_m2_s,
-                _reaction_coordinate_gradient(
-                    records, configuration, transition_record
-                ),
+                ).mobility_tensor_m2_s
+        projected_diffusivities.append(
+            project_diffusivity_onto_reaction_coordinate(
+                mobility_cache_m2_s[cache_key],
+                _reaction_coordinate_gradient(records, configuration, transition_record),
             )
-            for configuration, local_fields in zip(
-                transition_quadrature.configurations,
-                transition_quadrature.local_fields,
-                strict=True,
-            )
-        ],
-        dtype=float,
-    )
+        )
+    return np.asarray(projected_diffusivities, dtype=float)
 
 
 def _transition_coordinate_span(
@@ -5377,12 +5582,14 @@ def _annotate_transition_generator_diagnostics(
         ],
         dtype=float,
     )
+    mobility_cache_m2_s: dict[tuple, Array] = {}
     projected_diffusivity_profiles = tuple(
         _transition_projected_diffusivity_profile(
             records,
             transition_record,
             transition_quadrature,
             temperature_K,
+            mobility_cache_m2_s,
         )
         for transition_record, transition_quadrature in zip(
             transition_records,
@@ -5728,18 +5935,27 @@ def _validate_state_transport_owner_closure(
                 ].maximum_closure_residual_m2_s
             ),
         )
+        inclusive_ownership_tolerance = ownership_tolerance * (
+            1.0 + np.sqrt(np.finfo(float).eps)
+        )
         if float(
             np.linalg.norm(
                 final_self_tensor - tangent_self_tensor - bounded_tensor,
                 ord=2,
             )
-        ) > ownership_tolerance:
+        ) > inclusive_ownership_tolerance:
             raise ValueError(
                 f"state {state_quadrature.label} D_self violates owner closure"
             )
-        if float(np.linalg.norm(diagnostic_tensor, ord=2)) > ownership_tolerance:
+        if (
+            float(np.linalg.norm(diagnostic_tensor, ord=2))
+            > inclusive_ownership_tolerance
+        ):
             raise ValueError("diagnostic-owned state transport contributes D_self")
-        if float(np.linalg.norm(unowned_tensor, ord=2)) > ownership_tolerance:
+        if (
+            float(np.linalg.norm(unowned_tensor, ord=2))
+            > inclusive_ownership_tolerance
+        ):
             raise ValueError(
                 "populated state has unowned short-time transport: "
                 f"{state_quadrature.label}; "
@@ -7922,20 +8138,56 @@ def _partner_residence_memory_value(
     records: PhysicalLibraryRecords,
     configuration: SiteConfiguration,
 ) -> float:
-    return compute_role_coordination_number(
+    anion_coordination = compute_role_coordination_number(
         records,
         configuration,
         center_role=SpeciesRole.CATION.value,
         ligand_role=SpeciesRole.ANION.value,
         switch_name="Li_anion",
     )
+    ligand_coordination = compute_role_coordination_number(
+        records,
+        configuration,
+        center_role=SpeciesRole.CATION.value,
+        ligand_role=SpeciesRole.ADDITIVE.value,
+        switch_name="Li_ligand",
+    )
+    return anion_coordination / (1.0 + ligand_coordination)
 
 
 def _memory_li_anion_coordination_gradient(
     records: PhysicalLibraryRecords,
     configuration: SiteConfiguration,
 ) -> Array:
-    return _coordination_switch_gradient(records, configuration, "Li_anion")
+    anion_coordination = compute_role_coordination_number(
+        records,
+        configuration,
+        center_role=SpeciesRole.CATION.value,
+        ligand_role=SpeciesRole.ANION.value,
+        switch_name="Li_anion",
+    )
+    ligand_coordination = compute_role_coordination_number(
+        records,
+        configuration,
+        center_role=SpeciesRole.CATION.value,
+        ligand_role=SpeciesRole.ADDITIVE.value,
+        switch_name="Li_ligand",
+    )
+    anion_gradient = _coordination_switch_gradient(
+        records,
+        configuration,
+        "Li_anion",
+    )
+    ligand_gradient = _coordination_switch_gradient(
+        records,
+        configuration,
+        "Li_ligand",
+    )
+    ligand_denominator = 1.0 + ligand_coordination
+    return (
+        anion_gradient / ligand_denominator
+        - anion_coordination * ligand_gradient / ligand_denominator**2
+    )
 
 
 def _bounded_internal_polarization_x_memory_value(

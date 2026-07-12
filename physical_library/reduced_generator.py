@@ -298,6 +298,21 @@ def build_projected_generator_input(
         memory_coordinate_gradient=specification.memory_coordinate_gradient,
         basin_quadrature_points=tuple(basin_points),
         basin_quadrature_weights=tuple(basin_weights),
+        basin_energy_references_J_mol=np.asarray(
+            [
+                min(
+                    float(specification.potential_energy_J_mol(point))
+                    for point in points
+                )
+                for points in basin_points
+            ],
+            dtype=float,
+        ),
+        state_memory_active_mask=_state_memory_active_mask(
+            specification,
+            tuple(state_transport_ownership_bases),
+            tuple(basin_points),
+        ),
         transition_pair_indices=transition_pair_index_array,
         transition_quadrature_points=tuple(transition_points),
         transition_quadrature_weights=tuple(transition_weights),
@@ -340,6 +355,32 @@ def build_projected_generator_input(
             specification.state_memory_value_matrix, dtype=float
         ),
     )
+
+
+def _state_memory_active_mask(
+    specification: ReducedGeneratorSpecification,
+    state_transport_ownership_bases: tuple[
+        tuple[StateTransportOwnershipBasis, ...], ...
+    ],
+    basin_points: tuple[Array, ...],
+) -> Array:
+    memory_count = int(
+        np.asarray(
+            specification.memory_coordinate_gradient(basin_points[0][0]),
+            dtype=float,
+        ).shape[0]
+    )
+    active_mask = np.zeros(
+        (len(state_transport_ownership_bases), memory_count),
+        dtype=bool,
+    )
+    for state_index, state_bases in enumerate(state_transport_ownership_bases):
+        for ownership_basis in state_bases:
+            active_mask[
+                state_index,
+                np.asarray(ownership_basis.bounded_memory_mode_indices, dtype=int),
+            ] = True
+    return active_mask
 
 
 def _as_1d(array: Array, label: str) -> Array:

@@ -1624,6 +1624,8 @@ def test_physical_library_rejects_scalar_sigma_fitted_parameter_provenance() -> 
         basis_record=records.basis_record,
         transition_record=records.transition_record,
         memory_record=records.memory_record,
+        association_record=records.association_record,
+        equilibria_record=records.equilibria_record,
     )
 
     with pytest.raises(ValueError, match="rejects scalar-sigma-fitted parameter"):
@@ -1651,7 +1653,21 @@ def _recipe_context_with_perturbed_loadings(
     additive_concentration_scale = (
         target_additive_weight_fraction / base_additive_weight_fraction
     )
-    components = tuple(
+    resolved_species = tuple(
+        generator_construction.RecipeComponentLoading(
+            name=component.name,
+            concentration_mol_m3=(
+                component.concentration_mol_m3 * salt_scale
+                if component.role in {"salt_component", "cation", "anion"}
+                else component.concentration_mol_m3 * additive_concentration_scale
+                if component.name == active_additive_name
+                else component.concentration_mol_m3
+            ),
+            role=component.role,
+        )
+        for component in recipe_context.resolved_species
+    )
+    conserved_components = tuple(
         generator_construction.RecipeComponentLoading(
             name=component.name,
             concentration_mol_m3=(
@@ -1663,7 +1679,7 @@ def _recipe_context_with_perturbed_loadings(
             ),
             role=component.role,
         )
-        for component in recipe_context.components
+        for component in recipe_context.conserved_components
     )
     additive_weight_fractions = {
         additive_name: (
@@ -1677,7 +1693,9 @@ def _recipe_context_with_perturbed_loadings(
     }
     return generator_construction.RecipeBuildResult(
         temperature_K=recipe_context.temperature_K,
-        components=components,
+        conserved_components=conserved_components,
+        resolved_species=resolved_species,
+        speciation_equilibrium=recipe_context.speciation_equilibrium,
         solvent_volume_fractions=dict(recipe_context.solvent_volume_fractions),
         additive_weight_fractions=additive_weight_fractions,
         library_records=recipe_context.library_records,
@@ -2790,8 +2808,8 @@ def test_resistance_component_diagnostics_expose_finite_thickness_shape_drag() -
         axis=0,
     )
     assert np.all(maximum_feature_traces_kg_s[[0, 1, 4]] > 0.0)
-    assert maximum_feature_traces_kg_s[2] == pytest.approx(0.0)
-    assert maximum_feature_traces_kg_s[3] == pytest.approx(0.0)
+    assert maximum_feature_traces_kg_s[2] > 0.0
+    assert maximum_feature_traces_kg_s[3] > 0.0
 
 
 def test_charged_center_covariance_controls_neutral_pair_charge_mobility() -> None:
@@ -3139,6 +3157,8 @@ def _records_with_synthetic_neutral_pair_cloud_radius(
         basis_record=records.basis_record,
         transition_record=records.transition_record,
         memory_record=records.memory_record,
+        association_record=records.association_record,
+        equilibria_record=records.equilibria_record,
     )
 
 

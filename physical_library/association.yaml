@@ -5,6 +5,21 @@ association_residual:
   parameter_provenance: initialized_estimate
   initialization_basis: user_authorized_pre_validation_physical_initialization
   reference_temperature_K: 298.15
+  maximum_relative_log_partition_span: 50.0
+  state_feature_multipliers_RT:
+    pair:
+      CIP: -0.25
+      SSIP: -0.125
+      addSSIP: -0.1875
+    cluster:
+      Li2A_positive: 3.0
+      LiA2_negative: 3.0
+      Li2A2_neutral: 4.0
+      bridge_network: 5.0
+    ligand:
+      monodentate: 1.0
+      multidentate: 2.0
+      additive_separator: 1.5
   state_features:
     pair:
       free: 0.0
@@ -21,19 +36,19 @@ association_residual:
       free_additive_reservoir: 0.0
     ligand:
       none: 0.0
-      monodentate: 0.0
-      multidentate: 0.0
-      additive_separator: 0.0
+      monodentate: 2478.9570295567
+      multidentate: 4957.9140591134
+      additive_separator: 3718.43554433505
       free_ligand_reservoir: 0.0
     cluster:
       Li+: 0.0
       free_ions: 0.0
       LiA: 0.0
       Li_ligand_anion: 0.0
-      Li2A_positive: 1239.47851477835
-      LiA2_negative: 1239.47851477835
-      Li2A2_neutral: 2478.9570295567
-      bridge_network: 3098.696286945875
+      Li2A_positive: 7436.8710886701
+      LiA2_negative: 7436.8710886701
+      Li2A2_neutral: 9915.8281182268
+      bridge_network: 12394.7851477835
     orientation:
       radial: 0.0
       tangential: 0.0
@@ -75,6 +90,8 @@ aggregate_topologies:
     graph_edges: [[Li0, A0], [Li1, A0]]
     component_stoichiometry: {Li: 2, A: 1, ligand: 0}
     net_formal_charge_e: 1
+    symmetry_number: 2
+    degeneracy: 1
     minimum_cation_count: 2
     minimum_anion_count: 1
     minimum_ligand_count: 0
@@ -86,6 +103,8 @@ aggregate_topologies:
     graph_edges: [[Li0, A0], [Li0, A1]]
     component_stoichiometry: {Li: 1, A: 2, ligand: 0}
     net_formal_charge_e: -1
+    symmetry_number: 2
+    degeneracy: 1
     minimum_cation_count: 1
     minimum_anion_count: 2
     minimum_ligand_count: 0
@@ -97,6 +116,8 @@ aggregate_topologies:
     graph_edges: [[Li0, A0], [A0, Li1], [Li1, A1]]
     component_stoichiometry: {Li: 2, A: 2, ligand: 0}
     net_formal_charge_e: 0
+    symmetry_number: 2
+    degeneracy: 1
     minimum_cation_count: 2
     minimum_anion_count: 2
     minimum_ligand_count: 0
@@ -108,6 +129,8 @@ aggregate_topologies:
     graph_edges: [[Li0, A0], [A0, Li1], [Li1, A1], [A1, Li0]]
     component_stoichiometry: {Li: 2, A: 2, ligand: 0}
     net_formal_charge_e: 0
+    symmetry_number: 4
+    degeneracy: 1
     minimum_cation_count: 2
     minimum_anion_count: 2
     minimum_ligand_count: 0

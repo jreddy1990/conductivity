@@ -83,15 +83,6 @@ FIRST_PRINCIPLES_ALLOWED_PARAMETER_PROVENANCE = (
     "initialized_estimate",
 )
 
-ASSOCIATION_INITIALIZATION_MULTIPLIERS = {
-    ("pair", "CIP"): -0.25,  # Plan-defined quarter-RT favorable CIP residual.
-    ("pair", "SSIP"): -0.125,  # Plan-defined eighth-RT favorable SSIP residual.
-    ("pair", "addSSIP"): -0.1875,  # Plan-defined three-sixteenths-RT addSSIP residual.
-    ("cluster", "Li2A_positive"): 0.5,
-    ("cluster", "LiA2_negative"): 0.5,
-    ("cluster", "Li2A2_neutral"): 1.0,
-    ("cluster", "bridge_network"): 5.0 / 4.0,
-}
 FIRST_PRINCIPLES_REJECTED_PARAMETER_PROVENANCE = "fitted_to_scalar_sigma"
 
 
@@ -367,9 +358,19 @@ def _validate_association_record(association_record: dict) -> None:
     )
     for operator_name in ("association_residual", "state_resolved_born"):
         operator_record = association_record[operator_name]
+        required_operator_fields = (
+            "equation",
+            "source",
+            "parameter_provenance",
+            "initialization_basis",
+            "reference_temperature_K",
+            "state_features",
+        )
+        if operator_name == "association_residual":
+            required_operator_fields += ("maximum_relative_log_partition_span",)
         _require_mapping_keys(
             operator_record,
-            ("equation", "source", "parameter_provenance", "initialization_basis", "reference_temperature_K", "state_features"),
+            required_operator_fields,
             f"association.yaml.{operator_name}",
         )
         provenance = str(operator_record["parameter_provenance"])
@@ -385,6 +386,17 @@ def _validate_association_record(association_record: dict) -> None:
                 raise ValueError(f"association.yaml.{operator_name} initialized_estimate requires user-authorized initialization_basis")
             if reference_temperature_K != T_REF_K:
                 raise ValueError(f"association.yaml.{operator_name} initialized_estimate must use T_REF_K")
+        if operator_name == "association_residual":
+            maximum_log_partition_span = float(
+                operator_record["maximum_relative_log_partition_span"]
+            )
+            if (
+                not np.isfinite(maximum_log_partition_span)
+                or maximum_log_partition_span <= 0.0
+            ):
+                raise ValueError(
+                    "association maximum_relative_log_partition_span must be positive"
+                )
         state_features = operator_record["state_features"]
         if not isinstance(state_features, dict) or not state_features:
             raise ValueError(
@@ -407,14 +419,32 @@ def _validate_association_record(association_record: dict) -> None:
 
     residual_record = association_record["association_residual"]
     if residual_record["parameter_provenance"] == "initialized_estimate":
+        _require_mapping_keys(
+            residual_record,
+            ("state_feature_multipliers_RT",),
+            "association.yaml.association_residual",
+        )
         residual_features = residual_record["state_features"]
-        for feature_key, multiplier in ASSOCIATION_INITIALIZATION_MULTIPLIERS.items():
-            feature_name, state_value = feature_key
-            if feature_name not in residual_features or state_value not in residual_features[feature_name]:
-                raise KeyError(f"missing_state_free_energy_operator: association_residual.{feature_name}.{state_value}")
-            expected_J_mol = multiplier * R * T_REF_K
-            if float(residual_features[feature_name][state_value]) != expected_J_mol:
-                raise ValueError(f"association.yaml association_residual.{feature_name}.{state_value} must equal its exact R*T_REF_K initialization")
+        multiplier_features = residual_record["state_feature_multipliers_RT"]
+        for feature_name, state_multipliers in multiplier_features.items():
+            if feature_name not in residual_features:
+                raise KeyError(
+                    "missing_state_free_energy_operator: "
+                    f"association_residual.{feature_name}"
+                )
+            for state_value, multiplier in state_multipliers.items():
+                if state_value not in residual_features[feature_name]:
+                    raise KeyError(
+                        "missing_state_free_energy_operator: "
+                        f"association_residual.{feature_name}.{state_value}"
+                    )
+                expected_J_mol = float(multiplier) * R * T_REF_K
+                if float(residual_features[feature_name][state_value]) != expected_J_mol:
+                    raise ValueError(
+                        "association.yaml association_residual."
+                        f"{feature_name}.{state_value} must equal its declared "
+                        "R*T_REF_K initialization"
+                    )
     _validate_aggregate_topologies(association_record["aggregate_topologies"])
 
 
@@ -427,7 +457,20 @@ def _validate_aggregate_topologies(aggregate_topologies: dict) -> None:
     }
     if not isinstance(aggregate_topologies, dict) or set(aggregate_topologies) != set(expected_topologies):
         raise ValueError("association.yaml.aggregate_topologies must contain the exact required topology inventory")
-    required_fields = ("topology_id", "cluster_family", "graph_edges", "component_stoichiometry", "net_formal_charge_e", "minimum_cation_count", "minimum_anion_count", "minimum_ligand_count", "source", "parameter_provenance")
+    required_fields = (
+        "topology_id",
+        "cluster_family",
+        "graph_edges",
+        "component_stoichiometry",
+        "net_formal_charge_e",
+        "symmetry_number",
+        "degeneracy",
+        "minimum_cation_count",
+        "minimum_anion_count",
+        "minimum_ligand_count",
+        "source",
+        "parameter_provenance",
+    )
     for topology_id, expected in expected_topologies.items():
         topology_record = aggregate_topologies[topology_id]
         _require_mapping_keys(topology_record, required_fields, f"association.yaml.aggregate_topologies.{topology_id}")
@@ -440,6 +483,14 @@ def _validate_aggregate_topologies(aggregate_topologies: dict) -> None:
         expected_counts = (expected_stoichiometry["Li"], expected_stoichiometry["A"], expected_stoichiometry["ligand"])
         if minimum_counts != expected_counts:
             raise ValueError(f"association topology {topology_id} has inconsistent minimum multiplicity")
+        if int(topology_record["symmetry_number"]) <= 0:
+            raise ValueError(
+                f"association topology {topology_id} symmetry number must be positive"
+            )
+        if int(topology_record["degeneracy"]) <= 0:
+            raise ValueError(
+                f"association topology {topology_id} degeneracy must be positive"
+            )
         if topology_record["source"] != "user_authorized_initialized_topology" or topology_record["parameter_provenance"] != "initialized_estimate":
             raise ValueError(f"association topology {topology_id} requires initialized_estimate provenance")
 

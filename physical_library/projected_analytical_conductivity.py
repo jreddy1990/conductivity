@@ -262,6 +262,8 @@ class ProjectedGeneratorInput:
         memory_coordinate_gradient: Callable[[Array], Array],
         basin_quadrature_points: tuple[Array, ...],
         basin_quadrature_weights: tuple[Array, ...],
+        basin_energy_references_J_mol: Array,
+        state_memory_active_mask: Array,
         transition_pair_indices: Array,
         transition_quadrature_points: tuple[Array, ...],
         transition_quadrature_weights: tuple[Array, ...],
@@ -295,6 +297,8 @@ class ProjectedGeneratorInput:
         self.memory_coordinate_gradient = memory_coordinate_gradient
         self.basin_quadrature_points = basin_quadrature_points
         self.basin_quadrature_weights = basin_quadrature_weights
+        self.basin_energy_references_J_mol = basin_energy_references_J_mol
+        self.state_memory_active_mask = state_memory_active_mask
         self.transition_pair_indices = transition_pair_indices
         self.transition_quadrature_points = transition_quadrature_points
         self.transition_quadrature_weights = transition_quadrature_weights
@@ -622,6 +626,22 @@ def compute_projected_analytical_conductivity(
             memory_coordinate_gradient=memory_coordinate_gradient,
             basin_quadrature_points=basin_quadrature_points,
             basin_quadrature_weights=basin_quadrature_weights,
+            basin_energy_references_J_mol=_basin_energy_references_J_mol(
+                potential_energy_J_mol,
+                basin_quadrature_points,
+            ),
+            state_memory_active_mask=np.ones(
+                (
+                    state_count,
+                    int(
+                        np.asarray(
+                            memory_coordinate_gradient(basin_quadrature_points[0][0]),
+                            dtype=float,
+                        ).shape[0]
+                    ),
+                ),
+                dtype=bool,
+            ),
             transition_pair_indices=transition_pair_indices,
             transition_quadrature_points=transition_quadrature_points,
             transition_quadrature_weights=transition_quadrature_weights,
@@ -679,12 +699,14 @@ def _compute_projected_analytical_conductivity_from_input(
         model_input.potential_energy_J_mol,
         model_input.basin_quadrature_points,
         model_input.basin_quadrature_weights,
+        model_input.basin_energy_references_J_mol,
         model_input.temperature_K,
     )
     density_result = compute_basin_density_weights(
         model_input.potential_energy_J_mol,
         model_input.basin_quadrature_points,
         model_input.basin_quadrature_weights,
+        model_input.basin_energy_references_J_mol,
         log_partitions,
         model_input.total_component_concentrations_mol_m3,
         model_input.basin_stoichiometry,
@@ -754,6 +776,7 @@ def _compute_projected_analytical_conductivity_from_input(
         model_input.memory_coordinate_gradient,
         model_input.basin_quadrature_points,
         density_weights,
+        model_input.state_memory_active_mask,
     )
     bounded_memory_candidate_indices = _declared_bounded_memory_mode_indices(
         model_input.state_transport_ownership_bases
@@ -972,7 +995,12 @@ def _compute_projected_analytical_conductivity_from_input(
     )
     combined_state_memory_values = np.hstack(
         (
-            np.zeros((concentrations.size, continuous_memory_count), dtype=float),
+            np.asarray(
+                model_input.state_memory_active_mask[
+                    :, accepted_bounded_memory_mode_indices
+                ],
+                dtype=float,
+            ),
             discrete_state_memory_values,
         )
     )
@@ -1613,6 +1641,17 @@ def _compute_projected_analytical_conductivity_from_functions_input(
             memory_coordinate_gradient=gradpsi,
             basin_quadrature_points=model_input.basin_quadrature_points,
             basin_quadrature_weights=model_input.basin_quadrature_weights,
+            basin_energy_references_J_mol=_basin_energy_references_J_mol(
+                model_input.potential_energy_J_mol,
+                model_input.basin_quadrature_points,
+            ),
+            state_memory_active_mask=np.ones(
+                (
+                    model_input.basin_stoichiometry.shape[0],
+                    int(np.asarray(gradpsi(model_input.basin_quadrature_points[0][0])).shape[0]),
+                ),
+                dtype=bool,
+            ),
             transition_pair_indices=model_input.transition_pair_indices,
             transition_quadrature_points=model_input.transition_quadrature_points,
             transition_quadrature_weights=model_input.transition_quadrature_weights,
@@ -1788,16 +1827,42 @@ def _compute_projected_analytical_conductivity_from_primitive_input(
     )
 
 
+def _basin_energy_references_J_mol(
+    potential_energy_J_mol: Callable[[Array], float],
+    basin_quadrature_points: Sequence[Array],
+) -> Array:
+    references = np.asarray(
+        [
+            min(float(potential_energy_J_mol(point)) for point in as_2d(points, "basin"))
+            for points in basin_quadrature_points
+        ],
+        dtype=float,
+    )
+    if not np.all(np.isfinite(references)):
+        raise ValueError("basin energy references must be finite")
+    return references
+
+
 def compute_restricted_log_partition_values(
     potential_energy_J_mol: Callable[[Array], float],
     basin_quadrature_points: Sequence[Array],
     basin_quadrature_weights: Sequence[Array],
+    basin_energy_references_J_mol: Array,
     temperature_K: float,
 ) -> Array:
     beta_mol = 1.0 / (R_J_PER_MOL_K * positive_float(temperature_K, "temperature_K"))
     log_values = []
-    for points, weights in zip(
-        basin_quadrature_points, basin_quadrature_weights, strict=True
+    energy_references = as_1d(
+        basin_energy_references_J_mol,
+        "basin_energy_references_J_mol",
+    )
+    if energy_references.size != len(basin_quadrature_points):
+        raise ValueError("basin energy reference count must equal basin count")
+    for points, weights, energy_reference_J_mol in zip(
+        basin_quadrature_points,
+        basin_quadrature_weights,
+        energy_references,
+        strict=True,
     ):
         pts = as_2d(points, "basin_quadrature_points[]")
         w = as_1d(weights, "basin_quadrature_weights[]")
@@ -1806,9 +1871,11 @@ def compute_restricted_log_partition_values(
         basin_log_value = -np.inf
         for point, weight in zip(pts, w):
             positive_weight = positive_float(float(weight), "basin_quadrature_weight")
-            log_term = np.log(positive_weight) - beta_mol * float(
-                potential_energy_J_mol(point)
+            relative_energy_J_mol = (
+                float(potential_energy_J_mol(point))
+                - float(energy_reference_J_mol)
             )
+            log_term = np.log(positive_weight) - beta_mol * relative_energy_J_mol
             basin_log_value = np.logaddexp(basin_log_value, log_term)
         log_values.append(basin_log_value)
     log_value_array = np.asarray(log_values, dtype=float)
@@ -2033,6 +2100,7 @@ def compute_basin_density_weights(
     potential_energy_J_mol: Callable[[Array], float],
     basin_quadrature_points: Sequence[Array],
     basin_quadrature_weights: Sequence[Array],
+    basin_energy_references_J_mol: Array,
     restricted_log_partition_values: Array,
     total_component_concentrations_mol_m3: Array,
     basin_stoichiometry: Array,
@@ -2050,8 +2118,19 @@ def compute_basin_density_weights(
         dtype=float,
     )
     density_weights: list[Array] = []
-    for basin_index, (points, weights) in enumerate(
-        zip(basin_quadrature_points, basin_quadrature_weights, strict=True)
+    energy_references = as_1d(
+        basin_energy_references_J_mol,
+        "basin_energy_references_J_mol",
+    )
+    if energy_references.size != len(basin_quadrature_points):
+        raise ValueError("basin energy reference count must equal basin count")
+    for basin_index, (points, weights, energy_reference_J_mol) in enumerate(
+        zip(
+            basin_quadrature_points,
+            basin_quadrature_weights,
+            energy_references,
+            strict=True,
+        )
     ):
         quadrature_points = as_2d(points, "basin_quadrature_points[]")
         quadrature_weights = as_1d(weights, "basin_quadrature_weights[]")
@@ -2063,8 +2142,12 @@ def compute_basin_density_weights(
                 float(quadrature_weights[point_index]),
                 "basin_quadrature_weight",
             )
-            log_terms[point_index] = np.log(positive_weight) - beta_mol * float(
-                potential_energy_J_mol(point)
+            relative_energy_J_mol = (
+                float(potential_energy_J_mol(point))
+                - float(energy_reference_J_mol)
+            )
+            log_terms[point_index] = (
+                np.log(positive_weight) - beta_mol * relative_energy_J_mol
             )
         log_normalizer = float(np.max(log_terms))
         normalized_weights = np.exp(log_terms - log_normalizer)
@@ -3273,6 +3356,7 @@ def compute_mori_memory_matrices(
     memory_coordinate_gradient: Callable[[Array], Array],
     basin_quadrature_points: Sequence[Array],
     basin_density_weights_mol_m3: Sequence[Array],
+    state_memory_active_mask: Array,
 ) -> tuple[Array, Array]:
     first_point = np.asarray(basin_quadrature_points[0], dtype=float)[0]
     mem_dim = int(
@@ -3284,11 +3368,14 @@ def compute_mori_memory_matrices(
         return A, h
     if len(basin_density_weights_mol_m3) != len(basin_quadrature_points):
         raise ValueError("basin_density_weights_mol_m3 length must equal state count")
-    for points, density_weights in zip(
+    active_mask = np.asarray(state_memory_active_mask, dtype=bool)
+    if active_mask.shape != (len(basin_quadrature_points), mem_dim):
+        raise ValueError("state memory active mask has wrong shape")
+    for state_index, (points, density_weights) in enumerate(zip(
         basin_quadrature_points,
         basin_density_weights_mol_m3,
         strict=True,
-    ):
+    )):
         pts = as_2d(points, "basin_quadrature_points[]")
         W = as_1d(density_weights, "basin_density_weights_mol_m3[]")
         if pts.shape[0] != W.size:
@@ -3298,6 +3385,7 @@ def compute_mori_memory_matrices(
             gradpsi = as_2d(
                 memory_coordinate_gradient(point), "memory_coordinate_gradient"
             )
+            gradpsi = gradpsi * active_mask[state_index, :, np.newaxis]
             if gradpsi.shape[1] != point.size:
                 raise ValueError(
                     "memory_coordinate_gradient has wrong coordinate dimension"
@@ -3332,6 +3420,19 @@ def filter_memory_basis_by_dirichlet_residual(
         candidate_gradients,
         basin_quadrature_points,
         basin_density_weights_mol_m3,
+        np.ones(
+            (
+                len(basin_quadrature_points),
+                int(
+                    np.asarray(
+                        candidate_gradients(
+                            np.asarray(basin_quadrature_points[0], dtype=float)[0]
+                        )
+                    ).shape[0]
+                ),
+            ),
+            dtype=bool,
+        ),
     )
     candidate_count = raw_memory_matrix.shape[0]
     remaining_tensor_base = _symmetrize(
@@ -4719,6 +4820,23 @@ def validate_generator_input(x: ProjectedGeneratorInput) -> None:
     positive_float(x.volume_m3, "volume_m3")
     validate_basin_quadrature(x.basin_quadrature_points, x.basin_quadrature_weights)
     state_count = len(x.basin_quadrature_points)
+    energy_references = as_1d(
+        x.basin_energy_references_J_mol,
+        "basin_energy_references_J_mol",
+    )
+    if energy_references.size != state_count or not np.all(
+        np.isfinite(energy_references)
+    ):
+        raise ValueError("basin energy references must be finite and state-aligned")
+    memory_active_mask = np.asarray(x.state_memory_active_mask, dtype=bool)
+    memory_count = int(
+        np.asarray(
+            x.memory_coordinate_gradient(x.basin_quadrature_points[0][0]),
+            dtype=float,
+        ).shape[0]
+    )
+    if memory_active_mask.shape != (state_count, memory_count):
+        raise ValueError("state memory active mask must be state and mode aligned")
     validate_self_current_coordinate_projectors(
         x.self_current_coordinate_projectors,
         state_count,

@@ -39,10 +39,13 @@ def test_production_association_coefficients_are_exact_rt_initializations() -> N
         ("pair", "CIP"): -0.25,
         ("pair", "SSIP"): -0.125,
         ("pair", "addSSIP"): -0.1875,
-        ("cluster", "Li2A_positive"): 0.5,
-        ("cluster", "LiA2_negative"): 0.5,
-        ("cluster", "Li2A2_neutral"): 1.0,
-        ("cluster", "bridge_network"): 1.25,
+        ("cluster", "Li2A_positive"): 3.0,
+        ("cluster", "LiA2_negative"): 3.0,
+        ("cluster", "Li2A2_neutral"): 4.0,
+        ("cluster", "bridge_network"): 5.0,
+        ("ligand", "monodentate"): 1.0,
+        ("ligand", "multidentate"): 2.0,
+        ("ligand", "additive_separator"): 1.5,
     }
     for (feature_name, state_value), multiplier in expected.items():
         assert residual["state_features"][feature_name][state_value] == multiplier * R * T_REF_K
@@ -86,4 +89,4 @@ def test_production_operator_is_conditioned_on_pair_and_cluster() -> None:
     residual = load_physical_library(PHYSICAL_LIBRARY_ROOT).association_record["association_residual"]
     state_key = ("CIP", "solvent_only", "none", "PF6-:anion_localized", "free_rotating", "Li2A_positive", "partner_free", "identity_localized", "hop_localized", "cage_relaxed", "environment", "atmosphere_relaxed")
     energy_J_mol = generator_construction._state_feature_sum(residual, state_key, "missing_state_free_energy_operator")
-    assert energy_J_mol == (-0.25 + 0.5) * R * T_REF_K
+    assert energy_J_mol == (-0.25 + 3.0) * R * T_REF_K
