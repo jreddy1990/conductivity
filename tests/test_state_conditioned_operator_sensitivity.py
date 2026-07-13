@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -90,3 +91,46 @@ def test_production_operator_is_conditioned_on_pair_and_cluster() -> None:
     state_key = ("CIP", "solvent_only", "none", "PF6-:anion_localized", "free_rotating", "Li2A_positive", "partner_free", "identity_localized", "hop_localized", "cage_relaxed", "environment", "atmosphere_relaxed")
     energy_J_mol = generator_construction._state_feature_sum(residual, state_key, "missing_state_free_energy_operator")
     assert energy_J_mol == (-0.25 + 3.0) * R * T_REF_K
+
+
+def test_discrete_memory_family_distinguishes_partner_state() -> None:
+    shared_fields = (
+        "SSIP",
+        "anion_coordinated",
+        "none",
+        "FSI-:anion_delocalized",
+        "free_rotating",
+        "LiA",
+    )
+    trailing_fields = (
+        "identity_inactive",
+        "hop_inactive",
+        "cage_inactive",
+        "packing_0:ionic_1:dielectric_1:viscosity_0",
+        "atmosphere_inactive",
+    )
+    states = (
+        SimpleNamespace(
+            label="|".join(
+                (*shared_fields, "partner_bound", *trailing_fields)
+            )
+        ),
+        SimpleNamespace(
+            label="|".join(
+                (*shared_fields, "partner_exchanged", *trailing_fields)
+            )
+        ),
+    )
+    transition_edges = (
+        SimpleNamespace(from_state_index=0, to_state_index=1),
+    )
+
+    family_keys = generator_construction._state_family_memory_keys(states)
+    memory_values = generator_construction._state_family_memory_value_matrix(
+        states,
+        transition_edges,
+    )
+
+    assert family_keys[0] != family_keys[1]
+    assert memory_values.shape == (2, 1)
+    assert memory_values[0, 0] != memory_values[1, 0]

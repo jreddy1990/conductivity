@@ -7962,6 +7962,7 @@ def _state_family_memory_keys(
         STATE_KEY_CLUSTER_INDEX,
         STATE_KEY_CAGE_INDEX,
         STATE_KEY_ORIENTATION_INDEX,
+        STATE_KEY_PARTNER_INDEX,
     )
     return tuple(
         tuple(_state_key_from_label(state_quadrature.label)[index] for index in family_indices)
