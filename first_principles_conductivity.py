@@ -5,16 +5,29 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, dataclass
 from pathlib import Path
+import subprocess
 import sys
 from typing import Protocol, runtime_checkable
 
 import numpy as np
 from scipy.integrate import cumulative_trapezoid
 from scipy.linalg import svd
+from scipy.optimize import Bounds, LinearConstraint, milp
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from constants import K_B, S_M_TO_MS_CM
+from constants import (
+    ANGSTROM_TO_M,
+    E_CHARGE,
+    FEMTOSECOND_TO_S,
+    G_TO_KG,
+    K_B,
+    KCAL_TO_J,
+    KG_M3_PER_G_ML,
+    N_A,
+    S_M_TO_MS_CM,
+    S_PER_PS,
+)
 from electrolyte_model import ElectrolyteRecipeModel
 from utils.strict_validation import read_json_object, write_json_object
 from utils.time_series_statistics import linear_fit, select_stationary_suffix
@@ -22,6 +35,29 @@ from utils.time_series_statistics import linear_fit, select_stationary_suffix
 Array = np.ndarray
 CARTESIAN_DIMENSION = 3
 HALF = 0.5  # Analytical half-step used by Verlet and BAOAB splitting.
+FORCE_FIELD_ENVIRONMENT = "ff-md"
+LAMMPS_POSITION_COLUMNS = slice(4, 7)  # xu, yu, zu in the declared dump format.
+LAMMPS_VELOCITY_COLUMNS = slice(7, 10)  # vx, vy, vz in the declared dump format.
+LAMMPS_FORCE_COLUMNS = slice(10, 13)  # fx, fy, fz in the declared dump format.
+
+
+def molecule_with_explicit_hydrogens(smiles: str):
+    from rdkit import Chem
+
+    molecule = Chem.MolFromSmiles(smiles)
+    if molecule is None:
+        raise ValueError(f"could not parse SMILES: {smiles}")
+    return Chem.AddHs(molecule)
+
+
+def explicit_hydrogen_atom_count(smiles: str) -> int:
+    return int(molecule_with_explicit_hydrogens(smiles).GetNumAtoms())
+
+
+def molar_mass_g_mol(smiles: str) -> float:
+    from rdkit.Chem.Descriptors import MolWt
+
+    return float(MolWt(molecule_with_explicit_hydrogens(smiles)))
 
 
 @dataclass(frozen=True)
@@ -41,6 +77,7 @@ class DynamicsSettings:
     equilibration_steps: int
     production_steps: int
     sample_stride_steps: int
+    equilibration_langevin_friction_per_s: float
     langevin_friction_per_s: float
     force_difference_step_m: float
     force_consistency_relative_tolerance: float
@@ -53,6 +90,7 @@ class NumericalSettings:
     singular_value_relative_tolerance: float
     residual_tolerance: float
     conductivity_tolerance_S_m: float
+    projected_gk_tolerance_S_m: float
     maximum_basis_size: int
     radial_basis_count: int
     radial_cutoff_m: float
@@ -83,7 +121,6 @@ class PhaseSpaceTrajectory:
     positions_m: Array
     velocities_m_s: Array
     forces_N: Array
-    potential_energies_J: Array
     partial_charges_C: Array
     box_vectors_m: Array
     masses_kg: Array
@@ -93,147 +130,319 @@ class PhaseSpaceTrajectory:
 
 @runtime_checkable
 class InteratomicModel(Protocol):
-    def initial_configuration(
+    def sample_phase_space_trajectory(
         self,
         recipe: ElectrolyteRecipeModel,
+        temperature_K: float,
         density_kg_m3: float,
         molecule_count: int,
-        random_generator: np.random.Generator,
-    ) -> MicroscopicConfiguration: ...
+        dynamics: DynamicsSettings,
+        random_seed: int,
+    ) -> PhaseSpaceTrajectory: ...
 
+
+@runtime_checkable
+class ForceEnergyModel(Protocol):
     def energy_J(self, positions_m: Array, box_vectors_m: Array) -> float: ...
 
     def forces_N(self, positions_m: Array, box_vectors_m: Array) -> Array: ...
-
-    def virial_J(self, positions_m: Array, box_vectors_m: Array) -> Array: ...
 
     def partial_charges_C(
         self, positions_m: Array, box_vectors_m: Array
     ) -> Array: ...
 
 
-class TorchScriptInteratomicModel:
-    """TorchScript energy/charge model with an explicit atomistic topology."""
+def _charge_neutral_molecule_counts(
+    mole_fractions: Array,
+    molecular_charges_e: Array,
+    molecule_count: int,
+) -> Array:
+    species_count = mole_fractions.size
+    target_counts = mole_fractions * molecule_count
+    objective = np.concatenate((np.zeros(species_count), np.ones(species_count)))
+    equality_matrix = np.zeros((2, 2 * species_count), dtype=float)
+    equality_matrix[0, :species_count] = 1.0
+    equality_matrix[1, :species_count] = molecular_charges_e
+    deviation_matrix = np.zeros((2 * species_count, 2 * species_count), dtype=float)
+    deviation_upper = np.empty(2 * species_count, dtype=float)
+    for species_index in range(species_count):
+        deviation_matrix[2 * species_index, species_index] = 1.0
+        deviation_matrix[2 * species_index, species_count + species_index] = -1.0
+        deviation_upper[2 * species_index] = target_counts[species_index]
+        deviation_matrix[2 * species_index + 1, species_index] = -1.0
+        deviation_matrix[2 * species_index + 1, species_count + species_index] = -1.0
+        deviation_upper[2 * species_index + 1] = -target_counts[species_index]
+    lower_bounds = np.zeros(2 * species_count, dtype=float)
+    lower_bounds[:species_count] = np.where(mole_fractions > 0.0, 1.0, 0.0)
+    solution = milp(
+        c=objective,
+        integrality=np.concatenate(
+            (np.ones(species_count, dtype=int), np.zeros(species_count, dtype=int))
+        ),
+        bounds=Bounds(lower_bounds, np.full(2 * species_count, np.inf)),
+        constraints=(
+            LinearConstraint(
+                equality_matrix,
+                np.asarray((molecule_count, 0.0)),
+                np.asarray((molecule_count, 0.0)),
+            ),
+            LinearConstraint(
+                deviation_matrix,
+                np.full(2 * species_count, -np.inf),
+                deviation_upper,
+            ),
+        ),
+    )
+    if not solution.success or solution.x is None:
+        raise ValueError("no charge-neutral integer molecule allocation exists")
+    counts = np.rint(solution.x[:species_count]).astype(int)
+    if int(np.sum(counts)) != molecule_count:
+        raise ValueError("integer molecule allocation violates molecule count")
+    if not np.isclose(float(counts @ molecular_charges_e), 0.0, atol=1.0e-10):
+        raise ValueError("integer molecule allocation violates charge neutrality")
+    return counts
+
+
+class SageLammpsMicroscopicModel:
+    """Recipe-built Sage potential and inertial LAMMPS trajectory sampler."""
 
     def __init__(
         self,
-        model_path: Path,
-        configuration_path: Path,
-        recipe: ElectrolyteRecipeModel,
-        charge_consistency_tolerance_C: float,
+        run_directory: Path,
+        species_manifest_path: Path,
+        conda_executable: Path,
+        lammps_executable: Path,
     ) -> None:
-        import torch
+        self.run_directory = run_directory
+        self.species_manifest_path = species_manifest_path
+        self.conda_executable = conda_executable
+        self.lammps_executable = lammps_executable
 
-        self._torch = torch
-        self._model = torch.jit.load(str(model_path), map_location="cpu")
-        self._model.eval()
-        configuration = np.load(configuration_path, allow_pickle=False)
-        self._positions_m = np.asarray(configuration["positions_m"], dtype=float)
-        self._masses_kg = np.asarray(configuration["masses_kg"], dtype=float)
-        self._molecule_index = np.asarray(configuration["molecule_index"], dtype=int)
-        self._atom_type_index = np.asarray(configuration["atom_type_index"], dtype=int)
-        self._partial_charges_C = np.asarray(
-            configuration["partial_charges_C"], dtype=float
-        )
-        self._box_vectors_m = np.asarray(configuration["box_vectors_m"], dtype=float)
-        self._recipe = recipe
-        self._charge_consistency_tolerance_C = charge_consistency_tolerance_C
-        self._validate_topology()
-
-    def initial_configuration(
+    def sample_phase_space_trajectory(
         self,
         recipe: ElectrolyteRecipeModel,
+        temperature_K: float,
         density_kg_m3: float,
         molecule_count: int,
-        random_generator: np.random.Generator,
-    ) -> MicroscopicConfiguration:
-        del random_generator
-        if recipe.model_dump(mode="python") != self._recipe.model_dump(mode="python"):
-            raise ValueError("atomistic topology composition differs from recipe")
-        volume_m3 = float(abs(np.linalg.det(self._box_vectors_m)))
-        observed_density_kg_m3 = float(np.sum(self._masses_kg) / volume_m3)
-        relative_error = abs(observed_density_kg_m3 - density_kg_m3) / density_kg_m3
-        if relative_error > np.sqrt(np.finfo(float).eps):
-            raise ValueError("requested density differs from topology density")
-        if int(np.unique(self._molecule_index).size) != molecule_count:
-            raise ValueError("requested molecule count differs from topology")
-        positions_m = wrap_positions(self._positions_m, self._box_vectors_m)
-        return MicroscopicConfiguration(
-            positions_m=positions_m,
-            velocities_m_s=np.zeros_like(positions_m),
-            masses_kg=self._masses_kg.copy(),
-            partial_charges_C=self.partial_charges_C(
-                positions_m, self._box_vectors_m
-            ),
-            molecule_index=self._molecule_index.copy(),
-            atom_type_index=self._atom_type_index.copy(),
-            box_vectors_m=self._box_vectors_m.copy(),
-        )
-
-    def energy_J(self, positions_m: Array, box_vectors_m: Array) -> float:
-        energy, _charges = self._energy_and_charges(positions_m, box_vectors_m)
-        return float(energy.detach().cpu().numpy())
-
-    def forces_N(self, positions_m: Array, box_vectors_m: Array) -> Array:
-        positions = self._torch.tensor(
-            np.asarray(positions_m), dtype=self._torch.float64, requires_grad=True
-        )
-        box = self._torch.tensor(np.asarray(box_vectors_m), dtype=self._torch.float64)
-        atom_types = self._torch.tensor(self._atom_type_index, dtype=self._torch.int64)
-        energy, _charges = self._model(positions, box, atom_types)
-        gradient = self._torch.autograd.grad(energy, positions)[0]
-        return -np.asarray(gradient.detach().cpu().numpy(), dtype=float)
-
-    def virial_J(self, positions_m: Array, box_vectors_m: Array) -> Array:
-        forces_N = self.forces_N(positions_m, box_vectors_m)
-        centered_positions_m = positions_m - np.mean(positions_m, axis=0)
-        return -np.einsum("ia,ib->ab", centered_positions_m, forces_N)
-
-    def partial_charges_C(self, positions_m: Array, box_vectors_m: Array) -> Array:
-        _energy, charges = self._energy_and_charges(positions_m, box_vectors_m)
-        model_charges_C = np.asarray(charges.detach().cpu().numpy(), dtype=float)
-        if not np.allclose(
-            model_charges_C,
-            self._partial_charges_C,
-            rtol=0.0,
-            atol=self._charge_consistency_tolerance_C,
-        ):
-            raise ValueError(
-                "position-dependent charges require an explicit charge-flux current"
+        dynamics: DynamicsSettings,
+        random_seed: int,
+    ) -> PhaseSpaceTrajectory:
+        if self.run_directory.exists() and any(self.run_directory.iterdir()):
+            raise FileExistsError(
+                f"run directory must be empty: {self.run_directory}"
             )
-        return self._partial_charges_C.copy()
+        self.run_directory.mkdir(parents=True, exist_ok=True)
+        run_tag = "first_principles_conductivity"
+        recipe_path = self.run_directory / "recipe.json"
+        composition_path = self.run_directory / "composition.json"
+        recipe_record = recipe.model_dump(mode="json")
+        recipe_record["temperature_K"] = temperature_K
+        recipe_record["tag"] = run_tag
+        write_json_object(recipe_path, recipe_record, "electrolyte recipe")
+        equilibration_time_ps = (
+            dynamics.equilibration_steps * dynamics.timestep_s / S_PER_PS
+        )
+        production_time_ps = (
+            dynamics.production_steps * dynamics.timestep_s / S_PER_PS
+        )
+        timestep_fs = dynamics.timestep_s / FEMTOSECOND_TO_S
+        repository_root = Path(__file__).resolve().parents[1]
+        subprocess.run(
+            (
+                sys.executable,
+                str(repository_root / "scripts" / "recipe_to_md_composition.py"),
+                "--recipe-json",
+                str(recipe_path),
+                "--species-manifest-json",
+                str(self.species_manifest_path),
+                "--molecule-count",
+                str(molecule_count),
+                "--sim-time-ps",
+                str(production_time_ps),
+                "--eq-time-ps",
+                str(equilibration_time_ps),
+                "--velocity-seed",
+                str(_lammps_seed(random_seed)),
+                "--langevin-seed",
+                str(_lammps_seed(random_seed + 1)),
+                "--output-json",
+                str(composition_path),
+            ),
+            check=True,
+            cwd=repository_root,
+        )
+        composition_record = read_json_object(composition_path, "MD composition")
+        composition_record["target_density_g_cm3"] = (
+            density_kg_m3 / KG_M3_PER_G_ML
+        )
+        write_json_object(composition_path, composition_record, "MD composition")
+        subprocess.run(
+            (
+                str(self.conda_executable),
+                "run",
+                "-n",
+                FORCE_FIELD_ENVIRONMENT,
+                "python",
+                str(repository_root / "scripts" / "curate_ff_md_data.py"),
+                "--composition-json",
+                str(composition_path),
+                "--out-dir",
+                str(self.run_directory),
+                "--dt-fs",
+                str(timestep_fs),
+                "--trajectory-dump-stride-steps",
+                str(dynamics.sample_stride_steps),
+                "--equilibration-langevin-damping-fs",
+                str(
+                    1.0
+                    / (
+                        dynamics.equilibration_langevin_friction_per_s
+                        * FEMTOSECOND_TO_S
+                    )
+                ),
+                "--production-langevin-damping-fs",
+                str(
+                    1.0
+                    / (dynamics.langevin_friction_per_s * FEMTOSECOND_TO_S)
+                ),
+            ),
+            check=True,
+            cwd=repository_root,
+        )
+        subprocess.run(
+            (str(self.lammps_executable), "-in", f"in.{run_tag}", "-nocite"),
+            check=True,
+            cwd=self.run_directory,
+        )
+        trajectory = _read_lammps_phase_space_trajectory(
+            trajectory_path=self.run_directory / "trajectory.lammpstrj",
+            data_path=self.run_directory / f"{run_tag}.prod.lmp",
+            sample_interval_s=dynamics.timestep_s * dynamics.sample_stride_steps,
+        )
+        if np.unique(trajectory.molecule_index).size != molecule_count:
+            raise ValueError("LAMMPS trajectory molecule count differs from request")
+        return trajectory
 
-    def _energy_and_charges(self, positions_m: Array, box_vectors_m: Array):
-        positions = self._torch.tensor(np.asarray(positions_m), dtype=self._torch.float64)
-        box = self._torch.tensor(np.asarray(box_vectors_m), dtype=self._torch.float64)
-        atom_types = self._torch.tensor(self._atom_type_index, dtype=self._torch.int64)
-        energy, charges = self._model(positions, box, atom_types)
-        if energy.ndim != 0 or charges.shape != positions.shape[:1]:
-            raise ValueError("model must return scalar energy and per-atom charges")
-        return energy, charges
 
-    def _validate_topology(self) -> None:
-        atom_count = self._positions_m.shape[0]
-        if self._positions_m.shape != (atom_count, CARTESIAN_DIMENSION):
-            raise ValueError("positions_m must have shape (n_atoms, 3)")
-        if self._masses_kg.shape != (atom_count,) or np.any(self._masses_kg <= 0.0):
-            raise ValueError("masses_kg must be positive per atom")
-        if self._molecule_index.shape != (atom_count,):
-            raise ValueError("molecule_index must be defined per atom")
-        unique_molecule_indices = np.unique(self._molecule_index)
-        expected_molecule_indices = np.arange(unique_molecule_indices.size)
-        if not np.array_equal(unique_molecule_indices, expected_molecule_indices):
-            raise ValueError("molecule_index must be contiguous and start at zero")
-        if self._atom_type_index.shape != (atom_count,):
-            raise ValueError("atom_type_index must be defined per atom")
-        if self._partial_charges_C.shape != (atom_count,):
-            raise ValueError("partial_charges_C must be defined per atom")
-        if self._box_vectors_m.shape != (CARTESIAN_DIMENSION, CARTESIAN_DIMENSION):
-            raise ValueError("box_vectors_m must have shape (3, 3)")
-        if abs(np.linalg.det(self._box_vectors_m)) <= 0.0:
-            raise ValueError("periodic box volume must be positive")
+def _lammps_seed(random_seed: int) -> int:
+    maximum_lammps_seed = np.iinfo(np.int32).max
+    return int(random_seed % (maximum_lammps_seed - 1)) + 1
 
 
+def _read_lammps_phase_space_trajectory(
+    trajectory_path: Path,
+    data_path: Path,
+    sample_interval_s: float,
+) -> PhaseSpaceTrajectory:
+    masses_kg_by_type = _read_lammps_masses_kg(data_path)
+    positions: list[Array] = []
+    velocities: list[Array] = []
+    forces: list[Array] = []
+    charges: list[Array] = []
+    box_vectors: list[Array] = []
+    molecule_indices: list[Array] = []
+    atom_type_indices: list[Array] = []
+    with trajectory_path.open() as trajectory_file:
+        while True:
+            timestep_header = trajectory_file.readline()
+            if not timestep_header:
+                break
+            if timestep_header.strip() != "ITEM: TIMESTEP":
+                raise ValueError("invalid LAMMPS trajectory timestep header")
+            trajectory_file.readline()
+            if trajectory_file.readline().strip() != "ITEM: NUMBER OF ATOMS":
+                raise ValueError("invalid LAMMPS atom-count header")
+            atom_count = int(trajectory_file.readline())
+            if not trajectory_file.readline().strip().startswith("ITEM: BOX BOUNDS"):
+                raise ValueError("invalid LAMMPS box header")
+            bounds = np.asarray(
+                [
+                    [float(value) for value in trajectory_file.readline().split()[:2]]
+                    for _axis in range(CARTESIAN_DIMENSION)
+                ]
+            )
+            box_vectors.append(
+                np.diag(bounds[:, 1] - bounds[:, 0]) * ANGSTROM_TO_M
+            )
+            atom_header = trajectory_file.readline().split()
+            expected_columns = (
+                "id",
+                "mol",
+                "type",
+                "q",
+                "xu",
+                "yu",
+                "zu",
+                "vx",
+                "vy",
+                "vz",
+                "fx",
+                "fy",
+                "fz",
+            )
+            if tuple(atom_header[2:]) != expected_columns:
+                raise ValueError("LAMMPS trajectory lacks required phase-space columns")
+            atom_rows = np.asarray(
+                [
+                    [float(value) for value in trajectory_file.readline().split()]
+                    for _atom in range(atom_count)
+                ],
+                dtype=float,
+            )
+            atom_rows = atom_rows[np.argsort(atom_rows[:, 0])]
+            positions.append(atom_rows[:, LAMMPS_POSITION_COLUMNS] * ANGSTROM_TO_M)
+            velocities.append(
+                atom_rows[:, LAMMPS_VELOCITY_COLUMNS]
+                * ANGSTROM_TO_M
+                / FEMTOSECOND_TO_S
+            )
+            forces.append(
+                atom_rows[:, LAMMPS_FORCE_COLUMNS]
+                * KCAL_TO_J
+                / (N_A * ANGSTROM_TO_M)
+            )
+            charges.append(atom_rows[:, 3] * E_CHARGE)
+            molecule_indices.append(atom_rows[:, 1].astype(int) - 1)
+            atom_type_indices.append(atom_rows[:, 2].astype(int))
+    if not positions:
+        raise ValueError("LAMMPS trajectory contains no phase-space frames")
+    molecule_index = molecule_indices[0]
+    atom_type_index = atom_type_indices[0]
+    if not all(np.array_equal(molecule_index, frame) for frame in molecule_indices[1:]):
+        raise ValueError("molecule indices change across trajectory frames")
+    if not all(np.array_equal(atom_type_index, frame) for frame in atom_type_indices[1:]):
+        raise ValueError("atom types change across trajectory frames")
+    if not all(np.array_equal(box_vectors[0], frame) for frame in box_vectors[1:]):
+        raise ValueError("production trajectory must have a fixed periodic box")
+    masses_kg = np.asarray(
+        [masses_kg_by_type[int(atom_type)] for atom_type in atom_type_index],
+        dtype=float,
+    )
+    return PhaseSpaceTrajectory(
+        positions_m=np.asarray(positions),
+        velocities_m_s=np.asarray(velocities),
+        forces_N=np.asarray(forces),
+        partial_charges_C=np.asarray(charges),
+        box_vectors_m=box_vectors[0],
+        masses_kg=masses_kg,
+        molecule_index=molecule_index,
+        sample_interval_s=sample_interval_s,
+    )
+
+
+def _read_lammps_masses_kg(data_path: Path) -> dict[int, float]:
+    lines = data_path.read_text().splitlines()
+    section_index = lines.index("Masses") + 1
+    while not lines[section_index].strip():
+        section_index += 1
+    masses: dict[int, float] = {}
+    while section_index < len(lines) and lines[section_index].strip():
+        fields = lines[section_index].split()
+        masses[int(fields[0])] = float(fields[1]) * G_TO_KG / N_A
+        section_index += 1
+    if not masses:
+        raise ValueError("LAMMPS data file contains no masses")
+    return masses
 def wrap_positions(positions_m: Array, box_vectors_m: Array) -> Array:
     original_shape = np.asarray(positions_m).shape
     vectors = np.asarray(positions_m).reshape(-1, CARTESIAN_DIMENSION)
@@ -270,7 +479,7 @@ def maxwell_boltzmann_velocities(
 
 def velocity_verlet_step(
     configuration: MicroscopicConfiguration,
-    model: InteratomicModel,
+    model: ForceEnergyModel,
     timestep_s: float,
 ) -> MicroscopicConfiguration:
     forces_N = model.forces_N(configuration.positions_m, configuration.box_vectors_m)
@@ -300,7 +509,7 @@ def velocity_verlet_step(
 
 def langevin_baoab_step(
     configuration: MicroscopicConfiguration,
-    model: InteratomicModel,
+    model: ForceEnergyModel,
     temperature_K: float,
     timestep_s: float,
     friction_per_s: float,
@@ -344,7 +553,7 @@ def langevin_baoab_step(
 
 def equilibrate_configuration(
     configuration: MicroscopicConfiguration,
-    model: InteratomicModel,
+    model: ForceEnergyModel,
     temperature_K: float,
     settings: DynamicsSettings,
     random_generator: np.random.Generator,
@@ -364,7 +573,7 @@ def equilibrate_configuration(
 
 def sample_equilibrium_trajectory(
     configuration: MicroscopicConfiguration,
-    model: InteratomicModel,
+    model: ForceEnergyModel,
     temperature_K: float,
     settings: DynamicsSettings,
     random_generator: np.random.Generator,
@@ -372,7 +581,6 @@ def sample_equilibrium_trajectory(
     positions: list[Array] = []
     velocities: list[Array] = []
     forces: list[Array] = []
-    energies: list[float] = []
     charges: list[Array] = []
     state = configuration
     for step_index in range(settings.production_steps):
@@ -388,7 +596,6 @@ def sample_equilibrium_trajectory(
             positions.append(state.positions_m.copy())
             velocities.append(state.velocities_m_s.copy())
             forces.append(model.forces_N(state.positions_m, state.box_vectors_m))
-            energies.append(model.energy_J(state.positions_m, state.box_vectors_m))
             charges.append(state.partial_charges_C.copy())
     if len(positions) < CARTESIAN_DIMENSION:
         raise ValueError("production trajectory has too few sampled phase-space points")
@@ -396,7 +603,6 @@ def sample_equilibrium_trajectory(
         positions_m=np.asarray(positions),
         velocities_m_s=np.asarray(velocities),
         forces_N=np.asarray(forces),
-        potential_energies_J=np.asarray(energies),
         partial_charges_C=np.asarray(charges),
         box_vectors_m=state.box_vectors_m,
         masses_kg=state.masses_kg,
@@ -521,7 +727,7 @@ def charge_acceleration_series_A_m2_s(
 
 def validate_force_consistency(
     configuration: MicroscopicConfiguration,
-    model: InteratomicModel,
+    model: ForceEnergyModel,
     settings: DynamicsSettings,
     random_generator: np.random.Generator,
 ) -> None:
@@ -808,6 +1014,13 @@ def solve_projected_poisson(
     if singular_values[0] <= 0.0:
         raise ValueError("projected generator has no nonzero singular modes")
     retained = singular_values > relative_tolerance * singular_values[0]
+    rejected_left_vectors = left_vectors[:, ~retained]
+    if rejected_left_vectors.size:
+        incompatible_component = rejected_left_vectors.T @ current_coupling
+        coupling_norm = np.linalg.norm(current_coupling)
+        incompatibility_norm = np.linalg.norm(incompatible_component)
+        if incompatibility_norm > relative_tolerance * coupling_norm:
+            raise ValueError("current coupling is incompatible with generator left null space")
     inverse_singular_values = np.zeros_like(singular_values)
     inverse_singular_values[retained] = 1.0 / singular_values[retained]
     pseudoinverse = (
@@ -829,10 +1042,6 @@ def projected_conductivity(
     )
 
 
-def _candidate_residual_key(candidate: tuple[float, int, float]) -> float:
-    return candidate[0]
-
-
 def refine_projected_basis(
     basis: Array,
     generator_basis: Array,
@@ -845,41 +1054,41 @@ def refine_projected_basis(
     if split_index < CARTESIAN_DIMENSION:
         raise ValueError("trajectory is too short for held-out basis refinement")
     candidate_count = min(basis.shape[1], settings.maximum_basis_size)
-    selected: list[int] = []
-    remaining = list(range(candidate_count))
     conductivities: list[float] = []
     residuals: list[float] = []
     heldout_current = current_A_m2[split_index:]
     current_scale = float(np.mean(heldout_current**2))
     if current_scale <= 0.0:
         raise ValueError("microscopic charge current has zero variance")
-    while remaining:
-        candidates: list[tuple[float, int, float]] = []
-        for candidate_index in remaining:
-            indices = (*selected, candidate_index)
-            training_basis = basis[:split_index, indices]
-            training_generator = generator_basis[:split_index, indices]
-            coupling = current_coupling_matrix(
-                training_basis, current_A_m2[:split_index]
-            )
-            coefficients = solve_projected_poisson(
-                dirichlet_matrix(training_basis, training_generator),
-                coupling,
-                settings.singular_value_relative_tolerance,
-            )
-            heldout_residual = heldout_current + np.einsum(
-                "tma,ma->ta", generator_basis[split_index:, indices], coefficients
-            )
-            residual_score = float(np.mean(heldout_residual**2) / current_scale)
-            conductivity = projected_conductivity(
-                coupling, coefficients, volume_m3, temperature_K
-            )
-            candidates.append((residual_score, candidate_index, conductivity))
-        residual_score, selected_index, conductivity = min(
-            candidates, key=_candidate_residual_key
+    for basis_size in range(1, candidate_count + 1):
+        training_basis = basis[:split_index, :basis_size]
+        training_generator = generator_basis[:split_index, :basis_size]
+        coupling = current_coupling_matrix(
+            training_basis, current_A_m2[:split_index]
         )
-        selected.append(selected_index)
-        remaining.remove(selected_index)
+        generator_matrix = dirichlet_matrix(training_basis, training_generator)
+        coefficients = solve_projected_poisson(
+            generator_matrix,
+            coupling,
+            settings.singular_value_relative_tolerance,
+        )
+        algebraic_residual = np.einsum(
+            "amn,na->ma", generator_matrix, coefficients
+        ) - coupling
+        coupling_scale = max(np.linalg.norm(coupling), np.finfo(float).tiny)
+        if np.linalg.norm(algebraic_residual) / coupling_scale > (
+            settings.singular_value_relative_tolerance
+        ):
+            raise ValueError("projected Poisson solve has excessive algebraic residual")
+        heldout_residual = heldout_current + np.einsum(
+            "tma,ma->ta",
+            generator_basis[split_index:, :basis_size],
+            coefficients,
+        )
+        residual_score = float(np.mean(heldout_residual**2) / current_scale)
+        conductivity = projected_conductivity(
+            coupling, coefficients, volume_m3, temperature_K
+        )
         residuals.append(residual_score)
         conductivities.append(conductivity)
         conductivity_converged = False
@@ -897,7 +1106,7 @@ def refine_projected_basis(
         conductivities[0],
         tuple(conductivities),
         tuple(residuals),
-        len(selected),
+        len(conductivities),
     )
 
 
@@ -966,7 +1175,6 @@ def _stationary_trajectory(
         positions_m=trajectory.positions_m[start_index:],
         velocities_m_s=trajectory.velocities_m_s[start_index:],
         forces_N=trajectory.forces_N[start_index:],
-        potential_energies_J=trajectory.potential_energies_J[start_index:],
         partial_charges_C=trajectory.partial_charges_C[start_index:],
         box_vectors_m=trajectory.box_vectors_m,
         masses_kg=trajectory.masses_kg,
@@ -985,12 +1193,15 @@ def _validate_settings(
 ) -> None:
     positive_dynamics = (
         dynamics.timestep_s,
-        dynamics.langevin_friction_per_s,
         dynamics.force_difference_step_m,
         dynamics.force_consistency_relative_tolerance,
     )
     if any(value <= 0.0 for value in positive_dynamics):
         raise ValueError("all dimensional dynamics settings must be positive")
+    if dynamics.langevin_friction_per_s <= 0.0:
+        raise ValueError("production Langevin friction must be positive")
+    if dynamics.equilibration_langevin_friction_per_s <= 0.0:
+        raise ValueError("equilibration Langevin friction must be positive")
     positive_counts = (
         dynamics.equilibration_steps,
         dynamics.production_steps,
@@ -1007,6 +1218,7 @@ def _validate_settings(
         numerics.singular_value_relative_tolerance,
         numerics.residual_tolerance,
         numerics.conductivity_tolerance_S_m,
+        numerics.projected_gk_tolerance_S_m,
         numerics.radial_cutoff_m,
         numerics.configuration_directional_derivative_step_s,
         numerics.charge_consistency_tolerance_C,
@@ -1082,46 +1294,30 @@ def compute_first_principles_conductivity(
     if temperature_K <= 0.0 or density_kg_m3 <= 0.0 or molecule_count <= 0:
         raise ValueError("temperature, density, and molecule count must be positive")
     _validate_settings(dynamics, numerics)
-    random_generator = np.random.default_rng(random_seed)
-    configuration = interatomic_model.initial_configuration(
+    trajectory = interatomic_model.sample_phase_space_trajectory(
         recipe,
+        temperature_K,
         density_kg_m3,
         molecule_count,
-        random_generator,
+        dynamics,
+        random_seed,
     )
-    _validate_microscopic_configuration(
-        configuration,
-        molecule_count,
-        numerics.charge_consistency_tolerance_C,
-    )
-    configuration = MicroscopicConfiguration(
-        positions_m=configuration.positions_m,
-        velocities_m_s=maxwell_boltzmann_velocities(
-            configuration.masses_kg, temperature_K, random_generator
-        ),
-        masses_kg=configuration.masses_kg,
-        partial_charges_C=configuration.partial_charges_C,
-        molecule_index=configuration.molecule_index,
-        atom_type_index=configuration.atom_type_index,
-        box_vectors_m=configuration.box_vectors_m,
-    )
-    validate_force_consistency(
-        configuration, interatomic_model, dynamics, random_generator
-    )
-    equilibrated = equilibrate_configuration(
-        configuration,
-        interatomic_model,
+    if int(np.unique(trajectory.molecule_index).size) != molecule_count:
+        raise ValueError("sampled trajectory has the wrong molecule count")
+    return _conductivity_from_phase_space_trajectory(
+        trajectory,
         temperature_K,
         dynamics,
-        random_generator,
+        numerics,
     )
-    trajectory = sample_equilibrium_trajectory(
-        equilibrated,
-        interatomic_model,
-        temperature_K,
-        dynamics,
-        random_generator,
-    )
+
+
+def _conductivity_from_phase_space_trajectory(
+    trajectory: PhaseSpaceTrajectory,
+    temperature_K: float,
+    dynamics: DynamicsSettings,
+    numerics: NumericalSettings,
+) -> ConductivityResult:
     current_A_m2, molecular_current_A_m2 = current_series_A_m2(trajectory)
     original_sample_count = current_A_m2.shape[0]
     trajectory, current_A_m2, effective_sample_size = _stationary_trajectory(
@@ -1129,7 +1325,7 @@ def compute_first_principles_conductivity(
     )
     stationary_start_index = original_sample_count - current_A_m2.shape[0]
     molecular_current_A_m2 = molecular_current_A_m2[stationary_start_index:]
-    charge_acceleration_A_m2_s, molecular_acceleration_A_m2_s = (
+    charge_acceleration_A_m2_s, _molecular_acceleration_A_m2_s = (
         charge_acceleration_series_A_m2_s(trajectory)
     )
     basis, generator_basis = _basis_and_generator(
@@ -1148,23 +1344,6 @@ def compute_first_principles_conductivity(
         temperature_K,
         numerics,
     )
-    molecular_basis, molecular_generator_basis = _basis_and_generator(
-        trajectory,
-        molecular_current_A_m2,
-        molecular_acceleration_A_m2_s,
-        numerics,
-        dynamics.langevin_friction_per_s,
-    )
-    direct, _direct_first_basis, _direct_history, _direct_residuals, _direct_size = (
-        refine_projected_basis(
-            molecular_basis,
-            molecular_generator_basis,
-            molecular_current_A_m2,
-            volume_m3,
-            temperature_K,
-            numerics,
-        )
-    )
     green_kubo = integrated_green_kubo_conductivity(
         current_A_m2,
         trajectory.sample_interval_s,
@@ -1172,6 +1351,15 @@ def compute_first_principles_conductivity(
         temperature_K,
         numerics,
     )
+    direct = integrated_green_kubo_conductivity(
+        molecular_current_A_m2,
+        trajectory.sample_interval_s,
+        volume_m3,
+        temperature_K,
+        numerics,
+    )
+    if abs(conductivity - green_kubo) > numerics.projected_gk_tolerance_S_m:
+        raise ValueError("projected conductivity does not agree with same-run Green-Kubo")
     return ConductivityResult(
         conductivity_S_m=conductivity,
         direct_current_term_S_m=direct,
@@ -1212,11 +1400,13 @@ def main() -> int:
         arguments.numerics_json, "first-principles conductivity numerics"
     )
     dynamics, numerics = _settings_from_record(settings_record)
-    model = TorchScriptInteratomicModel(
-        model_path=Path(model_record["torchscript_model_path"]),
-        configuration_path=Path(model_record["configuration_npz_path"]),
-        recipe=ElectrolyteRecipeModel.model_validate(model_record["recipe"]),
-        charge_consistency_tolerance_C=numerics.charge_consistency_tolerance_C,
+    if model_record["model_type"] != "openff_sage_lammps":
+        raise ValueError("model_type must be openff_sage_lammps")
+    model = SageLammpsMicroscopicModel(
+        run_directory=Path(model_record["run_directory"]),
+        species_manifest_path=Path(model_record["species_manifest_path"]),
+        conda_executable=Path(model_record["conda_executable"]),
+        lammps_executable=Path(model_record["lammps_executable"]),
     )
     result = compute_first_principles_conductivity(
         recipe=recipe,
