@@ -84,6 +84,7 @@ class ReducedGeneratorSpecification:
     mobility_tensor_m2_s: Callable[[Array], Array]
     charge_polarization_gradient: Callable[[Array], Array]
     memory_coordinate_gradient: Callable[[Array], Array]
+    state_continuous_memory_family_keys: tuple[tuple[str, ...], ...]
     state_quadratures: tuple[ReducedStateQuadrature, ...]
     transition_quadratures: tuple[ReducedTransitionQuadrature, ...]
     total_component_concentrations_mol_m3: Array
@@ -291,11 +292,21 @@ def build_projected_generator_input(
             "multiple generated states require at least one transition quadrature"
         )
 
+    (
+        expanded_memory_gradient,
+        expanded_memory_mask,
+        expanded_ownership_bases,
+    ) = _expand_continuous_memory_by_state_family(
+        specification,
+        tuple(state_transport_ownership_bases),
+        tuple(basin_points),
+    )
+
     return ProjectedGeneratorInput(
         potential_energy_J_mol=specification.potential_energy_J_mol,
         mobility_tensor_m2_s=specification.mobility_tensor_m2_s,
         charge_polarization_gradient=specification.charge_polarization_gradient,
-        memory_coordinate_gradient=specification.memory_coordinate_gradient,
+        memory_coordinate_gradient=expanded_memory_gradient,
         basin_quadrature_points=tuple(basin_points),
         basin_quadrature_weights=tuple(basin_weights),
         basin_energy_references_J_mol=np.asarray(
@@ -308,11 +319,7 @@ def build_projected_generator_input(
             ],
             dtype=float,
         ),
-        state_memory_active_mask=_state_memory_active_mask(
-            specification,
-            tuple(state_transport_ownership_bases),
-            tuple(basin_points),
-        ),
+        state_memory_active_mask=expanded_memory_mask,
         transition_pair_indices=transition_pair_index_array,
         transition_quadrature_points=tuple(transition_points),
         transition_quadrature_weights=tuple(transition_weights),
@@ -342,7 +349,7 @@ def build_projected_generator_input(
         temperature_K=float(specification.temperature_K),
         volume_m3=float(specification.volume_m3),
         self_current_coordinate_projectors=tuple(self_projectors),
-        state_transport_ownership_bases=tuple(state_transport_ownership_bases),
+        state_transport_ownership_bases=expanded_ownership_bases,
         transition_transport_ownership=tuple(transition_transport_ownership),
         state_relative_displacement_fluctuations_m=tuple(
             relative_displacement_fluctuations
@@ -355,6 +362,93 @@ def build_projected_generator_input(
             specification.state_memory_value_matrix, dtype=float
         ),
     )
+
+
+def _expand_continuous_memory_by_state_family(
+    specification: ReducedGeneratorSpecification,
+    state_transport_ownership_bases: tuple[
+        tuple[StateTransportOwnershipBasis, ...], ...
+    ],
+    basin_points: tuple[Array, ...],
+) -> tuple[
+    Callable[[Array], Array],
+    Array,
+    tuple[tuple[StateTransportOwnershipBasis, ...], ...],
+]:
+    family_keys = tuple(specification.state_continuous_memory_family_keys)
+    if len(family_keys) != len(state_transport_ownership_bases):
+        raise ValueError("continuous memory family key count must match states")
+    base_mask = _state_memory_active_mask(
+        specification,
+        state_transport_ownership_bases,
+        basin_points,
+    )
+    base_memory_count = base_mask.shape[1]
+    expansion_pairs = tuple(
+        (memory_index, family_key)
+        for memory_index in range(base_memory_count)
+        for family_key in dict.fromkeys(
+            family_keys[state_index]
+            for state_index in range(len(family_keys))
+            if base_mask[state_index, memory_index]
+        )
+    )
+    if not expansion_pairs:
+        return specification.memory_coordinate_gradient, base_mask, state_transport_ownership_bases
+    expanded_index_by_pair = {
+        expansion_pair: expanded_index
+        for expanded_index, expansion_pair in enumerate(expansion_pairs)
+    }
+
+    def expanded_memory_gradient(point: Array) -> Array:
+        base_gradient = _as_2d(
+            specification.memory_coordinate_gradient(point),
+            "memory_coordinate_gradient",
+        )
+        if base_gradient.shape[0] != base_memory_count:
+            raise ValueError("continuous memory gradient row count changed")
+        return base_gradient[
+            np.asarray(
+                [memory_index for memory_index, _family_key in expansion_pairs],
+                dtype=int,
+            )
+        ]
+
+    expanded_mask = np.zeros(
+        (len(family_keys), len(expansion_pairs)),
+        dtype=bool,
+    )
+    expanded_bases = []
+    for state_index, state_bases in enumerate(state_transport_ownership_bases):
+        family_key = family_keys[state_index]
+        for memory_index in np.flatnonzero(base_mask[state_index]):
+            expanded_mask[
+                state_index,
+                expanded_index_by_pair[(int(memory_index), family_key)],
+            ] = True
+        expanded_state_bases = []
+        for ownership_basis in state_bases:
+            expanded_indices = np.asarray(
+                [
+                    expanded_index_by_pair[(int(memory_index), family_key)]
+                    for memory_index in ownership_basis.bounded_memory_mode_indices
+                ],
+                dtype=int,
+            )
+            expanded_state_bases.append(
+                StateTransportOwnershipBasis(
+                    transition_displacement_gradients=(
+                        ownership_basis.transition_displacement_gradients
+                    ),
+                    transition_edge_indices=ownership_basis.transition_edge_indices,
+                    bounded_memory_gradients=ownership_basis.bounded_memory_gradients,
+                    bounded_memory_mode_indices=expanded_indices,
+                    diagnostic_gradients=ownership_basis.diagnostic_gradients,
+                    diagnostic_source_ids=ownership_basis.diagnostic_source_ids,
+                )
+            )
+        expanded_bases.append(tuple(expanded_state_bases))
+    return expanded_memory_gradient, expanded_mask, tuple(expanded_bases)
 
 
 def _state_memory_active_mask(

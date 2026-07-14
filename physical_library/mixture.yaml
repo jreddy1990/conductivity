@@ -23,7 +23,7 @@ dielectric:
 viscosity:
   mixing_rule: solvent_reciprocal_volume_fraction
   pure_viscosity_source: data.species_data viscosity_cP
-  ownership: solvent_matrix_reference_only
+  ownership: solvent_matrix_reference
 mobility:
   resistance_terms:
   - Stokes
@@ -32,7 +32,9 @@ mobility:
   - atmosphere
   free_volume_exponent: 2.0
 packing:
-  local_volume_source: species_record_site_volumes
+  local_volume_source: state_active_union_vdw_molecular_volumes
+  local_kernel: lithium_centered_coordination_cell
+  union_quadrature_order: 8
   invalid_state_rule: local_packing_fraction_must_remain_below_configured_phi_max
   phi_max: 0.64
   phi_max_source: random_close_packing_reference_for_site_volume_free_volume_closure
@@ -48,24 +50,23 @@ local_fields:
   jones_dole_A_sqrt_m3_mol: 0.003
   jones_dole_B_m3_mol: 1.0e-05
   local_ionic_strength_packing_coupling: 1.0
-  packing_viscosity_exponent: 2.0
 property_ownership:
   dielectric:
     bulk: solvent_matrix_reference
     local: ionic_strength_decrement
   viscosity:
     bulk: solvent_matrix_reference
-    local: Jones_Dole_packing_and_state_additive_microviscosity
+    local: Jones_Dole_and_state_additive_microviscosity
   additive_properties:
-    bulk: excluded
-    local: state_configuration_occupancy
+    bulk: none
+    local: state_configuration_multi_additive_coordination_competition
 parameter_provenance:
   dielectric.pure_dielectric_source: measured_pure_property
   viscosity.pure_viscosity_source: measured_pure_property
   mobility.free_volume_exponent: continuum_theory
   packing.phi_max: measured_pure_property
+  packing.union_quadrature_order: numerical_convergence
   local_fields.dielectric_decrement_per_mol_m3: measured_mixture_property
   local_fields.jones_dole_A_sqrt_m3_mol: measured_mixture_property
   local_fields.jones_dole_B_m3_mol: measured_mixture_property
   local_fields.local_ionic_strength_packing_coupling: continuum_theory
-  local_fields.packing_viscosity_exponent: continuum_theory

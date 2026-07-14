@@ -10,6 +10,11 @@ formal_charge_e: 0.0
 molecular_weight_kg_mol: 0.10209
 density_kg_m3: 1205.0
 partial_molar_volume_m3_mol: 8.472199170124481e-05
+excluded_volume:
+  model: union_vdw_spheres
+  hard_core_volume_m3: 9.0422374999999991e-29
+  packing_radius_m: 2.7843838120985943e-10
+  provenance: geometry_derived
 sites:
 - site_id: 0
   element: C

@@ -3,8 +3,11 @@ memory_records:
   cage_backjump:
     transport_ownership: bounded_memory
     matching_transition_families: [cage_capture_release]
-  partner_residence:
+  pair_residence:
     transport_ownership: bounded_memory
+    matching_transition_families: [free_to_SSIP, SSIP_to_CIP]
+  partner_residence:
+    transport_ownership: diagnostic
     matching_transition_families: [partner_switch]
   ligand_shell_residence:
     transport_ownership: bounded_memory

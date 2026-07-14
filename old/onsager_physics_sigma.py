@@ -23,30 +23,39 @@ from conductivity.site_measure_transport import (
 )
 from data.species_data import ADDITIVES, CATION_PROPERTIES, SALTS, SOLVENTS
 from electrolyte_model import ElectrolyteRecipeModel
-from utils.config_cache import load_physics_config
+from utils.config_load_cache import load_physics_config
 from utils.strict_validation import (
     require_float,
     require_float as _require_float,
     require_mapping,
     require_mapping as _require_mapping,
-    require_string,
     require_string as _require_string,
 )
 
 
 LITER_TO_ML = 1000.0
-CATION_RADIUS_MATCH_TOLERANCE_A = 1.0e-9  # Explicit tolerance for metadata identity matching.
-COORDINATION_NUMBER_MATCH_TOLERANCE = 1.0e-9  # Explicit tolerance for cation-family CN uniqueness.
+CATION_RADIUS_MATCH_TOLERANCE_A = (
+    1.0e-9  # Explicit tolerance for metadata identity matching.
+)
+COORDINATION_NUMBER_MATCH_TOLERANCE = (
+    1.0e-9  # Explicit tolerance for cation-family CN uniqueness.
+)
 KJ_TO_J = 1000.0  # Explicit constant: unit conversion, 1 kJ = 1000 J.
-ANGSTROM_TO_NM = float("0.1")  # Explicit constant: unit conversion, 1 Angstrom = 0.1 nm.
+ANGSTROM_TO_NM = float(
+    "0.1"
+)  # Explicit constant: unit conversion, 1 Angstrom = 0.1 nm.
 ANGSTROM_TO_M = 1.0e-10  # Explicit constant: unit conversion, 1 Angstrom = 1e-10 m.
 CP_TO_PA_S = 1.0 / PA_S_TO_CP
 CM3_TO_M3 = 1.0e-6  # Explicit constant: unit conversion, 1 cm^3 = 1e-6 m^3.
 NANOSECOND_TO_SECOND = 1.0e-9  # Explicit constant: unit conversion, 1 ns = 1e-9 s.
-STOKES_SPHERE_DRAG_FACTOR = 6.0  # Explicit constant: Stokes-Einstein sphere drag denominator.
+STOKES_SPHERE_DRAG_FACTOR = (
+    6.0  # Explicit constant: Stokes-Einstein sphere drag denominator.
+)
 SHARED_LI_NEWTON_MAX_ITERATIONS = 80  # Explicit constant: numerical sentinel, 16 Newton attempts per variable for expected <=5-variable systems.
 SHARED_LI_BACKTRACKING_STEPS = 24  # Explicit constant: numerical sentinel, 24 halvings give a 2^-24 trial step before loud failure.
-SHARED_LI_LINE_SEARCH_REDUCTION = 0.5  # Explicit constant: numerical sentinel, bisection-style Newton backtracking.
+SHARED_LI_LINE_SEARCH_REDUCTION = (
+    0.5  # Explicit constant: numerical sentinel, bisection-style Newton backtracking.
+)
 SHARED_LI_RELATIVE_TOLERANCE = 1.0e-10  # Explicit constant: numerical sentinel, mass-balance residual tolerance below data precision.
 FINITE_DIFFERENCE_STEP = math.sqrt(float(np.finfo(float).eps))
 
@@ -211,7 +220,9 @@ class TransportKernelState:
     mobility: MobilityState
     site_measure: TransportSiteMeasure
 
-    def with_site_measure(self, site_measure: TransportSiteMeasure) -> "TransportKernelState":
+    def with_site_measure(
+        self, site_measure: TransportSiteMeasure
+    ) -> "TransportKernelState":
         return TransportKernelState(
             composition=self.composition,
             matrix=self.matrix,
@@ -237,7 +248,9 @@ def build_transport_kernel_state(
     matrix = _build_matrix_state(composition, physics_config, unit_params)
     solvation = _build_solvation_state(composition)
     site_measure = build_transport_site_measure(composition)
-    speciation = _build_speciation_state(composition, matrix, solvation, physics_config, unit_params, site_measure)
+    speciation = _build_speciation_state(
+        composition, matrix, solvation, physics_config, unit_params, site_measure
+    )
     mobility = _build_mobility_state(
         composition,
         matrix,
@@ -279,7 +292,9 @@ def evaluate_onsager_conductivity(
     matrix = _build_matrix_state(composition, physics_config, params)
     solvation = _build_solvation_state(composition)
     site_measure = build_transport_site_measure(composition)
-    speciation = _build_speciation_state(composition, matrix, solvation, physics_config, params, site_measure)
+    speciation = _build_speciation_state(
+        composition, matrix, solvation, physics_config, params, site_measure
+    )
     mobility = _build_mobility_state(
         composition,
         matrix,
@@ -322,7 +337,9 @@ def predict_onsager_conductivity_mS_cm(
 ) -> float:
     """Return only the fixed-readout conductivity in mS/cm."""
 
-    return evaluate_onsager_conductivity(recipe, temperature_K, params, physics_config).sigma_mS_cm
+    return evaluate_onsager_conductivity(
+        recipe, temperature_K, params, physics_config
+    ).sigma_mS_cm
 
 
 def fit_global_mobility_scale(
@@ -348,9 +365,13 @@ def fit_global_mobility_scale(
     for idx, entry in enumerate(entries):
         recipe = require_mapping(entry, "recipe", f"entry[{idx}]")
         properties = require_mapping(entry, "properties", f"entry[{idx}]")
-        measured = require_float(properties, "conductivity_mS_cm", f"entry[{idx}].properties")
+        measured = require_float(
+            properties, "conductivity_mS_cm", f"entry[{idx}].properties"
+        )
         if measured <= 0.0:
-            raise ValueError(f"entry[{idx}].properties.conductivity_mS_cm must be positive")
+            raise ValueError(
+                f"entry[{idx}].properties.conductivity_mS_cm must be positive"
+            )
         prediction = evaluate_onsager_conductivity(
             recipe,
             temperature_K=temperature_K,
@@ -358,7 +379,9 @@ def fit_global_mobility_scale(
             physics_config=physics_config,
         ).sigma_mS_cm
         if prediction <= 0.0 or not math.isfinite(prediction):
-            raise ValueError(f"entry[{idx}] produced invalid unit-scale prediction {prediction}")
+            raise ValueError(
+                f"entry[{idx}] produced invalid unit-scale prediction {prediction}"
+            )
         predictions.append(prediction)
         measurements.append(measured)
 
@@ -408,9 +431,13 @@ def fit_mechanism_params(
     for idx, entry in enumerate(entries):
         recipe = require_mapping(entry, "recipe", f"entry[{idx}]")
         properties = require_mapping(entry, "properties", f"entry[{idx}]")
-        measured = require_float(properties, "conductivity_mS_cm", f"entry[{idx}].properties")
+        measured = require_float(
+            properties, "conductivity_mS_cm", f"entry[{idx}].properties"
+        )
         if measured <= 0.0:
-            raise ValueError(f"entry[{idx}].properties.conductivity_mS_cm must be positive")
+            raise ValueError(
+                f"entry[{idx}].properties.conductivity_mS_cm must be positive"
+            )
         evaluate_onsager_conductivity(
             recipe,
             temperature_K=temperature_K,
@@ -420,7 +447,9 @@ def fit_mechanism_params(
         rows.append((recipe, measured))
 
     if not rows:
-        raise ValueError("Cannot fit mechanism parameters without measured conductivity rows")
+        raise ValueError(
+            "Cannot fit mechanism parameters without measured conductivity rows"
+        )
 
     global_fit = fit_global_mobility_scale(entries, temperature_K, physics_config)
 
@@ -466,7 +495,9 @@ def fit_mechanism_params(
     )
 
 
-def _build_composition_state(recipe_model: ElectrolyteRecipeModel, temperature_K: float) -> CompositionState:
+def _build_composition_state(
+    recipe_model: ElectrolyteRecipeModel, temperature_K: float
+) -> CompositionState:
     solvents = {name: float(value) for name, value in recipe_model.solvents.items()}
     salts = {name: float(value) for name, value in recipe_model.salts.items()}
     additives = {name: float(value) for name, value in recipe_model.additives.items()}
@@ -500,16 +531,26 @@ def _build_composition_state(recipe_model: ElectrolyteRecipeModel, temperature_K
         additive_volume_per_total_mass += wt_fraction / density
 
     solvent_blend_density = sum(
-        frac * _require_float(_require_species(SOLVENTS, name, "solvent"), "density_g_ml", f"solvent {name}")
+        frac
+        * _require_float(
+            _require_species(SOLVENTS, name, "solvent"),
+            "density_g_ml",
+            f"solvent {name}",
+        )
         for name, frac in solvents.items()
     )
     solvent_volume_numerator = (
         LITER_TO_ML
         - sum(salt_volumes_ml.values())
-        - total_salt_mass_g * additive_volume_per_total_mass / non_additive_mass_fraction
+        - total_salt_mass_g
+        * additive_volume_per_total_mass
+        / non_additive_mass_fraction
     )
     solvent_volume_denominator = (
-        1.0 + solvent_blend_density * additive_volume_per_total_mass / non_additive_mass_fraction
+        1.0
+        + solvent_blend_density
+        * additive_volume_per_total_mass
+        / non_additive_mass_fraction
     )
     solvent_total_volume_ml = solvent_volume_numerator / solvent_volume_denominator
     if solvent_total_volume_ml <= 0.0:
@@ -530,7 +571,9 @@ def _build_composition_state(recipe_model: ElectrolyteRecipeModel, temperature_K
         solvent_moles[name] = mass / mw
         total_solvent_mass_g += mass
 
-    total_mass_g = (total_solvent_mass_g + total_salt_mass_g) / non_additive_mass_fraction
+    total_mass_g = (
+        total_solvent_mass_g + total_salt_mass_g
+    ) / non_additive_mass_fraction
     additive_masses_g: dict[str, float] = {}
     additive_volumes_ml: dict[str, float] = {}
     additive_moles: dict[str, float] = {}
@@ -571,7 +614,9 @@ def _build_composition_state(recipe_model: ElectrolyteRecipeModel, temperature_K
     total_moles = sum(all_moles.values())
     if total_moles <= 0.0:
         raise ValueError("Total recipe moles are non-positive")
-    species_mole_fractions = {name: moles / total_moles for name, moles in all_moles.items()}
+    species_mole_fractions = {
+        name: moles / total_moles for name, moles in all_moles.items()
+    }
 
     return CompositionState(
         recipe={
@@ -595,7 +640,8 @@ def _build_composition_state(recipe_model: ElectrolyteRecipeModel, temperature_K
         species_mole_fractions=species_mole_fractions,
         total_mass_g=total_mass_g,
         density_g_ml=total_mass_g / LITER_TO_ML,
-        molality_mol_kg_solvent=sum(ionic_source_molarities.values()) / (total_solvent_mass_g / 1000.0),
+        molality_mol_kg_solvent=sum(ionic_source_molarities.values())
+        / (total_solvent_mass_g / 1000.0),
     )
 
 
@@ -604,9 +650,15 @@ def _build_matrix_state(
     physics_config: Mapping[str, Any],
     params: OnsagerConductivityParams,
 ) -> MatrixState:
-    viscosity_cfg = _require_mapping(physics_config, "viscosity_model", "physics_config")
-    dielectric_cfg = _require_mapping(physics_config, "dielectric_mixing", "physics_config")
-    pair_excess = _require_mapping(dielectric_cfg, "excess_interaction_parameters", "dielectric_mixing")
+    viscosity_cfg = _require_mapping(
+        physics_config, "viscosity_model", "physics_config"
+    )
+    dielectric_cfg = _require_mapping(
+        physics_config, "dielectric_mixing", "physics_config"
+    )
+    pair_excess = _require_mapping(
+        dielectric_cfg, "excess_interaction_parameters", "dielectric_mixing"
+    )
 
     ln_eta = 0.0
     epsilon_liquid = 0.0
@@ -640,8 +692,12 @@ def _build_matrix_state(
         * _compute_eyring_nrtl_excess_log_viscosity(composition, physics_config)
     )
     eta_liquid = math.exp(ln_eta)
-    dimer_factor = _compute_dimer_viscosity_factor(composition, physics_config, params.dimer_viscosity_scale)
-    salt_factor = _compute_salt_viscosity_factor(composition, viscosity_cfg, params.salt_viscosity_scale)
+    dimer_factor = _compute_dimer_viscosity_factor(
+        composition, physics_config, params.dimer_viscosity_scale
+    )
+    salt_factor = _compute_salt_viscosity_factor(
+        composition, viscosity_cfg, params.salt_viscosity_scale
+    )
     salt_additive_factor = _compute_salt_additive_viscosity_factor(
         composition,
         viscosity_cfg,
@@ -683,23 +739,33 @@ def _build_solvation_state(composition: CompositionState) -> SolvationState:
     strengths: dict[str, float] = {}
     for name in composition.neutral_liquid_volume_fractions:
         props = _neutral_species_props(name)
-        affinity = _require_float(props, "coordination_affinity_M_inv", f"neutral species {name}")
+        affinity = _require_float(
+            props, "coordination_affinity_M_inv", f"neutral species {name}"
+        )
         concentration_M = _neutral_species_moles(composition, name)
         strengths[name] = affinity * concentration_M
 
     total_strength = sum(strengths.values())
     if total_strength <= 0.0:
         raise ValueError("Li solvation shell has no positive coordination strength")
-    shell_fractions = {name: value / total_strength for name, value in strengths.items()}
+    shell_fractions = {
+        name: value / total_strength for name, value in strengths.items()
+    }
 
     shell_steric = 0.0
     shell_donor = 0.0
     shell_binding = 0.0
     for name, fraction in shell_fractions.items():
         props = _neutral_species_props(name)
-        shell_steric += fraction * _optional_float(props, "steric_disruption_beta", f"neutral species {name}")
-        shell_donor += fraction * _require_float(props, "donor_number", f"neutral species {name}")
-        shell_binding += fraction * _require_float(props, "li_binding_energy_kJ_mol", f"neutral species {name}")
+        shell_steric += fraction * _optional_float(
+            props, "steric_disruption_beta", f"neutral species {name}"
+        )
+        shell_donor += fraction * _require_float(
+            props, "donor_number", f"neutral species {name}"
+        )
+        shell_binding += fraction * _require_float(
+            props, "li_binding_energy_kJ_mol", f"neutral species {name}"
+        )
 
     weighted_cn = 0.0
     total_source_M = sum(composition.ionic_source_molarities_M.values())
@@ -731,11 +797,19 @@ def _build_speciation_state(
     params: OnsagerConductivityParams,
     site_measure: TransportSiteMeasure,
 ) -> SpeciationState:
-    pairing_cfg = _require_mapping(physics_config, "ion_pairing_model", "physics_config")
+    pairing_cfg = _require_mapping(
+        physics_config, "ion_pairing_model", "physics_config"
+    )
     eps_ref = _require_float(pairing_cfg, "bjerrum_eps_ref", "ion_pairing_model")
-    aggregate_onset = _require_float(pairing_cfg, "aggregate_onset_mol_l", "ion_pairing_model")
-    aggregate_scale = _require_float(pairing_cfg, "aggregate_scale_mol_l", "ion_pairing_model")
-    aggregate_max = _require_float(pairing_cfg, "aggregate_max_fraction_of_paired", "ion_pairing_model")
+    aggregate_onset = _require_float(
+        pairing_cfg, "aggregate_onset_mol_l", "ion_pairing_model"
+    )
+    aggregate_scale = _require_float(
+        pairing_cfg, "aggregate_scale_mol_l", "ion_pairing_model"
+    )
+    aggregate_max = _require_float(
+        pairing_cfg, "aggregate_max_fraction_of_paired", "ion_pairing_model"
+    )
     if aggregate_scale <= 0.0:
         raise ValueError("ion_pairing_model.aggregate_scale_mol_l must be positive")
 
@@ -775,17 +849,25 @@ def _build_speciation_state(
             * molarity
             / association_kernel.total_lithium_molarity_M
         )
-        free_anion_concentration = speciation_solution.free_anion_molarity_M[anion_feature_id]
+        free_anion_concentration = speciation_solution.free_anion_molarity_M[
+            anion_feature_id
+        ]
         ssip_concentration = speciation_solution.ssip_molarity_M[anion_feature_id]
         cip_concentration = speciation_solution.cip_molarity_M[anion_feature_id]
-        aggregate_concentration = speciation_solution.aggregate_molarity_M[anion_feature_id]
-        bridge_network_concentration = speciation_solution.bridge_network_molarity_M[anion_feature_id]
+        aggregate_concentration = speciation_solution.aggregate_molarity_M[
+            anion_feature_id
+        ]
+        bridge_network_concentration = speciation_solution.bridge_network_molarity_M[
+            anion_feature_id
+        ]
 
         free_by_feature[anion_feature_id] = free_cation_concentration / molarity
         ssip_by_feature[anion_feature_id] = ssip_concentration / molarity
         cip_by_feature[anion_feature_id] = cip_concentration / molarity
         aggregate_by_feature[anion_feature_id] = aggregate_concentration / molarity
-        bridge_network_by_feature[anion_feature_id] = 2.0 * bridge_network_concentration / molarity
+        bridge_network_by_feature[anion_feature_id] = (
+            2.0 * bridge_network_concentration / molarity
+        )
         paired_by_feature[anion_feature_id] = (
             ssip_concentration
             + cip_concentration
@@ -793,21 +875,33 @@ def _build_speciation_state(
             + 2.0 * bridge_network_concentration
         ) / molarity
 
-        motif_concentrations[f"free_cation:{anion_feature_id}"] = free_cation_concentration
-        motif_concentrations[f"free_anion:{anion_feature_id}"] = free_anion_concentration
+        motif_concentrations[f"free_cation:{anion_feature_id}"] = (
+            free_cation_concentration
+        )
+        motif_concentrations[f"free_anion:{anion_feature_id}"] = (
+            free_anion_concentration
+        )
         motif_concentrations[f"SSIP:{anion_feature_id}"] = ssip_concentration
         motif_concentrations[f"CIP:{anion_feature_id}"] = cip_concentration
         motif_concentrations[f"AGG:{anion_feature_id}"] = aggregate_concentration
-        motif_concentrations[f"BRIDGE_NETWORK:{anion_feature_id}"] = bridge_network_concentration
+        motif_concentrations[f"BRIDGE_NETWORK:{anion_feature_id}"] = (
+            bridge_network_concentration
+        )
 
-        _accumulate_float(carrier_concentrations, cation_symbol, free_cation_concentration)
-        _accumulate_float(carrier_concentrations, anion_site.carrier_label, free_anion_concentration)
+        _accumulate_float(
+            carrier_concentrations, cation_symbol, free_cation_concentration
+        )
+        _accumulate_float(
+            carrier_concentrations, anion_site.carrier_label, free_anion_concentration
+        )
         carrier_charges[cation_symbol] = cation_charge
         carrier_charges[anion_site.carrier_label] = anion_site.charge
 
     for ligand_site in site_measure.neutral_ligand_sites:
         ligand_feature_id = ligand_site.canonical_feature_id
-        li_ligand_concentration = speciation_solution.li_ligand_molarity_M[ligand_feature_id]
+        li_ligand_concentration = speciation_solution.li_ligand_molarity_M[
+            ligand_feature_id
+        ]
         li_ligand_by_feature[ligand_feature_id] = (
             li_ligand_concentration / association_kernel.total_lithium_molarity_M
         )
@@ -842,8 +936,13 @@ def _build_shared_li_association_kernel(
     pairing_kernel_config: IonPairingKernelConfig,
     site_measure: TransportSiteMeasure,
 ) -> SharedLiAssociationKernel:
-    _assert_positive_float(pairing_kernel_config.bjerrum_eps_ref, "ion_pairing_model.bjerrum_eps_ref")
-    _assert_positive_float(pairing_kernel_config.aggregate_scale_M, "ion_pairing_model.aggregate_scale_mol_l")
+    _assert_positive_float(
+        pairing_kernel_config.bjerrum_eps_ref, "ion_pairing_model.bjerrum_eps_ref"
+    )
+    _assert_positive_float(
+        pairing_kernel_config.aggregate_scale_M,
+        "ion_pairing_model.aggregate_scale_mol_l",
+    )
     _assert_nonnegative_float(
         pairing_kernel_config.aggregate_max_fraction,
         "ion_pairing_model.aggregate_max_fraction_of_paired",
@@ -857,7 +956,9 @@ def _build_shared_li_association_kernel(
     for anion_site in site_measure.anion_sites:
         anion_feature_id = anion_site.canonical_feature_id
         molarity_M = anion_site.molarity_M
-        _assert_nonnegative_float(molarity_M, f"anion feature {anion_feature_id} molarity")
+        _assert_nonnegative_float(
+            molarity_M, f"anion feature {anion_feature_id} molarity"
+        )
         if molarity_M == 0.0:
             continue
         total_association = _feature_association_constant_M_inv(
@@ -867,25 +968,33 @@ def _build_shared_li_association_kernel(
             params,
             pairing_kernel_config.bjerrum_eps_ref,
         )
-        ssip_fraction, cip_fraction = _ssip_cip_split_from_feature(anion_site, composition, solvation)
+        ssip_fraction, cip_fraction = _ssip_cip_split_from_feature(
+            anion_site, composition, solvation
+        )
         anion_molarities[anion_feature_id] = molarity_M
         ssip_association[anion_feature_id] = total_association * ssip_fraction
         cip_association[anion_feature_id] = total_association * cip_fraction
         aggregate_association[anion_feature_id] = _aggregate_association_constant_M_inv(
             anion_feature_id,
-            total_source_molarity_M=sum(site.molarity_M for site in site_measure.anion_sites),
+            total_source_molarity_M=sum(
+                site.molarity_M for site in site_measure.anion_sites
+            ),
             aggregate_onset_M=pairing_kernel_config.aggregate_onset_M,
             aggregate_scale_M=pairing_kernel_config.aggregate_scale_M,
             aggregate_max_fraction=pairing_kernel_config.aggregate_max_fraction,
         )
-        bridge_network_association[anion_feature_id] = _bridge_network_association_constant_from_feature_M_inv3(
-            anion_site,
-            total_association,
-            pairing_kernel_config.aggregate_scale_M,
+        bridge_network_association[anion_feature_id] = (
+            _bridge_network_association_constant_from_feature_M_inv3(
+                anion_site,
+                total_association,
+                pairing_kernel_config.aggregate_scale_M,
+            )
         )
 
     if not anion_molarities:
-        raise ValueError("shared-Li speciation requires at least one positive ionic source")
+        raise ValueError(
+            "shared-Li speciation requires at least one positive ionic source"
+        )
 
     ligand_molarities: dict[str, float] = {}
     ligand_association: dict[str, float] = {}
@@ -925,7 +1034,9 @@ def solve_shared_li_speciation(
     for iteration_index in range(SHARED_LI_NEWTON_MAX_ITERATIONS):
         residual_norm = float(np.linalg.norm(residual, ord=np.inf))
         if residual_norm <= tolerance:
-            return _shared_li_solution_from_log_concentrations(log_concentrations, association_kernel)
+            return _shared_li_solution_from_log_concentrations(
+                log_concentrations, association_kernel
+            )
         jacobian = _shared_li_finite_difference_jacobian(
             log_concentrations,
             residual,
@@ -958,13 +1069,17 @@ def _initial_shared_li_log_concentrations(
             association_kernel.ssip_association_M_inv[anion_feature_id]
             + association_kernel.cip_association_M_inv[anion_feature_id]
         )
-        association_load += total_association * association_kernel.anion_molarities_M[anion_feature_id]
+        association_load += (
+            total_association * association_kernel.anion_molarities_M[anion_feature_id]
+        )
     for ligand_feature_id in association_kernel.neutral_ligand_feature_ids:
         association_load += (
             association_kernel.neutral_ligand_association_M_inv[ligand_feature_id]
             * association_kernel.neutral_ligand_molarities_M[ligand_feature_id]
         )
-    free_lithium_guess = association_kernel.total_lithium_molarity_M / (1.0 + association_load)
+    free_lithium_guess = association_kernel.total_lithium_molarity_M / (
+        1.0 + association_load
+    )
     _assert_positive_float(free_lithium_guess, "shared-Li initial free lithium")
     guesses = [math.log(free_lithium_guess)]
     for anion_feature_id in association_kernel.anion_feature_ids:
@@ -972,11 +1087,12 @@ def _initial_shared_li_log_concentrations(
             association_kernel.ssip_association_M_inv[anion_feature_id]
             + association_kernel.cip_association_M_inv[anion_feature_id]
         )
-        free_anion_guess = (
-            association_kernel.anion_molarities_M[anion_feature_id]
-            / (1.0 + total_association * free_lithium_guess)
+        free_anion_guess = association_kernel.anion_molarities_M[anion_feature_id] / (
+            1.0 + total_association * free_lithium_guess
         )
-        _assert_positive_float(free_anion_guess, f"shared-Li initial free anion {anion_feature_id}")
+        _assert_positive_float(
+            free_anion_guess, f"shared-Li initial free anion {anion_feature_id}"
+        )
         guesses.append(math.log(free_anion_guess))
     return np.asarray(guesses, dtype=float)
 
@@ -985,7 +1101,9 @@ def _shared_li_residual_vector(
     log_concentrations: np.ndarray,
     association_kernel: SharedLiAssociationKernel,
 ) -> np.ndarray:
-    solution = _shared_li_solution_from_log_concentrations(log_concentrations, association_kernel)
+    solution = _shared_li_solution_from_log_concentrations(
+        log_concentrations, association_kernel
+    )
     lithium_balance = (
         solution.free_lithium_molarity_M
         + math.fsum(solution.ssip_molarity_M.values())
@@ -1003,7 +1121,9 @@ def _shared_li_residual_vector(
             + solution.aggregate_molarity_M[anion_feature_id]
             + 2.0 * solution.bridge_network_molarity_M[anion_feature_id]
         )
-        residuals.append(source_balance - association_kernel.anion_molarities_M[anion_feature_id])
+        residuals.append(
+            source_balance - association_kernel.anion_molarities_M[anion_feature_id]
+        )
     return np.asarray(residuals, dtype=float)
 
 
@@ -1017,8 +1137,12 @@ def _shared_li_solution_from_log_concentrations(
         raise ValueError("shared-Li log concentrations must be finite")
     free_lithium_molarity = float(math.exp(float(log_concentrations[0])))
     free_anion_molarity: dict[str, float] = {}
-    for source_index, anion_feature_id in enumerate(association_kernel.anion_feature_ids, start=1):
-        free_anion_molarity[anion_feature_id] = float(math.exp(float(log_concentrations[source_index])))
+    for source_index, anion_feature_id in enumerate(
+        association_kernel.anion_feature_ids, start=1
+    ):
+        free_anion_molarity[anion_feature_id] = float(
+            math.exp(float(log_concentrations[source_index]))
+        )
     return _shared_li_solution_from_free_concentrations(
         association_kernel,
         free_lithium_molarity,
@@ -1038,7 +1162,9 @@ def _shared_li_solution_from_free_concentrations(
     bridge_network_molarity: dict[str, float] = {}
     for anion_feature_id in association_kernel.anion_feature_ids:
         free_anion_molarity = float(free_anion_molarity_M[anion_feature_id])
-        _assert_positive_float(free_anion_molarity, f"free_anion_molarity_M.{anion_feature_id}")
+        _assert_positive_float(
+            free_anion_molarity, f"free_anion_molarity_M.{anion_feature_id}"
+        )
         ssip_molarity[anion_feature_id] = (
             association_kernel.ssip_association_M_inv[anion_feature_id]
             * free_lithium_molarity_M
@@ -1084,12 +1210,16 @@ def _shared_li_finite_difference_jacobian(
     base_residual: np.ndarray,
     association_kernel: SharedLiAssociationKernel,
 ) -> np.ndarray:
-    jacobian = np.zeros((base_residual.shape[0], log_concentrations.shape[0]), dtype=float)
+    jacobian = np.zeros(
+        (base_residual.shape[0], log_concentrations.shape[0]), dtype=float
+    )
     for column_index in range(log_concentrations.shape[0]):
         perturbed = np.array(log_concentrations, dtype=float)
         perturbed[column_index] += FINITE_DIFFERENCE_STEP
         perturbed_residual = _shared_li_residual_vector(perturbed, association_kernel)
-        jacobian[:, column_index] = (perturbed_residual - base_residual) / FINITE_DIFFERENCE_STEP
+        jacobian[:, column_index] = (
+            perturbed_residual - base_residual
+        ) / FINITE_DIFFERENCE_STEP
     return jacobian
 
 
@@ -1103,7 +1233,9 @@ def _shared_li_backtracking_update(
     step_multiplier = 1.0
     for backtracking_index in range(SHARED_LI_BACKTRACKING_STEPS):
         trial_log_concentrations = log_concentrations + step_multiplier * newton_step
-        trial_residual = _shared_li_residual_vector(trial_log_concentrations, association_kernel)
+        trial_residual = _shared_li_residual_vector(
+            trial_log_concentrations, association_kernel
+        )
         trial_norm = float(np.linalg.norm(trial_residual, ord=np.inf))
         if math.isfinite(trial_norm) and trial_norm < base_norm:
             return trial_log_concentrations, trial_residual
@@ -1128,19 +1260,29 @@ def _feature_association_constant_M_inv(
     params: OnsagerConductivityParams,
     eps_ref: float,
 ) -> float:
-    contact_distance_nm = (anion_site.cation_radius_A + anion_site.anion_radius_A) * ANGSTROM_TO_NM
-    _assert_positive_float(contact_distance_nm, f"anion feature {anion_site.canonical_feature_id} contact distance")
+    contact_distance_nm = (
+        anion_site.cation_radius_A + anion_site.anion_radius_A
+    ) * ANGSTROM_TO_NM
+    _assert_positive_float(
+        contact_distance_nm,
+        f"anion feature {anion_site.canonical_feature_id} contact distance",
+    )
     _assert_positive_float(
         anion_site.bjerrum_association_reference_M_inv,
         f"anion feature {anion_site.canonical_feature_id}.bjerrum_association_reference_M_inv",
     )
-    coulomb_term = BJERRUM_LENGTH_NM * (T_REF_K / composition.temperature_K) / contact_distance_nm
+    coulomb_term = (
+        BJERRUM_LENGTH_NM * (T_REF_K / composition.temperature_K) / contact_distance_nm
+    )
     association_constant = anion_site.bjerrum_association_reference_M_inv * math.exp(
         params.bjerrum_dielectric_scale
         * coulomb_term
         * (1.0 / matrix.epsilon_effective - 1.0 / eps_ref)
     )
-    _assert_positive_float(association_constant, f"anion feature {anion_site.canonical_feature_id} association constant")
+    _assert_positive_float(
+        association_constant,
+        f"anion feature {anion_site.canonical_feature_id} association constant",
+    )
     return association_constant
 
 
@@ -1170,10 +1312,13 @@ def _aggregate_association_constant_M_inv(
     _assert_positive_float(aggregate_scale_M, "aggregate scale")
     _assert_nonnegative_float(aggregate_max_fraction, "aggregate max fraction")
     aggregate_gate = aggregate_max_fraction / (
-        1.0 + math.exp(-(total_source_molarity_M - aggregate_onset_M) / aggregate_scale_M)
+        1.0
+        + math.exp(-(total_source_molarity_M - aggregate_onset_M) / aggregate_scale_M)
     )
     aggregate_association = aggregate_gate / aggregate_scale_M
-    _assert_nonnegative_float(aggregate_association, f"ionic source {source_name} aggregate association")
+    _assert_nonnegative_float(
+        aggregate_association, f"ionic source {source_name} aggregate association"
+    )
     return aggregate_association
 
 
@@ -1201,13 +1346,22 @@ def _bridge_network_association_constant_from_feature_M_inv3(
             * anion_site.preferred_coordination_number
         )
     )
-    _assert_nonnegative_float(bridge_eligibility, f"anion feature {anion_site.canonical_feature_id} bridge eligibility")
-    return bridge_eligibility * association_constant_M_inv / (aggregate_scale_M * aggregate_scale_M)
+    _assert_nonnegative_float(
+        bridge_eligibility,
+        f"anion feature {anion_site.canonical_feature_id} bridge eligibility",
+    )
+    return (
+        bridge_eligibility
+        * association_constant_M_inv
+        / (aggregate_scale_M * aggregate_scale_M)
+    )
 
 
 def _logsumexp_pair(first_value: float, second_value: float) -> float:
     max_value = max(first_value, second_value)
-    return max_value + math.log(math.exp(first_value - max_value) + math.exp(second_value - max_value))
+    return max_value + math.log(
+        math.exp(first_value - max_value) + math.exp(second_value - max_value)
+    )
 
 
 def _accumulate_float(values: dict[str, float], key: str, increment: float) -> None:
@@ -1225,13 +1379,17 @@ def raw_ionic_occupied_volume_fraction(
 ) -> float:
     occupied_volume_fraction = 0.0
     for motif_name, concentration_M in speciation.motif_concentrations_M.items():
-        _assert_nonnegative_float(concentration_M, f"speciation.motif_concentrations_M.{motif_name}")
+        _assert_nonnegative_float(
+            concentration_M, f"speciation.motif_concentrations_M.{motif_name}"
+        )
         partial_molar_volume_cm3_mol = _motif_partial_molar_volume_cm3_mol(
             motif_name,
             composition,
             site_measure,
         )
-        occupied_volume_fraction += concentration_M * partial_molar_volume_cm3_mol / LITER_TO_ML
+        occupied_volume_fraction += (
+            concentration_M * partial_molar_volume_cm3_mol / LITER_TO_ML
+        )
     if occupied_volume_fraction < 0.0 or occupied_volume_fraction >= 1.0:
         raise ValueError(
             "ionic occupied volume fraction must satisfy 0 <= phi < 1, "
@@ -1250,7 +1408,9 @@ def persistent_network_occupied_volume_fraction(
     _assert_positive_float(temperature_K, "temperature_K")
     occupied_volume_fraction = 0.0
     for motif_name, concentration_M in speciation.motif_concentrations_M.items():
-        _assert_nonnegative_float(concentration_M, f"speciation.motif_concentrations_M.{motif_name}")
+        _assert_nonnegative_float(
+            concentration_M, f"speciation.motif_concentrations_M.{motif_name}"
+        )
         partial_molar_volume_cm3_mol = _motif_partial_molar_volume_cm3_mol(
             motif_name,
             composition,
@@ -1276,7 +1436,9 @@ def persistent_network_occupied_volume_fraction(
     return occupied_volume_fraction
 
 
-def crowding_factor_from_ionic_volume_fraction(occupied_volume_fraction: float) -> float:
+def crowding_factor_from_ionic_volume_fraction(
+    occupied_volume_fraction: float,
+) -> float:
     if occupied_volume_fraction < 0.0 or occupied_volume_fraction >= 1.0:
         raise ValueError(
             "crowding factor requires 0 <= ionic occupied volume fraction < 1, "
@@ -1304,13 +1466,22 @@ def _motif_partial_molar_volume_cm3_mol(
         return anion_site_by_id[anion_feature_id].anion_molar_volume_cm3_mol
     if motif_name.startswith("SSIP:"):
         anion_feature_id = _motif_feature_id(motif_name, "SSIP:")
-        return site_measure.cation.molar_volume_cm3_mol + anion_site_by_id[anion_feature_id].anion_molar_volume_cm3_mol
+        return (
+            site_measure.cation.molar_volume_cm3_mol
+            + anion_site_by_id[anion_feature_id].anion_molar_volume_cm3_mol
+        )
     if motif_name.startswith("CIP:"):
         anion_feature_id = _motif_feature_id(motif_name, "CIP:")
-        return site_measure.cation.molar_volume_cm3_mol + anion_site_by_id[anion_feature_id].anion_molar_volume_cm3_mol
+        return (
+            site_measure.cation.molar_volume_cm3_mol
+            + anion_site_by_id[anion_feature_id].anion_molar_volume_cm3_mol
+        )
     if motif_name.startswith("AGG:"):
         anion_feature_id = _motif_feature_id(motif_name, "AGG:")
-        return site_measure.cation.molar_volume_cm3_mol + anion_site_by_id[anion_feature_id].anion_molar_volume_cm3_mol
+        return (
+            site_measure.cation.molar_volume_cm3_mol
+            + anion_site_by_id[anion_feature_id].anion_molar_volume_cm3_mol
+        )
     if motif_name.startswith("BRIDGE_NETWORK:"):
         anion_feature_id = _motif_feature_id(motif_name, "BRIDGE_NETWORK:")
         return 2.0 * (
@@ -1319,7 +1490,10 @@ def _motif_partial_molar_volume_cm3_mol(
         )
     if motif_name.startswith("Li_ligand:"):
         ligand_feature_id = _motif_feature_id(motif_name, "Li_ligand:")
-        return site_measure.cation.molar_volume_cm3_mol + ligand_site_by_id[ligand_feature_id].molecular_volume_cm3_mol
+        return (
+            site_measure.cation.molar_volume_cm3_mol
+            + ligand_site_by_id[ligand_feature_id].molecular_volume_cm3_mol
+        )
     raise ValueError(f"Unhandled motif concentration key {motif_name}")
 
 
@@ -1360,7 +1534,11 @@ def _neutral_ligand_network_persistence_factor(
         temperature_K,
     )
     persistence_factor = bound_lifetime_s / (bound_lifetime_s + hop_lifetime_s)
-    if persistence_factor < 0.0 or persistence_factor > 1.0 or not math.isfinite(persistence_factor):
+    if (
+        persistence_factor < 0.0
+        or persistence_factor > 1.0
+        or not math.isfinite(persistence_factor)
+    ):
         raise ValueError(
             f"neutral ligand persistence factor must satisfy 0 <= p <= 1, got {persistence_factor}"
         )
@@ -1379,8 +1557,12 @@ def _neutral_ligand_bound_lifetime_s(
         matrix,
         temperature_K,
     )
-    bound_lifetime_s = ligand_site.coordination_affinity_M_inv / association_rate_M_inv_s
-    _assert_positive_float(bound_lifetime_s, f"{ligand_site.canonical_feature_id}.bound_lifetime_s")
+    bound_lifetime_s = (
+        ligand_site.coordination_affinity_M_inv / association_rate_M_inv_s
+    )
+    _assert_positive_float(
+        bound_lifetime_s, f"{ligand_site.canonical_feature_id}.bound_lifetime_s"
+    )
     return bound_lifetime_s
 
 
@@ -1401,7 +1583,9 @@ def _neutral_ligand_cage_hop_lifetime_s(
         * capture_radius_m
         / (STOKES_SPHERE_DRAG_FACTOR * cation_diffusivity_m2_s)
     )
-    _assert_positive_float(hop_lifetime_s, f"{ligand_site.canonical_feature_id}.hop_lifetime_s")
+    _assert_positive_float(
+        hop_lifetime_s, f"{ligand_site.canonical_feature_id}.hop_lifetime_s"
+    )
     return hop_lifetime_s
 
 
@@ -1414,8 +1598,12 @@ def _smoluchowski_association_rate_M_inv_s(
     ligand_radius_m = _neutral_ligand_hydrodynamic_radius_m(ligand_site)
     cation_radius_m = cation_site.solvated_radius_A * ANGSTROM_TO_M
     capture_radius_m = ligand_radius_m + cation_radius_m
-    ligand_diffusivity_m2_s = _stokes_diffusivity_m2_s(ligand_radius_m, matrix, temperature_K)
-    cation_diffusivity_m2_s = _stokes_diffusivity_m2_s(cation_radius_m, matrix, temperature_K)
+    ligand_diffusivity_m2_s = _stokes_diffusivity_m2_s(
+        ligand_radius_m, matrix, temperature_K
+    )
+    cation_diffusivity_m2_s = _stokes_diffusivity_m2_s(
+        cation_radius_m, matrix, temperature_K
+    )
     association_rate_M_inv_s = (
         4.0
         * math.pi
@@ -1424,7 +1612,10 @@ def _smoluchowski_association_rate_M_inv_s(
         * N_A
         * LITER_TO_ML
     )
-    _assert_positive_float(association_rate_M_inv_s, f"{ligand_site.canonical_feature_id}.association_rate_M_inv_s")
+    _assert_positive_float(
+        association_rate_M_inv_s,
+        f"{ligand_site.canonical_feature_id}.association_rate_M_inv_s",
+    )
     return association_rate_M_inv_s
 
 
@@ -1432,14 +1623,23 @@ def _neutral_ligand_capture_radius_m(
     ligand_site: NeutralLigandSiteFeature,
     cation_site: CationSiteFeature,
 ) -> float:
-    return _neutral_ligand_hydrodynamic_radius_m(ligand_site) + cation_site.solvated_radius_A * ANGSTROM_TO_M
+    return (
+        _neutral_ligand_hydrodynamic_radius_m(ligand_site)
+        + cation_site.solvated_radius_A * ANGSTROM_TO_M
+    )
 
 
-def _neutral_ligand_hydrodynamic_radius_m(ligand_site: NeutralLigandSiteFeature) -> float:
+def _neutral_ligand_hydrodynamic_radius_m(
+    ligand_site: NeutralLigandSiteFeature,
+) -> float:
     molecular_volume_m3 = ligand_site.molecular_volume_cm3_mol * 1.0e-6 / N_A
-    _assert_positive_float(molecular_volume_m3, f"{ligand_site.canonical_feature_id}.molecular_volume_m3")
+    _assert_positive_float(
+        molecular_volume_m3, f"{ligand_site.canonical_feature_id}.molecular_volume_m3"
+    )
     radius_m = (3.0 * molecular_volume_m3 / (4.0 * math.pi)) ** (1.0 / 3.0)
-    _assert_positive_float(radius_m, f"{ligand_site.canonical_feature_id}.hydrodynamic_radius_m")
+    _assert_positive_float(
+        radius_m, f"{ligand_site.canonical_feature_id}.hydrodynamic_radius_m"
+    )
     return radius_m
 
 
@@ -1469,13 +1669,34 @@ def _microviscosity_coupling_exponent(
     shell_persistence_factor: float,
     context: str,
 ) -> float:
-    if fractional_stokes_alpha <= 0.0 or fractional_stokes_alpha > 1.0 or not math.isfinite(fractional_stokes_alpha):
-        raise ValueError(f"{context}.fractional_stokes_alpha must satisfy 0 < alpha <= 1, got {fractional_stokes_alpha}")
-    if shell_persistence_factor < 0.0 or shell_persistence_factor > 1.0 or not math.isfinite(shell_persistence_factor):
-        raise ValueError(f"{context}.shell_persistence_factor must satisfy 0 <= p <= 1, got {shell_persistence_factor}")
-    coupling_exponent = fractional_stokes_alpha + (1.0 - fractional_stokes_alpha) * shell_persistence_factor
-    if coupling_exponent <= 0.0 or coupling_exponent > 1.0 or not math.isfinite(coupling_exponent):
-        raise ValueError(f"{context}.microviscosity_coupling_exponent must satisfy 0 < xi <= 1, got {coupling_exponent}")
+    if (
+        fractional_stokes_alpha <= 0.0
+        or fractional_stokes_alpha > 1.0
+        or not math.isfinite(fractional_stokes_alpha)
+    ):
+        raise ValueError(
+            f"{context}.fractional_stokes_alpha must satisfy 0 < alpha <= 1, got {fractional_stokes_alpha}"
+        )
+    if (
+        shell_persistence_factor < 0.0
+        or shell_persistence_factor > 1.0
+        or not math.isfinite(shell_persistence_factor)
+    ):
+        raise ValueError(
+            f"{context}.shell_persistence_factor must satisfy 0 <= p <= 1, got {shell_persistence_factor}"
+        )
+    coupling_exponent = (
+        fractional_stokes_alpha
+        + (1.0 - fractional_stokes_alpha) * shell_persistence_factor
+    )
+    if (
+        coupling_exponent <= 0.0
+        or coupling_exponent > 1.0
+        or not math.isfinite(coupling_exponent)
+    ):
+        raise ValueError(
+            f"{context}.microviscosity_coupling_exponent must satisfy 0 < xi <= 1, got {coupling_exponent}"
+        )
     return coupling_exponent
 
 
@@ -1485,8 +1706,14 @@ def transport_microviscosity_cP(
     viscosity_exponent: float,
 ) -> float:
     _assert_positive_float(reference_viscosity_cP, "reference_viscosity_cP")
-    if viscosity_exponent <= 0.0 or viscosity_exponent > 1.0 or not math.isfinite(viscosity_exponent):
-        raise ValueError(f"transport viscosity exponent must satisfy 0 < exponent <= 1, got {viscosity_exponent}")
+    if (
+        viscosity_exponent <= 0.0
+        or viscosity_exponent > 1.0
+        or not math.isfinite(viscosity_exponent)
+    ):
+        raise ValueError(
+            f"transport viscosity exponent must satisfy 0 < exponent <= 1, got {viscosity_exponent}"
+        )
     liquid_microviscosity_cP = (
         reference_viscosity_cP
         * (matrix.eta_liquid_cP / reference_viscosity_cP) ** viscosity_exponent
@@ -1520,9 +1747,17 @@ def _solvation_shell_persistence_factor(
         mobile_radius_m,
         temperature_K,
     )
-    persistence_factor = shell_lifetime_s / (shell_lifetime_s + cage_crossing_lifetime_s)
-    if persistence_factor < 0.0 or persistence_factor > 1.0 or not math.isfinite(persistence_factor):
-        raise ValueError(f"solvation shell persistence factor must satisfy 0 <= p <= 1, got {persistence_factor}")
+    persistence_factor = shell_lifetime_s / (
+        shell_lifetime_s + cage_crossing_lifetime_s
+    )
+    if (
+        persistence_factor < 0.0
+        or persistence_factor > 1.0
+        or not math.isfinite(persistence_factor)
+    ):
+        raise ValueError(
+            f"solvation shell persistence factor must satisfy 0 <= p <= 1, got {persistence_factor}"
+        )
     return persistence_factor
 
 
@@ -1534,7 +1769,9 @@ def _weighted_solvation_shell_lifetime_s(
 ) -> float:
     shell_lifetime_s = 0.0
     for neutral_species_name, shell_fraction in solvation.shell_fractions.items():
-        _assert_nonnegative_float(shell_fraction, f"solvation.shell_fractions.{neutral_species_name}")
+        _assert_nonnegative_float(
+            shell_fraction, f"solvation.shell_fractions.{neutral_species_name}"
+        )
         neutral_props = _neutral_species_props(neutral_species_name)
         neutral_lifetime_s = _neutral_species_shell_lifetime_s(
             neutral_species_name,
@@ -1560,8 +1797,12 @@ def _neutral_species_shell_lifetime_s(
         residence_time_ns = _require_float(neutral_props, "residence_time_ns", context)
         _assert_positive_float(residence_time_ns, f"{context}.residence_time_ns")
         return residence_time_ns * NANOSECOND_TO_SECOND
-    coordination_affinity_M_inv = _require_float(neutral_props, "coordination_affinity_M_inv", context)
-    _assert_positive_float(coordination_affinity_M_inv, f"{context}.coordination_affinity_M_inv")
+    coordination_affinity_M_inv = _require_float(
+        neutral_props, "coordination_affinity_M_inv", context
+    )
+    _assert_positive_float(
+        coordination_affinity_M_inv, f"{context}.coordination_affinity_M_inv"
+    )
     association_rate_M_inv_s = _neutral_species_association_rate_M_inv_s(
         neutral_props,
         cation_site,
@@ -1587,13 +1828,17 @@ def _solvation_cage_crossing_lifetime_s(
         + solvation.preferred_coordination_number * weighted_neutral_radius_m
     )
     _assert_positive_float(shell_path_length_m, "solvation_shell_path_length_m")
-    mobile_diffusivity_m2_s = _stokes_diffusivity_m2_s(mobile_radius_m, matrix, temperature_K)
+    mobile_diffusivity_m2_s = _stokes_diffusivity_m2_s(
+        mobile_radius_m, matrix, temperature_K
+    )
     cage_crossing_lifetime_s = (
         shell_path_length_m
         * shell_path_length_m
         / (STOKES_SPHERE_DRAG_FACTOR * mobile_diffusivity_m2_s)
     )
-    _assert_positive_float(cage_crossing_lifetime_s, "solvation_cage_crossing_lifetime_s")
+    _assert_positive_float(
+        cage_crossing_lifetime_s, "solvation_cage_crossing_lifetime_s"
+    )
     return cage_crossing_lifetime_s
 
 
@@ -1602,7 +1847,9 @@ def _weighted_neutral_shell_radius_m(
 ) -> float:
     weighted_radius_m = 0.0
     for neutral_species_name, shell_fraction in solvation.shell_fractions.items():
-        _assert_nonnegative_float(shell_fraction, f"solvation.shell_fractions.{neutral_species_name}")
+        _assert_nonnegative_float(
+            shell_fraction, f"solvation.shell_fractions.{neutral_species_name}"
+        )
         neutral_props = _neutral_species_props(neutral_species_name)
         weighted_radius_m += shell_fraction * _neutral_species_hydrodynamic_radius_m(
             neutral_props,
@@ -1622,8 +1869,12 @@ def _neutral_species_association_rate_M_inv_s(
     neutral_radius_m = _neutral_species_hydrodynamic_radius_m(neutral_props, context)
     cation_radius_m = cation_site.solvated_radius_A * ANGSTROM_TO_M
     capture_radius_m = neutral_radius_m + cation_radius_m
-    neutral_diffusivity_m2_s = _stokes_diffusivity_m2_s(neutral_radius_m, matrix, temperature_K)
-    cation_diffusivity_m2_s = _stokes_diffusivity_m2_s(cation_radius_m, matrix, temperature_K)
+    neutral_diffusivity_m2_s = _stokes_diffusivity_m2_s(
+        neutral_radius_m, matrix, temperature_K
+    )
+    cation_diffusivity_m2_s = _stokes_diffusivity_m2_s(
+        cation_radius_m, matrix, temperature_K
+    )
     association_rate_M_inv_s = (
         4.0
         * math.pi
@@ -1632,7 +1883,9 @@ def _neutral_species_association_rate_M_inv_s(
         * N_A
         * LITER_TO_ML
     )
-    _assert_positive_float(association_rate_M_inv_s, f"{context}.association_rate_M_inv_s")
+    _assert_positive_float(
+        association_rate_M_inv_s, f"{context}.association_rate_M_inv_s"
+    )
     return association_rate_M_inv_s
 
 
@@ -1671,9 +1924,15 @@ def _build_mobility_state(
     physics_config: Mapping[str, Any],
     site_measure: TransportSiteMeasure,
 ) -> MobilityState:
-    arrhenius_cfg = _require_mapping(physics_config, "transport_arrhenius", "physics_config")
-    eta_ref = _require_float(arrhenius_cfg, "reference_viscosity_cP", "transport_arrhenius")
-    ea = _require_float(arrhenius_cfg, "diffusion_activation_energy_J_mol", "transport_arrhenius")
+    arrhenius_cfg = _require_mapping(
+        physics_config, "transport_arrhenius", "physics_config"
+    )
+    eta_ref = _require_float(
+        arrhenius_cfg, "reference_viscosity_cP", "transport_arrhenius"
+    )
+    ea = _require_float(
+        arrhenius_cfg, "diffusion_activation_energy_J_mol", "transport_arrhenius"
+    )
     if eta_ref <= 0.0:
         raise ValueError("transport_arrhenius.reference_viscosity_cP must be positive")
 
@@ -1686,7 +1945,9 @@ def _build_mobility_state(
     anion_shape_factor_by_feature: dict[str, float] = {}
     anion_microviscosity_coupling_by_feature: dict[str, float] = {}
     temp_factor = math.exp(-ea / R * (1.0 / temperature_K - 1.0 / T_REF_K))
-    raw_volume_fraction = raw_ionic_occupied_volume_fraction(composition, speciation, site_measure)
+    raw_volume_fraction = raw_ionic_occupied_volume_fraction(
+        composition, speciation, site_measure
+    )
     network_volume_fraction = persistent_network_occupied_volume_fraction(
         composition,
         matrix,
@@ -1694,7 +1955,9 @@ def _build_mobility_state(
         site_measure,
         temperature_K,
     )
-    crowding_factor = crowding_factor_from_ionic_volume_fraction(network_volume_fraction)
+    crowding_factor = crowding_factor_from_ionic_volume_fraction(
+        network_volume_fraction
+    )
     shared_cation_symbol = site_measure.cation.ion_symbol
     lambda_cation0 = _shared_cation_mobility_baseline_S_cm2_mol(
         site_measure.cation,
@@ -1735,7 +1998,9 @@ def _build_mobility_state(
         anion_carrier = anion_site.carrier_label
         lambda0_total = anion_site.limiting_molar_conductivity_S_cm2_mol
         if lambda0_total <= 0.0:
-            raise ValueError(f"anion feature {anion_feature_id}.limiting_molar_conductivity must be positive")
+            raise ValueError(
+                f"anion feature {anion_feature_id}.limiting_molar_conductivity must be positive"
+            )
 
         lambda_anion0 = lambda0_total - lambda_cation0
         if lambda_anion0 <= 0.0:
@@ -1772,11 +2037,15 @@ def _build_mobility_state(
             )
         )
         anion_shape_factor = anion_site.shape_friction_factor
-        lambda_anion_no_crowding = lambda_anion_no_crowding_no_shape / anion_shape_factor
+        lambda_anion_no_crowding = (
+            lambda_anion_no_crowding_no_shape / anion_shape_factor
+        )
         lambda_anion_no_shape = lambda_anion_no_crowding_no_shape * crowding_factor
         lambda_anion = lambda_anion_no_shape / anion_shape_factor
         anion_shape_factor_by_feature[anion_feature_id] = anion_shape_factor
-        anion_microviscosity_coupling_by_feature[anion_feature_id] = anion_microviscosity_coupling
+        anion_microviscosity_coupling_by_feature[anion_feature_id] = (
+            anion_microviscosity_coupling
+        )
 
         feature_splits[anion_feature_id] = {
             shared_cation_symbol: lambda_cation,
@@ -1796,10 +2065,22 @@ def _build_mobility_state(
             f"free_anion:{anion_feature_id}",
             "speciation.motif_concentrations_M",
         )
-        _accumulate_float(carrier_lambda_weighted_sum, shared_cation_symbol, free_cation_concentration * lambda_cation)
-        _accumulate_float(carrier_lambda_weighted_sum, anion_carrier, free_anion_concentration * lambda_anion)
-        _accumulate_float(carrier_concentration_sum, shared_cation_symbol, free_cation_concentration)
-        _accumulate_float(carrier_concentration_sum, anion_carrier, free_anion_concentration)
+        _accumulate_float(
+            carrier_lambda_weighted_sum,
+            shared_cation_symbol,
+            free_cation_concentration * lambda_cation,
+        )
+        _accumulate_float(
+            carrier_lambda_weighted_sum,
+            anion_carrier,
+            free_anion_concentration * lambda_anion,
+        )
+        _accumulate_float(
+            carrier_concentration_sum, shared_cation_symbol, free_cation_concentration
+        )
+        _accumulate_float(
+            carrier_concentration_sum, anion_carrier, free_anion_concentration
+        )
         _accumulate_float(
             carrier_strength_no_crowding,
             shared_cation_symbol,
@@ -1810,13 +2091,21 @@ def _build_mobility_state(
             anion_carrier,
             free_anion_concentration * lambda_anion_no_crowding,
         )
-        _accumulate_float(carrier_strength, shared_cation_symbol, free_cation_concentration * lambda_cation)
-        _accumulate_float(carrier_strength, anion_carrier, free_anion_concentration * lambda_anion)
+        _accumulate_float(
+            carrier_strength,
+            shared_cation_symbol,
+            free_cation_concentration * lambda_cation,
+        )
+        _accumulate_float(
+            carrier_strength, anion_carrier, free_anion_concentration * lambda_anion
+        )
 
     carrier_lambda: dict[str, float] = {}
     for carrier_name, weighted_lambda_sum in carrier_lambda_weighted_sum.items():
         concentration_sum = carrier_concentration_sum[carrier_name]
-        _assert_positive_float(concentration_sum, f"carrier concentration sum {carrier_name}")
+        _assert_positive_float(
+            concentration_sum, f"carrier concentration sum {carrier_name}"
+        )
         carrier_lambda[carrier_name] = weighted_lambda_sum / concentration_sum
 
     return MobilityState(
@@ -1845,12 +2134,16 @@ def _build_correlation_state(
     params: OnsagerConductivityParams,
     site_measure: TransportSiteMeasure,
 ) -> CorrelationState:
-    pairing_cfg = _require_mapping(physics_config, "ion_pairing_model", "physics_config")
+    pairing_cfg = _require_mapping(
+        physics_config, "ion_pairing_model", "physics_config"
+    )
     eps_ref = _require_float(pairing_cfg, "bjerrum_eps_ref", "ion_pairing_model")
 
     cation_symbol = site_measure.cation.ion_symbol
     carrier_order = [cation_symbol] + [
-        carrier for carrier in mobility.carrier_strength_mS_cm if carrier != cation_symbol
+        carrier
+        for carrier in mobility.carrier_strength_mS_cm
+        if carrier != cation_symbol
     ]
     if len(carrier_order) != len(mobility.carrier_strength_mS_cm):
         raise ValueError("Carrier order construction lost at least one carrier")
@@ -1861,7 +2154,9 @@ def _build_correlation_state(
     dimension = len(carrier_order)
     basis_vectors.append(_unit_vector(dimension, 0))
 
-    anion_site_by_carrier = {site.carrier_label: site for site in site_measure.anion_sites}
+    anion_site_by_carrier = {
+        site.carrier_label: site for site in site_measure.anion_sites
+    }
     for idx, carrier in enumerate(carrier_order[1:], start=1):
         if carrier not in anion_site_by_carrier:
             raise ValueError(f"carrier {carrier} has no anion site feature")
@@ -1869,9 +2164,13 @@ def _build_correlation_state(
         anion_feature_id = anion_site.canonical_feature_id
         anion_radius = anion_site.anion_radius_A
         cation_radius = site_measure.cation.solvated_radius_A
-        dielectric_support = matrix.epsilon_effective / (matrix.epsilon_effective + eps_ref)
+        dielectric_support = matrix.epsilon_effective / (
+            matrix.epsilon_effective + eps_ref
+        )
         anion_size_share = anion_radius / (anion_radius + cation_radius)
-        memory_fraction = _motif_memory_fraction(speciation, anion_feature_id, dielectric_support)
+        memory_fraction = _motif_memory_fraction(
+            speciation, anion_feature_id, dielectric_support
+        )
         decoupling_fraction = _motif_decoupling_fraction(speciation, anion_feature_id)
         raw = (
             params.pair_correlation_gain * memory_fraction
@@ -1917,13 +2216,21 @@ def _motif_memory_fraction(
         + aggregate_fraction
         + bridge_fraction
     )
-    _assert_nonnegative_float(memory_fraction, f"{anion_feature_id}.motif_memory_fraction")
+    _assert_nonnegative_float(
+        memory_fraction, f"{anion_feature_id}.motif_memory_fraction"
+    )
     return memory_fraction
 
 
 def _ssip_memory_weight(dielectric_support: float) -> float:
-    if dielectric_support < 0.0 or dielectric_support > 1.0 or not math.isfinite(dielectric_support):
-        raise ValueError(f"dielectric_support must satisfy 0 <= x <= 1, got {dielectric_support}")
+    if (
+        dielectric_support < 0.0
+        or dielectric_support > 1.0
+        or not math.isfinite(dielectric_support)
+    ):
+        raise ValueError(
+            f"dielectric_support must satisfy 0 <= x <= 1, got {dielectric_support}"
+        )
     return dielectric_support * (1.0 - dielectric_support)
 
 
@@ -1933,10 +2240,11 @@ def _motif_decoupling_fraction(
 ) -> float:
     ligand_fraction = math.fsum(speciation.li_ligand_fraction_by_feature.values())
     decoupling_fraction = (
-        speciation.ssip_fraction_by_feature[anion_feature_id]
-        + ligand_fraction
+        speciation.ssip_fraction_by_feature[anion_feature_id] + ligand_fraction
     )
-    _assert_nonnegative_float(decoupling_fraction, f"{anion_feature_id}.motif_decoupling_fraction")
+    _assert_nonnegative_float(
+        decoupling_fraction, f"{anion_feature_id}.motif_decoupling_fraction"
+    )
     return decoupling_fraction
 
 
@@ -1946,7 +2254,10 @@ def _onsager_readout(
     correlation: CorrelationState,
 ) -> tuple[float, float]:
     strengths = np.asarray(
-        [mobility.carrier_strength_mS_cm[carrier] for carrier in correlation.carrier_order],
+        [
+            mobility.carrier_strength_mS_cm[carrier]
+            for carrier in correlation.carrier_order
+        ],
         dtype=float,
     )
     charges = np.asarray(
@@ -1957,7 +2268,9 @@ def _onsager_readout(
         raise ValueError(f"Negative carrier strength encountered: {strengths}")
 
     sqrt_strength = np.sqrt(strengths)
-    onsager_matrix = np.diag(sqrt_strength) @ correlation.matrix @ np.diag(sqrt_strength)
+    onsager_matrix = (
+        np.diag(sqrt_strength) @ correlation.matrix @ np.diag(sqrt_strength)
+    )
     sigma = float(charges @ onsager_matrix @ charges)
     sigma_uncorrelated = float(np.dot(charges * charges, strengths))
     if sigma <= 0.0 or not math.isfinite(sigma):
@@ -1973,8 +2286,12 @@ def _compute_dimer_viscosity_factor(
     physics_config: Mapping[str, Any],
     dimer_viscosity_scale: float,
 ) -> float:
-    corrections = _require_mapping(physics_config, "interaction_corrections", "physics_config")
-    dimer_cfg = _require_mapping(corrections, "dimerization_viscosity", "interaction_corrections")
+    corrections = _require_mapping(
+        physics_config, "interaction_corrections", "physics_config"
+    )
+    dimer_cfg = _require_mapping(
+        corrections, "dimerization_viscosity", "interaction_corrections"
+    )
     viscosity_dimer_factor = _require_float(
         dimer_cfg,
         "viscosity_dimer_factor",
@@ -1984,12 +2301,16 @@ def _compute_dimer_viscosity_factor(
     factor = 1.0
     for name, phi in composition.neutral_liquid_volume_fractions.items():
         props = _neutral_species_props(name)
-        k_dimer = _optional_float(props, "dimerization_constant_M_inv", f"neutral species {name}")
+        k_dimer = _optional_float(
+            props, "dimerization_constant_M_inv", f"neutral species {name}"
+        )
         if k_dimer == 0.0:
             continue
         concentration = _neutral_species_moles(composition, name)
         dimer_fraction = k_dimer * concentration / (1.0 + k_dimer * concentration)
-        factor *= 1.0 + dimer_viscosity_scale * viscosity_dimer_factor * phi * dimer_fraction
+        factor *= (
+            1.0 + dimer_viscosity_scale * viscosity_dimer_factor * phi * dimer_fraction
+        )
     return factor
 
 
@@ -2004,7 +2325,9 @@ def _compute_salt_viscosity_factor(
         "viscosity_model",
     )
     b_vis = _require_float(viscosity_cfg, "jones_dole_B_vis", "viscosity_model")
-    b_linear_ref = _require_float(viscosity_cfg, "jones_dole_B_linear_ref", "viscosity_model")
+    b_linear_ref = _require_float(
+        viscosity_cfg, "jones_dole_B_linear_ref", "viscosity_model"
+    )
     d_vis = _require_float(viscosity_cfg, "jones_dole_D_vis", "viscosity_model")
     if b_linear_ref <= 0.0:
         raise ValueError("viscosity_model.jones_dole_B_linear_ref must be positive")
@@ -2019,7 +2342,9 @@ def _compute_salt_viscosity_factor(
         )
         linear += b_linear * b_vis / b_linear_ref * molarity
         total_molarity += molarity
-    return math.exp(salt_viscosity_scale * (linear + d_vis * total_molarity * total_molarity))
+    return math.exp(
+        salt_viscosity_scale * (linear + d_vis * total_molarity * total_molarity)
+    )
 
 
 def _compute_salt_additive_viscosity_factor(
@@ -2035,7 +2360,9 @@ def _compute_salt_additive_viscosity_factor(
         "viscosity_model",
     )
     b_vis = _require_float(viscosity_cfg, "jones_dole_B_vis", "viscosity_model")
-    b_linear_ref = _require_float(viscosity_cfg, "jones_dole_B_linear_ref", "viscosity_model")
+    b_linear_ref = _require_float(
+        viscosity_cfg, "jones_dole_B_linear_ref", "viscosity_model"
+    )
     d_vis = _require_float(viscosity_cfg, "jones_dole_D_vis", "viscosity_model")
     _assert_positive_float(b_linear_ref, "viscosity_model.jones_dole_B_linear_ref")
     _assert_positive_float(composition.total_mass_g, "composition.total_mass_g")
@@ -2051,13 +2378,8 @@ def _compute_salt_additive_viscosity_factor(
             "viscosity_model.jones_dole_B_by_species",
         )
         source_viscosity_strength = (
-            b_linear
-            * b_vis
-            / b_linear_ref
-            * molarity_M
-            + d_vis
-            * molarity_M
-            * molarity_M
+            b_linear * b_vis / b_linear_ref * molarity_M
+            + d_vis * molarity_M * molarity_M
         )
         for additive_name, additive_mass_g in composition.additive_masses_g.items():
             _assert_nonnegative_float(additive_mass_g, f"additive {additive_name} mass")
@@ -2071,10 +2393,16 @@ def _compute_salt_additive_viscosity_factor(
                 "viscosity_cP",
                 f"additive {additive_name}",
             )
-            _assert_positive_float(additive_viscosity_cP, f"additive {additive_name} viscosity_cP")
+            _assert_positive_float(
+                additive_viscosity_cP, f"additive {additive_name} viscosity_cP"
+            )
             additive_weight_fraction = additive_mass_g / composition.total_mass_g
             viscosity_contrast = additive_viscosity_cP / eta_liquid_cP - 1.0
-            log_factor += source_viscosity_strength * additive_weight_fraction * viscosity_contrast
+            log_factor += (
+                source_viscosity_strength
+                * additive_weight_fraction
+                * viscosity_contrast
+            )
     return math.exp(salt_viscosity_scale * log_factor)
 
 
@@ -2082,18 +2410,30 @@ def _compute_eyring_nrtl_excess_log_viscosity(
     composition: CompositionState,
     physics_config: Mapping[str, Any],
 ) -> float:
-    viscosity_cfg = _require_mapping(physics_config, "viscosity_model", "physics_config")
+    viscosity_cfg = _require_mapping(
+        physics_config, "viscosity_model", "physics_config"
+    )
     eyring_cfg = _require_mapping(viscosity_cfg, "eyring_nrtl", "viscosity_model")
-    tau_params = _require_mapping(eyring_cfg, "tau_parameters", "viscosity_model.eyring_nrtl")
-    alpha = _require_float(eyring_cfg, "alpha_nonrandomness", "viscosity_model.eyring_nrtl")
+    tau_params = _require_mapping(
+        eyring_cfg, "tau_parameters", "viscosity_model.eyring_nrtl"
+    )
+    alpha = _require_float(
+        eyring_cfg, "alpha_nonrandomness", "viscosity_model.eyring_nrtl"
+    )
 
     neutral_names = list(composition.neutral_liquid_volume_fractions)
-    neutral_moles = {name: _neutral_species_moles(composition, name) for name in neutral_names}
+    neutral_moles = {
+        name: _neutral_species_moles(composition, name) for name in neutral_names
+    }
     total_moles = sum(neutral_moles.values())
     if total_moles <= 0.0:
-        raise ValueError("Cannot compute Eyring-NRTL viscosity with zero neutral-liquid moles")
+        raise ValueError(
+            "Cannot compute Eyring-NRTL viscosity with zero neutral-liquid moles"
+        )
 
-    x = np.asarray([neutral_moles[name] / total_moles for name in neutral_names], dtype=float)
+    x = np.asarray(
+        [neutral_moles[name] / total_moles for name in neutral_names], dtype=float
+    )
     n = len(neutral_names)
     tau = np.zeros((n, n), dtype=float)
     g = np.ones((n, n), dtype=float)
@@ -2103,7 +2443,9 @@ def _compute_eyring_nrtl_excess_log_viscosity(
                 continue
             key = f"{name_i}>{name_j}"
             if key in tau_params:
-                tau[i, j] = _require_float(tau_params, key, "viscosity_model.eyring_nrtl.tau_parameters")
+                tau[i, j] = _require_float(
+                    tau_params, key, "viscosity_model.eyring_nrtl.tau_parameters"
+                )
                 g[i, j] = math.exp(-alpha * tau[i, j])
 
     excess = 0.0
@@ -2114,7 +2456,9 @@ def _compute_eyring_nrtl_excess_log_viscosity(
         numer = float(np.dot(x, tau[:, i] * g[:, i]))
         excess += float(x[i]) * numer / denom
 
-    rk_cfg = _require_mapping(eyring_cfg, "redlich_kister_asymmetry", "viscosity_model.eyring_nrtl")
+    rk_cfg = _require_mapping(
+        eyring_cfg, "redlich_kister_asymmetry", "viscosity_model.eyring_nrtl"
+    )
     for i, name_i in enumerate(neutral_names):
         for j, name_j in enumerate(neutral_names[i + 1 :], start=i + 1):
             g1 = _optional_pair_float(
@@ -2152,7 +2496,9 @@ def _ionic_source_cation_name(source: str, props: Mapping[str, Any]) -> str:
     cation_radius_A = _require_float(props, "cation_radius", f"ionic source {source}")
     matches: list[str] = []
     for cation_name, cation_props in CATION_PROPERTIES.items():
-        reference_radius_A = _require_float(cation_props, "ionic_radius_A", f"cation {cation_name}")
+        reference_radius_A = _require_float(
+            cation_props, "ionic_radius_A", f"cation {cation_name}"
+        )
         if abs(reference_radius_A - cation_radius_A) <= CATION_RADIUS_MATCH_TOLERANCE_A:
             matches.append(cation_name)
     if len(matches) != 1:
@@ -2162,9 +2508,13 @@ def _ionic_source_cation_name(source: str, props: Mapping[str, Any]) -> str:
     return matches[0]
 
 
-def _ionic_source_preferred_coordination_number(source: str, props: Mapping[str, Any]) -> float:
+def _ionic_source_preferred_coordination_number(
+    source: str, props: Mapping[str, Any]
+) -> float:
     if "preferred_coordination_number" in props:
-        return _require_float(props, "preferred_coordination_number", f"ionic source {source}")
+        return _require_float(
+            props, "preferred_coordination_number", f"ionic source {source}"
+        )
     cation_name = _ionic_source_cation_name(source, props)
     reference_values: list[float] = []
     for salt_name, salt_props in SALTS.items():
@@ -2217,7 +2567,9 @@ def _source_for_anion(composition: CompositionState, anion: str) -> str:
         if _require_string(props, "anion", f"ionic source {source}") == anion:
             matches.append(source)
     if len(matches) != 1:
-        raise ValueError(f"Expected exactly one source for anion {anion}, found {matches}")
+        raise ValueError(
+            f"Expected exactly one source for anion {anion}, found {matches}"
+        )
     return matches[0]
 
 
@@ -2227,7 +2579,9 @@ def _single_cation_name(composition: CompositionState) -> str:
         props = _ionic_source_props(source)
         cation_names.add(_ionic_source_cation_name(source, props))
     if len(cation_names) != 1:
-        raise ValueError(f"Onsager prototype currently requires one cation family, found {sorted(cation_names)}")
+        raise ValueError(
+            f"Onsager prototype currently requires one cation family, found {sorted(cation_names)}"
+        )
     return next(iter(cation_names))
 
 
@@ -2239,7 +2593,9 @@ def _single_cation_symbol(composition: CompositionState) -> str:
         cation_props = _require_species(CATION_PROPERTIES, cation, "cation")
         symbols.add(_require_string(cation_props, "ion_symbol", f"cation {cation}"))
     if len(symbols) != 1:
-        raise ValueError(f"Onsager prototype currently requires one cation family, found {sorted(symbols)}")
+        raise ValueError(
+            f"Onsager prototype currently requires one cation family, found {sorted(symbols)}"
+        )
     return next(iter(symbols))
 
 
@@ -2250,16 +2606,27 @@ def _shared_cation_mobility_baseline_S_cm2_mol(
 ) -> float:
     solvated_radius_A = cation_feature.solvated_radius_A
     charge = float(cation_feature.charge)
-    _assert_positive_float(solvated_radius_A, f"cation feature {cation_feature.canonical_feature_id} solvated_radius_A")
+    _assert_positive_float(
+        solvated_radius_A,
+        f"cation feature {cation_feature.canonical_feature_id} solvated_radius_A",
+    )
     _assert_positive_float(reference_viscosity_cP, "reference_viscosity_cP")
     _assert_positive_float(reference_temperature_K, "reference_temperature_K")
     radius_m = solvated_radius_A * ANGSTROM_TO_NM * 1.0e-9
     diffusion_m2_s = (
         K_B
         * reference_temperature_K
-        / (STOKES_SPHERE_DRAG_FACTOR * math.pi * reference_viscosity_cP * CP_TO_PA_S * radius_m)
+        / (
+            STOKES_SPHERE_DRAG_FACTOR
+            * math.pi
+            * reference_viscosity_cP
+            * CP_TO_PA_S
+            * radius_m
+        )
     )
-    mobility_S_m2_mol = charge * charge * F * F * diffusion_m2_s / (R * reference_temperature_K)
+    mobility_S_m2_mol = (
+        charge * charge * F * F * diffusion_m2_s / (R * reference_temperature_K)
+    )
     mobility_S_cm2_mol = mobility_S_m2_mol * CM2_PER_M2
     _assert_positive_float(
         mobility_S_cm2_mol,
@@ -2291,7 +2658,9 @@ def _unit_vector(dimension: int, index: int) -> np.ndarray:
     return vector
 
 
-def species_record(registry: Mapping[str, Mapping[str, Any]], name: str, role: str) -> Mapping[str, Any]:
+def species_record(
+    registry: Mapping[str, Mapping[str, Any]], name: str, role: str
+) -> Mapping[str, Any]:
     if name not in registry:
         raise ValueError(f"Unknown {role} species {name}")
     return registry[name]
@@ -2315,14 +2684,24 @@ def _optional_float(mapping: Mapping[str, Any], key: str, context: str) -> float
 
 def _validate_params(params: OnsagerConductivityParams) -> None:
     _assert_positive_float(params.mobility_scale, "params.mobility_scale")
-    _assert_positive_float(params.bjerrum_dielectric_scale, "params.bjerrum_dielectric_scale")
-    _assert_positive_float(params.viscosity_exponent_scale, "params.viscosity_exponent_scale")
-    _assert_positive_float(params.liquid_excess_viscosity_scale, "params.liquid_excess_viscosity_scale")
+    _assert_positive_float(
+        params.bjerrum_dielectric_scale, "params.bjerrum_dielectric_scale"
+    )
+    _assert_positive_float(
+        params.viscosity_exponent_scale, "params.viscosity_exponent_scale"
+    )
+    _assert_positive_float(
+        params.liquid_excess_viscosity_scale, "params.liquid_excess_viscosity_scale"
+    )
     _assert_positive_float(params.dimer_viscosity_scale, "params.dimer_viscosity_scale")
     _assert_positive_float(params.salt_viscosity_scale, "params.salt_viscosity_scale")
     _assert_positive_float(params.pair_correlation_gain, "params.pair_correlation_gain")
-    _assert_positive_float(params.aggregate_correlation_gain, "params.aggregate_correlation_gain")
-    _assert_positive_float(params.steric_anticorrelation_gain, "params.steric_anticorrelation_gain")
+    _assert_positive_float(
+        params.aggregate_correlation_gain, "params.aggregate_correlation_gain"
+    )
+    _assert_positive_float(
+        params.steric_anticorrelation_gain, "params.steric_anticorrelation_gain"
+    )
 
 
 def _assert_positive_float(value: float, context: str) -> None:

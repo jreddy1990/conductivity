@@ -12,6 +12,7 @@ from conductivity.physical_library.projected_analytical_conductivity import (
     CARTESIAN,
     refine_mori_basis_by_projected_residual,
 )
+from utils.time_series_statistics import linear_fit
 
 ANGSTROM_TO_M = 1.0e-10
 DEFAULT_DISPLACEMENT_ZERO_TOLERANCE_M = 0.0
@@ -167,6 +168,8 @@ class TrajectoryBasisRefinement:
     candidate_labels: tuple[str, ...]
     candidate_sample_count: int
     selected_candidate_indices: tuple[int, ...]
+    conductivity_history_S_m: tuple[float, ...]
+    selected_residual_score_history_m2_s: tuple[float, ...]
     candidate_set_exhausted: bool
     convergence_status: str
     not_complete_reasons: tuple[str, ...]
@@ -329,6 +332,14 @@ def refine_trajectory_basis_from_state_current_samples(
         candidate_sample_count=candidate_sample_count,
         selected_candidate_indices=tuple(
             int(index) for index in refinement_result["selected_candidate_indices"]
+        ),
+        conductivity_history_S_m=tuple(
+            float(value)
+            for value in refinement_result["conductivity_history_S_m"]
+        ),
+        selected_residual_score_history_m2_s=tuple(
+            float(value)
+            for value in refinement_result["selected_residual_score_history"]
         ),
         candidate_set_exhausted=bool(refinement_result["candidate_set_exhausted"]),
         convergence_status=str(refinement_result["convergence_status"]),
@@ -938,17 +949,8 @@ def _find_diffusive_covariance_window(
 
 
 def _linear_slope_and_error(x_values: Array, y_values: Array) -> tuple[float, float]:
-    design = np.column_stack((np.ones(x_values.size, dtype=float), x_values))
-    coefficients, _, _, _ = np.linalg.lstsq(design, y_values, rcond=None)
-    residuals = y_values - design @ coefficients
-    degrees_of_freedom = x_values.size - design.shape[1]
-    if degrees_of_freedom <= 0:
-        raise ValueError(
-            "slope estimation requires positive regression degrees of freedom"
-        )
-    residual_variance = float(residuals @ residuals) / float(degrees_of_freedom)
-    coefficient_covariance = residual_variance * np.linalg.inv(design.T @ design)
-    return float(coefficients[1]), float(np.sqrt(coefficient_covariance[1, 1]))
+    fit = linear_fit(x_values, y_values)
+    return fit.slope, fit.slope_standard_error
 
 
 def _failed_diffusion_convergence(

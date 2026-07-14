@@ -26,7 +26,7 @@ from conductivity.physical_library.reduced_generator import (
 from conductivity.physical_library.library_io import PhysicalLibraryRecords
 
 Array = np.ndarray
-LOCAL_FIELD_VECTOR_LENGTH = 4
+LOCAL_FIELD_VECTOR_LENGTH = 5  # dielectric, viscosity, ionic strength, packing, collision exposure
 
 
 @dataclass(frozen=True)
@@ -35,6 +35,7 @@ class PhysicalLocalFields:
     viscosity_Pa_s: float
     ionic_strength_mol_m3: float
     local_packing_fraction: float
+    additive_pair_collision_exposure: float
 
 
 @dataclass(frozen=True)
@@ -79,6 +80,7 @@ class PhysicalGeneratorBuildInput:
     state_quadratures: tuple[PhysicalStateQuadrature, ...]
     transition_quadratures: tuple[PhysicalTransitionQuadrature, ...]
     memory_coordinate_gradient_functions: tuple[Callable[[SiteConfiguration], Array], ...]
+    state_continuous_memory_family_keys: tuple[tuple[str, ...], ...]
     state_memory_value_matrix: Array
     total_component_concentrations_mol_m3: Array
     temperature_K: float
@@ -132,6 +134,10 @@ def build_reduced_generator_specification_from_physical_objects(
             build_input,
             point_registry,
         ),
+        state_continuous_memory_family_keys=tuple(
+            tuple(str(value) for value in family_key)
+            for family_key in build_input.state_continuous_memory_family_keys
+        ),
         state_quadratures=state_quadratures,
         transition_quadratures=transition_quadratures,
         total_component_concentrations_mol_m3=np.asarray(
@@ -161,6 +167,7 @@ def flatten_configuration_with_local_fields(
             local_fields.viscosity_Pa_s,
             local_fields.ionic_strength_mol_m3,
             local_fields.local_packing_fraction,
+            local_fields.additive_pair_collision_exposure,
         ],
         dtype=float,
     )
@@ -184,6 +191,7 @@ def configuration_and_local_fields_from_generator_point(
         viscosity_Pa_s=float(local_field_values[1]),
         ionic_strength_mol_m3=float(local_field_values[2]),
         local_packing_fraction=float(local_field_values[3]),
+        additive_pair_collision_exposure=float(local_field_values[4]),
     )
     validate_local_fields(local_fields, "generator_point.local_fields")
     configuration = SiteConfiguration(
@@ -580,6 +588,7 @@ def _physical_object_function(
             local_fields.viscosity_Pa_s,
             local_fields.ionic_strength_mol_m3,
             local_fields.local_packing_fraction,
+            local_fields.additive_pair_collision_exposure,
         )
         physical_object_cache[cache_key] = physical_object
         return physical_object
@@ -692,6 +701,10 @@ def validate_local_fields(local_fields: PhysicalLocalFields, label: str) -> None
         raise ValueError(f"{label}.ionic_strength_mol_m3 must be nonnegative")
     if local_fields.local_packing_fraction < 0.0:
         raise ValueError(f"{label}.local_packing_fraction must be nonnegative")
+    if local_fields.additive_pair_collision_exposure < 0.0:
+        raise ValueError(
+            f"{label}.additive_pair_collision_exposure must be nonnegative"
+        )
 
 
 def _extend_square_matrix_to_dimension(

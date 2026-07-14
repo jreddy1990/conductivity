@@ -10,6 +10,11 @@ formal_charge_e: 1.0
 molecular_weight_kg_mol: 0.006941200000000001
 density_kg_m3: 6268.364892575225
 partial_molar_volume_m3_mol: 1.1073382164177676e-06
+excluded_volume:
+  model: union_vdw_spheres
+  hard_core_volume_m3: 3.1874999999999999e-30
+  packing_radius_m: 9.1296443853453606e-11
+  provenance: geometry_derived
 sites:
 - site_id: 0
   element: Li

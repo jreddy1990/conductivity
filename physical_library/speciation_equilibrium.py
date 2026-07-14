@@ -43,6 +43,12 @@ def solve_speciation_equilibrium(
     relative_tolerance = _positive_float(
         equilibrium_record["relative_residual_tolerance"], "relative residual tolerance"
     )
+    solver_tolerance_fraction = _positive_float(
+        equilibrium_record["solver_tolerance_fraction"], "solver tolerance fraction"
+    )
+    if solver_tolerance_fraction >= 1.0:
+        raise ValueError("solver_tolerance_fraction must be less than one")
+    solver_tolerance = relative_tolerance * solver_tolerance_fraction
     recipe_formulas = equilibrium_record["recipe_component_formulas"]
     species_formulas = equilibrium_record["equilibrium_species_formulas"]
     recipe_names = tuple(sorted(recipe_concentrations_mol_m3))
@@ -90,9 +96,9 @@ def solve_speciation_equilibrium(
     solution = least_squares(
         residual,
         np.full(len(species_names), initial_value),
-        xtol=relative_tolerance,
-        ftol=relative_tolerance,
-        gtol=relative_tolerance,
+        xtol=solver_tolerance,
+        ftol=solver_tolerance,
+        gtol=solver_tolerance,
         max_nfev=int(equilibrium_record["maximum_function_evaluations"]),
     )
     concentrations = standard_concentration_mol_m3 * np.exp(solution.x)

@@ -15,7 +15,7 @@ from threading import RLock, get_ident
 
 import numpy as np
 
-from constants import R
+from constants import MOL_M3_PER_MOL_L, R
 from conductivity.physical_library.basin_builder import (
     OrientationBasin,
     assign_orientation_basin,
@@ -38,6 +38,7 @@ from conductivity.physical_library.physical_objects import (
     CARTESIAN_DIMENSION,
     PairBasin,
     SiteConfiguration,
+    molecular_geometry_anisotropy,
     molecule_center_of_mass_m,
     molecule_site_indices_and_mass_fractions,
     anion_internal_charge_separation_factor,
@@ -46,6 +47,7 @@ from conductivity.physical_library.physical_objects import (
     compute_charge_polarization_m,
     compute_born_energy_J_mol,
     compute_local_packing_fraction,
+    local_molecular_packing_is_feasible,
     compute_resistance_component_diagnostics,
 )
 from conductivity.physical_library.projected_analytical_conductivity import (
@@ -56,6 +58,7 @@ from conductivity.physical_library.projected_analytical_conductivity import (
     _compute_projected_analytical_conductivity_from_input,
     compute_restricted_log_partition_values,
     primitive_prediction_readiness_as_effect_attribution,
+    solve_basin_chemical_potentials,
     symmetric_psd_pseudoinverse,
 )
 from conductivity.physical_library.library_io import (
@@ -63,8 +66,12 @@ from conductivity.physical_library.library_io import (
     RecipeBuildResult,
     RecipeComponentLoading,
     build_recipe_library_context,
+    load_recipe_mapping,
 )
-from utils.config_loader import content_hash_files
+from conductivity.physical_library.microscopic_convergence import (
+    load_converged_conductivity_for_recipe,
+)
+from utils.config_load_cache import content_hash_files
 from utils.typed_sqlite import sha256_text
 from conductivity.physical_library.reduced_generator import (
     build_projected_generator_input,
@@ -88,6 +95,7 @@ CHAIN_OUTER_CENTER_OFFSET_MULTIPLIER = 3.0 / 2.0  # Four-center chain spacing pl
 CHAIN_INNER_CENTER_OFFSET_MULTIPLIER = 1.0 / 2.0  # Four-center chain spacing places inner centers at one half-bond.
 __all__ = ("NumericalOptions", "compute_conductivity_from_recipe")
 NO_TRANSITION_FAMILY = ""
+LOCAL_ADDITIVE_COLLISION_EXPOSURE = "local_additive_collision_exposure"
 STATE_KEY_PAIR_FIELD = "pair"
 STATE_KEY_SHELL_FIELD = "shell"
 STATE_KEY_LIGAND_FIELD = "ligand"
@@ -135,7 +143,6 @@ LOCAL_FIELD_LAW_REQUIRED_KEYS = (
     "jones_dole_A_sqrt_m3_mol",
     "jones_dole_B_m3_mol",
     "local_ionic_strength_packing_coupling",
-    "packing_viscosity_exponent",
 )
 PAIR_STATE_FREE_ADDITIVE_RESERVOIR = "free_additive_reservoir"
 LIGAND_STATE_FREE_ADDITIVE_RESERVOIR = "free_ligand_reservoir"
@@ -302,6 +309,7 @@ class ReducedCoordinate(Enum):
 class MemoryCoordinateFamily(Enum):
     ATMOSPHERE_POLARIZATION = "atmosphere_polarization"
     CAGE_BACKJUMP = "cage_backjump"
+    PAIR_RESIDENCE = "pair_residence"
     PARTNER_RESIDENCE = "partner_residence"
     LIGAND_SHELL = "ligand_shell"
     ANION_ORIENTATION = "anion_orientation"
@@ -336,6 +344,7 @@ class MemoryCoordinate:
     records: PhysicalLibraryRecords
     required_roles: tuple[SpeciesRole, ...]
     required_species_names: tuple[str, ...]
+    active_pair_basins: tuple[PairBasin, ...]
     value_function: Callable[[PhysicalLibraryRecords, SiteConfiguration], float]
     gradient_function: Callable[[PhysicalLibraryRecords, SiteConfiguration], Array]
 
@@ -383,6 +392,7 @@ class StateChargeMobilityDiagnostics:
     resistance_aggregate_constraint_trace_kg_s: float
     resistance_bridge_constraint_trace_kg_s: float
     resistance_orientation_denticity_trace_kg_s: float
+    resistance_additive_environment_trace_kg_s: float
     resistance_total_trace_kg_s: float
     atmosphere_electrophoretic_trace_kg_s: float
     atmosphere_relaxation_trace_kg_s: float
@@ -420,9 +430,21 @@ class StateQuadratureNode:
 
 _CONDUCTIVITY_RESULT_CACHE: dict[tuple, ProjectedConductivityResult] = {}
 _CONDUCTIVITY_RESULT_CACHE_LOCK = RLock()
+_CONDUCTIVITY_RESULT_KEY_LOCKS: dict[tuple, RLock] = {}
 
 
 def compute_conductivity_from_recipe(
+    recipe: Path,
+    library_root: Path,
+) -> ProjectedConductivityResult:
+    recipe_record = load_recipe_mapping(recipe)
+    return load_converged_conductivity_for_recipe(
+        recipe_record=recipe_record,
+        certificate_directory=library_root / "microscopic_certificates",
+    )
+
+
+def compute_analytical_conductivity_from_recipe(
     recipe: Path,
     library_root: Path,
     numerical_options: NumericalOptions,
@@ -433,35 +455,38 @@ def compute_conductivity_from_recipe(
         numerical_options,
     )
     with _CONDUCTIVITY_RESULT_CACHE_LOCK:
-        cached_result = _CONDUCTIVITY_RESULT_CACHE.get(cache_key)
-    if cached_result is not None:
-        _validate_cached_conductivity_result(cached_result)
-        return copy.deepcopy(cached_result)
-    persistent_cache_path = _persistent_conductivity_cache_path(cache_key)
-    if persistent_cache_path.exists():
-        with persistent_cache_path.open("rb") as cache_file:
-            persistent_result = pickle.load(cache_file)
-        if not isinstance(persistent_result, ProjectedConductivityResult):
-            raise TypeError("persistent conductivity cache has wrong result type")
-        _validate_cached_conductivity_result(persistent_result)
+        cache_key_lock = _CONDUCTIVITY_RESULT_KEY_LOCKS.setdefault(cache_key, RLock())
+    with cache_key_lock:
         with _CONDUCTIVITY_RESULT_CACHE_LOCK:
-            _CONDUCTIVITY_RESULT_CACHE[cache_key] = copy.deepcopy(persistent_result)
-        return persistent_result
-    conductivity_result = _compute_conductivity_from_recipe_uncached(
-        recipe,
-        library_root,
-        numerical_options,
-    )
-    with _CONDUCTIVITY_RESULT_CACHE_LOCK:
-        _CONDUCTIVITY_RESULT_CACHE[cache_key] = copy.deepcopy(conductivity_result)
-    persistent_cache_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_cache_path = persistent_cache_path.with_suffix(
-        f".{os.getpid()}.{get_ident()}.tmp"
-    )
-    with temporary_cache_path.open("wb") as cache_file:
-        pickle.dump(conductivity_result, cache_file)
-    temporary_cache_path.replace(persistent_cache_path)
-    return conductivity_result
+            cached_result = _CONDUCTIVITY_RESULT_CACHE.get(cache_key)
+        if cached_result is not None:
+            _validate_cached_conductivity_result(cached_result)
+            return copy.deepcopy(cached_result)
+        persistent_cache_path = _persistent_conductivity_cache_path(cache_key)
+        if persistent_cache_path.exists():
+            with persistent_cache_path.open("rb") as cache_file:
+                persistent_result = pickle.load(cache_file)
+            if not isinstance(persistent_result, ProjectedConductivityResult):
+                raise TypeError("persistent conductivity cache has wrong result type")
+            _validate_cached_conductivity_result(persistent_result)
+            with _CONDUCTIVITY_RESULT_CACHE_LOCK:
+                _CONDUCTIVITY_RESULT_CACHE[cache_key] = copy.deepcopy(persistent_result)
+            return persistent_result
+        conductivity_result = _compute_conductivity_from_recipe_uncached(
+            recipe,
+            library_root,
+            numerical_options,
+        )
+        with _CONDUCTIVITY_RESULT_CACHE_LOCK:
+            _CONDUCTIVITY_RESULT_CACHE[cache_key] = copy.deepcopy(conductivity_result)
+        persistent_cache_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_cache_path = persistent_cache_path.with_suffix(
+            f".{os.getpid()}.{get_ident()}.tmp"
+        )
+        with temporary_cache_path.open("wb") as cache_file:
+            pickle.dump(conductivity_result, cache_file)
+        temporary_cache_path.replace(persistent_cache_path)
+        return conductivity_result
 
 
 def _validate_cached_conductivity_result(
@@ -497,7 +522,7 @@ def _conductivity_result_cache_key(
     if not library_paths:
         raise ValueError("physical library contains no YAML records")
     return (
-        content_hash_files(recipe, *library_paths),
+        content_hash_files((recipe, *library_paths)),
         tuple(
             float(length_m)
             for length_m in np.asarray(
@@ -550,10 +575,13 @@ def _compute_conductivity_from_recipe_uncached(
         temperature_K=recipe_context.temperature_K,
         numerical_options=numerical_options,
     )
-    transition_edges = finite_generator_transition_edges(
-        records,
-        state_quadratures,
-        recipe_context.temperature_K,
+    transition_edges = tuple(
+        TransitionEdge(
+            from_state_index=transition_quadrature.from_state_index,
+            to_state_index=transition_quadrature.to_state_index,
+            family=transition_quadrature.transition_family,
+        )
+        for transition_quadrature in transition_quadratures
     )
     _validate_transport_graph_closure(
         records=records,
@@ -588,6 +616,9 @@ def _compute_conductivity_from_recipe_uncached(
             state_quadratures=state_quadratures,
             transition_quadratures=transition_quadratures,
             memory_coordinate_gradient_functions=memory_gradient_functions,
+            state_continuous_memory_family_keys=_state_family_memory_keys(
+                state_quadratures
+            ),
             state_memory_value_matrix=_state_family_memory_value_matrix(
                 state_quadratures,
                 transition_edges,
@@ -680,7 +711,7 @@ def _annotate_partition_measure_diagnostics(
             f"observed={observed_span:.9g}; configured={maximum_span:.9g}"
         )
     thermal_energy_J_mol = R * float(generator_input.temperature_K)
-    state_free_energies_over_RT = np.asarray(
+    declared_association_free_energies_over_RT = np.asarray(
         [
             _state_feature_sum(
                 records.association_record["association_residual"],
@@ -691,6 +722,10 @@ def _annotate_partition_measure_diagnostics(
             for state in state_quadratures
         ],
         dtype=float,
+    )
+    energy_references_over_RT = (
+        np.asarray(generator_input.basin_energy_references_J_mol, dtype=float)
+        / thermal_energy_J_mol
     )
     relative_energy_ranges_over_RT = np.asarray(
         [
@@ -710,13 +745,86 @@ def _annotate_partition_measure_diagnostics(
         ],
         dtype=float,
     )
+    chemical_potential_result = solve_basin_chemical_potentials(
+        generator_input.total_component_concentrations_mol_m3,
+        generator_input.basin_stoichiometry,
+        log_partitions,
+    )
+    chemical_potentials = np.asarray(
+        chemical_potential_result["chemical_potentials"], dtype=float
+    )
+    chemical_potential_terms = (
+        np.asarray(generator_input.basin_stoichiometry, dtype=float)
+        @ chemical_potentials
+    )
+    log_standard_concentration = float(np.log(MOL_M3_PER_MOL_L))
+    log_concentrations = (
+        log_standard_concentration + log_partitions + chemical_potential_terms
+    )
+    reconstructed_concentrations = np.exp(log_concentrations)
+    result_concentrations = np.asarray(
+        conductivity_result.state_concentrations_mol_m3, dtype=float
+    )
+    if not np.allclose(
+        reconstructed_concentrations,
+        result_concentrations,
+        rtol=1.0e-10,
+        atol=1.0e-12,
+    ):
+        raise ValueError(
+            "STATE_PARTITION_CONCENTRATION_RECONSTRUCTION_MISMATCH: "
+            f"maximum_absolute_error_mol_m3="
+            f"{float(np.max(np.abs(reconstructed_concentrations - result_concentrations))):.9g}"
+        )
+    partition_measure_ledger = []
+    for state_index, state in enumerate(state_quadratures):
+        topology_record = _aggregate_topology_record_from_state_key(
+            records,
+            _state_key_from_label(state.label),
+        )
+        symmetry_number = (
+            int(topology_record["symmetry_number"]) if topology_record else 1
+        )
+        degeneracy = int(topology_record["degeneracy"]) if topology_record else 1
+        partition_measure_ledger.append(
+            {
+                "state_index": state_index,
+                "state_label": state.label,
+                "energy_reference_over_RT": float(
+                    energy_references_over_RT[state_index]
+                ),
+                "declared_association_free_energy_over_RT": float(
+                    declared_association_free_energies_over_RT[state_index]
+                ),
+                "log_relative_partition_integral": float(
+                    log_partitions[state_index]
+                ),
+                "chemical_potential_term_nu_dot_lambda": float(
+                    chemical_potential_terms[state_index]
+                ),
+                "log_standard_concentration": log_standard_concentration,
+                "log_concentration_mol_m3": float(log_concentrations[state_index]),
+                "concentration_mol_m3": float(
+                    reconstructed_concentrations[state_index]
+                ),
+                "relative_internal_energy_range_over_RT": float(
+                    relative_energy_ranges_over_RT[state_index]
+                ),
+                "symmetry_number": symmetry_number,
+                "degeneracy": degeneracy,
+            }
+        )
     conductivity_result.effect_attribution.update(
         {
             "state_relative_log_partition_values": relative_log_partitions,
-            "state_free_energies_over_RT": state_free_energies_over_RT,
+            "state_declared_association_free_energies_over_RT": (
+                declared_association_free_energies_over_RT
+            ),
+            "state_energy_references_over_RT": energy_references_over_RT,
             "state_relative_internal_energy_ranges_over_RT": (
                 relative_energy_ranges_over_RT
             ),
+            "state_partition_measure_ledger": tuple(partition_measure_ledger),
             "relative_log_partition_span": observed_span,
             "maximum_relative_log_partition_span": maximum_span,
         }
@@ -872,6 +980,9 @@ def _annotate_state_primitive_owner_table(
             "R_free_volume_trace_kg_s": float(
                 attribution["state_resistance_free_volume_traces_kg_s"][state_index]
             ),
+            "local_packing_fraction": float(
+                attribution["state_local_packing_fractions"][state_index]
+            ),
             "R_cage_constraint_trace_kg_s": float(
                 attribution["state_resistance_cage_constraint_traces_kg_s"][
                     state_index
@@ -894,6 +1005,11 @@ def _annotate_state_primitive_owner_table(
             ),
             "R_orientation_denticity_trace_kg_s": float(
                 attribution["state_resistance_orientation_denticity_traces_kg_s"][
+                    state_index
+                ]
+            ),
+            "R_additive_environment_trace_kg_s": float(
+                attribution["state_resistance_additive_environment_traces_kg_s"][
                     state_index
                 ]
             ),
@@ -1050,29 +1166,42 @@ def _memory_coordinate_is_active_for_state(
     state_key: tuple[str, ...],
     configuration: SiteConfiguration,
 ) -> bool:
-    if memory_coordinate.family is not MemoryCoordinateFamily.PARTNER_RESIDENCE:
+    cluster_state = _state_key_base_value(state_key[STATE_KEY_CLUSTER_INDEX])
+    if memory_coordinate.family is MemoryCoordinateFamily.BOUNDED_INTERNAL_POLARIZATION:
+        return cluster_state.startswith("aggregate:") or cluster_state == "bridge_network"
+    if memory_coordinate.family is MemoryCoordinateFamily.ANION_ORIENTATION:
+        return _required_anion_geometry_anisotropy(memory_coordinate) > np.sqrt(
+            np.finfo(float).eps
+        )
+    if memory_coordinate.family is not MemoryCoordinateFamily.PAIR_RESIDENCE:
         return True
     ligand_state = _state_key_base_value(state_key[STATE_KEY_LIGAND_INDEX])
     shell_state = _state_key_base_value(state_key[STATE_KEY_SHELL_INDEX])
     pair_state = _state_key_base_value(state_key[STATE_KEY_PAIR_INDEX])
-    cluster_state = _state_key_base_value(state_key[STATE_KEY_CLUSTER_INDEX])
-    coordinating_additive_is_present = any(
-        _species_role(memory_coordinate.records, species_name)
-        is SpeciesRole.ADDITIVE
-        for species_name in configuration.species_names
-    )
-    pair_has_continuous_residence = (
-        pair_state == PairBasin.CONTACT_ION_PAIR.value
-        or (
-            pair_state == PairBasin.SOLVENT_SEPARATED_ION_PAIR.value
-            and not coordinating_additive_is_present
-        )
-    )
+    pair_has_continuous_residence = pair_state in {
+        pair_basin.value for pair_basin in memory_coordinate.active_pair_basins
+    }
     return (
         ligand_state == "none"
         and shell_state not in {"neutral_ligand_bound", "mixed_ligand_anion"}
         and pair_has_continuous_residence
         and cluster_state == "LiA"
+    )
+
+
+def _required_anion_geometry_anisotropy(
+    memory_coordinate: MemoryCoordinate,
+) -> float:
+    required_anion_names = tuple(
+        species_name
+        for species_name in memory_coordinate.required_species_names
+        if _species_role(memory_coordinate.records, species_name) is SpeciesRole.ANION
+    )
+    if len(required_anion_names) != 1:
+        raise ValueError("anion memory coordinate requires one anion species")
+    return molecular_geometry_anisotropy(
+        memory_coordinate.records,
+        required_anion_names[0],
     )
 
 
@@ -1118,7 +1247,11 @@ def _annotate_mori_mode_diagnostics(
         template_configuration,
         transition_edges,
     )
-    candidate_labels = tuple(coordinate.label for coordinate in selected_coordinates)
+    continuous_candidates = _continuous_memory_family_candidates(
+        selected_coordinates,
+        state_quadratures,
+    )
+    candidate_labels = tuple(candidate[0] for candidate in continuous_candidates)
     selected_indices = np.asarray(
         conductivity_result.effect_attribution[
             "mori_filter_accepted_candidate_indices"
@@ -1133,6 +1266,16 @@ def _annotate_mori_mode_diagnostics(
         conductivity_result.mori_current_coupling_matrix_h,
         dtype=float,
     )
+    discrete_memory_matrix = np.asarray(
+        conductivity_result.discrete_state_memory_matrix_A_Q,
+        dtype=float,
+    )
+    discrete_current_coupling = np.asarray(
+        conductivity_result.discrete_state_current_coupling_matrix_h_Q,
+        dtype=float,
+    )
+    continuous_memory_matrix = memory_matrix - discrete_memory_matrix
+    continuous_current_coupling = current_coupling - discrete_current_coupling
     state_family_memory_values = _state_family_memory_value_matrix(
         state_quadratures,
         transition_edges,
@@ -1163,20 +1306,7 @@ def _annotate_mori_mode_diagnostics(
     mode_contributions = np.einsum("ia,ia->i", current_coupling, memory_solution)
     mode_ledger = []
     for selected_position, candidate_index in enumerate(selected_indices):
-        supported_state_labels = []
-        for state_index, state_quadrature in enumerate(
-            state_quadratures
-        ):
-            coordinate_is_active = any(
-                candidate_index
-                in np.asarray(
-                    ownership_basis.bounded_memory_mode_indices,
-                    dtype=int,
-                )
-                for ownership_basis in state_quadrature.transport_ownership_bases
-            )
-            if coordinate_is_active:
-                supported_state_labels.append(state_quadratures[state_index].label)
+        supported_state_labels = continuous_candidates[candidate_index][1]
         coordinate_label = candidate_labels[candidate_index]
         transport_ownership, matching_transition_families = _memory_transport_ownership(
             records, coordinate_label
@@ -1186,10 +1316,22 @@ def _annotate_mori_mode_diagnostics(
                 "mode_label": coordinate_label,
                 "A_mu_mu": float(memory_matrix[selected_position, selected_position]),
                 "h_mu_norm": float(np.linalg.norm(current_coupling[selected_position])),
+                "A_D_mu_mu": float(
+                    continuous_memory_matrix[selected_position, selected_position]
+                ),
+                "h_D_mu_norm": float(
+                    np.linalg.norm(continuous_current_coupling[selected_position])
+                ),
+                "A_Q_mu_mu": float(
+                    discrete_memory_matrix[selected_position, selected_position]
+                ),
+                "h_Q_mu_norm": float(
+                    np.linalg.norm(discrete_current_coupling[selected_position])
+                ),
                 "h_mu_A_pseudoinverse_h_contribution": float(
                     mode_contributions[selected_position]
                 ),
-                "state_support": tuple(supported_state_labels),
+                "state_support": supported_state_labels,
                 "physical_owner": _memory_coordinate_physical_owner(coordinate_label),
                 "transport_ownership": transport_ownership.value,
                 "matching_transition_families": matching_transition_families,
@@ -1208,6 +1350,18 @@ def _annotate_mori_mode_diagnostics(
                 "mode_label": f"state_family_residence_subspace[{family_position}]",
                 "A_mu_mu": float(memory_matrix[matrix_index, matrix_index]),
                 "h_mu_norm": float(np.linalg.norm(current_coupling[matrix_index])),
+                "A_D_mu_mu": float(
+                    continuous_memory_matrix[matrix_index, matrix_index]
+                ),
+                "h_D_mu_norm": float(
+                    np.linalg.norm(continuous_current_coupling[matrix_index])
+                ),
+                "A_Q_mu_mu": float(
+                    discrete_memory_matrix[matrix_index, matrix_index]
+                ),
+                "h_Q_mu_norm": float(
+                    np.linalg.norm(discrete_current_coupling[matrix_index])
+                ),
                 "h_mu_A_pseudoinverse_h_contribution": float(
                     mode_contributions[matrix_index]
                 ),
@@ -1225,9 +1379,55 @@ def _annotate_mori_mode_diagnostics(
     conductivity_result.effect_attribution["mori_mode_ledger"] = tuple(mode_ledger)
 
 
+def _continuous_memory_family_candidates(
+    selected_coordinates: tuple[MemoryCoordinate, ...],
+    state_quadratures: tuple[PhysicalStateQuadrature, ...],
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    family_keys = _state_family_memory_keys(state_quadratures)
+    candidates = []
+    for memory_index, coordinate in enumerate(selected_coordinates):
+        active_family_keys = tuple(
+            dict.fromkeys(
+                family_keys[state_index]
+                for state_index, state_quadrature in enumerate(state_quadratures)
+                if any(
+                    memory_index
+                    in np.asarray(
+                        ownership_basis.bounded_memory_mode_indices,
+                        dtype=int,
+                    )
+                    for ownership_basis in state_quadrature.transport_ownership_bases
+                )
+            )
+        )
+        for family_key in active_family_keys:
+            supported_state_labels = tuple(
+                state_quadrature.label
+                for state_index, state_quadrature in enumerate(state_quadratures)
+                if family_keys[state_index] == family_key
+                and any(
+                    memory_index
+                    in np.asarray(
+                        ownership_basis.bounded_memory_mode_indices,
+                        dtype=int,
+                    )
+                    for ownership_basis in state_quadrature.transport_ownership_bases
+                )
+            )
+            family_label = ",".join(family_key)
+            candidates.append(
+                (
+                    f"{coordinate.label}@state_family[{family_label}]",
+                    supported_state_labels,
+                )
+            )
+    return tuple(candidates)
+
+
 def _memory_coordinate_physical_owner(coordinate_label: str) -> str:
     owner_by_coordinate = {
         MemoryCoordinateFamily.CAGE_BACKJUMP.value: "cage_backjump_memory",
+        MemoryCoordinateFamily.PAIR_RESIDENCE.value: "pair_residence_memory",
         MemoryCoordinateFamily.PARTNER_RESIDENCE.value: "partner_residence_memory",
         MemoryCoordinateFamily.LIGAND_SHELL.value: "ligand_shell_residence_memory",
         MemoryCoordinateFamily.ANION_ORIENTATION.value: "anion_orientation_memory",
@@ -1249,6 +1449,7 @@ def _memory_transport_ownership(
 ) -> tuple[TransportOwnership, tuple[str, ...]]:
     record_key_by_coordinate = {
         MemoryCoordinateFamily.CAGE_BACKJUMP.value: "cage_backjump",
+        MemoryCoordinateFamily.PAIR_RESIDENCE.value: "pair_residence",
         MemoryCoordinateFamily.PARTNER_RESIDENCE.value: "partner_residence",
         MemoryCoordinateFamily.LIGAND_SHELL.value: "ligand_shell_residence",
         MemoryCoordinateFamily.ANION_ORIENTATION.value: "anion_orientation",
@@ -1620,6 +1821,7 @@ def _state_quadratures_with_equilibrium_attribution(
                 local_fields.viscosity_Pa_s,
                 local_fields.ionic_strength_mol_m3,
                 local_fields.local_packing_fraction,
+                local_fields.additive_pair_collision_exposure,
             ).potential_energy_J_mol
             attributed_potential = _state_equilibrium_potential_energy_J_mol(
                 records,
@@ -1670,7 +1872,7 @@ def _normalize_transport_equivalent_partition_weights(
 
 
 def _thermodynamic_state_group(state_key: tuple[str, ...]) -> tuple[str, ...]:
-    return tuple(
+    thermodynamic_group = tuple(
         state_key[state_index]
         for state_index in (
             STATE_KEY_PAIR_INDEX,
@@ -1680,6 +1882,7 @@ def _thermodynamic_state_group(state_key: tuple[str, ...]) -> tuple[str, ...]:
             STATE_KEY_CLUSTER_INDEX,
         )
     )
+    return thermodynamic_group
 
 
 def _apply_state_symmetry_and_degeneracy_factors(
@@ -1894,10 +2097,10 @@ def _state_key_with_active_additive(
     key_parts = list(state_key)
     pair_state = _state_key_base_value(key_parts[STATE_KEY_PAIR_INDEX])
     ligand_state = _state_key_base_value(key_parts[STATE_KEY_LIGAND_INDEX])
-    if ligand_state == "none":
-        if pair_state != "addSSIP":
-            raise ValueError("additive-consuming state resolved to ligand none")
+    if pair_state == "addSSIP":
         ligand_state = LIGAND_STATE_ADDITIVE_SEPARATOR
+    elif ligand_state == "none":
+        raise ValueError("additive-consuming state resolved to ligand none")
     key_parts[STATE_KEY_LIGAND_INDEX] = (
         f"{active_additive_component_name}{STATE_KEY_COMPONENT_SEPARATOR}{ligand_state}"
     )
@@ -1932,6 +2135,9 @@ def _bulk_local_field_coordinate_values(
         ),
         ReducedCoordinate.LOCAL_DIELECTRIC.value: float(mixture.dielectric_constant),
         ReducedCoordinate.LOCAL_VISCOSITY.value: float(mixture.viscosity_Pa_s),
+        LOCAL_ADDITIVE_COLLISION_EXPOSURE: float(
+            mixture.additive_collision_exposure
+        ),
         ReducedCoordinate.LI_LIGAND_COORDINATION.value: 1.0,
         ReducedCoordinate.LI_ANION_DISTANCE.value: float(
             records.basis_record["pair_basins"]["r_free_m"]
@@ -2241,7 +2447,7 @@ def _feasible_state_local_transport_configurations(
     topology_record: dict,
 ) -> tuple[SiteConfiguration, ...]:
     if topology_record:
-        return tuple(
+        candidate_configurations = tuple(
             _configuration_for_aggregate_topology(
                 records,
                 _state_local_transport_configuration_from_coordinates(
@@ -2257,7 +2463,7 @@ def _feasible_state_local_transport_configurations(
             )
             for coordinate_values in coordinate_values_by_node
         )
-    if _state_key_base_value(state_key[STATE_KEY_PAIR_INDEX]) == "addSSIP":
+    elif _state_key_base_value(state_key[STATE_KEY_PAIR_INDEX]) == "addSSIP":
         unseparated_configurations = tuple(
             _configured_state_from_reduced_coordinates(
                 records=records,
@@ -2274,21 +2480,36 @@ def _feasible_state_local_transport_configurations(
             for configuration in unseparated_configurations
         ):
             return ()
-        return tuple(
+        candidate_configurations = tuple(
             _configuration_with_ligand_separator_geometry(records, configuration)
             for configuration in unseparated_configurations
         )
-    return tuple(
-        _state_local_transport_configuration_from_coordinates(
-            records=records,
-            template_configuration=template_configuration,
-            coordinate_values=coordinate_values,
-            active_anion_component_name=active_anion_component_name,
-            active_additive_component_name=active_additive_component_name,
-            state_key=state_key,
+    else:
+        candidate_configurations = tuple(
+            _state_local_transport_configuration_from_coordinates(
+                records=records,
+                template_configuration=template_configuration,
+                coordinate_values=coordinate_values,
+                active_anion_component_name=active_anion_component_name,
+                active_additive_component_name=active_additive_component_name,
+                state_key=state_key,
+            )
+            for coordinate_values in coordinate_values_by_node
         )
-        for coordinate_values in coordinate_values_by_node
-    )
+    if not all(
+        local_molecular_packing_is_feasible(records, configuration)
+        for configuration in candidate_configurations
+    ):
+        return ()
+    if (
+        _state_key_base_value(state_key[STATE_KEY_PAIR_INDEX]) == "addSSIP"
+        and not all(
+            _ligand_anion_hard_cores_are_separated(records, configuration)
+            for configuration in candidate_configurations
+        )
+    ):
+        return ()
+    return candidate_configurations
 
 
 def _configuration_for_aggregate_topology(
@@ -2543,6 +2764,60 @@ def _ligand_separator_geometry_is_feasible(
     return 0.0 < cation_ligand_distance_m < cation_anion_distance_m
 
 
+def _ligand_anion_hard_cores_are_separated(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+) -> bool:
+    anion_indices = _first_molecule_indices_with_role(
+        records,
+        configuration,
+        SpeciesRole.ANION,
+    )
+    additive_indices = _first_molecule_indices_with_role(
+        records,
+        configuration,
+        SpeciesRole.ADDITIVE,
+    )
+    for anion_index in anion_indices:
+        anion_species_name = configuration.species_names[anion_index]
+        anion_radius_m = float(
+            records.species_records[anion_species_name]["sites"][
+                int(configuration.site_ids[anion_index])
+            ]["steric_radius_m"]
+        )
+        for additive_index in additive_indices:
+            additive_species_name = configuration.species_names[additive_index]
+            additive_radius_m = float(
+                records.species_records[additive_species_name]["sites"][
+                    int(configuration.site_ids[additive_index])
+                ]["steric_radius_m"]
+            )
+            center_distance_m = float(
+                np.linalg.norm(
+                    _minimum_image_vector_m(
+                        configuration.positions_m[anion_index],
+                        configuration.positions_m[additive_index],
+                        configuration.box_lengths_m,
+                    )
+                )
+            )
+            separation_scale_m = max(
+                center_distance_m,
+                anion_radius_m + additive_radius_m,
+            )
+            roundoff_tolerance_m = (
+                np.finfo(float).eps
+                * separation_scale_m
+                * SUMMATION_ROUNDOFF_EPSILON_FACTOR
+            )
+            if (
+                center_distance_m + roundoff_tolerance_m
+                < anion_radius_m + additive_radius_m
+            ):
+                return False
+    return True
+
+
 def _configuration_with_ligand_separator_geometry(
     records: PhysicalLibraryRecords,
     configuration: SiteConfiguration,
@@ -2727,6 +3002,7 @@ def _state_log_partition_value(
             local_fields.viscosity_Pa_s,
             local_fields.ionic_strength_mol_m3,
             local_fields.local_packing_fraction,
+            local_fields.additive_pair_collision_exposure,
         )
         if weight <= 0.0:
             raise ValueError(
@@ -2767,6 +3043,11 @@ def _state_equilibrium_potential_energy_J_mol(
         state_key,
         "state_resolved_born_missing",
     )
+    occluded_fraction += _pair_geometry_occluded_solid_angle_fraction(
+        records,
+        state_key,
+        configuration,
+    )
     if occluded_fraction < 0.0 or occluded_fraction >= 1.0:
         raise ValueError("state-resolved Born occlusion fraction must be in [0, 1)")
     born_energy_J_mol = compute_born_energy_J_mol(
@@ -2780,6 +3061,91 @@ def _state_equilibrium_potential_energy_J_mol(
         + association_energy_J_mol
         + desolvation_energy_J_mol,
         f"{state_label}.state_equilibrium_potential_energy_J_mol",
+    )
+
+
+def _pair_geometry_occluded_solid_angle_fraction(
+    records: PhysicalLibraryRecords,
+    state_key: tuple[str, ...],
+    configuration: SiteConfiguration,
+) -> float:
+    pair_state = _state_key_base_value(state_key[STATE_KEY_PAIR_INDEX])
+    if pair_state not in {
+        PairBasin.CONTACT_ION_PAIR.value,
+        PairBasin.SOLVENT_SEPARATED_ION_PAIR.value,
+        "addSSIP",
+    }:
+        return 0.0
+    molecule_keys = tuple(
+        dict.fromkeys(
+            zip(
+                configuration.species_names,
+                np.asarray(configuration.molecule_ids, dtype=int).tolist(),
+                strict=True,
+            )
+        )
+    )
+    cation_key = next(
+        key
+        for key in molecule_keys
+        if _species_role(records, key[0]) is SpeciesRole.CATION
+    )
+    anion_key = next(
+        key
+        for key in molecule_keys
+        if _species_role(records, key[0]) is SpeciesRole.ANION
+    )
+    cation_center_m = molecule_center_of_mass_m(
+        records,
+        configuration,
+        cation_key[0],
+        cation_key[1],
+    )
+    anion_center_m = molecule_center_of_mass_m(
+        records,
+        configuration,
+        anion_key[0],
+        anion_key[1],
+    )
+    separation_m = float(
+        np.linalg.norm(
+            _minimum_image_vector_m(
+                cation_center_m,
+                anion_center_m,
+                configuration.box_lengths_m,
+            )
+        )
+    )
+    if separation_m <= 0.0:
+        raise ValueError("Li-anion pair geometry has zero center separation")
+    cation_radius_m = float(
+        records.species_records[cation_key[0]]["excluded_volume"]["packing_radius_m"]
+    )
+    anion_radius_m = float(
+        records.species_records[anion_key[0]]["excluded_volume"]["packing_radius_m"]
+    )
+    association_cell_radius_m = _positive_float(
+        float(records.basis_record["pair_basins"]["r_free_m"]),
+        "pair_basins.r_free_m",
+    )
+    maximum_packing_fraction = _positive_float(
+        float(records.mixture_record["packing"]["phi_max"]),
+        "packing.phi_max",
+    )
+
+    def blocked_sphere_fraction(blocking_radius_m: float) -> float:
+        radius_ratio = blocking_radius_m / separation_m
+        apparent_solid_angle_fraction = 0.5 * (
+            1.0 - 1.0 / np.sqrt(1.0 + radius_ratio**2)
+        )
+        association_cell_volume_fraction = (
+            blocking_radius_m / association_cell_radius_m
+        ) ** 3 * maximum_packing_fraction
+        return apparent_solid_angle_fraction * association_cell_volume_fraction
+
+    return 0.5 * (
+        blocked_sphere_fraction(cation_radius_m)
+        + blocked_sphere_fraction(anion_radius_m)
     )
 
 
@@ -2907,6 +3273,9 @@ def _group_state_quadrature_nodes(
                 strict=True,
             )
         }
+        coordinate_values[LOCAL_ADDITIVE_COLLISION_EXPOSURE] = float(
+            mixture.additive_collision_exposure
+        )
         configuration = _configuration_with_reduced_coordinate_values(
             records,
             template_configuration,
@@ -2922,6 +3291,8 @@ def _group_state_quadrature_nodes(
         )
         state_key = _population_basin_state_key(state_key)
         state_label = "|".join(state_key)
+        if not local_molecular_packing_is_feasible(records, configuration):
+            continue
         if state_label not in grouped_quadrature:
             grouped_quadrature[state_label] = StateQuadratureGroup(
                 state_key=state_key,
@@ -2946,8 +3317,8 @@ def _population_basin_state_key(state_key: tuple[str, ...]) -> tuple[str, ...]:
         raise ValueError("state key has wrong length")
     population_key = list(state_key)
     population_key[STATE_KEY_ORIENTATION_INDEX] = "free_rotating"
-    population_key[STATE_KEY_PARTNER_INDEX] = "partner_inactive"
     population_key[STATE_KEY_CAGE_INDEX] = "cage_inactive"
+    population_key[STATE_KEY_PARTNER_INDEX] = "partner_inactive"
     population_key[STATE_KEY_ATMOSPHERE_INDEX] = "atmosphere_inactive"
     return tuple(population_key)
 
@@ -3116,6 +3487,8 @@ def _transport_axis_conditioning_indices(
     coordinate = coordinate_nodes[coordinate_index][0]
     if coordinate not in _unit_interval_state_coordinates():
         return (tuple(pair_baseline_indices),)
+    if coordinate is ReducedCoordinate.STRUCTURAL_HOP_COORDINATE:
+        return (tuple(pair_baseline_indices),)
     conditioned_indices = [tuple(pair_baseline_indices)]
     ligand_coordinate_index = _coordinate_nodes_index(
         coordinate_nodes,
@@ -3255,6 +3628,11 @@ def build_all_transition_quadratures(
             )
             for coordinate_value in reaction_coordinate_grid
         )
+        if not all(
+            local_molecular_packing_is_feasible(records, configuration)
+            for configuration in configurations
+        ):
+            continue
         local_fields = tuple(
             _local_fields_for_coordinate_values(
                 records,
@@ -3289,6 +3667,7 @@ def build_all_transition_quadratures(
                 local_fields_at_grid_point.viscosity_Pa_s,
                 local_fields_at_grid_point.ionic_strength_mol_m3,
                 local_fields_at_grid_point.local_packing_fraction,
+                local_fields_at_grid_point.additive_pair_collision_exposure,
             )
             for configuration, local_fields_at_grid_point in zip(
                 configurations,
@@ -3562,6 +3941,7 @@ def _transition_base_coordinate_values(
         ReducedCoordinate.LOCAL_IONIC_STRENGTH.value: mixture.ionic_strength_mol_m3,
         ReducedCoordinate.LOCAL_DIELECTRIC.value: mixture.dielectric_constant,
         ReducedCoordinate.LOCAL_VISCOSITY.value: mixture.viscosity_Pa_s,
+        LOCAL_ADDITIVE_COLLISION_EXPOSURE: mixture.additive_collision_exposure,
         ReducedCoordinate.ATMOSPHERE_POLARIZATION.value: 0.0,
         ReducedCoordinate.CAGE_COORDINATE.value: 0.0,
         ReducedCoordinate.PARTNER_RESIDENCE_COORDINATE.value: 0.5,
@@ -4052,11 +4432,27 @@ def _local_fields_for_coordinate_values(
         local_ionic_strength_mol_m3,
         local_packing_fraction,
     )
+    if ReducedCoordinate.LI_ANION_COORDINATION.value in coordinate_values:
+        ion_pair_coordination = _nonnegative_float(
+            float(
+                coordinate_values[ReducedCoordinate.LI_ANION_COORDINATION.value]
+            ),
+            ReducedCoordinate.LI_ANION_COORDINATION.value,
+        )
+    else:
+        ion_pair_coordination = 0.0
     return PhysicalLocalFields(
         dielectric_constant=local_dielectric_constant,
         viscosity_Pa_s=local_viscosity_Pa_s,
         ionic_strength_mol_m3=local_ionic_strength_mol_m3,
         local_packing_fraction=local_packing_fraction,
+        additive_pair_collision_exposure=(
+            _nonnegative_float(
+                float(coordinate_values[LOCAL_ADDITIVE_COLLISION_EXPOSURE]),
+                LOCAL_ADDITIVE_COLLISION_EXPOSURE,
+            )
+            / (1.0 + ion_pair_coordination)
+        ),
     )
 
 
@@ -4121,54 +4517,12 @@ def _local_viscosity_Pa_s(
         + jones_dole_a * float(np.sqrt(local_ionic_strength_mol_m3))
         + jones_dole_b * local_ionic_strength_mol_m3
     )
-    packing_record = records.mixture_record["packing"]
-    phi_max = _positive_float(
-        float(packing_record["phi_max"]), "mixture.packing.phi_max"
-    )
-    if local_packing_fraction >= phi_max:
-        raise ValueError("local_packing_fraction exceeds mixture.packing.phi_max")
-    packing_exponent = _positive_float(
-        float(local_field_record["packing_viscosity_exponent"]),
-        "packing_viscosity_exponent",
-    )
-    packing_factor = (1.0 - local_packing_fraction / phi_max) ** (-packing_exponent)
-    additive_factor = 1.0 + _configuration_additive_fraction(
-        records,
-        configuration,
-    )
+    if local_packing_fraction < 0.0:
+        raise ValueError("local_packing_fraction must be nonnegative")
     return _positive_float(
-        base_viscosity_Pa_s * salt_factor * packing_factor * additive_factor,
+        base_viscosity_Pa_s * salt_factor,
         "local_viscosity_Pa_s",
     )
-
-
-def _configuration_additive_fraction(
-    records: PhysicalLibraryRecords,
-    configuration: SiteConfiguration,
-) -> float:
-    molecule_keys = tuple(
-        dict.fromkeys(
-            zip(
-                configuration.species_names,
-                np.asarray(configuration.molecule_ids, dtype=int),
-                strict=True,
-            )
-        )
-    )
-    if not molecule_keys:
-        raise ValueError("configuration has no sites")
-    additive_weight = 0.0
-    for species_name, _molecule_id in molecule_keys:
-        if _species_role(records, species_name) != SpeciesRole.ADDITIVE:
-            continue
-        species_record = records.species_records[species_name]
-        if "local_microviscosity_coefficient" not in species_record:
-            raise KeyError(f"{species_name} missing local_microviscosity_coefficient")
-        additive_weight += _nonnegative_float(
-            float(species_record["local_microviscosity_coefficient"]),
-            f"{species_name}.local_microviscosity_coefficient",
-        )
-    return additive_weight / float(len(molecule_keys))
 
 
 def _reaction_coordinate_gradient(
@@ -5432,6 +5786,7 @@ def _transition_projected_diffusivity_profile(
                     local_fields.viscosity_Pa_s,
                     local_fields.ionic_strength_mol_m3,
                     local_fields.local_packing_fraction,
+                    local_fields.additive_pair_collision_exposure,
                 ).mobility_tensor_m2_s
         projected_diffusivities.append(
             project_diffusivity_onto_reaction_coordinate(
@@ -6458,6 +6813,13 @@ def _annotate_state_charge_mobility_diagnostics(
                 ],
                 dtype=float,
             ),
+            "state_resistance_additive_environment_traces_kg_s": np.asarray(
+                [
+                    diagnostic.resistance_additive_environment_trace_kg_s
+                    for diagnostic in diagnostics
+                ],
+                dtype=float,
+            ),
             "state_resistance_total_traces_kg_s": np.asarray(
                 [diagnostic.resistance_total_trace_kg_s for diagnostic in diagnostics],
                 dtype=float,
@@ -6714,6 +7076,15 @@ def _state_charge_mobility_diagnostics(
                 ],
             )
         ),
+        resistance_additive_environment_trace_kg_s=float(
+            np.dot(
+                normalized_weights,
+                [
+                    diagnostic.resistance_additive_environment_trace_kg_s
+                    for diagnostic in point_diagnostics
+                ],
+            )
+        ),
         resistance_total_trace_kg_s=float(
             np.dot(
                 normalized_weights,
@@ -6888,6 +7259,7 @@ def _relative_displacement_point_terms(
         local_fields.viscosity_Pa_s,
         local_fields.ionic_strength_mol_m3,
         local_fields.local_packing_fraction,
+        local_fields.additive_pair_collision_exposure,
     )
     cation_projection = _molecular_center_projection(
         cation_centers[0], len(configuration.species_names)
@@ -6928,6 +7300,7 @@ def _state_charge_mobility_point_terms(
         local_fields.viscosity_Pa_s,
         local_fields.ionic_strength_mol_m3,
         local_fields.local_packing_fraction,
+        local_fields.additive_pair_collision_exposure,
     )
     mobility = np.asarray(physical_objects.mobility_tensor_m2_s, dtype=float)
     cation_centers = _molecular_charge_centers_for_role(
@@ -6978,6 +7351,7 @@ def _state_charge_mobility_point_terms(
         local_fields.ionic_strength_mol_m3,
         temperature_K,
         local_fields.local_packing_fraction,
+        local_fields.additive_pair_collision_exposure,
     )
     return StateChargeMobilityDiagnostics(
         charge_mobility_m2_s=charge_mobility_m2_s,
@@ -7044,6 +7418,9 @@ def _state_charge_mobility_point_terms(
         ),
         resistance_orientation_denticity_trace_kg_s=float(
             resistance_diagnostics.orientation_denticity_trace_kg_s
+        ),
+        resistance_additive_environment_trace_kg_s=float(
+            resistance_diagnostics.additive_environment_trace_kg_s
         ),
         resistance_total_trace_kg_s=float(resistance_diagnostics.total_trace_kg_s),
         atmosphere_electrophoretic_trace_kg_s=float(
@@ -7790,6 +8167,7 @@ def _selected_memory_coordinates(
             "charge_density_sine",
         },
         "cage_backjump": {"cage_backjump"},
+        "pair_residence": {"pair_residence"},
         "partner_residence": {"partner_residence"},
         "ligand_shell_residence": {"ligand_shell"},
         "anion_orientation": {"anion_orientation"},
@@ -7806,6 +8184,7 @@ def _selected_memory_coordinates(
         "atmosphere_polarization": SpeciesRole.ANION,
         "charge_density_relaxation": SpeciesRole.ANION,
         "cage_backjump": SpeciesRole.ANION,
+        "pair_residence": SpeciesRole.ANION,
         "partner_residence": SpeciesRole.ANION,
         "ligand_shell_residence": SpeciesRole.ADDITIVE,
         "anion_orientation": SpeciesRole.ANION,
@@ -7883,8 +8262,29 @@ def build_default_memory_coordinates(
                     records=records,
                     required_roles=(SpeciesRole.CATION, SpeciesRole.ANION),
                     required_species_names=(anion_species_name,),
+                    active_pair_basins=(),
                     value_function=_cage_backjump_memory_value,
                     gradient_function=_memory_pair_distance_gradient,
+                ),
+                MemoryCoordinate(
+                    label=f"pair_residence[{anion_species_name},CIP]",
+                    family=MemoryCoordinateFamily.PAIR_RESIDENCE,
+                    records=records,
+                    required_roles=(SpeciesRole.CATION, SpeciesRole.ANION),
+                    required_species_names=(anion_species_name,),
+                    active_pair_basins=(PairBasin.CONTACT_ION_PAIR,),
+                    value_function=_cip_pair_residence_memory_value,
+                    gradient_function=_cip_pair_residence_memory_gradient,
+                ),
+                MemoryCoordinate(
+                    label=f"pair_residence[{anion_species_name},SSIP]",
+                    family=MemoryCoordinateFamily.PAIR_RESIDENCE,
+                    records=records,
+                    required_roles=(SpeciesRole.CATION, SpeciesRole.ANION),
+                    required_species_names=(anion_species_name,),
+                    active_pair_basins=(PairBasin.SOLVENT_SEPARATED_ION_PAIR,),
+                    value_function=_ssip_pair_residence_memory_value,
+                    gradient_function=_ssip_pair_residence_memory_gradient,
                 ),
                 MemoryCoordinate(
                     label=f"partner_residence[{anion_species_name}]",
@@ -7892,6 +8292,7 @@ def build_default_memory_coordinates(
                     records=records,
                     required_roles=(SpeciesRole.CATION, SpeciesRole.ANION),
                     required_species_names=(anion_species_name,),
+                    active_pair_basins=(),
                     value_function=_partner_residence_memory_value,
                     gradient_function=_memory_li_anion_coordination_gradient,
                 ),
@@ -7901,6 +8302,7 @@ def build_default_memory_coordinates(
                     records=records,
                     required_roles=(SpeciesRole.ANION,),
                     required_species_names=(anion_species_name,),
+                    active_pair_basins=(),
                     value_function=_anion_orientation_memory_value,
                     gradient_function=_anion_orientation_memory_gradient,
                 ),
@@ -7933,6 +8335,7 @@ def build_default_memory_coordinates(
                     records=records,
                     required_roles=(SpeciesRole.CATION, SpeciesRole.ANION),
                     required_species_names=(anion_species_name,),
+                    active_pair_basins=(),
                     value_function=value_function,
                     gradient_function=gradient_function,
                 )
@@ -7945,6 +8348,7 @@ def build_default_memory_coordinates(
                 records=records,
                 required_roles=(SpeciesRole.CATION, SpeciesRole.ADDITIVE),
                 required_species_names=(additive_species_name,),
+                active_pair_basins=(),
                 value_function=_ligand_shell_memory_value,
                 gradient_function=_memory_li_ligand_coordination_gradient,
             )
@@ -8156,6 +8560,167 @@ def _partner_residence_memory_value(
     return anion_coordination / (1.0 + ligand_coordination)
 
 
+def _cip_pair_residence_memory_value(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+) -> float:
+    return _pair_basin_switch_value(
+        records,
+        configuration,
+        "r_CIP_m",
+    )
+
+
+def _ssip_pair_residence_memory_value(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+) -> float:
+    return _pair_basin_switch_value(
+        records,
+        configuration,
+        "r_SSIP_m",
+    ) - _pair_basin_switch_value(
+        records,
+        configuration,
+        "r_CIP_m",
+    )
+
+
+def _pair_basin_switch_value(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+    basin_radius_key: str,
+) -> float:
+    pair_distance_m, _unit_pair_axis, _center_records = (
+        _molecular_li_anion_pair_geometry(records, configuration)
+    )
+    pair_basins = records.basis_record["pair_basins"]
+    switch_record = records.basis_record["coordination_switches"]["Li_anion"]
+    basin_radius_m = _positive_float(
+        float(pair_basins[basin_radius_key]),
+        f"pair_basins.{basin_radius_key}",
+    )
+    switch_exponent = _positive_float(
+        float(switch_record["exponent"]),
+        "coordination_switches.Li_anion.exponent",
+    )
+    reduced_distance = pair_distance_m / basin_radius_m
+    return float(1.0 / (1.0 + reduced_distance**switch_exponent))
+
+
+def _cip_pair_residence_memory_gradient(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+) -> Array:
+    return _pair_basin_switch_gradient(records, configuration, "r_CIP_m")
+
+
+def _ssip_pair_residence_memory_gradient(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+) -> Array:
+    return _pair_basin_switch_gradient(
+        records,
+        configuration,
+        "r_SSIP_m",
+    ) - _pair_basin_switch_gradient(records, configuration, "r_CIP_m")
+
+
+def _pair_basin_switch_gradient(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+    basin_radius_key: str,
+) -> Array:
+    pair_distance_m, unit_pair_axis, center_records = (
+        _molecular_li_anion_pair_geometry(records, configuration)
+    )
+    pair_basins = records.basis_record["pair_basins"]
+    switch_record = records.basis_record["coordination_switches"]["Li_anion"]
+    basin_radius_m = _positive_float(
+        float(pair_basins[basin_radius_key]),
+        f"pair_basins.{basin_radius_key}",
+    )
+    switch_exponent = _positive_float(
+        float(switch_record["exponent"]),
+        "coordination_switches.Li_anion.exponent",
+    )
+    reduced_distance = pair_distance_m / basin_radius_m
+    derivative_wrt_distance_m = (
+        -switch_exponent
+        * reduced_distance ** (switch_exponent - 1.0)
+        / (
+            basin_radius_m
+            * (1.0 + reduced_distance**switch_exponent) ** 2
+        )
+    )
+    gradient = np.zeros(
+        (1, len(configuration.species_names) * CARTESIAN_DIMENSION),
+        dtype=float,
+    )
+    for center_sign, site_indices, center_of_mass_weights in center_records:
+        for site_index, center_of_mass_weight in zip(
+            site_indices,
+            center_of_mass_weights,
+            strict=True,
+        ):
+            site_slice = slice(
+                site_index * CARTESIAN_DIMENSION,
+                (site_index + 1) * CARTESIAN_DIMENSION,
+            )
+            gradient[0, site_slice] = (
+                center_sign
+                * center_of_mass_weight
+                * derivative_wrt_distance_m
+                * unit_pair_axis
+            )
+    return gradient
+
+
+def _molecular_li_anion_pair_geometry(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+) -> tuple[float, Array, tuple[tuple[float, tuple[int, ...], Array], ...]]:
+    center_records = []
+    center_positions_m = []
+    for center_sign, role in (
+        (-1.0, SpeciesRole.CATION),
+        (1.0, SpeciesRole.ANION),
+    ):
+        site_indices = _first_molecule_indices_with_role(records, configuration, role)
+        first_site_index = site_indices[0]
+        species_name = configuration.species_names[first_site_index]
+        molecule_id = int(configuration.molecule_ids[first_site_index])
+        molecule_site_indices, center_of_mass_weights = (
+            molecule_site_indices_and_mass_fractions(
+                records,
+                configuration,
+                species_name,
+                molecule_id,
+            )
+        )
+        center_positions_m.append(
+            molecule_center_of_mass_m(
+                records,
+                configuration,
+                species_name,
+                molecule_id,
+            )
+        )
+        center_records.append(
+            (center_sign, molecule_site_indices, center_of_mass_weights)
+        )
+    pair_vector_m = _minimum_image_vector_m(
+        center_positions_m[0],
+        center_positions_m[1],
+        configuration.box_lengths_m,
+    )
+    pair_distance_m = _positive_float(
+        float(np.linalg.norm(pair_vector_m)),
+        "molecular Li-anion pair distance",
+    )
+    return pair_distance_m, pair_vector_m / pair_distance_m, tuple(center_records)
+
+
 def _memory_li_anion_coordination_gradient(
     records: PhysicalLibraryRecords,
     configuration: SiteConfiguration,
@@ -8229,16 +8794,34 @@ def _bounded_internal_polarization_memory_value_for_axis(
     configuration: SiteConfiguration,
     cartesian_axis: int,
 ) -> float:
-    cation_index = _first_role_index(records, configuration, SpeciesRole.CATION)
-    anion_index = _first_role_index(records, configuration, SpeciesRole.ANION)
-    pair_vector = np.asarray(
-        configuration.positions_m[anion_index], dtype=float
-    ) - np.asarray(configuration.positions_m[cation_index], dtype=float)
-    charge_numbers = _configuration_charge_numbers(records, configuration)
-    return float(
-        (charge_numbers[cation_index] - charge_numbers[anion_index])
-        * pair_vector[cartesian_axis]
+    charged_centers = _configuration_molecular_charge_centers(records, configuration)
+    center_positions_m = np.asarray(
+        [
+            _molecular_center_position(configuration, charged_center)
+            for charged_center in charged_centers
+        ],
+        dtype=float,
     )
+    formal_charge_numbers = np.asarray(
+        [charged_center.formal_charge_number for charged_center in charged_centers],
+        dtype=float,
+    )
+    molecular_masses_kg_mol = _charged_center_molecular_masses_kg_mol(
+        records,
+        configuration,
+        charged_centers,
+    )
+    charged_cluster_center_m = np.einsum(
+        "i,ia->a",
+        molecular_masses_kg_mol / np.sum(molecular_masses_kg_mol),
+        center_positions_m,
+    )
+    internal_polarization_m = np.einsum(
+        "i,ia->a",
+        formal_charge_numbers,
+        center_positions_m - charged_cluster_center_m[np.newaxis, :],
+    )
+    return float(internal_polarization_m[cartesian_axis])
 
 
 def _bounded_internal_polarization_x_memory_gradient(
@@ -8279,23 +8862,83 @@ def _bounded_internal_polarization_memory_gradient_for_axis(
     configuration: SiteConfiguration,
     cartesian_axis: int,
 ) -> Array:
-    cation_index = _first_role_index(records, configuration, SpeciesRole.CATION)
-    anion_index = _first_role_index(records, configuration, SpeciesRole.ANION)
-    charge_numbers = _configuration_charge_numbers(records, configuration)
-    charge_difference = charge_numbers[cation_index] - charge_numbers[anion_index]
+    charged_centers = _configuration_molecular_charge_centers(records, configuration)
+    molecular_masses_kg_mol = _charged_center_molecular_masses_kg_mol(
+        records,
+        configuration,
+        charged_centers,
+    )
+    cluster_mass_fractions = molecular_masses_kg_mol / np.sum(
+        molecular_masses_kg_mol
+    )
+    net_formal_charge_number = float(
+        np.sum(
+            [
+                charged_center.formal_charge_number
+                for charged_center in charged_centers
+            ]
+        )
+    )
     gradient = np.zeros(
         (1, len(configuration.species_names) * CARTESIAN_DIMENSION),
         dtype=float,
     )
-    gradient[
-        0,
-        cation_index * CARTESIAN_DIMENSION + cartesian_axis,
-    ] = -charge_difference
-    gradient[
-        0,
-        anion_index * CARTESIAN_DIMENSION + cartesian_axis,
-    ] = charge_difference
+    for charged_center, cluster_mass_fraction in zip(
+        charged_centers,
+        cluster_mass_fractions,
+        strict=True,
+    ):
+        center_coefficient = (
+            charged_center.formal_charge_number
+            - net_formal_charge_number * cluster_mass_fraction
+        )
+        for site_index, center_of_mass_weight in zip(
+            charged_center.site_indices,
+            charged_center.center_of_mass_weights,
+            strict=True,
+        ):
+            gradient[
+                0,
+                site_index * CARTESIAN_DIMENSION + cartesian_axis,
+            ] = center_coefficient * center_of_mass_weight
     return gradient
+
+
+def _configuration_molecular_charge_centers(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+) -> tuple[MolecularChargeCenter, ...]:
+    charged_centers = tuple(
+        center
+        for role in (SpeciesRole.CATION, SpeciesRole.ANION)
+        for center in _molecular_charge_centers_for_role(
+            records,
+            configuration,
+            role,
+            "",
+        )
+    )
+    if len(charged_centers) < 2:
+        raise ValueError("bounded cluster polarization requires two charged molecules")
+    return charged_centers
+
+
+def _charged_center_molecular_masses_kg_mol(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+    charged_centers: tuple[MolecularChargeCenter, ...],
+) -> Array:
+    return np.asarray(
+        [
+            float(
+                records.species_records[
+                    configuration.species_names[charged_center.site_indices[0]]
+                ]["molecular_weight_kg_mol"]
+            )
+            for charged_center in charged_centers
+        ],
+        dtype=float,
+    )
 
 
 def _anion_orientation_memory_value(
@@ -8439,7 +9082,7 @@ def _ligand_coordination_nodes(
     coordinate: ReducedCoordinate,
     recipe_context: RecipeBuildResult,
 ) -> tuple[Array, Array]:
-    if not _recipe_has_role(recipe_context, SpeciesRole.ADDITIVE):
+    if not recipe_context.additive_weight_fractions:
         return np.asarray([0.0], dtype=float), np.asarray([1.0], dtype=float)
     return _configured_coordinate_nodes(records, coordinate)
 
@@ -8449,7 +9092,7 @@ def _solvent_coordination_nodes(
     coordinate: ReducedCoordinate,
     recipe_context: RecipeBuildResult,
 ) -> tuple[Array, Array]:
-    if not _recipe_has_role(recipe_context, SpeciesRole.SOLVENT):
+    if not recipe_context.solvent_volume_fractions:
         return np.asarray([0.0], dtype=float), np.asarray([1.0], dtype=float)
     return _configured_coordinate_nodes(records, coordinate)
 
@@ -8599,16 +9242,6 @@ def _nodes_from_thresholds(
         values.append((lower_bound + upper_bound) / 2.0)
         weights.append(upper_bound - lower_bound)
     return np.asarray(values, dtype=float), np.asarray(weights, dtype=float)
-
-
-def _recipe_has_role(
-    recipe_context: RecipeBuildResult,
-    role: SpeciesRole,
-) -> bool:
-    for component in recipe_context.resolved_species:
-        if _species_role(recipe_context.library_records, component.name) == role:
-            return True
-    return False
 
 
 def _configuration_with_reduced_coordinate_values(

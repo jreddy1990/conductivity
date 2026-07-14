@@ -1,6 +1,7 @@
 schema: conductivity_speciation_equilibria_v1
 standard_concentration_mol_m3: 1000.0
 relative_residual_tolerance: 1.0e-9
+solver_tolerance_fraction: 0.01
 maximum_function_evaluations: 2000
 recipe_component_formulas:
   Li+: {lithium: 1.0}

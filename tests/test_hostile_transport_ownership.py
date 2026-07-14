@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -8,8 +9,11 @@ import pytest
 
 from conductivity.physical_library import generator_construction
 from conductivity.physical_library import physical_generator_builder
+from conductivity.physical_library import physical_objects
 from conductivity.physical_library import projected_analytical_conductivity as model
+from conductivity.physical_library import reduced_generator
 from conductivity.physical_library.library_io import load_physical_library
+from conductivity.physical_library.physical_objects import SiteConfiguration
 from conductivity.physical_library.reduced_generator import (
     ReducedGeneratorSpecification,
     ReducedStateQuadrature,
@@ -20,6 +24,30 @@ from conductivity.physical_library.transition_moment_bvp import (
     EndpointTransportMomentInput,
     build_endpoint_transport_moments,
 )
+
+
+def test_additive_obstruction_has_one_executable_resistance_owner() -> None:
+    local_viscosity_source = inspect.getsource(
+        generator_construction._local_viscosity_Pa_s
+    )
+    resistance_source = inspect.getsource(
+        physical_objects.compute_resistance_tensor_kg_s
+    )
+    diagnostics_source = inspect.getsource(
+        physical_objects.compute_resistance_component_diagnostics
+    )
+    state_feature_source = inspect.getsource(
+        physical_objects.compute_state_feature_resistance_components
+    )
+    physical_objects_source = inspect.getsource(physical_objects)
+
+    assert "additive" not in local_viscosity_source
+    assert "compute_state_feature_resistance_components" in resistance_source
+    assert "compute_state_feature_resistance_components" in diagnostics_source
+    assert "molecule_record[4] * additive_pair_collision_exposure" in state_feature_source
+    assert physical_objects_source.count(
+        "molecule_record[4] * additive_pair_collision_exposure"
+    ) == 1
 
 
 def _zero_potential_J_mol(point: np.ndarray) -> float:
@@ -74,6 +102,44 @@ def _empty_ownership_basis(coordinate_dimension: int):
         bounded_memory_mode_indices=np.empty(0, dtype=int),
         diagnostic_gradients=np.empty((0, coordinate_dimension)),
         diagnostic_source_ids=(),
+    )
+
+
+def _single_memory_gradient(point: np.ndarray) -> np.ndarray:
+    return np.asarray([[point[0]]], dtype=float)
+
+
+def test_continuous_memory_expands_and_remaps_by_state_family() -> None:
+    bounded_basis = _ownership_basis(
+        transition_gradients=np.empty((0, 1)),
+        transition_edge_indices=np.empty(0, dtype=int),
+        bounded_memory_gradients=np.asarray([[1.0]], dtype=float),
+        bounded_memory_mode_indices=np.asarray([0], dtype=int),
+        diagnostic_gradients=np.empty((0, 1)),
+        diagnostic_source_ids=(),
+    )
+    specification = SimpleNamespace(
+        memory_coordinate_gradient=_single_memory_gradient,
+        state_continuous_memory_family_keys=(("SSIP",), ("CIP",)),
+    )
+
+    gradient, active_mask, ownership_bases = (
+        reduced_generator._expand_continuous_memory_by_state_family(
+            specification,
+            ((bounded_basis,), (bounded_basis,)),
+            (np.asarray([[1.0]]), np.asarray([[2.0]])),
+        )
+    )
+
+    np.testing.assert_allclose(gradient(np.asarray([3.0])), [[3.0], [3.0]])
+    np.testing.assert_array_equal(active_mask, np.eye(2, dtype=bool))
+    np.testing.assert_array_equal(
+        ownership_bases[0][0].bounded_memory_mode_indices,
+        [0],
+    )
+    np.testing.assert_array_equal(
+        ownership_bases[1][0].bounded_memory_mode_indices,
+        [1],
     )
 
 
@@ -289,6 +355,7 @@ def test_energy_reference_preserves_disconnected_basin_energy_difference() -> No
         mobility_tensor_m2_s=_unit_mobility_tensor_m2_s,
         charge_polarization_gradient=_zero_charge_gradient,
         memory_coordinate_gradient=_empty_memory_gradient,
+        state_continuous_memory_family_keys=(("state_0",), ("state_1",)),
         state_quadratures=state_quadratures,
         transition_quadratures=(),
         total_component_concentrations_mol_m3=np.asarray([1.0], dtype=float),
@@ -398,7 +465,7 @@ def test_transport_graph_closure_rejects_pruned_displacement_edges() -> None:
         )
 
 
-def test_partner_residence_memory_declares_partner_switch_owner() -> None:
+def test_one_partner_generator_keeps_partner_residence_diagnostic() -> None:
     records = generator_construction.build_recipe_library_context(
         generator_construction.Path(
             "conductivity/physical_library/recipe_ec_dmc_lipf6_1m.yaml"
@@ -408,8 +475,11 @@ def test_partner_residence_memory_declares_partner_switch_owner() -> None:
     partner_residence_record = records.memory_record["memory_records"][
         "partner_residence"
     ]
+    pair_residence_record = records.memory_record["memory_records"][
+        "pair_residence"
+    ]
 
-    assert partner_residence_record["transport_ownership"] == "bounded_memory"
+    assert partner_residence_record["transport_ownership"] == "diagnostic"
     assert partner_residence_record["matching_transition_families"] == [
         "partner_switch"
     ]
@@ -419,6 +489,159 @@ def test_partner_residence_memory_declares_partner_switch_owner() -> None:
         ]
         == "transition_displacement"
     )
+    assert pair_residence_record == {
+        "transport_ownership": "bounded_memory",
+        "matching_transition_families": ["free_to_SSIP", "SSIP_to_CIP"],
+    }
+
+
+def test_pair_residence_uses_translation_invariant_molecular_centers() -> None:
+    records = load_physical_library(Path("conductivity/physical_library"))
+    positions_m = np.asarray(
+        [[0.0, 0.0, 0.0], [4.0e-10, 0.0, 0.0]],
+        dtype=float,
+    )
+    configuration = SiteConfiguration(
+        species_names=("Li+", "PF6-"),
+        molecule_ids=np.asarray([0, 1], dtype=int),
+        site_ids=np.asarray([0, 1], dtype=int),
+        positions_m=positions_m,
+        unwrapped_positions_m=positions_m,
+        box_lengths_m=np.asarray([1.0e-8, 1.0e-8, 1.0e-8], dtype=float),
+    )
+    translation_m = np.asarray([3.0e-10, -1.0e-10, 2.0e-10], dtype=float)
+    translated_configuration = SiteConfiguration(
+        species_names=configuration.species_names,
+        molecule_ids=configuration.molecule_ids,
+        site_ids=configuration.site_ids,
+        positions_m=configuration.positions_m + translation_m,
+        unwrapped_positions_m=configuration.unwrapped_positions_m + translation_m,
+        box_lengths_m=configuration.box_lengths_m,
+    )
+
+    original_value = generator_construction._cip_pair_residence_memory_value(
+        records,
+        configuration,
+    )
+    translated_value = generator_construction._cip_pair_residence_memory_value(
+        records,
+        translated_configuration,
+    )
+    gradient = generator_construction._cip_pair_residence_memory_gradient(
+        records,
+        configuration,
+    )
+
+    assert 0.0 < original_value < 1.0
+    assert translated_value == pytest.approx(original_value)
+    assert np.linalg.norm(gradient) > 0.0
+    for cartesian_axis in range(3):
+        uniform_translation = np.tile(
+            np.eye(3, dtype=float)[cartesian_axis],
+            len(configuration.species_names),
+        )
+        assert float((gradient @ uniform_translation).item()) == pytest.approx(
+            0.0,
+            abs=1.0e-14,
+        )
+
+
+def test_pair_residence_is_topology_independent_and_orientation_is_geometry_derived() -> None:
+    records = load_physical_library(Path("conductivity/physical_library"))
+    cip_state_key = (
+        "CIP",
+        "anion_coordinated",
+        "none",
+        "anion",
+        "orientation",
+        "LiA",
+        "single_partner",
+        "identity",
+        "no_hop",
+        "cage",
+        "environment",
+        "atmosphere",
+    )
+    for anion_name in ("PF6-", "FSI-"):
+        positions_m = np.asarray(
+            [[0.0, 0.0, 0.0], [4.0e-10, 0.0, 0.0]],
+            dtype=float,
+        )
+        configuration = SiteConfiguration(
+            species_names=("Li+", anion_name),
+            molecule_ids=np.asarray([0, 1], dtype=int),
+            site_ids=np.asarray([0, 0], dtype=int),
+            positions_m=positions_m,
+            unwrapped_positions_m=positions_m,
+            box_lengths_m=np.asarray([1.0e-8, 1.0e-8, 1.0e-8], dtype=float),
+        )
+        cip_pair_coordinate = next(
+            coordinate
+            for coordinate in generator_construction.build_default_memory_coordinates(
+                records,
+                configuration,
+            )
+            if coordinate.family
+            is generator_construction.MemoryCoordinateFamily.PAIR_RESIDENCE
+            and coordinate.active_pair_basins
+            == (generator_construction.PairBasin.CONTACT_ION_PAIR,)
+        )
+        assert generator_construction._memory_coordinate_is_active_for_state(
+            cip_pair_coordinate,
+            cip_state_key,
+            configuration,
+        )
+        for pair_state, ligand_state, shell_state, cluster_state in (
+            ("free", "none", "anion_coordinated", "LiA"),
+            ("addSSIP", "additive_separator", "mixed_ligand_anion", "LiA"),
+            ("CIP", "monodentate", "neutral_ligand_bound", "LiA"),
+            ("CIP", "none", "anion_coordinated", "aggregate:Li2A2_neutral"),
+            ("SSIP", "none", "anion_coordinated", "bridge_network"),
+        ):
+            excluded_state_key = (
+                pair_state,
+                shell_state,
+                ligand_state,
+                "anion",
+                "orientation",
+                cluster_state,
+                "single_partner",
+                "identity",
+                "no_hop",
+                "cage",
+                "environment",
+                "atmosphere",
+            )
+            assert not generator_construction._memory_coordinate_is_active_for_state(
+                cip_pair_coordinate,
+                excluded_state_key,
+                configuration,
+            )
+
+    pf6_anisotropy = physical_objects.molecular_geometry_anisotropy(records, "PF6-")
+    fsi_anisotropy = physical_objects.molecular_geometry_anisotropy(records, "FSI-")
+    assert pf6_anisotropy == pytest.approx(0.0, abs=1.0e-12)
+    assert fsi_anisotropy > pf6_anisotropy
+
+    molecular_radius_m = 2.0e-10
+    symmetric_coordinates_m = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [molecular_radius_m, 0.0, 0.0],
+            [-molecular_radius_m, 0.0, 0.0],
+            [0.0, molecular_radius_m, 0.0],
+            [0.0, -molecular_radius_m, 0.0],
+            [0.0, 0.0, molecular_radius_m],
+            [0.0, 0.0, -molecular_radius_m],
+        ],
+        dtype=float,
+    )
+    symmetric_site_masses_kg = np.ones(len(symmetric_coordinates_m), dtype=float)
+    assert physical_objects._geometry_anisotropy(
+        symmetric_coordinates_m,
+        symmetric_site_masses_kg,
+        "symmetric-test-geometry",
+    ) == pytest.approx(0.0, abs=1.0e-12)
 
 
 def test_full_self_plus_transition_overcounts_while_tangent_self_is_correct() -> None:
@@ -515,6 +738,7 @@ def _two_state_family_specification() -> ReducedGeneratorSpecification:
         mobility_tensor_m2_s=_unit_mobility_tensor_m2_s,
         charge_polarization_gradient=_two_coordinate_charge_gradient,
         memory_coordinate_gradient=_empty_memory_gradient,
+        state_continuous_memory_family_keys=(("state_0",), ("state_1",)),
         state_quadratures=states,
         transition_quadratures=(transition,),
         total_component_concentrations_mol_m3=np.asarray([2.0], dtype=float),
@@ -662,6 +886,9 @@ def test_constructor_preserves_ill_scaled_independent_normal_row_space() -> None
         mobility_tensor_m2_s=specification.mobility_tensor_m2_s,
         charge_polarization_gradient=specification.charge_polarization_gradient,
         memory_coordinate_gradient=specification.memory_coordinate_gradient,
+        state_continuous_memory_family_keys=(
+            specification.state_continuous_memory_family_keys
+        ),
         state_quadratures=ill_scaled_states,
         transition_quadratures=(ill_scaled_transition,),
         total_component_concentrations_mol_m3=(
@@ -810,6 +1037,7 @@ def test_reduced_generator_projection_owns_explicit_transition_moments() -> None
         mobility_tensor_m2_s=_unit_mobility_tensor_m2_s,
         charge_polarization_gradient=_zero_charge_gradient,
         memory_coordinate_gradient=_empty_memory_gradient,
+        state_continuous_memory_family_keys=(("state_0",), ("state_1",)),
         state_quadratures=states,
         transition_quadratures=(transition,),
         total_component_concentrations_mol_m3=np.asarray([2.0], dtype=float),

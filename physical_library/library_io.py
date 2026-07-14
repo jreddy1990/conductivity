@@ -24,6 +24,7 @@ SPECIES_REQUIRED_FIELDS = (
     "molecular_weight_kg_mol",
     "density_kg_m3",
     "partial_molar_volume_m3_mol",
+    "excluded_volume",
     "sites",
     "bonds",
     "angles",
@@ -79,6 +80,7 @@ FIRST_PRINCIPLES_ALLOWED_PARAMETER_PROVENANCE = (
     "measured_pure_property",
     "measured_mixture_property",
     "continuum_theory",
+    "numerical_convergence",
     "fitted_to_primitive",
     "initialized_estimate",
 )
@@ -157,7 +159,7 @@ def build_recipe_library_context(
     recipe_yaml_path: Path,
     library_root: Path,
 ) -> RecipeBuildResult:
-    recipe_record = _load_recipe_mapping(recipe_yaml_path)
+    recipe_record = load_recipe_mapping(recipe_yaml_path)
     return build_recipe_library_context_from_record(recipe_record, library_root)
 
 
@@ -322,6 +324,7 @@ def _validate_equilibria_record(equilibria_record: dict, species_records: dict) 
             "schema",
             "standard_concentration_mol_m3",
             "relative_residual_tolerance",
+            "solver_tolerance_fraction",
             "maximum_function_evaluations",
             "recipe_component_formulas",
             "equilibrium_species_formulas",
@@ -329,6 +332,19 @@ def _validate_equilibria_record(equilibria_record: dict, species_records: dict) 
         ),
         "equilibria.yaml",
     )
+    standard_concentration_mol_m3 = float(
+        equilibria_record["standard_concentration_mol_m3"]
+    )
+    if standard_concentration_mol_m3 != MOL_M3_PER_MOL_L:
+        raise ValueError(
+            "equilibria.standard_concentration_mol_m3 must equal the "
+            "definitional mol/L to mol/m3 conversion"
+        )
+    solver_tolerance_fraction = float(equilibria_record["solver_tolerance_fraction"])
+    if not 0.0 < solver_tolerance_fraction < 1.0:
+        raise ValueError(
+            "equilibria.solver_tolerance_fraction must be between zero and one"
+        )
     for species_name in equilibria_record["equilibrium_species_formulas"]:
         if species_name not in species_records:
             raise KeyError(f"equilibria.yaml references missing species {species_name}")
@@ -353,7 +369,12 @@ def _validate_equilibria_record(equilibria_record: dict, species_records: dict) 
 def _validate_association_record(association_record: dict) -> None:
     _require_mapping_keys(
         association_record,
-        ("schema", "association_residual", "state_resolved_born", "aggregate_topologies"),
+        (
+            "schema",
+            "association_residual",
+            "state_resolved_born",
+            "aggregate_topologies",
+        ),
         "association.yaml",
     )
     for operator_name in ("association_residual", "state_resolved_born"):
@@ -585,6 +606,7 @@ def main() -> int:
     parser.add_argument("--volume-m3", type=float)
     parser.add_argument("--state-quadrature-order", type=int)
     parser.add_argument("--transition-grid-count", type=int)
+    parser.add_argument("--property-db-worker-count", type=int)
     parsed_arguments = parser.parse_args()
     if parsed_arguments.command == "validate-library":
         return _main_validate_library(parsed_arguments.library_root)
@@ -594,6 +616,7 @@ def main() -> int:
             "volume_m3": parsed_arguments.volume_m3,
             "state_quadrature_order": parsed_arguments.state_quadrature_order,
             "transition_grid_count": parsed_arguments.transition_grid_count,
+            "property_db_worker_count": parsed_arguments.property_db_worker_count,
         }
         missing_argument_names = tuple(
             argument_name
@@ -614,6 +637,7 @@ def main() -> int:
             volume_m3=parsed_arguments.volume_m3,
             state_quadrature_order=parsed_arguments.state_quadrature_order,
             transition_grid_count=parsed_arguments.transition_grid_count,
+            property_db_worker_count=parsed_arguments.property_db_worker_count,
         )
     raise ValueError(f"unsupported command {parsed_arguments.command}")
 
@@ -633,6 +657,7 @@ def _main_validate_property_db(
     volume_m3: float,
     state_quadrature_order: int,
     transition_grid_count: int,
+    property_db_worker_count: int,
 ) -> int:
     from conductivity.physical_library.generator_construction import NumericalOptions
     from conductivity.physical_library.property_db_validation import (
@@ -650,6 +675,8 @@ def _main_validate_property_db(
         property_db_entries=DATA,
         physical_library_root=library_root,
         numerical_options=numerical_options,
+        worker_count=property_db_worker_count,
+        progress_callback=_print_property_db_validation_progress,
     )
     print(f"total_entry_count={summary.total_entry_count}")
     print(f"evaluated_entry_count={summary.evaluated_entry_count}")
@@ -666,6 +693,14 @@ def _main_validate_property_db(
     )
     print(f"max_absolute_error_mS_cm={summary.max_absolute_error_mS_cm:.12g}")
     return 0
+
+
+def _print_property_db_validation_progress(progress) -> None:
+    print(
+        f"row={progress.entry_index} classification={progress.classification} "
+        f"detail={progress.detail}",
+        flush=True,
+    )
 
 
 def _validate_required_files_exist(library_root: Path) -> None:
@@ -749,6 +784,38 @@ def _validate_species_record(species_name: str, species_record: dict) -> None:
     coordinate_count = len(species_record["reference_conformer_coordinates_m"])
     if coordinate_count != len(species_record["sites"]):
         raise ValueError(f"{species_name} conformer coordinate count does not match sites")
+    excluded_volume = species_record["excluded_volume"]
+    _require_mapping_keys(
+        excluded_volume,
+        ("model", "hard_core_volume_m3", "packing_radius_m", "provenance"),
+        f"{species_name}.excluded_volume",
+    )
+    if str(excluded_volume["model"]) not in {
+        "union_vdw_spheres",
+        "alpha_shape",
+        "supplied_hard_core",
+    }:
+        raise ValueError(f"{species_name} excluded-volume model is unsupported")
+    if str(excluded_volume["provenance"]) not in {
+        "geometry_derived",
+        "measured_density_derived",
+        "supplied_physical_property",
+    }:
+        raise ValueError(f"{species_name} excluded-volume provenance is unsupported")
+    hard_core_volume_m3 = float(excluded_volume["hard_core_volume_m3"])
+    packing_radius_m = float(excluded_volume["packing_radius_m"])
+    if hard_core_volume_m3 <= 0.0 or packing_radius_m <= 0.0:
+        raise ValueError(f"{species_name} excluded-volume values must be positive")
+    equivalent_sphere_volume_m3 = 4.0 * np.pi * packing_radius_m**3 / 3.0
+    if not np.isclose(
+        hard_core_volume_m3,
+        equivalent_sphere_volume_m3,
+        rtol=float(np.sqrt(np.finfo(float).eps)),
+        atol=0.0,
+    ):
+        raise ValueError(
+            f"{species_name} packing radius does not match hard-core volume"
+        )
 
 
 def _validate_pair_record(
@@ -772,6 +839,11 @@ def _validate_pair_record(
 
 
 def _validate_mixture_parameter_provenance(mixture_record: dict) -> None:
+    union_quadrature_order = int(
+        mixture_record["packing"]["union_quadrature_order"]
+    )
+    if union_quadrature_order < 2:
+        raise ValueError("mixture packing union_quadrature_order must be at least two")
     parameter_provenance = mixture_record["parameter_provenance"]
     if not isinstance(parameter_provenance, dict):
         raise TypeError("mixture.parameter_provenance must be a mapping")
@@ -809,6 +881,7 @@ def _active_mixture_parameter_paths(mixture_record: dict) -> tuple[str, ...]:
         active_parameter_paths.append("mobility.free_volume_exponent")
     if "free_volume" in resistance_terms:
         active_parameter_paths.append("packing.phi_max")
+        active_parameter_paths.append("packing.union_quadrature_order")
     if "local_fields" in mixture_record:
         local_field_record = mixture_record["local_fields"]
         for local_field_key in sorted(local_field_record):
@@ -816,7 +889,7 @@ def _active_mixture_parameter_paths(mixture_record: dict) -> tuple[str, ...]:
     return tuple(active_parameter_paths)
 
 
-def _load_recipe_mapping(path: Path) -> dict:
+def load_recipe_mapping(path: Path) -> dict:
     record = yaml.safe_load(path.read_text())
     if not isinstance(record, dict):
         raise TypeError(f"{path} must contain a YAML mapping")

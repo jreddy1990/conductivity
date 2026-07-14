@@ -2,19 +2,21 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
-import os
 from operator import attrgetter
 import tempfile
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections.abc import Callable
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import yaml
+from threadpoolctl import threadpool_limits
 
-from constants import T_REF_K
+from constants import FRACTION_TO_PERCENT, T_REF_K
 from conductivity.physical_library.generator_construction import (
     NumericalOptions,
     compute_conductivity_from_recipe,
@@ -62,14 +64,34 @@ class PropertyDbConductivityValidationProgress:
 
 
 @dataclass(frozen=True)
-class _EvaluatedPropertyDbConductivityValidationOutcome:
-    progress: PropertyDbConductivityValidationProgress
-    validation_row: PropertyDbConductivityValidationRow
+class _SupportedValidationRequest:
+    entry_index: int
+    measured_conductivity_mS_cm: float
 
 
 @dataclass(frozen=True)
-class _ClassifiedPropertyDbConductivityValidationOutcome:
-    progress: PropertyDbConductivityValidationProgress
+class _CanonicalRecipeWork:
+    recipe_digest: str
+    supported_recipe: _SupportedRecipe
+    requests: tuple[_SupportedValidationRequest, ...]
+
+
+@dataclass(frozen=True)
+class _RecipePrediction:
+    predicted_conductivity_mS_cm: float
+    readiness_status: str
+    scalar_label: str
+
+
+@dataclass(frozen=True)
+class _EvaluatedCanonicalRecipeOutcome:
+    prediction: _RecipePrediction
+
+
+@dataclass(frozen=True)
+class _ClassifiedCanonicalRecipeOutcome:
+    classification: str
+    detail: str
 
 
 @dataclass(frozen=True)
@@ -149,8 +171,13 @@ def validate_property_db_supported_conductivity_rows(
     property_db_entries,
     physical_library_root: Path,
     numerical_options: NumericalOptions,
+    worker_count: int,
+    progress_callback: Callable[[PropertyDbConductivityValidationProgress], None],
 ) -> PropertyDbConductivityValidationSummary:
     """Run current physical-library predictions for DB rows with supported species."""
+
+    if worker_count <= 0:
+        raise ValueError("property DB validation worker_count must be positive")
 
     physical_library_records = load_physical_library(physical_library_root)
     supported_species_names = frozenset(physical_library_records.species_records)
@@ -178,10 +205,12 @@ def validate_property_db_supported_conductivity_rows(
             )
             if "conductivity_mS_cm" not in properties_record:
                 skip_counts_by_unsupported_species[MISSING_CONDUCTIVITY_KEY] += 1
-                progress_rows.append(
+                _record_validation_progress(
+                    progress_rows,
                     PropertyDbConductivityValidationProgress(
                         entry_index, MISSING_CONDUCTIVITY_CLASSIFICATION, ""
-                    )
+                    ),
+                    progress_callback,
                 )
                 continue
 
@@ -194,12 +223,14 @@ def validate_property_db_supported_conductivity_rows(
                 skip_counts_by_unsupported_species[
                     supported_recipe.unsupported_species_key
                 ] += 1
-                progress_rows.append(
+                _record_validation_progress(
+                    progress_rows,
                     PropertyDbConductivityValidationProgress(
                         entry_index,
                         UNSUPPORTED_SPECIES_CLASSIFICATION,
                         supported_recipe.unsupported_species_key,
-                    )
+                    ),
+                    progress_callback,
                 )
                 continue
             measured_conductivity_mS_cm = _finite_float(
@@ -210,38 +241,48 @@ def validate_property_db_supported_conductivity_rows(
                 (entry_index, supported_recipe, measured_conductivity_mS_cm)
             )
 
-        worker_count = min(len(supported_work), os.cpu_count() or 1)
-        with ThreadPoolExecutor(max_workers=max(1, worker_count)) as executor:
-            future_to_entry_index = {
+        canonical_recipe_work = _canonical_recipe_work(supported_work)
+        recipe_paths = {
+            work.recipe_digest: temporary_directory
+            / f"property_db_recipe_{work.recipe_digest}.yaml"
+            for work in canonical_recipe_work
+        }
+        for work in canonical_recipe_work:
+            _write_recipe_yaml(
+                recipe_paths[work.recipe_digest],
+                work.supported_recipe,
+            )
+
+        active_worker_count = min(len(canonical_recipe_work), worker_count)
+        with ProcessPoolExecutor(max_workers=active_worker_count) as executor:
+            future_to_work = {
                 executor.submit(
-                    _evaluate_supported_validation_row,
-                    entry_index,
-                    supported_recipe,
-                    measured_conductivity_mS_cm,
-                    temporary_directory,
+                    _evaluate_canonical_recipe,
+                    recipe_paths[work.recipe_digest],
                     physical_library_root,
                     numerical_options,
-                ): entry_index
-                for entry_index, supported_recipe, measured_conductivity_mS_cm in supported_work
+                ): work
+                for work in canonical_recipe_work
             }
-            for future in as_completed(future_to_entry_index):
-                entry_index = future_to_entry_index[future]
+            for future in as_completed(future_to_work):
+                work = future_to_work[future]
                 worker_error = future.exception()
                 if worker_error is not None:
-                    progress_rows.append(
-                        PropertyDbConductivityValidationProgress(
-                            entry_index,
-                            EVALUATION_FAILURE_CLASSIFICATION,
-                            f"{type(worker_error).__name__}: {worker_error}",
-                        )
+                    _record_canonical_recipe_failure(
+                        work=work,
+                        detail=f"{type(worker_error).__name__}: {worker_error}",
+                        progress_rows=progress_rows,
+                        progress_callback=progress_callback,
                     )
                     continue
                 outcome = future.result()
-                progress_rows.append(outcome.progress)
-                if isinstance(
-                    outcome, _EvaluatedPropertyDbConductivityValidationOutcome
-                ):
-                    validation_rows.append(outcome.validation_row)
+                _record_canonical_recipe_outcome(
+                    work=work,
+                    outcome=outcome,
+                    validation_rows=validation_rows,
+                    progress_rows=progress_rows,
+                    progress_callback=progress_callback,
+                )
 
     validation_row_tuple = tuple(sorted(validation_rows, key=attrgetter("entry_index")))
     progress_tuple = tuple(sorted(progress_rows, key=attrgetter("entry_index")))
@@ -285,24 +326,76 @@ def validate_property_db_supported_conductivity_rows(
     )
 
 
-def _evaluate_supported_validation_row(
-    entry_index: int,
-    supported_recipe: _SupportedRecipe,
-    measured_conductivity_mS_cm: float,
-    temporary_directory: Path,
+def _record_validation_progress(
+    progress_rows: list[PropertyDbConductivityValidationProgress],
+    progress: PropertyDbConductivityValidationProgress,
+    progress_callback: Callable[[PropertyDbConductivityValidationProgress], None],
+) -> None:
+    progress_rows.append(progress)
+    progress_callback(progress)
+
+
+def _canonical_recipe_work(
+    supported_work: list[tuple[int, _SupportedRecipe, float]],
+) -> tuple[_CanonicalRecipeWork, ...]:
+    grouped_requests: dict[
+        tuple,
+        tuple[_SupportedRecipe, list[_SupportedValidationRequest]],
+    ] = {}
+    for entry_index, supported_recipe, measured_conductivity_mS_cm in supported_work:
+        recipe_key = _canonical_recipe_key(supported_recipe)
+        if recipe_key not in grouped_requests:
+            grouped_requests[recipe_key] = (supported_recipe, [])
+        grouped_requests[recipe_key][1].append(
+            _SupportedValidationRequest(
+                entry_index=entry_index,
+                measured_conductivity_mS_cm=measured_conductivity_mS_cm,
+            )
+        )
+    sorted_grouped_requests = sorted(
+        grouped_requests.items(),
+        key=_canonical_recipe_group_sort_key,
+    )
+    return tuple(
+        _CanonicalRecipeWork(
+            recipe_digest=_canonical_recipe_digest(recipe_key),
+            supported_recipe=supported_recipe,
+            requests=tuple(requests),
+        )
+        for recipe_key, (supported_recipe, requests) in sorted_grouped_requests
+    )
+
+
+def _canonical_recipe_group_sort_key(grouped_recipe_item: tuple) -> tuple:
+    return grouped_recipe_item[0]
+
+
+def _canonical_recipe_key(supported_recipe: _SupportedRecipe) -> tuple:
+    return (
+        supported_recipe.temperature_K,
+        tuple(sorted(supported_recipe.solvents_vv.items())),
+        tuple(sorted(supported_recipe.salts_mol_l.items())),
+        tuple(sorted(supported_recipe.additives_weight_fraction.items())),
+    )
+
+
+def _canonical_recipe_digest(recipe_key: tuple) -> str:
+    canonical_yaml = yaml.safe_dump(recipe_key, sort_keys=True)
+    return hashlib.sha256(canonical_yaml.encode("utf-8")).hexdigest()
+
+
+def _evaluate_canonical_recipe(
+    recipe_yaml_path: Path,
     physical_library_root: Path,
     numerical_options: NumericalOptions,
 ) -> (
-    _EvaluatedPropertyDbConductivityValidationOutcome
-    | _ClassifiedPropertyDbConductivityValidationOutcome
+    _EvaluatedCanonicalRecipeOutcome | _ClassifiedCanonicalRecipeOutcome
 ):
-    recipe_yaml_path = temporary_directory / f"property_db_{entry_index}.yaml"
-    _write_recipe_yaml(recipe_yaml_path, supported_recipe)
-    conductivity_result = compute_conductivity_from_recipe(
-        recipe=recipe_yaml_path,
-        library_root=physical_library_root,
-        numerical_options=numerical_options,
-    )
+    with threadpool_limits(limits=1):
+        conductivity_result = compute_conductivity_from_recipe(
+            recipe=recipe_yaml_path,
+            library_root=physical_library_root,
+        )
     classification = _property_validation_classification_from_result(
         conductivity_result=conductivity_result,
     )
@@ -313,26 +406,113 @@ def _evaluate_supported_validation_row(
                 "primitive_prediction_not_complete_reasons"
             ]
         )
-        return _ClassifiedPropertyDbConductivityValidationOutcome(
-            progress=PropertyDbConductivityValidationProgress(
-                entry_index=entry_index,
-                classification=classification,
-                detail=",".join(reasons),
-            )
+        return _ClassifiedCanonicalRecipeOutcome(
+            classification=classification,
+            detail=",".join(reasons),
         )
-    validation_row = _validation_row_from_result(
-        entry_index=entry_index,
-        supported_recipe=supported_recipe,
-        measured_conductivity_mS_cm=measured_conductivity_mS_cm,
-        conductivity_result=conductivity_result,
+    if conductivity_result.sigma_mS_cm is None:
+        raise ValueError("canonical recipe produced a missing conductivity prediction")
+    predicted_conductivity_mS_cm = float(conductivity_result.sigma_mS_cm)
+    if not math.isfinite(predicted_conductivity_mS_cm):
+        raise ValueError("canonical recipe produced a non-finite conductivity prediction")
+    effect_attribution = conductivity_result.effect_attribution
+    return _EvaluatedCanonicalRecipeOutcome(
+        prediction=_RecipePrediction(
+            predicted_conductivity_mS_cm=predicted_conductivity_mS_cm,
+            readiness_status=str(
+                effect_attribution["primitive_prediction_readiness_status"]
+            ),
+            scalar_label=str(
+                effect_attribution["primitive_prediction_scalar_label"]
+            ),
+        )
     )
-    return _EvaluatedPropertyDbConductivityValidationOutcome(
-        progress=PropertyDbConductivityValidationProgress(
-            entry_index=entry_index,
-            classification=EVALUATED_CLASSIFICATION,
-            detail=f"primitive_residual_mS_cm={validation_row.error_mS_cm:.12g}",
+
+
+def _record_canonical_recipe_failure(
+    work: _CanonicalRecipeWork,
+    detail: str,
+    progress_rows: list[PropertyDbConductivityValidationProgress],
+    progress_callback: Callable[[PropertyDbConductivityValidationProgress], None],
+) -> None:
+    for request in work.requests:
+        _record_validation_progress(
+            progress_rows,
+            PropertyDbConductivityValidationProgress(
+                entry_index=request.entry_index,
+                classification=EVALUATION_FAILURE_CLASSIFICATION,
+                detail=detail,
+            ),
+            progress_callback,
+        )
+
+
+def _record_canonical_recipe_outcome(
+    work: _CanonicalRecipeWork,
+    outcome: _EvaluatedCanonicalRecipeOutcome | _ClassifiedCanonicalRecipeOutcome,
+    validation_rows: list[PropertyDbConductivityValidationRow],
+    progress_rows: list[PropertyDbConductivityValidationProgress],
+    progress_callback: Callable[[PropertyDbConductivityValidationProgress], None],
+) -> None:
+    if isinstance(outcome, _ClassifiedCanonicalRecipeOutcome):
+        for request in work.requests:
+            _record_validation_progress(
+                progress_rows,
+                PropertyDbConductivityValidationProgress(
+                    entry_index=request.entry_index,
+                    classification=outcome.classification,
+                    detail=outcome.detail,
+                ),
+                progress_callback,
+            )
+        return
+
+    for request in work.requests:
+        validation_row = _validation_row_from_prediction(
+            entry_index=request.entry_index,
+            supported_recipe=work.supported_recipe,
+            measured_conductivity_mS_cm=request.measured_conductivity_mS_cm,
+            prediction=outcome.prediction,
+        )
+        validation_rows.append(validation_row)
+        _record_validation_progress(
+            progress_rows,
+            PropertyDbConductivityValidationProgress(
+                entry_index=request.entry_index,
+                classification=EVALUATED_CLASSIFICATION,
+                detail=f"primitive_residual_mS_cm={validation_row.error_mS_cm:.12g}",
+            ),
+            progress_callback,
+        )
+
+
+def _validation_row_from_prediction(
+    entry_index: int,
+    supported_recipe: _SupportedRecipe,
+    measured_conductivity_mS_cm: float,
+    prediction: _RecipePrediction,
+) -> PropertyDbConductivityValidationRow:
+    if measured_conductivity_mS_cm <= 0.0:
+        raise ValueError(
+            f"property DB entry {entry_index} conductivity_mS_cm must be positive"
+        )
+    error_mS_cm = (
+        prediction.predicted_conductivity_mS_cm - measured_conductivity_mS_cm
+    )
+    return PropertyDbConductivityValidationRow(
+        entry_index=entry_index,
+        solvents_vv=dict(supported_recipe.solvents_vv),
+        salts_mol_l=dict(supported_recipe.salts_mol_l),
+        additives_weight_fraction=dict(supported_recipe.additives_weight_fraction),
+        measured_conductivity_mS_cm=measured_conductivity_mS_cm,
+        predicted_conductivity_mS_cm=prediction.predicted_conductivity_mS_cm,
+        error_mS_cm=error_mS_cm,
+        absolute_error_mS_cm=abs(error_mS_cm),
+        percent_error=(
+            error_mS_cm / measured_conductivity_mS_cm * FRACTION_TO_PERCENT
         ),
-        validation_row=validation_row,
+        readiness_status=prediction.readiness_status,
+        scalar_label=prediction.scalar_label,
     )
 
 
@@ -421,7 +601,6 @@ def diagnose_property_db_entry_primitives(
         conductivity_result = compute_conductivity_from_recipe(
             recipe=recipe_yaml_path,
             library_root=physical_library_root,
-            numerical_options=numerical_options,
         )
 
     validation_row = _validation_row_from_result(
@@ -688,7 +867,9 @@ def _validation_row_from_result(
         predicted_conductivity_mS_cm=predicted_conductivity_mS_cm,
         error_mS_cm=error_mS_cm,
         absolute_error_mS_cm=abs(error_mS_cm),
-        percent_error=error_mS_cm / measured_conductivity_mS_cm * 100.0,
+        percent_error=(
+            error_mS_cm / measured_conductivity_mS_cm * FRACTION_TO_PERCENT
+        ),
         readiness_status=readiness_status,
         scalar_label=scalar_label,
     )

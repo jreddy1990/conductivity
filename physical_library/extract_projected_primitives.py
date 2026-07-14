@@ -24,6 +24,9 @@ from conductivity.physical_library.projected_analytical_conductivity import (
     primitive_prediction_readiness_as_effect_attribution,
 )
 from conductivity.physical_library import generator_construction
+from conductivity.physical_library.microscopic_convergence import (
+    microscopic_helfand_moment_C_m,
+)
 from conductivity.physical_library.library_io import (
     RecipeBuildResult,
     build_recipe_library_context_from_record,
@@ -55,7 +58,20 @@ LAMMPS_COLUMN_MOLECULE_ID = 1
 LAMMPS_COLUMN_CHARGE_E = 2
 LAMMPS_POSITION_COLUMN_START = 3
 LAMMPS_POSITION_COLUMN_STOP = LAMMPS_POSITION_COLUMN_START + CARTESIAN
-LAMMPS_DUMP_COLUMN_COUNT = LAMMPS_POSITION_COLUMN_STOP
+LAMMPS_VELOCITY_COLUMN_START = LAMMPS_POSITION_COLUMN_STOP
+LAMMPS_VELOCITY_COLUMN_STOP = LAMMPS_VELOCITY_COLUMN_START + CARTESIAN
+LAMMPS_REQUIRED_COLUMNS = ("id", "mol", "q", "xu", "yu", "zu")
+LAMMPS_MICROSCOPIC_COLUMNS = (
+    "id",
+    "mol",
+    "q",
+    "xu",
+    "yu",
+    "zu",
+    "vx",
+    "vy",
+    "vz",
+)
 BOX_BOUND_LOW_COLUMN = 0
 BOX_BOUND_HIGH_COLUMN = 1
 MINIMUM_LOCAL_MINIMUM_COUNT = 2
@@ -78,6 +94,7 @@ class LammpsDumpFrame:
     timestep: int
     box_bounds_A: np.ndarray
     atom_table: np.ndarray
+    atom_columns: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -124,6 +141,35 @@ class AssociationThresholds:
     solvent_separated_pair_max_distance_A: float
 
 
+def charge_helfand_series_from_lammps_dump(
+    trajectory_path: Path,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the all-atom partial-charge Helfand moment used by current.dat."""
+    frames = _read_lammps_custom_dump(trajectory_path)
+    helfand_moments_C_m = np.asarray(
+        [
+            microscopic_helfand_moment_C_m(
+                frame.atom_table[:, LAMMPS_COLUMN_CHARGE_E],
+                frame.atom_table[
+                    :,
+                    LAMMPS_POSITION_COLUMN_START:LAMMPS_POSITION_COLUMN_STOP,
+                ],
+            )
+            for frame in frames
+        ],
+        dtype=float,
+    )
+    box_volumes_m3 = np.asarray(
+        [
+            np.prod(frame.box_bounds_A[:, BOX_BOUND_HIGH_COLUMN] - frame.box_bounds_A[:, BOX_BOUND_LOW_COLUMN])
+            * ANGSTROM_TO_M**CARTESIAN
+            for frame in frames
+        ],
+        dtype=float,
+    )
+    return helfand_moments_C_m, box_volumes_m3
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -137,6 +183,7 @@ def main() -> int:
     parser.add_argument("--physical-library-root", required=True, type=Path)
     parser.add_argument("--dt-fs", required=True, type=float)
     parser.add_argument("--trajectory-dump-stride-steps", required=True, type=int)
+    parser.add_argument("--stationary-start-frame-index", required=True, type=int)
     parser.add_argument("--output-yaml", required=True, type=Path)
     args = parser.parse_args()
 
@@ -147,6 +194,7 @@ def main() -> int:
         physical_library_root=args.physical_library_root,
         timestep_fs=float(args.dt_fs),
         trajectory_dump_stride_steps=int(args.trajectory_dump_stride_steps),
+        stationary_start_frame_index=int(args.stationary_start_frame_index),
         output_yaml_path=args.output_yaml,
     )
     return 0
@@ -159,6 +207,7 @@ def extract_projected_primitives_from_lammps_dump(
     physical_library_root: Path,
     timestep_fs: float,
     trajectory_dump_stride_steps: int,
+    stationary_start_frame_index: int,
     output_yaml_path: Path,
 ):
     composition_record = _load_json_mapping(composition_json_path)
@@ -175,6 +224,7 @@ def extract_projected_primitives_from_lammps_dump(
         recipe_context=recipe_context,
         timestep_fs=timestep_fs,
         trajectory_dump_stride_steps=trajectory_dump_stride_steps,
+        stationary_start_frame_index=stationary_start_frame_index,
         output_yaml_path=output_yaml_path,
     )
 
@@ -187,12 +237,15 @@ def _extract_projected_primitives_from_lammps_dump_with_context(
     recipe_context: RecipeBuildResult,
     timestep_fs: float,
     trajectory_dump_stride_steps: int,
+    stationary_start_frame_index: int,
     output_yaml_path: Path,
 ):
     if timestep_fs <= 0.0:
         raise ValueError("timestep_fs must be positive")
     if trajectory_dump_stride_steps <= 0:
         raise ValueError("trajectory_dump_stride_steps must be positive")
+    if stationary_start_frame_index < 0:
+        raise ValueError("stationary_start_frame_index must be nonnegative")
     copies_record = _load_json_mapping(copies_json_path)
     records = recipe_context.library_records
     trajectory_basis_config = records.basis_record["trajectory_basis_refinement"]
@@ -218,7 +271,9 @@ def _extract_projected_primitives_from_lammps_dump_with_context(
     environment_catalog = _molecular_environment_catalog_from_species_ranges(
         species_ranges
     )
-    frames = tuple(_read_lammps_custom_dump(trajectory_path))
+    frames = tuple(_read_lammps_custom_dump(trajectory_path))[
+        stationary_start_frame_index:
+    ]
     if len(frames) < MINIMUM_LOCAL_MINIMUM_COUNT:
         raise ValueError("primitive extraction needs at least two trajectory frames")
 
@@ -399,6 +454,12 @@ def _extract_projected_primitives_from_lammps_dump_with_context(
         "candidate_sample_count": trajectory_basis_refinement.candidate_sample_count,
         "selected_candidate_indices": list(
             trajectory_basis_refinement.selected_candidate_indices
+        ),
+        "conductivity_history_S_m": list(
+            trajectory_basis_refinement.conductivity_history_S_m
+        ),
+        "selected_residual_score_history_m2_s": list(
+            trajectory_basis_refinement.selected_residual_score_history_m2_s
         ),
         "candidate_set_exhausted": trajectory_basis_refinement.candidate_set_exhausted,
         "convergence_status": trajectory_basis_refinement.convergence_status,
@@ -708,8 +769,9 @@ def _read_lammps_custom_dump(path: Path) -> tuple[LammpsDumpFrame, ...]:
             atoms_header = trajectory_file.readline().strip()
             if not atoms_header.startswith(LammpsDumpHeader.ATOMS_PREFIX.value):
                 raise ValueError(f"expected ATOMS header, got {atoms_header}")
+            atom_columns = _atom_columns_from_header(atoms_header)
             atom_rows = [
-                _read_atom_line(trajectory_file.readline())
+                _read_atom_line(trajectory_file.readline(), len(atom_columns))
                 for _atom_index in range(atom_count)
             ]
             atom_table = np.asarray(atom_rows, dtype=float)
@@ -719,6 +781,7 @@ def _read_lammps_custom_dump(path: Path) -> tuple[LammpsDumpFrame, ...]:
                     timestep=timestep,
                     box_bounds_A=box_bounds_A,
                     atom_table=atom_table[order],
+                    atom_columns=atom_columns,
                 )
             )
             header_line = trajectory_file.readline()
@@ -749,9 +812,33 @@ def _read_box_bound_line(line: str) -> tuple[float, float]:
     return float(pieces[0]), float(pieces[1])
 
 
-def _read_atom_line(line: str) -> tuple[float, ...]:
+def _atom_columns_from_header(atoms_header: str) -> tuple[str, ...]:
+    header_pieces = atoms_header.split()
+    atom_columns = tuple(header_pieces[2:])
+    if not atom_columns:
+        raise ValueError("LAMMPS ATOMS header declares no columns")
+    missing_columns = tuple(
+        column_name
+        for column_name in LAMMPS_REQUIRED_COLUMNS
+        if column_name not in atom_columns
+    )
+    if missing_columns:
+        raise ValueError(
+            "LAMMPS trajectory is missing required columns: "
+            + ", ".join(missing_columns)
+        )
+    expected_prefix = atom_columns[: len(LAMMPS_REQUIRED_COLUMNS)]
+    if expected_prefix != LAMMPS_REQUIRED_COLUMNS:
+        raise ValueError(
+            "LAMMPS trajectory columns must begin with "
+            + " ".join(LAMMPS_REQUIRED_COLUMNS)
+        )
+    return atom_columns
+
+
+def _read_atom_line(line: str, column_count: int) -> tuple[float, ...]:
     pieces = line.split()
-    if len(pieces) != LAMMPS_DUMP_COLUMN_COUNT:
+    if len(pieces) != column_count:
         raise ValueError(f"invalid atom dump row: {line}")
     return tuple(float(piece) for piece in pieces)
 
@@ -1407,6 +1494,9 @@ def _reduced_coordinate_values_from_center_observation(
         ),
         generator_construction.ReducedCoordinate.LOCAL_VISCOSITY.value: (
             mixture.viscosity_Pa_s
+        ),
+        generator_construction.LOCAL_ADDITIVE_COLLISION_EXPOSURE: (
+            mixture.additive_collision_exposure
         ),
         generator_construction.ReducedCoordinate.ATMOSPHERE_POLARIZATION.value: 0.0,
         generator_construction.ReducedCoordinate.CAGE_COORDINATE.value: temporal_coordinates[

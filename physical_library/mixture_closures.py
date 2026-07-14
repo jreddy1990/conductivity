@@ -5,10 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 
-from constants import EPS_0, F, R
+from constants import EPS_0, F, N_A, R
 from conductivity.physical_library.library_io import PhysicalLibraryRecords
 
 IONIC_STRENGTH_PREFACTOR = 0.5  # Explicit constant: ionic strength is one half sum z_i^2 c_i.
+UNORDERED_PAIR_PREFACTOR = 0.5  # Each symmetric unlike-additive encounter is one unordered pair.
 
 
 @dataclass(frozen=True)
@@ -25,6 +26,7 @@ class MixtureClosureResult:
     ionic_strength_mol_m3: float
     debye_kappa_m_inv: float
     debye_length_m: float
+    additive_collision_exposure: float
 
 
 def compute_mixture_closures(
@@ -50,6 +52,90 @@ def compute_mixture_closures(
         ionic_strength_mol_m3=ionic_strength_mol_m3,
         debye_kappa_m_inv=debye_kappa_m_inv,
         debye_length_m=1.0 / debye_kappa_m_inv,
+        additive_collision_exposure=compute_additive_collision_exposure(
+            records,
+            composition,
+        ),
+    )
+
+
+def compute_additive_collision_exposure(
+    records: PhysicalLibraryRecords,
+    composition: MixtureComposition,
+) -> float:
+    additive_names = tuple(
+        additive_name
+        for additive_name, weight_fraction in composition.additive_weight_fractions.items()
+        if weight_fraction > 0.0
+    )
+    reference_density_kg_m3 = float(records.mixture_record["reference_density_kg_m3"])
+    additive_concentrations_mol_m3 = {
+        additive_name: composition.additive_weight_fractions[additive_name]
+        * reference_density_kg_m3
+        / float(records.species_records[additive_name]["molecular_weight_kg_mol"])
+        for additive_name in additive_names
+    }
+    collision_exposure = 0.0
+    association_cell_radius_m = float(
+        records.basis_record["pair_basins"]["r_free_m"]
+    )
+    for additive_name in additive_names:
+        additive_record = records.species_records[additive_name]
+        additive_hard_core_volume_m3 = float(
+            additive_record["excluded_volume"]["hard_core_volume_m3"]
+        )
+        additive_coefficient = float(
+            additive_record["local_microviscosity_coefficient"]
+        )
+        collision_exposure += (
+            N_A
+            * additive_concentrations_mol_m3[additive_name]
+            * additive_hard_core_volume_m3
+            * additive_coefficient
+        )
+    for additive_index, additive_name in enumerate(additive_names):
+        additive_record = records.species_records[additive_name]
+        additive_coefficient = float(
+            additive_record["local_microviscosity_coefficient"]
+        )
+        for other_additive_name in additive_names[additive_index + 1 :]:
+            other_additive_record = records.species_records[other_additive_name]
+            other_additive_coefficient = float(
+                other_additive_record["local_microviscosity_coefficient"]
+            )
+            additive_encounter_volume_m3 = _additive_encounter_volume_m3(
+                additive_record,
+                association_cell_radius_m,
+            )
+            other_additive_encounter_volume_m3 = _additive_encounter_volume_m3(
+                other_additive_record,
+                association_cell_radius_m,
+            )
+            collision_exposure += UNORDERED_PAIR_PREFACTOR * N_A * (
+                composition.additive_weight_fractions[additive_name]
+                * additive_coefficient
+                * additive_concentrations_mol_m3[other_additive_name]
+                * other_additive_encounter_volume_m3
+                + composition.additive_weight_fractions[other_additive_name]
+                * other_additive_coefficient
+                * additive_concentrations_mol_m3[additive_name]
+                * additive_encounter_volume_m3
+            )
+    return collision_exposure
+
+
+def _additive_encounter_volume_m3(
+    additive_record: dict,
+    association_cell_radius_m: float,
+) -> float:
+    additive_radius_m = float(
+        additive_record["excluded_volume"]["packing_radius_m"]
+    )
+    return (
+        4.0
+        * math.pi
+        * (association_cell_radius_m + additive_radius_m) ** 3
+        / 3.0
     )
 
 

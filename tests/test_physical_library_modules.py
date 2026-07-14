@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from constants import T_REF_K
+from constants import CP_TO_PA_S, MOL_M3_PER_MOL_L, N_A, T_REF_K
 from conductivity.physical_library import generator_construction
 from conductivity.physical_library import extract_projected_primitives
 from conductivity.physical_library import physical_generator_builder
@@ -27,6 +27,7 @@ from conductivity.physical_library.generator_construction import (
 )
 from conductivity.physical_library.mixture_closures import (
     MixtureComposition,
+    compute_additive_collision_exposure,
     compute_bulk_dielectric_constant,
     compute_bulk_viscosity_Pa_s,
     compute_mixture_closures,
@@ -50,6 +51,7 @@ from conductivity.physical_library.physical_objects import (
     compute_resistance_component_diagnostics,
     compute_resistance_tensor_kg_s,
     _rpy_cross_mobility_block_kg_inv_s,
+    _rpy_hydrodynamic_mobility_kg_inv_s,
     _rigid_body_kinematic_map,
     anion_internal_charge_separation_factor,
     li_anion_feature_coordination_energy_multiplier,
@@ -545,6 +547,7 @@ def test_reduced_generator_assembles_projected_input() -> None:
         mobility_tensor_m2_s=_unit_mobility_tensor_m2_s,
         charge_polarization_gradient=_single_axis_charge_gradient,
         memory_coordinate_gradient=_empty_memory_gradient,
+        state_continuous_memory_family_keys=(("state_0",),),
         state_quadratures=(
             ReducedStateQuadrature(
                 points=np.asarray([[0.0]]),
@@ -584,6 +587,7 @@ def test_physical_object_builder_computes_site_level_objects() -> None:
         viscosity_Pa_s=1.0e-3,
         ionic_strength_mol_m3=1000.0,
         local_packing_fraction=compute_local_packing_fraction(records, configuration),
+        additive_pair_collision_exposure=0.0,
     )
 
     assert np.isfinite(bundle.potential_energy_J_mol)
@@ -592,7 +596,7 @@ def test_physical_object_builder_computes_site_level_objects() -> None:
     assert bundle.charge_polarization_m[0] == pytest.approx(5.0e-10)
     assert bundle.charge_polarization_gradient[0, 0] == pytest.approx(1.0)
     assert bundle.charge_polarization_gradient[0, 3] == pytest.approx(1.0)
-    assert bundle.local_packing_fraction > 0.0
+    assert bundle.local_packing_fraction == 0.0
 
 
 def test_charge_polarization_uses_formal_ion_centers_not_neutral_partial_charges() -> None:
@@ -609,6 +613,7 @@ def test_charge_polarization_uses_formal_ion_centers_not_neutral_partial_charges
             records,
             neutral_configuration,
         ),
+        additive_pair_collision_exposure=0.0,
     )
 
     assert np.array_equal(
@@ -629,6 +634,7 @@ def test_charge_polarization_uses_formal_ion_centers_not_neutral_partial_charges
         viscosity_Pa_s=1.0e-3,
         ionic_strength_mol_m3=1000.0,
         local_packing_fraction=compute_local_packing_fraction(records, ion_configuration),
+        additive_pair_collision_exposure=0.0,
     )
 
     assert ion_bundle.charge_polarization_m[0] == pytest.approx(-5.0e-10)
@@ -700,6 +706,7 @@ def test_physical_generator_builder_exposes_physical_functions() -> None:
             ),
             transition_quadratures=(),
             memory_coordinate_gradient_functions=(),
+            state_continuous_memory_family_keys=(("charged_pair",),),
             state_memory_value_matrix=np.zeros((1, 0), dtype=float),
             total_component_concentrations_mol_m3=np.asarray([1.0], dtype=float),
             temperature_K=T_REF_K,
@@ -745,17 +752,25 @@ def test_cloud_atmosphere_wavevector_partition_has_disjoint_limits() -> None:
     assert all_atmosphere_fraction == pytest.approx(0.0)
 
 
-def test_bulk_matrix_properties_exclude_additive_local_field_corrections() -> None:
+def test_bulk_matrix_properties_exclude_additive_transport_corrections() -> None:
     records = load_physical_library(PHYSICAL_LIBRARY_ROOT)
     matrix_composition = MixtureComposition(
         solvent_volume_fractions={"EC": 0.3, "DMC": 0.7},
-        ion_concentrations_mol_m3={"Li+": 1000.0, "PF6-": 1000.0},
+        ion_concentrations_mol_m3={
+            "Li+": MOL_M3_PER_MOL_L,
+            "PF6-": MOL_M3_PER_MOL_L,
+        },
         additive_weight_fractions={},
     )
     additive_composition = MixtureComposition(
         solvent_volume_fractions=matrix_composition.solvent_volume_fractions,
         ion_concentrations_mol_m3=matrix_composition.ion_concentrations_mol_m3,
         additive_weight_fractions={"FEC": 0.1},
+    )
+    multi_additive_composition = MixtureComposition(
+        solvent_volume_fractions=matrix_composition.solvent_volume_fractions,
+        ion_concentrations_mol_m3=matrix_composition.ion_concentrations_mol_m3,
+        additive_weight_fractions={"TPP": 0.02, "PS": 0.01, "VC": 0.005},
     )
 
     assert compute_bulk_dielectric_constant(
@@ -764,6 +779,21 @@ def test_bulk_matrix_properties_exclude_additive_local_field_corrections() -> No
     assert compute_bulk_viscosity_Pa_s(
         records, additive_composition
     ) == pytest.approx(compute_bulk_viscosity_Pa_s(records, matrix_composition))
+    assert compute_bulk_viscosity_Pa_s(
+        records, multi_additive_composition
+    ) == pytest.approx(compute_bulk_viscosity_Pa_s(records, matrix_composition))
+    single_additive_collision_exposure = compute_mixture_closures(
+        records,
+        additive_composition,
+        T_REF_K,
+    ).additive_collision_exposure
+    multi_additive_collision_exposure = compute_mixture_closures(
+        records,
+        multi_additive_composition,
+        T_REF_K,
+    ).additive_collision_exposure
+    assert single_additive_collision_exposure > 0.0
+    assert multi_additive_collision_exposure > single_additive_collision_exposure
     assert records.mixture_record["property_ownership"] == {
         "dielectric": {
             "bulk": "solvent_matrix_reference",
@@ -771,13 +801,126 @@ def test_bulk_matrix_properties_exclude_additive_local_field_corrections() -> No
         },
         "viscosity": {
             "bulk": "solvent_matrix_reference",
-            "local": "Jones_Dole_packing_and_state_additive_microviscosity",
+            "local": "Jones_Dole_and_state_additive_microviscosity",
         },
         "additive_properties": {
-            "bulk": "excluded",
-            "local": "state_configuration_occupancy",
+            "bulk": "none",
+            "local": "state_configuration_multi_additive_coordination_competition",
         },
     }
+
+
+def test_additive_collision_exposure_has_exact_pair_counting() -> None:
+    records = load_physical_library(PHYSICAL_LIBRARY_ROOT)
+    no_additive_composition = MixtureComposition(
+        solvent_volume_fractions={"EC": 0.3, "DMC": 0.7},
+        ion_concentrations_mol_m3={"Li+": 1000.0, "PF6-": 1000.0},
+        additive_weight_fractions={},
+    )
+    single_additive_composition = MixtureComposition(
+        solvent_volume_fractions=no_additive_composition.solvent_volume_fractions,
+        ion_concentrations_mol_m3=no_additive_composition.ion_concentrations_mol_m3,
+        additive_weight_fractions={"FEC": 0.05},
+    )
+    additive_weight_fractions = {"TPP": 0.02, "PS": 0.01}
+    reversed_additive_weight_fractions = dict(
+        reversed(tuple(additive_weight_fractions.items()))
+    )
+    multi_additive_composition = MixtureComposition(
+        solvent_volume_fractions=no_additive_composition.solvent_volume_fractions,
+        ion_concentrations_mol_m3=no_additive_composition.ion_concentrations_mol_m3,
+        additive_weight_fractions=additive_weight_fractions,
+    )
+    reversed_multi_additive_composition = MixtureComposition(
+        solvent_volume_fractions=no_additive_composition.solvent_volume_fractions,
+        ion_concentrations_mol_m3=no_additive_composition.ion_concentrations_mol_m3,
+        additive_weight_fractions=reversed_additive_weight_fractions,
+    )
+
+    reference_density_kg_m3 = float(records.mixture_record["reference_density_kg_m3"])
+    fec_record = records.species_records["FEC"]
+    fec_concentration_mol_m3 = (
+        0.05
+        * reference_density_kg_m3
+        / float(fec_record["molecular_weight_kg_mol"])
+    )
+    expected_single_exposure = (
+        N_A
+        * fec_concentration_mol_m3
+        * float(fec_record["excluded_volume"]["hard_core_volume_m3"])
+        * float(fec_record["local_microviscosity_coefficient"])
+    )
+    single_exposure = compute_additive_collision_exposure(
+        records,
+        single_additive_composition,
+    )
+    multi_exposure = compute_additive_collision_exposure(
+        records,
+        multi_additive_composition,
+    )
+    independent_occupancy_exposure = sum(
+        N_A
+        * additive_weight_fraction
+        * reference_density_kg_m3
+        / float(records.species_records[additive_name]["molecular_weight_kg_mol"])
+        * float(
+            records.species_records[additive_name]["excluded_volume"][
+                "hard_core_volume_m3"
+            ]
+        )
+        * float(
+            records.species_records[additive_name][
+                "local_microviscosity_coefficient"
+            ]
+        )
+        for additive_name, additive_weight_fraction in additive_weight_fractions.items()
+    )
+    association_cell_radius_m = float(
+        records.basis_record["pair_basins"]["r_free_m"]
+    )
+    additive_concentrations_mol_m3 = {
+        additive_name: additive_weight_fraction
+        * reference_density_kg_m3
+        / float(records.species_records[additive_name]["molecular_weight_kg_mol"])
+        for additive_name, additive_weight_fraction in additive_weight_fractions.items()
+    }
+    additive_encounter_volumes_m3 = {
+        additive_name: (
+            4.0
+            * np.pi
+            * (
+                association_cell_radius_m
+                + float(
+                    records.species_records[additive_name]["excluded_volume"][
+                        "packing_radius_m"
+                    ]
+                )
+            )
+            ** 3
+            / 3.0
+        )
+        for additive_name in additive_weight_fractions
+    }
+    expected_unlike_pair_exposure = (1.0 / 2.0) * N_A * (
+        additive_weight_fractions["TPP"]
+        * float(records.species_records["TPP"]["local_microviscosity_coefficient"])
+        * additive_concentrations_mol_m3["PS"]
+        * additive_encounter_volumes_m3["PS"]
+        + additive_weight_fractions["PS"]
+        * float(records.species_records["PS"]["local_microviscosity_coefficient"])
+        * additive_concentrations_mol_m3["TPP"]
+        * additive_encounter_volumes_m3["TPP"]
+    )
+
+    assert compute_additive_collision_exposure(records, no_additive_composition) == 0.0
+    assert single_exposure == pytest.approx(expected_single_exposure)
+    assert multi_exposure == pytest.approx(
+        independent_occupancy_exposure + expected_unlike_pair_exposure
+    )
+    assert compute_additive_collision_exposure(
+        records,
+        reversed_multi_additive_composition,
+    ) == pytest.approx(multi_exposure)
 
 
 def test_mixture_basin_memory_and_transition_builders_are_executable() -> None:
@@ -913,7 +1056,8 @@ def test_mixture_basin_memory_and_transition_builders_are_executable() -> None:
             ),
             transition_quadratures=(transition.transition_quadrature,),
             memory_coordinate_gradient_functions=(),
-            state_memory_value_matrix=np.zeros((1, 0), dtype=float),
+            state_continuous_memory_family_keys=(("first",), ("second",)),
+            state_memory_value_matrix=np.zeros((2, 0), dtype=float),
             total_component_concentrations_mol_m3=np.asarray([1.0, 1.0], dtype=float),
             temperature_K=T_REF_K,
             volume_m3=1.0,
@@ -997,6 +1141,7 @@ def test_physical_generator_registry_keeps_species_distinct_at_identical_coordin
         viscosity_Pa_s=1.0e-3,
         ionic_strength_mol_m3=1000.0,
         local_packing_fraction=0.2,
+        additive_pair_collision_exposure=0.0,
     )
     signatures = (
         physical_generator_builder._configuration_identity_signature(
@@ -1303,8 +1448,12 @@ def test_mixed_salt_recipe_keeps_additive_stoichiometry_and_transition_channel()
         switch_name="Li_ligand",
     )
 
-    assert additive_local_fields.viscosity_Pa_s > non_additive_local_fields.viscosity_Pa_s
-    assert compute_local_packing_fraction(records, additive_configuration) > (
+    assert additive_local_fields.viscosity_Pa_s == pytest.approx(
+        non_additive_local_fields.viscosity_Pa_s
+    )
+    assert additive_local_fields.additive_pair_collision_exposure > 0.0
+    assert non_additive_local_fields.additive_pair_collision_exposure > 0.0
+    assert compute_local_packing_fraction(records, additive_configuration) >= (
         compute_local_packing_fraction(records, non_additive_configuration)
     )
     assert additive_ligand_coordination > 0.0
@@ -1378,6 +1527,11 @@ def _compute_conductivity_from_recipe_context(
                 state_quadratures=state_quadratures,
                 transition_quadratures=transition_quadratures,
                 memory_coordinate_gradient_functions=memory_gradient_functions,
+                state_continuous_memory_family_keys=(
+                    generator_construction._state_family_memory_keys(
+                        state_quadratures
+                    )
+                ),
                 state_memory_value_matrix=(
                     generator_construction._state_family_memory_value_matrix(
                         state_quadratures,
@@ -1488,10 +1642,12 @@ def test_reference_recipe_primitive_owner_audit_table() -> None:
     expected_statuses = ("correct", "correct", "correct", "correct")
 
     for recipe_path in recipe_paths:
-        conductivity_result = generator_construction.compute_conductivity_from_recipe(
-            recipe_path,
-            PHYSICAL_LIBRARY_ROOT,
-            numerical_options,
+        conductivity_result = (
+            generator_construction.compute_analytical_conductivity_from_recipe(
+                recipe_path,
+                PHYSICAL_LIBRARY_ROOT,
+                numerical_options,
+            )
         )
         owner_rows = primitive_owner_audit_table(
             recipe_path.name,
@@ -1525,11 +1681,13 @@ def test_reference_recipe_primitive_owner_audit_table() -> None:
             "R_atmosphere_relaxation_trace_kg_s",
             "R_atmosphere_cross_trace_kg_s",
             "R_free_volume_trace_kg_s",
+            "local_packing_fraction",
             "R_cage_constraint_trace_kg_s",
             "R_ligand_shell_obstruction_trace_kg_s",
             "R_aggregate_constraint_trace_kg_s",
             "R_bridge_constraint_trace_kg_s",
             "R_orientation_denticity_trace_kg_s",
+            "R_additive_environment_trace_kg_s",
             "mori_mode_labels",
             "incident_transition_edge_indices",
         }
@@ -1537,29 +1695,136 @@ def test_reference_recipe_primitive_owner_audit_table() -> None:
             set(primitive_owner_record) == required_primitive_owner_fields
             for primitive_owner_record in primitive_owner_table
         )
+        state_labels = tuple(
+            str(label)
+            for label in conductivity_result.effect_attribution["state_labels"]
+        )
+        assert not any(
+            "neutral_ligand_bound" in state_label
+            and "hop_inactive" not in state_label
+            for state_label in state_labels
+        )
+        transition_families = tuple(
+            str(family)
+            for family in conductivity_result.effect_attribution[
+                "transition_edge_families"
+            ]
+        )
+        structural_hop_edge_indices = tuple(
+            edge_index
+            for edge_index, family in enumerate(transition_families)
+            if family == "structural_hop"
+        )
+        assert structural_hop_edge_indices
+        transition_capacity_fluxes = np.asarray(
+            conductivity_result.effect_attribution[
+                "transition_edge_capacity_fluxes_K_ij_mol_m3_s"
+            ],
+            dtype=float,
+        )
+        transition_forward_rates = np.asarray(
+            conductivity_result.effect_attribution[
+                "transition_edge_forward_rates_Q_ij_s_inv"
+            ],
+            dtype=float,
+        )
+        transition_reverse_rates = np.asarray(
+            conductivity_result.effect_attribution[
+                "transition_edge_reverse_rates_Q_ji_s_inv"
+            ],
+            dtype=float,
+        )
+        transition_second_moment_traces = np.asarray(
+            conductivity_result.effect_attribution[
+                "transition_edge_second_moment_traces_m2"
+            ],
+            dtype=float,
+        )
+        for edge_index in structural_hop_edge_indices:
+            assert transition_capacity_fluxes[edge_index] > 0.0
+            assert transition_forward_rates[edge_index] > 0.0
+            assert transition_reverse_rates[edge_index] > 0.0
+            assert transition_second_moment_traces[edge_index] > 0.0
+        partition_measure_ledger = conductivity_result.effect_attribution[
+            "state_partition_measure_ledger"
+        ]
+        assert len(partition_measure_ledger) == len(
+            conductivity_result.state_concentrations_mol_m3
+        )
+        required_partition_fields = {
+            "state_index",
+            "state_label",
+            "energy_reference_over_RT",
+            "declared_association_free_energy_over_RT",
+            "log_relative_partition_integral",
+            "chemical_potential_term_nu_dot_lambda",
+            "log_standard_concentration",
+            "log_concentration_mol_m3",
+            "concentration_mol_m3",
+            "relative_internal_energy_range_over_RT",
+            "symmetry_number",
+            "degeneracy",
+        }
+        assert all(
+            set(partition_record) == required_partition_fields
+            for partition_record in partition_measure_ledger
+        )
+        assert np.allclose(
+            [
+                partition_record["concentration_mol_m3"]
+                for partition_record in partition_measure_ledger
+            ],
+            conductivity_result.state_concentrations_mol_m3,
+            rtol=1.0e-10,
+            atol=1.0e-12,
+        )
+        assert conductivity_result.effect_attribution[
+            "relative_log_partition_span"
+        ] <= conductivity_result.effect_attribution[
+            "maximum_relative_log_partition_span"
+        ]
         assert expected_min_mS_cm <= conductivity_result.sigma_mS_cm <= expected_max_mS_cm
         ownership_state_tensors = conductivity_result.effect_attribution[
             "transport_ownership_state_tensors"
         ]
         assert ownership_state_tensors
-        for ownership_state_tensor in ownership_state_tensors:
+        for state_index, ownership_state_tensor in enumerate(ownership_state_tensors):
             short_mobility_tensor = ownership_state_tensor["D_Q_short"]
             unowned_mobility_tensor = ownership_state_tensor["D_Q_unowned"]
-            ownership_scale_m2_s = max(
-                float(np.linalg.norm(short_mobility_tensor, ord=2)),
-                np.finfo(float).tiny,
+            owner_tensors = (
+                ownership_state_tensor["D_Q_dc_self"],
+                ownership_state_tensor["D_Q_transition_owned"],
+                ownership_state_tensor["D_Q_bounded_memory"],
+                ownership_state_tensor["D_Q_diagnostic"],
             )
-            assert float(np.linalg.norm(unowned_mobility_tensor, ord=2)) <= (
-                64.0 * np.finfo(float).eps * ownership_scale_m2_s
+            ownership_subtraction_scale_m2_s = float(
+                np.linalg.norm(short_mobility_tensor, ord=2)
+            ) + sum(
+                float(np.linalg.norm(owner_tensor, ord=2))
+                for owner_tensor in owner_tensors
             )
+            subtraction_tolerance_m2_s = (
+                64.0
+                * np.sqrt(np.finfo(float).eps)
+                * ownership_subtraction_scale_m2_s
+            )
+            recorded_closure_tolerance_m2_s = conductivity_result.state_transport_ownership_quadratures[
+                state_index
+            ].maximum_closure_residual_m2_s
+            assert float(np.linalg.norm(unowned_mobility_tensor, ord=2)) <= max(
+                subtraction_tolerance_m2_s,
+                recorded_closure_tolerance_m2_s
+                * (1.0 + np.sqrt(np.finfo(float).eps)),
+            )
+            owned_sum_mobility_tensor = sum(owner_tensors)
             assert np.allclose(
-                ownership_state_tensor["D_Q_short"],
-                ownership_state_tensor["D_Q_dc_self"]
-                + ownership_state_tensor["D_Q_transition_owned"]
-                + ownership_state_tensor["D_Q_bounded_memory"]
-                + ownership_state_tensor["D_Q_diagnostic"],
-                rtol=1.0e-10,
-                atol=1.0e-30,
+                short_mobility_tensor - owned_sum_mobility_tensor,
+                unowned_mobility_tensor,
+                rtol=0.0,
+                atol=max(
+                    subtraction_tolerance_m2_s,
+                    recorded_closure_tolerance_m2_s,
+                ),
             )
         assert conductivity_result.effect_attribution[
             "primitive_prediction_scalar_label"
@@ -1585,9 +1850,16 @@ def test_reference_recipe_primitive_owner_audit_table() -> None:
         assert all(
             mode["transport_ownership"] == "bounded_memory"
             and mode["A_mu_mu"] > 0.0
-            and mode["h_mu_A_pseudoinverse_h_contribution"] >= 0.0
             and mode["state_support"]
             for mode in mori_mode_ledger
+        )
+        mori_mode_contribution_sum = sum(
+            mode["h_mu_A_pseudoinverse_h_contribution"]
+            for mode in mori_mode_ledger
+        )
+        assert mori_mode_contribution_sum >= 0.0
+        assert mori_mode_contribution_sum == pytest.approx(
+            float(np.trace(conductivity_result.continuous_mori_correction_tensor))
         )
         for resistance_trace_key in (
             "state_resistance_stokes_traces_kg_s",
@@ -2226,31 +2498,62 @@ def test_anion_internal_charge_separation_amplifies_li_coordination_response() -
     ) == pytest.approx(1.0 + separation_factor)
 
 
-def test_additive_microviscosity_comes_from_species_feature_record() -> None:
+def test_local_viscosity_excludes_configuration_additive_multiplier() -> None:
     records = load_physical_library(PHYSICAL_LIBRARY_ROOT)
     configuration = _lithium_pf6_fec_configuration(pair_distance_m=4.0e-10)
-    molecule_keys = tuple(
-        dict.fromkeys(
-            zip(
-                configuration.species_names,
-                np.asarray(configuration.molecule_ids, dtype=int),
-                strict=True,
-            )
-        )
-    )
-    additive_molecule_count = sum(
-        species_name == "FEC" for species_name, _molecule_id in molecule_keys
-    )
-
-    expected_fraction = (
-        additive_molecule_count
-        * float(records.species_records["FEC"]["local_microviscosity_coefficient"])
-        / len(molecule_keys)
-    )
-    assert generator_construction._configuration_additive_fraction(
+    local_viscosity_Pa_s = generator_construction._local_viscosity_Pa_s(
         records,
         configuration,
-    ) == pytest.approx(expected_fraction)
+        {
+            generator_construction.ReducedCoordinate.LOCAL_VISCOSITY.value: CP_TO_PA_S
+        },
+        local_ionic_strength_mol_m3=0.0,
+        local_packing_fraction=0.0,
+    )
+    assert local_viscosity_Pa_s == pytest.approx(CP_TO_PA_S)
+
+
+def test_additive_collision_exposure_is_attenuated_by_state_coordination() -> None:
+    records = load_physical_library(PHYSICAL_LIBRARY_ROOT)
+    configuration = _lithium_pf6_fec_configuration(pair_distance_m=4.0e-10)
+    unpaired_coordinate_values = {
+        **_local_field_test_coordinate_values(),
+        generator_construction.LOCAL_ADDITIVE_COLLISION_EXPOSURE: 0.4,
+        generator_construction.ReducedCoordinate.LI_ANION_COORDINATION.value: 0.0,
+    }
+    paired_coordinate_values = {
+        **unpaired_coordinate_values,
+        generator_construction.ReducedCoordinate.LI_ANION_COORDINATION.value: 1.0,
+    }
+    unpaired_fields = generator_construction._local_fields_for_coordinate_values(
+        records,
+        configuration,
+        unpaired_coordinate_values,
+    )
+    paired_fields = generator_construction._local_fields_for_coordinate_values(
+        records,
+        configuration,
+        paired_coordinate_values,
+    )
+    unpaired_resistance = physical_objects.compute_state_feature_resistance_components(
+        records,
+        configuration,
+        unpaired_fields.viscosity_Pa_s,
+        unpaired_fields.additive_pair_collision_exposure,
+    )
+    paired_resistance = physical_objects.compute_state_feature_resistance_components(
+        records,
+        configuration,
+        paired_fields.viscosity_Pa_s,
+        paired_fields.additive_pair_collision_exposure,
+    )
+
+    assert paired_fields.additive_pair_collision_exposure == pytest.approx(
+        unpaired_fields.additive_pair_collision_exposure / 2.0
+    )
+    assert np.trace(paired_resistance.additive_environment_tensor_kg_s) == pytest.approx(
+        np.trace(unpaired_resistance.additive_environment_tensor_kg_s) / 2.0
+    )
 
 
 def test_state_quadrature_stores_physical_local_field_laws() -> None:
@@ -2314,9 +2617,10 @@ def test_state_quadrature_stores_physical_local_field_laws() -> None:
     assert local_fields.local_packing_fraction >= coordinate_values[
         generator_construction.ReducedCoordinate.LOCAL_PACKING_FRACTION.value
     ]
-    assert local_fields.ionic_strength_mol_m3 > coordinate_values[
+    assert local_fields.ionic_strength_mol_m3 >= coordinate_values[
         generator_construction.ReducedCoordinate.LOCAL_IONIC_STRENGTH.value
     ]
+    assert local_fields.additive_pair_collision_exposure > 0.0
     assert local_fields.dielectric_constant < coordinate_values[
         generator_construction.ReducedCoordinate.LOCAL_DIELECTRIC.value
     ]
@@ -2457,6 +2761,29 @@ def test_structural_hop_endpoint_geometry_requires_structural_displacement() -> 
         )
 
 
+def test_structural_hop_axis_does_not_create_ligand_bound_conditioning() -> None:
+    structural_hop_coordinate = (
+        generator_construction.ReducedCoordinate.STRUCTURAL_HOP_COORDINATE
+    )
+    coordinate_nodes = (
+        (
+            structural_hop_coordinate,
+            np.zeros(1, dtype=float),
+            np.ones(1, dtype=float),
+        ),
+    )
+
+    conditioning_indices = (
+        generator_construction._transport_axis_conditioning_indices(
+            coordinate_nodes=coordinate_nodes,
+            coordinate_index=0,
+            pair_baseline_indices=[0],
+        )
+    )
+
+    assert conditioning_indices == ((0,),)
+
+
 def test_transition_rate_bounds_fail_loudly() -> None:
     recipe_context = generator_construction.build_recipe_library_context(
         PHYSICAL_LIBRARY_ROOT / "recipe_ec_dmc_lipf6_lifsi_fec.yaml",
@@ -2566,6 +2893,7 @@ def test_atmosphere_resistance_separation_recovers_independent_ion_drag() -> Non
             records,
             colocated_configuration,
         ),
+        additive_pair_collision_exposure=0.0,
     )
     separated_resistance = compute_resistance_tensor_kg_s(
         records,
@@ -2578,6 +2906,7 @@ def test_atmosphere_resistance_separation_recovers_independent_ion_drag() -> Non
             records,
             separated_configuration,
         ),
+        additive_pair_collision_exposure=0.0,
     )
 
     assert float(translation_vector @ separated_resistance @ translation_vector) > float(
@@ -2755,6 +3084,7 @@ def test_resistance_component_diagnostics_expose_finite_thickness_shape_drag() -
         local_fields.ionic_strength_mol_m3,
         recipe_context.temperature_K,
         local_fields.local_packing_fraction,
+        local_fields.additive_pair_collision_exposure,
     )
 
     assert 0.0 < diagnostics.free_volume_trace_kg_s < diagnostics.stokes_trace_kg_s
@@ -2768,11 +3098,13 @@ def test_resistance_component_diagnostics_expose_finite_thickness_shape_drag() -
     )
     assert all(trace_kg_s >= 0.0 for trace_kg_s in state_feature_traces_kg_s)
     assert sum(state_feature_traces_kg_s) > 0.0
+    assert diagnostics.additive_environment_trace_kg_s >= 0.0
     assert diagnostics.total_trace_kg_s == pytest.approx(
         diagnostics.stokes_trace_kg_s
         + diagnostics.free_volume_trace_kg_s
         + diagnostics.charge_cloud_trace_kg_s
         + diagnostics.atmosphere_trace_kg_s
+        + diagnostics.additive_environment_trace_kg_s
         + sum(state_feature_traces_kg_s)
     )
     maximum_feature_traces_kg_s = np.max(
@@ -2800,6 +3132,7 @@ def test_resistance_component_diagnostics_expose_finite_thickness_shape_drag() -
                         candidate_fields.ionic_strength_mol_m3,
                         recipe_context.temperature_K,
                         candidate_fields.local_packing_fraction,
+                        candidate_fields.additive_pair_collision_exposure,
                     ),
                 )
             ],
@@ -2966,6 +3299,7 @@ def _local_fields(
         viscosity_Pa_s=viscosity_Pa_s,
         ionic_strength_mol_m3=ionic_strength_mol_m3,
         local_packing_fraction=compute_local_packing_fraction(records, configuration),
+        additive_pair_collision_exposure=0.0,
     )
 
 
@@ -3049,6 +3383,52 @@ def _lithium_pf6_configuration(pair_distance_m: float) -> SiteConfiguration:
         ),
         box_lengths_m=np.asarray([1.0e-8, 1.0e-8, 1.0e-8], dtype=float),
     )
+
+
+def test_bounded_cluster_polarization_is_translation_invariant() -> None:
+    records = load_physical_library(PHYSICAL_LIBRARY_ROOT)
+    configuration = _lithium_pf6_configuration(3.0e-10)
+    translation_m = np.asarray([4.0e-10, -2.0e-10, 1.0e-10], dtype=float)
+    translated_configuration = SiteConfiguration(
+        species_names=configuration.species_names,
+        molecule_ids=configuration.molecule_ids,
+        site_ids=configuration.site_ids,
+        positions_m=configuration.positions_m + translation_m,
+        unwrapped_positions_m=configuration.unwrapped_positions_m + translation_m,
+        box_lengths_m=configuration.box_lengths_m,
+    )
+
+    for cartesian_axis in range(3):
+        original_value = (
+            generator_construction._bounded_internal_polarization_memory_value_for_axis(
+                records,
+                configuration,
+                cartesian_axis,
+            )
+        )
+        translated_value = (
+            generator_construction._bounded_internal_polarization_memory_value_for_axis(
+                records,
+                translated_configuration,
+                cartesian_axis,
+            )
+        )
+        gradient = (
+            generator_construction._bounded_internal_polarization_memory_gradient_for_axis(
+                records,
+                configuration,
+                cartesian_axis,
+            )
+        )
+        uniform_translation = np.tile(
+            np.eye(3, dtype=float)[cartesian_axis],
+            len(configuration.species_names),
+        )
+        assert translated_value == pytest.approx(original_value)
+        assert (gradient @ uniform_translation).item() == pytest.approx(
+            0.0,
+            abs=1.0e-15,
+        )
 
 
 def _lithium_full_pf6_configuration(pair_distance_m: float) -> SiteConfiguration:
@@ -3167,6 +3547,7 @@ def _single_site_charged_species_record(
     charge_number: float,
     charge_cloud_radius_m: float,
 ) -> dict:
+    hard_core_volume_m3 = 4.0 * np.pi * (1.0e-10) ** 3 / 3.0
     return {
         "role": role,
         "formal_charge_e": charge_number,
@@ -3175,6 +3556,12 @@ def _single_site_charged_species_record(
         "partial_molar_volume_m3_mol": 1.0e-5,
         "dielectric_constant": 1.0,
         "viscosity_Pa_s": 1.0e-3,
+        "excluded_volume": {
+            "model": "union_vdw_spheres",
+            "hard_core_volume_m3": hard_core_volume_m3,
+            "packing_radius_m": 1.0e-10,
+            "provenance": "geometry_derived",
+        },
         "sites": (
             {
                 "site_id": 0,
@@ -3197,6 +3584,7 @@ def _single_site_charged_species_record(
         "angles": (),
         "torsions": (),
         "constraints": (),
+        "reference_conformer_coordinates_m": ((0.0, 0.0, 0.0),),
     }
 
 
@@ -3241,6 +3629,47 @@ def test_unequal_radius_regularized_rpy_is_continuous_at_regime_boundaries() -> 
             atol=0.0,
         )
         np.testing.assert_allclose(below_block, below_block.T, rtol=0.0, atol=0.0)
+
+
+def test_rpy_uses_one_unwrapped_free_space_geometry_across_box_boundary() -> None:
+    records = load_physical_library(PHYSICAL_LIBRARY_ROOT)
+    viscosity_Pa_s = CP_TO_PA_S
+    box_length_m = 4.0e-9
+    first_unwrapped_position_m = np.asarray([0.1e-9, 0.0, 0.0], dtype=float)
+    second_unwrapped_position_m = np.asarray([4.5e-9, 0.0, 0.0], dtype=float)
+    configuration = SiteConfiguration(
+        species_names=("Li+", "Li+"),
+        molecule_ids=np.asarray([0, 1], dtype=int),
+        site_ids=np.asarray([0, 0], dtype=int),
+        positions_m=np.asarray(
+            [first_unwrapped_position_m, second_unwrapped_position_m % box_length_m],
+            dtype=float,
+        ),
+        unwrapped_positions_m=np.asarray(
+            [first_unwrapped_position_m, second_unwrapped_position_m],
+            dtype=float,
+        ),
+        box_lengths_m=np.full(3, box_length_m, dtype=float),
+    )
+
+    mobility = _rpy_hydrodynamic_mobility_kg_inv_s(
+        records,
+        configuration,
+        viscosity_Pa_s,
+    )
+    lithium_radius_m = float(
+        records.species_records["Li+"]["sites"][0]["hydrodynamic_radius_m"]
+    )
+    expected_cross_block = _rpy_cross_mobility_block_kg_inv_s(
+        second_unwrapped_position_m - first_unwrapped_position_m,
+        lithium_radius_m,
+        lithium_radius_m,
+        viscosity_Pa_s,
+    )
+
+    np.testing.assert_allclose(mobility[:3, 3:], expected_cross_block)
+    np.testing.assert_allclose(mobility, mobility.T)
+    assert float(np.min(np.linalg.eigvalsh(mobility))) >= 0.0
 
 
 def test_rigid_kinematic_map_preserves_all_intramolecular_distances() -> None:
@@ -3312,6 +3741,7 @@ def _local_field_test_coordinate_values() -> dict[str, float]:
         generator_construction.ReducedCoordinate.LOCAL_IONIC_STRENGTH.value: 500.0,
         generator_construction.ReducedCoordinate.LOCAL_DIELECTRIC.value: 50.0,
         generator_construction.ReducedCoordinate.LOCAL_VISCOSITY.value: 1.0e-3,
+        generator_construction.LOCAL_ADDITIVE_COLLISION_EXPOSURE: 0.0,
         generator_construction.ReducedCoordinate.ATMOSPHERE_POLARIZATION.value: 0.0,
         generator_construction.ReducedCoordinate.CAGE_COORDINATE.value: 0.0,
         generator_construction.ReducedCoordinate.PARTNER_RESIDENCE_COORDINATE.value: 0.0,
@@ -3356,6 +3786,7 @@ def _physical_objects_for_local_fields(
         local_fields.viscosity_Pa_s,
         local_fields.ionic_strength_mol_m3,
         local_fields.local_packing_fraction,
+        local_fields.additive_pair_collision_exposure,
     )
 
 

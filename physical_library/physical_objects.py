@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 import math
+from threading import RLock
 
 import numpy as np
 
@@ -17,6 +18,8 @@ from utils.strict_validation import (
 
 Array = np.ndarray
 _BONDED_ENERGY_CACHE: dict[tuple, float] = {}
+_ATMOSPHERE_DIAGNOSTICS_CACHE: dict[tuple, AtmosphereResistanceDiagnostics] = {}
+_ATMOSPHERE_DIAGNOSTICS_CACHE_LOCK = RLock()
 
 CARTESIAN_DIMENSION = 3
 LJ_ATTRACTIVE_EXPONENT = 6  # Explicit constant: Lennard-Jones 12-6 attractive exponent.
@@ -91,6 +94,7 @@ class ResistanceComponentDiagnostics:
     aggregate_constraint_trace_kg_s: float
     bridge_constraint_trace_kg_s: float
     orientation_denticity_trace_kg_s: float
+    additive_environment_trace_kg_s: float
     total_trace_kg_s: float
 
 
@@ -101,6 +105,7 @@ class StateFeatureResistanceComponents:
     aggregate_constraint_tensor_kg_s: Array
     bridge_constraint_tensor_kg_s: Array
     orientation_denticity_tensor_kg_s: Array
+    additive_environment_tensor_kg_s: Array
 
     @property
     def total_tensor_kg_s(self) -> Array:
@@ -110,6 +115,7 @@ class StateFeatureResistanceComponents:
             + self.aggregate_constraint_tensor_kg_s
             + self.bridge_constraint_tensor_kg_s
             + self.orientation_denticity_tensor_kg_s
+            + self.additive_environment_tensor_kg_s
         )
 
 
@@ -121,6 +127,7 @@ def build_physical_objects(
     viscosity_Pa_s: float,
     ionic_strength_mol_m3: float,
     local_packing_fraction: float,
+    additive_pair_collision_exposure: float,
 ) -> PhysicalObjectBundle:
     """Compute U, D, P, gradient(P), and local packing from site records."""
 
@@ -172,6 +179,7 @@ def build_physical_objects(
             dielectric_constant,
             ionic_strength_mol_m3,
             local_packing_fraction,
+            additive_pair_collision_exposure,
         ),
         charge_polarization_m=compute_charge_polarization_m(records, configuration),
         charge_polarization_gradient=compute_charge_polarization_gradient(
@@ -550,11 +558,149 @@ def compute_local_packing_fraction(
     records: PhysicalLibraryRecords,
     configuration: SiteConfiguration,
 ) -> float:
-    cell_volume_m3 = _cell_volume_m3(configuration.box_lengths_m)
-    occupied_volume_m3 = 0.0
-    for site_index in range(len(configuration.species_names)):
-        occupied_volume_m3 += float(_site_record(records, configuration, site_index)["volume_m3"])
-    return occupied_volume_m3 / cell_volume_m3
+    local_packing_fraction = _local_molecular_packing_fraction(records, configuration)
+    phi_max = float(records.mixture_record["packing"]["phi_max"])
+    if not 0.0 <= local_packing_fraction < phi_max:
+        raise ValueError(
+            "state-local excluded-volume packing exceeds phi_max: "
+            f"packing_fraction={local_packing_fraction:.12g}, phi_max={phi_max:.12g}"
+        )
+    return local_packing_fraction
+
+
+def local_molecular_packing_is_feasible(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+) -> bool:
+    """Return whether a candidate state satisfies the molecular packing limit."""
+    local_packing_fraction = _local_molecular_packing_fraction(records, configuration)
+    phi_max = float(records.mixture_record["packing"]["phi_max"])
+    return 0.0 <= local_packing_fraction < phi_max
+
+
+def _local_molecular_packing_fraction(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+) -> float:
+    molecule_records = _state_feature_molecule_records(
+        records,
+        configuration,
+        viscosity_Pa_s=1.0,
+    )
+    cation_keys = tuple(
+        molecule_key
+        for molecule_key, molecule_record in molecule_records.items()
+        if molecule_record[0] == "cation"
+    )
+    if not cation_keys:
+        return UNITY - UNITY
+    minimum_kernel_radius_m = float(
+        records.basis_record["coordination_switches"]["Li_solvent"]["r0_m"]
+    )
+    coordination_switch_by_role = {
+        "anion": "Li_anion",
+        "solvent": "Li_solvent",
+        "additive": "Li_ligand",
+    }
+    quadrature_order = int(records.mixture_record["packing"]["union_quadrature_order"])
+    if quadrature_order < 2:
+        raise ValueError("packing union_quadrature_order must be at least two")
+    local_packing_fractions = []
+    for cation_key in cation_keys:
+        cation_record = molecule_records[cation_key]
+        neighbor_site_indices = tuple(
+            site_index
+            for neighbor_key, neighbor_record in molecule_records.items()
+            if neighbor_key != cation_key
+            and neighbor_record[0] in coordination_switch_by_role
+            for site_index in neighbor_record[2]
+        )
+        local_packing_fractions.append(
+            _site_sphere_union_fraction_in_local_sphere(
+                records,
+                configuration,
+                neighbor_site_indices,
+                cation_record[1],
+                minimum_kernel_radius_m,
+                quadrature_order,
+            )
+        )
+    return max(local_packing_fractions)
+
+
+def _site_sphere_union_fraction_in_local_sphere(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+    neighbor_site_indices: tuple[int, ...],
+    local_center_m: Array,
+    local_radius_m: float,
+    quadrature_order: int,
+) -> float:
+    if not neighbor_site_indices:
+        return 0.0
+    quadrature_nodes, quadrature_weights = np.polynomial.legendre.leggauss(
+        quadrature_order
+    )
+    radial_coordinates_m = local_radius_m * (quadrature_nodes + UNITY) / 2.0
+    radial_weights = (
+        local_radius_m
+        * quadrature_weights
+        * radial_coordinates_m**2
+        / 2.0
+    )
+    cosine_coordinates = quadrature_nodes
+    cosine_weights = quadrature_weights
+    azimuthal_coordinates = math.pi * (quadrature_nodes + UNITY)
+    azimuthal_weights = math.pi * quadrature_weights
+    radial_grid_m, cosine_grid, azimuthal_grid = np.meshgrid(
+        radial_coordinates_m,
+        cosine_coordinates,
+        azimuthal_coordinates,
+        indexing="ij",
+    )
+    sine_grid = np.sqrt(np.maximum(0.0, UNITY - cosine_grid**2))
+    local_points_m = np.asarray(local_center_m, dtype=float) + np.stack(
+        (
+            radial_grid_m * sine_grid * np.cos(azimuthal_grid),
+            radial_grid_m * sine_grid * np.sin(azimuthal_grid),
+            radial_grid_m * cosine_grid,
+        ),
+        axis=-1,
+    ).reshape(-1, CARTESIAN_DIMENSION)
+    point_weights = (
+        radial_weights[:, np.newaxis, np.newaxis]
+        * cosine_weights[np.newaxis, :, np.newaxis]
+        * azimuthal_weights[np.newaxis, np.newaxis, :]
+    ).reshape(-1)
+    neighbor_positions_m = np.asarray(
+        configuration.positions_m[np.asarray(neighbor_site_indices, dtype=int)],
+        dtype=float,
+    )
+    point_to_site_vectors_m = (
+        neighbor_positions_m[np.newaxis, :, :]
+        - local_points_m[:, np.newaxis, :]
+    )
+    point_to_site_vectors_m -= configuration.box_lengths_m * np.round(
+        point_to_site_vectors_m / configuration.box_lengths_m
+    )
+    site_radii_m = np.asarray(
+        [
+            float(
+                _site_record(records, configuration, site_index)["steric_radius_m"]
+            )
+            for site_index in neighbor_site_indices
+        ],
+        dtype=float,
+    )
+    occupied_points = np.any(
+        np.sum(point_to_site_vectors_m**2, axis=2) <= site_radii_m[np.newaxis, :] ** 2,
+        axis=1,
+    )
+    total_weight = float(np.sum(point_weights))
+    occupied_weight = float(np.sum(point_weights[occupied_points]))
+    if total_weight <= 0.0:
+        raise ValueError("packing union quadrature produced nonpositive volume")
+    return occupied_weight / total_weight
 
 
 def compute_packing_energy_J_mol(
@@ -609,8 +755,10 @@ def _rpy_hydrodynamic_mobility_kg_inv_s(
     viscosity_Pa_s: float,
 ) -> Array:
     site_records = _configuration_site_records(records, configuration)
-    positions_m = np.asarray(configuration.positions_m, dtype=float)
-    box_lengths_m = np.asarray(configuration.box_lengths_m, dtype=float)
+    unwrapped_positions_m = np.asarray(
+        configuration.unwrapped_positions_m,
+        dtype=float,
+    )
     site_count = len(site_records)
     mobility = np.zeros(
         (CARTESIAN_DIMENSION * site_count, CARTESIAN_DIMENSION * site_count),
@@ -636,8 +784,10 @@ def _rpy_hydrodynamic_mobility_kg_inv_s(
         mobility[first_slice, first_slice] = first_self_mobility * identity
         for second_site_index in range(first_site_index + 1, site_count):
             second_radius_m = radii_m[second_site_index]
-            displacement_m = positions_m[second_site_index] - positions_m[first_site_index]
-            displacement_m -= box_lengths_m * np.rint(displacement_m / box_lengths_m)
+            displacement_m = (
+                unwrapped_positions_m[second_site_index]
+                - unwrapped_positions_m[first_site_index]
+            )
             cross_mobility = _rpy_cross_mobility_block_kg_inv_s(
                 displacement_m,
                 first_radius_m,
@@ -726,6 +876,7 @@ def compute_mobility_tensor_m2_s(
     dielectric_constant: float,
     ionic_strength_mol_m3: float,
     local_packing_fraction: float,
+    additive_pair_collision_exposure: float,
 ) -> Array:
     resistance = compute_resistance_tensor_kg_s(
         records,
@@ -735,6 +886,7 @@ def compute_mobility_tensor_m2_s(
         ionic_strength_mol_m3,
         temperature_K,
         local_packing_fraction,
+        additive_pair_collision_exposure,
     )
     constrained_mobility = _rigid_constrained_mobility_kg_inv_s(
         records,
@@ -917,6 +1069,7 @@ def compute_resistance_tensor_kg_s(
     ionic_strength_mol_m3: float,
     temperature_K: float,
     local_packing_fraction: float,
+    additive_pair_collision_exposure: float,
 ) -> Array:
     if viscosity_Pa_s <= 0.0:
         raise ValueError("viscosity_Pa_s must be positive")
@@ -978,6 +1131,7 @@ def compute_resistance_tensor_kg_s(
         records,
         configuration,
         viscosity_Pa_s,
+        additive_pair_collision_exposure,
     ).total_tensor_kg_s
     return resistance
 
@@ -990,6 +1144,7 @@ def compute_resistance_component_diagnostics(
     ionic_strength_mol_m3: float,
     temperature_K: float,
     local_packing_fraction: float,
+    additive_pair_collision_exposure: float,
 ) -> ResistanceComponentDiagnostics:
     if viscosity_Pa_s <= 0.0:
         raise ValueError("viscosity_Pa_s must be positive")
@@ -1040,6 +1195,7 @@ def compute_resistance_component_diagnostics(
         records,
         configuration,
         viscosity_Pa_s,
+        additive_pair_collision_exposure,
     )
     cage_constraint_trace_kg_s = float(
         np.trace(feature_components.cage_constraint_tensor_kg_s)
@@ -1056,6 +1212,9 @@ def compute_resistance_component_diagnostics(
     orientation_denticity_trace_kg_s = float(
         np.trace(feature_components.orientation_denticity_tensor_kg_s)
     )
+    additive_environment_trace_kg_s = float(
+        np.trace(feature_components.additive_environment_tensor_kg_s)
+    )
     return ResistanceComponentDiagnostics(
         stokes_trace_kg_s=stokes_trace_kg_s,
         free_volume_trace_kg_s=free_volume_trace_kg_s,
@@ -1066,6 +1225,7 @@ def compute_resistance_component_diagnostics(
         aggregate_constraint_trace_kg_s=aggregate_constraint_trace_kg_s,
         bridge_constraint_trace_kg_s=bridge_constraint_trace_kg_s,
         orientation_denticity_trace_kg_s=orientation_denticity_trace_kg_s,
+        additive_environment_trace_kg_s=additive_environment_trace_kg_s,
         total_trace_kg_s=(
             stokes_trace_kg_s
             + free_volume_trace_kg_s
@@ -1076,6 +1236,7 @@ def compute_resistance_component_diagnostics(
             + aggregate_constraint_trace_kg_s
             + bridge_constraint_trace_kg_s
             + orientation_denticity_trace_kg_s
+            + additive_environment_trace_kg_s
         ),
     )
 
@@ -1084,14 +1245,22 @@ def compute_state_feature_resistance_components(
     records: PhysicalLibraryRecords,
     configuration: SiteConfiguration,
     viscosity_Pa_s: float,
+    additive_pair_collision_exposure: float,
 ) -> StateFeatureResistanceComponents:
     """Build local PSD resistance operators from coordination and ionic geometry."""
 
     if viscosity_Pa_s <= 0.0:
         raise ValueError("viscosity_Pa_s must be positive")
     coordinate_count = CARTESIAN_DIMENSION * len(configuration.species_names)
-    components = [np.zeros((coordinate_count, coordinate_count), dtype=float) for _ in range(5)]
-    cage_tensor, ligand_tensor, aggregate_tensor, bridge_tensor, orientation_tensor = components
+    components = [np.zeros((coordinate_count, coordinate_count), dtype=float) for _ in range(6)]
+    (
+        cage_tensor,
+        ligand_tensor,
+        aggregate_tensor,
+        bridge_tensor,
+        orientation_tensor,
+        additive_environment_tensor,
+    ) = components
     molecule_records = _state_feature_molecule_records(
         records, configuration, viscosity_Pa_s
     )
@@ -1101,6 +1270,16 @@ def compute_state_feature_resistance_components(
     anion_keys = tuple(
         key for key, molecule_record in molecule_records.items() if molecule_record[0] == "anion"
     )
+    if additive_pair_collision_exposure < 0.0:
+        raise ValueError("additive_pair_collision_exposure must be nonnegative")
+    for molecule_record in molecule_records.values():
+        if molecule_record[0] not in ("cation", "anion"):
+            continue
+        _add_center_translation_resistance(
+            additive_environment_tensor,
+            molecule_record,
+            molecule_record[4] * additive_pair_collision_exposure,
+        )
     for cation_key in cation_keys:
         for neighbor_key, neighbor_record in molecule_records.items():
             neighbor_role = neighbor_record[0]
@@ -1110,10 +1289,23 @@ def compute_state_feature_resistance_components(
             coordination, direction = _molecule_coordination_and_direction(
                 records,
                 configuration,
-                molecule_records[cation_key][1],
-                neighbor_record[1],
+                molecule_records[cation_key],
+                neighbor_record,
                 switch_name,
+                neighbor_role == "additive",
             )
+            if neighbor_role == "additive" and any(
+                _ligand_occupies_ion_pair_separator_corridor(
+                    records,
+                    configuration,
+                    molecule_records[cation_key],
+                    molecule_records[anion_key],
+                    neighbor_record,
+                    neighbor_key[0],
+                )
+                for anion_key in anion_keys
+            ):
+                continue
             pair_drag = _harmonic_mean_values(
                 molecule_records[cation_key][4], neighbor_record[4]
             )
@@ -1132,6 +1324,36 @@ def compute_state_feature_resistance_components(
                     pair_drag * coordination,
                     np.eye(CARTESIAN_DIMENSION) - np.outer(direction, direction),
                 )
+                additive_record = records.species_records[neighbor_key[0]]
+                microviscosity_coefficient = float(
+                    additive_record[
+                    "local_microviscosity_coefficient"
+                    ]
+                )
+                if microviscosity_coefficient < 0.0:
+                    raise ValueError(
+                        f"{neighbor_key[0]}.local_microviscosity_coefficient "
+                        "must be nonnegative"
+                    )
+                additive_radius_m = float(
+                    additive_record["excluded_volume"]["packing_radius_m"]
+                )
+                association_cell_radius_m = float(
+                    records.basis_record["pair_basins"]["r_free_m"]
+                )
+                local_hard_core_occupancy = (
+                    additive_radius_m / association_cell_radius_m
+                ) ** 3
+                _add_center_relative_resistance(
+                    additive_environment_tensor,
+                    molecule_records[cation_key],
+                    neighbor_record,
+                    pair_drag
+                    * coordination
+                    * local_hard_core_occupancy
+                    * microviscosity_coefficient,
+                    np.eye(CARTESIAN_DIMENSION) - np.outer(direction, direction),
+                )
 
     anion_contacted_cations: dict[tuple[str, int], list[tuple[tuple[str, int], float, Array]]] = {}
     cation_coordination_degrees = {cation_key: 0.0 for cation_key in cation_keys}
@@ -1140,9 +1362,10 @@ def compute_state_feature_resistance_components(
             coordination, direction = _molecule_coordination_and_direction(
                 records,
                 configuration,
-                molecule_records[cation_key][1],
-                molecule_records[anion_key][1],
+                molecule_records[cation_key],
+                molecule_records[anion_key],
                 "Li_anion",
+                False,
             )
             anion_contacted_cations.setdefault(anion_key, []).append(
                 (cation_key, coordination, direction)
@@ -1177,17 +1400,33 @@ def compute_state_feature_resistance_components(
                     pair_drag * coordination * bridge_excess_degree,
                     np.outer(direction, direction),
                 )
-            acceptor_count = sum(
-                bool(_site_record(records, configuration, site_index)["acceptor_flag"])
-                for site_index in molecule_records[anion_key][2]
+            anion_species_name = anion_key[0]
+            molecular_anisotropy = molecular_geometry_anisotropy(
+                records,
+                anion_species_name,
             )
-            _add_center_relative_resistance(
-                orientation_tensor,
-                molecule_records[cation_key],
-                molecule_records[anion_key],
-                pair_drag * coordination * float(acceptor_count),
-                np.eye(CARTESIAN_DIMENSION) - np.outer(direction, direction),
-            )
+            if molecular_anisotropy > np.sqrt(np.finfo(float).eps):
+                acceptor_count = sum(
+                    bool(
+                        _site_record(records, configuration, site_index)[
+                            "acceptor_flag"
+                        ]
+                    )
+                    for site_index in molecule_records[anion_key][2]
+                )
+                acceptor_fraction = acceptor_count / len(
+                    molecule_records[anion_key][2]
+                )
+                _add_center_relative_resistance(
+                    orientation_tensor,
+                    molecule_records[cation_key],
+                    molecule_records[anion_key],
+                    pair_drag
+                    * coordination
+                    * float(acceptor_fraction)
+                    * molecular_anisotropy,
+                    np.eye(CARTESIAN_DIMENSION) - np.outer(direction, direction),
+                )
     return StateFeatureResistanceComponents(*components)
 
 
@@ -1229,24 +1468,143 @@ def _state_feature_molecule_records(
 def _molecule_coordination_and_direction(
     records: PhysicalLibraryRecords,
     configuration: SiteConfiguration,
-    first_center_m: Array,
-    second_center_m: Array,
+    first_molecule_record: tuple[str, Array, tuple[int, ...], Array, float],
+    second_molecule_record: tuple[str, Array, tuple[int, ...], Array, float],
     switch_name: str,
+    use_site_coordination: bool,
 ) -> tuple[float, Array]:
     switch_record = records.basis_record["coordination_switches"][switch_name]
     displacement_m = _minimum_image_vector_m(
-        first_center_m,
-        second_center_m,
+        first_molecule_record[1],
+        second_molecule_record[1],
         configuration.box_lengths_m,
     )
     distance_m = float(np.linalg.norm(displacement_m))
     if distance_m <= ZERO_DISTANCE_TOLERANCE_M:
-        return UNITY, np.zeros_like(displacement_m)
-    coordination = UNITY / (
-        UNITY
-        + (distance_m / float(switch_record["r0_m"])) ** float(switch_record["exponent"])
+        direction = np.zeros_like(displacement_m)
+    else:
+        direction = displacement_m / distance_m
+    if use_site_coordination:
+        positions_m = np.asarray(configuration.positions_m, dtype=float)
+        coordination = 0.0
+        for first_site_index in first_molecule_record[2]:
+            for second_site_index in second_molecule_record[2]:
+                site_displacement_m = _minimum_image_vector_m(
+                    positions_m[first_site_index],
+                    positions_m[second_site_index],
+                    configuration.box_lengths_m,
+                )
+                site_distance_m = float(np.linalg.norm(site_displacement_m))
+                if site_distance_m <= ZERO_DISTANCE_TOLERANCE_M:
+                    coordination += UNITY
+                    continue
+                coordination += UNITY / (
+                    UNITY
+                    + (site_distance_m / float(switch_record["r0_m"]))
+                    ** float(switch_record["exponent"])
+                )
+    else:
+        coordination = UNITY / (
+            UNITY
+            + (distance_m / float(switch_record["r0_m"]))
+            ** float(switch_record["exponent"])
+        )
+    return coordination, direction
+
+
+def _ligand_occupies_ion_pair_separator_corridor(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+    cation_record: tuple[str, Array, tuple[int, ...], Array, float],
+    anion_record: tuple[str, Array, tuple[int, ...], Array, float],
+    ligand_record: tuple[str, Array, tuple[int, ...], Array, float],
+    ligand_species_name: str,
+) -> bool:
+    ion_pair_vector_m = _minimum_image_vector_m(
+        cation_record[1],
+        anion_record[1],
+        configuration.box_lengths_m,
     )
-    return coordination, displacement_m / distance_m
+    ion_pair_distance_squared_m2 = float(np.dot(ion_pair_vector_m, ion_pair_vector_m))
+    if ion_pair_distance_squared_m2 <= ZERO_DISTANCE_TOLERANCE_M**2:
+        return False
+    positions_m = np.asarray(configuration.positions_m, dtype=float)
+    coordination_site_vector_m = None
+    minimum_site_distance_squared_m2 = math.inf
+    for site_index in ligand_record[2]:
+        site_vector_m = _minimum_image_vector_m(
+            cation_record[1],
+            positions_m[site_index],
+            configuration.box_lengths_m,
+        )
+        site_distance_squared_m2 = float(np.dot(site_vector_m, site_vector_m))
+        if site_distance_squared_m2 < minimum_site_distance_squared_m2:
+            minimum_site_distance_squared_m2 = site_distance_squared_m2
+            coordination_site_vector_m = site_vector_m
+    if coordination_site_vector_m is None:
+        raise ValueError("ligand separator geometry requires at least one ligand site")
+    axial_fraction = float(
+        np.dot(coordination_site_vector_m, ion_pair_vector_m)
+        / ion_pair_distance_squared_m2
+    )
+    if not 0.0 < axial_fraction < 1.0:
+        return False
+    radial_vector_m = coordination_site_vector_m - axial_fraction * ion_pair_vector_m
+    packing_radius_m = float(
+        records.species_records[ligand_species_name]["excluded_volume"][
+            "packing_radius_m"
+        ]
+    )
+    return float(np.linalg.norm(radial_vector_m)) <= packing_radius_m
+
+
+def molecular_geometry_anisotropy(
+    records: PhysicalLibraryRecords,
+    species_name: str,
+) -> float:
+    species_record = records.species_records[species_name]
+    coordinates_m = np.asarray(
+        species_record["reference_conformer_coordinates_m"],
+        dtype=float,
+    )
+    site_masses_kg = np.asarray(
+        [float(site_record["mass_kg"]) for site_record in species_record["sites"]],
+        dtype=float,
+    )
+    return _geometry_anisotropy(coordinates_m, site_masses_kg, species_name)
+
+
+def _geometry_anisotropy(
+    coordinates_m: Array,
+    site_masses_kg: Array,
+    geometry_label: str,
+) -> float:
+    if coordinates_m.shape != (len(site_masses_kg), CARTESIAN_DIMENSION):
+        raise ValueError(f"{geometry_label} reference conformer has invalid shape")
+    total_mass_kg = float(np.sum(site_masses_kg))
+    if total_mass_kg <= 0.0:
+        raise ValueError(f"{geometry_label} molecular mass must be positive")
+    center_of_mass_m = np.sum(
+        site_masses_kg[:, None] * coordinates_m,
+        axis=0,
+    ) / total_mass_kg
+    centered_coordinates_m = coordinates_m - center_of_mass_m
+    geometry_covariance_m2 = (
+        centered_coordinates_m.T
+        @ (site_masses_kg[:, None] * centered_coordinates_m)
+        / total_mass_kg
+    )
+    principal_second_moments_m2 = np.linalg.eigvalsh(
+        0.5 * (geometry_covariance_m2 + geometry_covariance_m2.T)
+    )
+    total_second_moment_m2 = float(np.sum(principal_second_moments_m2))
+    if total_second_moment_m2 <= np.finfo(float).tiny:
+        return 0.0
+    mean_second_moment_m2 = total_second_moment_m2 / CARTESIAN_DIMENSION
+    return float(
+        np.linalg.norm(principal_second_moments_m2 - mean_second_moment_m2)
+        / total_second_moment_m2
+    )
 
 
 def _harmonic_mean_values(first_drag: float, second_drag: float) -> float:
@@ -1295,6 +1653,21 @@ def _add_center_relative_resistance(
     )
 
 
+def _add_center_translation_resistance(
+    tensor_kg_s: Array,
+    molecule_record: tuple[str, Array, tuple[int, ...], Array, float],
+    drag_kg_s: float,
+) -> None:
+    _add_weighted_center_block(
+        tensor_kg_s,
+        molecule_record[2],
+        molecule_record[3],
+        molecule_record[2],
+        molecule_record[3],
+        drag_kg_s * np.eye(CARTESIAN_DIMENSION, dtype=float),
+    )
+
+
 def _add_weighted_center_block(
     tensor_kg_s: Array,
     row_site_indices: tuple[int, ...],
@@ -1323,6 +1696,43 @@ def _add_weighted_center_block(
 
 
 def compute_atmosphere_resistance_diagnostics(
+    records: PhysicalLibraryRecords,
+    configuration: SiteConfiguration,
+    dielectric_constant: float,
+    ionic_strength_mol_m3: float,
+    temperature_K: float,
+    viscosity_Pa_s: float,
+) -> AtmosphereResistanceDiagnostics:
+    cache_key = (
+        id(records),
+        configuration.species_names,
+        tuple(np.asarray(configuration.molecule_ids, dtype=int)),
+        tuple(np.asarray(configuration.site_ids, dtype=int)),
+        tuple(np.asarray(configuration.positions_m, dtype=float).reshape(-1)),
+        tuple(np.asarray(configuration.box_lengths_m, dtype=float)),
+        float(dielectric_constant),
+        float(ionic_strength_mol_m3),
+        float(temperature_K),
+        float(viscosity_Pa_s),
+    )
+    with _ATMOSPHERE_DIAGNOSTICS_CACHE_LOCK:
+        cached_diagnostics = _ATMOSPHERE_DIAGNOSTICS_CACHE.get(cache_key)
+    if cached_diagnostics is not None:
+        return cached_diagnostics
+    diagnostics = _compute_atmosphere_resistance_diagnostics_uncached(
+        records,
+        configuration,
+        dielectric_constant,
+        ionic_strength_mol_m3,
+        temperature_K,
+        viscosity_Pa_s,
+    )
+    with _ATMOSPHERE_DIAGNOSTICS_CACHE_LOCK:
+        _ATMOSPHERE_DIAGNOSTICS_CACHE[cache_key] = diagnostics
+    return diagnostics
+
+
+def _compute_atmosphere_resistance_diagnostics_uncached(
     records: PhysicalLibraryRecords,
     configuration: SiteConfiguration,
     dielectric_constant: float,
