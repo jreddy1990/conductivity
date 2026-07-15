@@ -1,0 +1,12 @@
+{
+  "tag": "ec_dmc_3_7_lipf6_1m_298K",
+  "temperature_K": 298.15,
+  "solvents": {
+    "EC": 0.3,
+    "DMC": 0.7
+  },
+  "salts": {
+    "LiPF6": 1.0
+  },
+  "additives": {}
+}

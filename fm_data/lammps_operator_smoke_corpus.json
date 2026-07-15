@@ -1,0 +1,18 @@
+{
+  "maximum_parallel_runs": 1,
+  "runs": [
+    {
+      "recipe_json": "conductivity/fm_data/recipes/ec_dmc_3_7_lipf6_1m_298K.json",
+      "mpi_ranks": 1,
+      "timestep_fs": 1.0,
+      "trajectory_stride_steps": 10,
+      "molecule_count": 50,
+      "production_time_ps": 0.1,
+      "equilibration_time_ps": 0.1,
+      "velocity_seed": 104729,
+      "pressure_atm": 1.0,
+      "npt_temperature_damping_fs": 100.0,
+      "npt_pressure_damping_fs": 1000.0
+    }
+  ]
+}

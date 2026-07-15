@@ -1,0 +1,10 @@
+{
+  "DFOB-": {
+    "ff_source": "sage_2.2.0_plus_overlay",
+    "supplemental_forcefield_files": [
+      "conductivity/fm_data/forcefields/lidfob_dfob_sage_overlay.offxml"
+    ],
+    "partial_charges_e": [1.1, -0.55, -0.55, -0.58, 0.66, -0.58, 0.66, -0.58, -0.58],
+    "partial_charge_source": "fixed DFOB anion charges in OpenFF atom order B,F,F,O,C,O,C,O,O"
+  }
+}

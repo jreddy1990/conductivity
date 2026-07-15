@@ -1,0 +1,226 @@
+{
+  "BF4-": {
+    "allow_undefined_stereo": false,
+    "ff_source": "sage_2.2.0",
+    "formal_charge_e": -1,
+    "smiles": "F[B-](F)(F)F",
+    "supplemental_forcefield_files": []
+  },
+  "BOB-": {
+    "allow_undefined_stereo": false,
+    "ff_source": "sage_2.2.0",
+    "formal_charge_e": -1,
+    "smiles": "O=C1O[B-]2(OC1=O)OC(=O)C(=O)O2",
+    "supplemental_forcefield_files": []
+  },
+  "ClO4-": {
+    "allow_undefined_stereo": false,
+    "ff_source": "sage_2.2.0",
+    "formal_charge_e": -1,
+    "smiles": "[O-][Cl+3]([O-])([O-])[O-]",
+    "supplemental_forcefield_files": []
+  },
+  "DEC": {
+    "allow_undefined_stereo": false,
+    "ff_source": "sage_2.2.0",
+    "formal_charge_e": 0,
+    "smiles": "CCOC(=O)OCC",
+    "supplemental_forcefield_files": []
+  },
+  "DFOB-": {
+    "allow_undefined_stereo": false,
+    "ff_source": "sage_2.2.0_plus_overlay",
+    "formal_charge_e": -1,
+    "partial_charge_source": "fixed DFOB anion charges in OpenFF atom order B,F,F,O,C,O,C,O,O",
+    "partial_charges_e": [
+      1.1,
+      -0.55,
+      -0.55,
+      -0.58,
+      0.66,
+      -0.58,
+      0.66,
+      -0.58,
+      -0.58
+    ],
+    "smiles": "O=C1O[B-](F)(F)OC1=O",
+    "supplemental_forcefield_files": [
+      "conductivity/fm_data/forcefields/lidfob_dfob_sage_overlay.offxml"
+    ]
+  },
+  "DMC": {
+    "allow_undefined_stereo": false,
+    "ff_source": "sage_2.2.0",
+    "formal_charge_e": 0,
+    "smiles": "COC(=O)OC",
+    "supplemental_forcefield_files": []
+  },
+  "DMMP": {
+    "allow_undefined_stereo": false,
+    "ff_source": "sage_2.2.0",
+    "formal_charge_e": 0,
+    "smiles": "COP(=O)(C)OC",
+    "supplemental_forcefield_files": []
+  },
+  "DTD": {
+    "allow_undefined_stereo": false,
+    "ff_source": "sage_2.2.0",
+    "formal_charge_e": 0,
+    "smiles": "C1CSSC1",
+    "supplemental_forcefield_files": []
+  },
+  "DTN": {
+    "allow_undefined_stereo": false,
+    "ff_source": "sage_2.2.0",
+    "formal_charge_e": 0,
+    "smiles": "N#CC1CCCCC1",
+    "supplemental_forcefield_files": []
+  },
+  "EC": {
+    "allow_undefined_stereo": false,
+    "ff_source": "sage_2.2.0",
+    "formal_charge_e": 0,
+    "smiles": "C1COC(=O)O1",
+    "supplemental_forcefield_files": []
+  },
+  "EMC": {
+    "allow_undefined_stereo": false,
+    "ff_source": "sage_2.2.0",
+    "formal_charge_e": 0,
+    "smiles": "CCOC(=O)OC",
+    "supplemental_forcefield_files": []
+  },
+  "ES": {
+    "allow_undefined_stereo": false,
+    "ff_source": "sage_2.2.0",
+    "formal_charge_e": 0,
+    "smiles": "O=S1OCCO1",
+    "supplemental_forcefield_files": []
+  },
+  "FEC": {
+    "allow_undefined_stereo": true,
+    "ff_source": "sage_2.2.0",
+    "formal_charge_e": 0,
+    "smiles": "FC1COC(=O)O1",
+    "supplemental_forcefield_files": []
+  },
+  "FEMC": {
+    "allow_undefined_stereo": false,
+    "ff_source": "sage_2.2.0",
+    "formal_charge_e": 0,
+    "smiles": "COC(=O)OCC(F)(F)F",
+    "supplemental_forcefield_files": []
+  },
+  "FSI-": {
+    "allow_undefined_stereo": false,
+    "ff_source": "sage_2.2.0",
+    "formal_charge_e": -1,
+    "smiles": "O=S(=O)(F)[N-]S(=O)(=O)F",
+    "supplemental_forcefield_files": []
+  },
+  "Li+": {
+    "allow_undefined_stereo": false,
+    "ff_source": "sage_2.2.0",
+    "formal_charge_e": 1,
+    "smiles": "[Li+]",
+    "supplemental_forcefield_files": []
+  },
+  "MEC": {
+    "allow_undefined_stereo": false,
+    "ff_source": "sage_2.2.0",
+    "formal_charge_e": 0,
+    "smiles": "C=C1COC(=O)O1",
+    "supplemental_forcefield_files": []
+  },
+  "NO3-": {
+    "allow_undefined_stereo": false,
+    "ff_source": "sage_2.2.0",
+    "formal_charge_e": -1,
+    "smiles": "O=[N+]([O-])[O-]",
+    "supplemental_forcefield_files": []
+  },
+  "Na+": {
+    "allow_undefined_stereo": false,
+    "ff_source": "sage_2.2.0",
+    "formal_charge_e": 1,
+    "smiles": "[Na+]",
+    "supplemental_forcefield_files": []
+  },
+  "PC": {
+    "allow_undefined_stereo": true,
+    "ff_source": "sage_2.2.0",
+    "formal_charge_e": 0,
+    "smiles": "CC1COC(=O)O1",
+    "supplemental_forcefield_files": []
+  },
+  "PF6-": {
+    "allow_undefined_stereo": false,
+    "ff_source": "sage_2.2.0",
+    "formal_charge_e": -1,
+    "smiles": "F[P-](F)(F)(F)(F)F",
+    "supplemental_forcefield_files": []
+  },
+  "PO2F2-": {
+    "allow_undefined_stereo": false,
+    "ff_source": "sage_2.2.0",
+    "formal_charge_e": -1,
+    "smiles": "O=P([O-])(F)F",
+    "supplemental_forcefield_files": []
+  },
+  "PS": {
+    "allow_undefined_stereo": false,
+    "ff_source": "sage_2.2.0",
+    "formal_charge_e": 0,
+    "smiles": "C1COS(=O)(=O)O1",
+    "supplemental_forcefield_files": []
+  },
+  "SA": {
+    "allow_undefined_stereo": false,
+    "ff_source": "sage_2.2.0",
+    "formal_charge_e": 0,
+    "smiles": "O=C1CCC(=O)O1",
+    "supplemental_forcefield_files": []
+  },
+  "SN": {
+    "allow_undefined_stereo": false,
+    "ff_source": "sage_2.2.0",
+    "formal_charge_e": 0,
+    "smiles": "N#CCCC#N",
+    "supplemental_forcefield_files": []
+  },
+  "TFSI-": {
+    "allow_undefined_stereo": false,
+    "ff_source": "sage_2.2.0",
+    "formal_charge_e": -1,
+    "smiles": "O=S(=O)([O-])N(C(F)(F)F)S(=O)(=O)C(F)(F)F",
+    "supplemental_forcefield_files": []
+  },
+  "TMSPi": {
+    "allow_undefined_stereo": false,
+    "ff_source": "sage_2.2.0",
+    "formal_charge_e": 0,
+    "smiles": "C[Si](C)(C)OP(O[Si](C)(C)C)O[Si](C)(C)C",
+    "supplemental_forcefield_files": []
+  },
+  "TPP": {
+    "allow_undefined_stereo": false,
+    "ff_source": "sage_2.2.0",
+    "formal_charge_e": 0,
+    "smiles": "O=P(Oc1ccccc1)(Oc1ccccc1)Oc1ccccc1",
+    "supplemental_forcefield_files": []
+  },
+  "TTFP": {
+    "allow_undefined_stereo": false,
+    "ff_source": "sage_2.2.0",
+    "formal_charge_e": 0,
+    "smiles": "O=P(OCC(F)(F)F)(OCC(F)(F)F)OCC(F)(F)F",
+    "supplemental_forcefield_files": []
+  },
+  "VC": {
+    "allow_undefined_stereo": false,
+    "ff_source": "sage_2.2.0",
+    "formal_charge_e": 0,
+    "smiles": "O=C1OC=CO1",
+    "supplemental_forcefield_files": []
+  }
+}

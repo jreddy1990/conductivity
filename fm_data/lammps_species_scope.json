@@ -1,0 +1,12 @@
+{
+  "solvents": ["EC", "PC", "EMC", "DMC", "DEC", "FEMC"],
+  "salts": [
+    "LiPF6", "LiFSI", "LiTFSI", "LiBF4", "LiClO4",
+    "NaPF6", "NaFSI", "NaClO4"
+  ],
+  "additives": [
+    "VC", "FEC", "PS", "TPP", "LiDFOB", "NaDFOB", "LiBOB",
+    "SN", "DTD", "DTN", "ES", "SA", "TMSPi", "DMMP", "TTFP",
+    "MEC", "LiPO2F2", "LiNO3"
+  ]
+}
