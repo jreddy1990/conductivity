@@ -1,24 +1,62 @@
 {
   "BF4-": {
     "allow_undefined_stereo": false,
-    "ff_source": "sage_2.2.0",
+    "ff_source": "clp_bf4_plus_sage_2.2.0",
     "formal_charge_e": -1,
+    "partial_charge_source": "CL&P tetrafluoroborate charge ratios in OpenFF atom order F,B,F,F,F, uniformly normalized from -0.84 e to formal charge -1 e",
+    "partial_charges_e": [
+      -0.5,
+      1.0,
+      -0.5,
+      -0.5,
+      -0.5
+    ],
     "smiles": "F[B-](F)(F)F",
-    "supplemental_forcefield_files": []
+    "supplemental_forcefield_files": [
+      "conductivity/fm_data/forcefields/bf4_clp_sage_overlay.offxml"
+    ]
   },
   "BOB-": {
     "allow_undefined_stereo": false,
-    "ff_source": "sage_2.2.0",
+    "ff_source": "sage_2.2.0_plus_borate_overlay",
     "formal_charge_e": -1,
+    "partial_charge_source": "DFOB borate and oxalate local charge transfer in OpenFF atom order, with boron charge enforcing formal charge -1 e",
+    "partial_charges_e": [
+      -0.58,
+      0.66,
+      -0.58,
+      1.0,
+      -0.58,
+      0.66,
+      -0.58,
+      -0.58,
+      0.66,
+      -0.58,
+      0.66,
+      -0.58,
+      -0.58
+    ],
     "smiles": "O=C1O[B-]2(OC1=O)OC(=O)C(=O)O2",
-    "supplemental_forcefield_files": []
+    "supplemental_forcefield_files": [
+      "conductivity/fm_data/forcefields/lidfob_dfob_sage_overlay.offxml"
+    ]
   },
   "ClO4-": {
     "allow_undefined_stereo": false,
-    "ff_source": "sage_2.2.0",
+    "ff_source": "published_charmm_perchlorate_plus_sage_2.2.0",
     "formal_charge_e": -1,
+    "partial_charge_source": "published perchlorate charges in OpenFF atom order O,Cl,O,O,O",
+    "partial_charges_e": [
+      -0.58,
+      1.32,
+      -0.58,
+      -0.58,
+      -0.58
+    ],
     "smiles": "[O-][Cl+3]([O-])([O-])[O-]",
-    "supplemental_forcefield_files": []
+    "supplemental_forcefield_files": [
+      "conductivity/fm_data/forcefields/clo4_charmm_sage_overlay.offxml"
+    ]
   },
   "DEC": {
     "allow_undefined_stereo": false,
@@ -197,10 +235,58 @@
   },
   "TMSPi": {
     "allow_undefined_stereo": false,
-    "ff_source": "sage_2.2.0",
+    "ff_source": "sage_2.2.0_plus_gaff2_silicon_overlay",
     "formal_charge_e": 0,
+    "partial_charge_source": "GAFF2 AM1-BCC charges in OpenFF atom order; the 0.002012 e printed precision residual is assigned to phosphorus to enforce exact neutrality",
+    "partial_charges_e": [
+      -0.3481,
+      1.0437,
+      -0.3481,
+      -0.3481,
+      -0.7108,
+      0.753312,
+      -0.7108,
+      1.0437,
+      -0.3481,
+      -0.3481,
+      -0.3481,
+      -0.7108,
+      1.0437,
+      -0.3481,
+      -0.3481,
+      -0.3481,
+      0.051144,
+      0.051144,
+      0.051144,
+      0.051144,
+      0.051144,
+      0.051144,
+      0.051144,
+      0.051144,
+      0.051144,
+      0.051144,
+      0.051144,
+      0.051144,
+      0.051144,
+      0.051144,
+      0.051144,
+      0.051144,
+      0.051144,
+      0.051144,
+      0.051144,
+      0.051144,
+      0.051144,
+      0.051144,
+      0.051144,
+      0.051144,
+      0.051144,
+      0.051144,
+      0.051144
+    ],
     "smiles": "C[Si](C)(C)OP(O[Si](C)(C)C)O[Si](C)(C)C",
-    "supplemental_forcefield_files": []
+    "supplemental_forcefield_files": [
+      "conductivity/fm_data/forcefields/tmspi_gaff2_sage_overlay.offxml"
+    ]
   },
   "TPP": {
     "allow_undefined_stereo": false,

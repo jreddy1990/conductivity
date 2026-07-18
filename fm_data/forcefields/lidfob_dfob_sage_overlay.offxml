@@ -4,12 +4,12 @@
     <Atom smirks="[#5X4-1:1]" id="lidfob-borate-b" epsilon="0.095 * mole ** -1 * kilocalorie ** 1" rmin_half="1.92 * angstrom ** 1"/>
   </vdW>
   <Bonds version="0.4" potential="harmonic" fractional_bondorder_method="AM1-Wiberg" fractional_bondorder_interpolation="linear">
-    <Bond smirks="[#5X4-1:1]-[#9X1:2]" id="lidfob-bf" length="1.39 * angstrom" k="450.0 * kilocalorie_per_mole/angstrom**2"/>
+    <Bond smirks="[#5X4-1$(*(-[#9])(-[#9])(-[#8])-[#8]):1]-[#9X1:2]" id="lidfob-bf" length="1.39 * angstrom" k="450.0 * kilocalorie_per_mole/angstrom**2"/>
     <Bond smirks="[#5X4-1:1]-[#8X2:2]" id="lidfob-bo" length="1.48 * angstrom" k="430.0 * kilocalorie_per_mole/angstrom**2"/>
   </Bonds>
   <Angles version="0.3" potential="harmonic">
-    <Angle smirks="[#9X1:1]-[#5X4-1:2]-[#9X1:3]" id="lidfob-fbf" angle="109.5 * degree" k="90.0 * kilocalorie_per_mole/radian**2"/>
-    <Angle smirks="[#9X1:1]-[#5X4-1:2]-[#8X2:3]" id="lidfob-fbo" angle="109.5 * degree" k="95.0 * kilocalorie_per_mole/radian**2"/>
+    <Angle smirks="[#9X1:1]-[#5X4-1$(*(-[#9])(-[#9])(-[#8])-[#8]):2]-[#9X1:3]" id="lidfob-fbf" angle="109.5 * degree" k="90.0 * kilocalorie_per_mole/radian**2"/>
+    <Angle smirks="[#9X1:1]-[#5X4-1$(*(-[#9])(-[#9])(-[#8])-[#8]):2]-[#8X2:3]" id="lidfob-fbo" angle="109.5 * degree" k="95.0 * kilocalorie_per_mole/radian**2"/>
     <Angle smirks="[#8X2:1]-[#5X4-1:2]-[#8X2:3]" id="lidfob-obo" angle="109.5 * degree" k="100.0 * kilocalorie_per_mole/radian**2"/>
     <Angle smirks="[#5X4-1:1]-[#8X2:2]-[#6X3:3]" id="lidfob-boc" angle="120.0 * degree" k="110.0 * kilocalorie_per_mole/radian**2"/>
   </Angles>

@@ -769,12 +769,15 @@ def _read_lammps_custom_dump(path: Path) -> tuple[LammpsDumpFrame, ...]:
             atoms_header = trajectory_file.readline().strip()
             if not atoms_header.startswith(LammpsDumpHeader.ATOMS_PREFIX.value):
                 raise ValueError(f"expected ATOMS header, got {atoms_header}")
-            atom_columns = _atom_columns_from_header(atoms_header)
+            source_atom_columns = _atom_columns_from_header(atoms_header)
+            atom_columns, source_column_indices = _canonical_atom_column_indices(
+                source_atom_columns
+            )
             atom_rows = [
-                _read_atom_line(trajectory_file.readline(), len(atom_columns))
+                _read_atom_line(trajectory_file.readline(), len(source_atom_columns))
                 for _atom_index in range(atom_count)
             ]
-            atom_table = np.asarray(atom_rows, dtype=float)
+            atom_table = np.asarray(atom_rows, dtype=float)[:, source_column_indices]
             order = np.argsort(atom_table[:, LAMMPS_COLUMN_ID])
             frames.append(
                 LammpsDumpFrame(
@@ -827,13 +830,38 @@ def _atom_columns_from_header(atoms_header: str) -> tuple[str, ...]:
             "LAMMPS trajectory is missing required columns: "
             + ", ".join(missing_columns)
         )
-    expected_prefix = atom_columns[: len(LAMMPS_REQUIRED_COLUMNS)]
-    if expected_prefix != LAMMPS_REQUIRED_COLUMNS:
-        raise ValueError(
-            "LAMMPS trajectory columns must begin with "
-            + " ".join(LAMMPS_REQUIRED_COLUMNS)
-        )
     return atom_columns
+
+
+def _canonical_atom_column_indices(
+    source_atom_columns: tuple[str, ...],
+) -> tuple[tuple[str, ...], tuple[int, ...]]:
+    duplicate_columns = tuple(
+        column_name
+        for column_name in dict.fromkeys(source_atom_columns)
+        if source_atom_columns.count(column_name) > 1
+    )
+    if duplicate_columns:
+        raise ValueError(
+            "LAMMPS trajectory contains duplicate columns: "
+            + ", ".join(duplicate_columns)
+        )
+    leading_columns = LAMMPS_REQUIRED_COLUMNS + tuple(
+        column_name
+        for column_name in LAMMPS_MICROSCOPIC_COLUMNS
+        if column_name not in LAMMPS_REQUIRED_COLUMNS
+        and column_name in source_atom_columns
+    )
+    trailing_columns = tuple(
+        column_name
+        for column_name in source_atom_columns
+        if column_name not in leading_columns
+    )
+    canonical_columns = leading_columns + trailing_columns
+    source_indices = tuple(
+        source_atom_columns.index(column_name) for column_name in canonical_columns
+    )
+    return canonical_columns, source_indices
 
 
 def _read_atom_line(line: str, column_count: int) -> tuple[float, ...]:

@@ -8,6 +8,7 @@ from typing import Mapping
 
 import numpy as np
 
+from constants import K_B
 from conductivity.physical_library.projected_analytical_conductivity import (
     CARTESIAN,
     refine_mori_basis_by_projected_residual,
@@ -179,6 +180,791 @@ class TrajectoryBasisRefinement:
     conductivity_change_tolerance_S_m: float
     final_mori_memory_matrix_A: Array
     final_mori_current_coupling_matrix_h: Array
+
+
+@dataclass(frozen=True)
+class MolecularFamilyMemoryKernelEstimate:
+    replica_count: int
+    molecule_ids: tuple[int, ...]
+    molecular_family_labels: tuple[str, ...]
+    family_labels: tuple[str, ...]
+    molecular_masses_kg: Array
+    family_masses_kg: Array
+    molecular_com_velocities_m_s: Array
+    molecular_total_forces_N: Array
+    family_com_velocities_m_s: Array
+    family_total_forces_N: Array
+    correlation_lag_times_s: Array
+    memory_kernel_lag_times_s: Array
+    velocity_autocorrelation_m2_s2: Array
+    force_velocity_correlation_N_m_s: Array
+    memory_kernel_kg_s2: Array
+    cumulative_memory_integral_kg_s: Array
+    integrated_memory_kernel_kg_s: Array
+    diffusion_tensor_m2_s: Array
+    markov_diffusion_available: bool
+    plateau_relative_variation: float
+    tail_relative_norm: float
+    minimum_plateau_eigenvalue_kg_s: float
+    plateau_gate_passed: bool
+    tail_gate_passed: bool
+    psd_gate_passed: bool
+    not_complete_reasons: tuple[str, ...]
+
+
+def estimate_molecular_family_memory_kernel(
+    atomic_velocities_m_s: Array,
+    atomic_forces_N: Array,
+    atomic_masses_kg: Array,
+    atom_molecule_ids: Array,
+    molecular_family_labels: tuple[str, ...],
+    temperature_K: float,
+    timestep_s: float,
+    maximum_lag_frames: int,
+    plateau_window_frames: int,
+    maximum_plateau_relative_variation: float,
+    maximum_tail_relative_norm: float,
+    psd_relative_tolerance: float,
+    volterra_regularization: float,
+    singular_value_relative_tolerance: float,
+) -> MolecularFamilyMemoryKernelEstimate:
+    """Estimate a molecular-family GLE kernel from force-complete trajectories."""
+
+    velocities_m_s, forces_N, masses_kg, molecule_ids = (
+        _validated_force_complete_atomic_trajectory(
+            atomic_velocities_m_s,
+            atomic_forces_N,
+            atomic_masses_kg,
+            atom_molecule_ids,
+        )
+    )
+    physical_temperature_K = _positive_float(temperature_K, "temperature_K")
+    physical_timestep_s = _positive_float(timestep_s, "timestep_s")
+    validated_maximum_lag_frames = _memory_kernel_lag_count(
+        maximum_lag_frames,
+        velocities_m_s.shape[0],
+    )
+    validated_plateau_window_frames = _memory_kernel_plateau_count(
+        plateau_window_frames,
+        validated_maximum_lag_frames,
+    )
+    plateau_tolerance = _nonnegative_float(
+        maximum_plateau_relative_variation,
+        "maximum_plateau_relative_variation",
+    )
+    tail_tolerance = _nonnegative_float(
+        maximum_tail_relative_norm,
+        "maximum_tail_relative_norm",
+    )
+    psd_tolerance = _nonnegative_float(
+        psd_relative_tolerance,
+        "psd_relative_tolerance",
+    )
+    regularization = _nonnegative_float(
+        volterra_regularization,
+        "volterra_regularization",
+    )
+    singular_value_tolerance = _positive_float(
+        singular_value_relative_tolerance,
+        "singular_value_relative_tolerance",
+    )
+    if singular_value_tolerance >= 1.0:
+        raise ValueError("singular_value_relative_tolerance must be less than one")
+
+    ordered_molecule_ids = tuple(int(value) for value in np.unique(molecule_ids))
+    family_labels_by_molecule = _validated_molecular_family_labels(
+        molecular_family_labels,
+        len(ordered_molecule_ids),
+    )
+    (
+        molecular_masses_kg,
+        molecular_com_velocities_m_s,
+        molecular_total_forces_N,
+    ) = _project_atoms_to_molecules(
+        velocities_m_s,
+        forces_N,
+        masses_kg,
+        molecule_ids,
+        ordered_molecule_ids,
+    )
+    family_labels = tuple(dict.fromkeys(family_labels_by_molecule))
+    (
+        family_masses_kg,
+        family_com_velocities_m_s,
+        family_total_forces_N,
+    ) = _project_molecules_to_families(
+        molecular_masses_kg,
+        molecular_com_velocities_m_s,
+        molecular_total_forces_N,
+        family_labels_by_molecule,
+        family_labels,
+    )
+
+    centered_family_velocities_m_s = family_com_velocities_m_s - np.mean(
+        family_com_velocities_m_s,
+        axis=0,
+        keepdims=True,
+    )
+    centered_family_forces_N = family_total_forces_N - np.mean(
+        family_total_forces_N,
+        axis=0,
+        keepdims=True,
+    )
+    flattened_family_velocities_m_s = centered_family_velocities_m_s.reshape(
+        centered_family_velocities_m_s.shape[0],
+        -1,
+    )
+    flattened_family_forces_N = centered_family_forces_N.reshape(
+        centered_family_forces_N.shape[0],
+        -1,
+    )
+    coordinate_masses_kg = np.repeat(family_masses_kg, CARTESIAN)
+    flattened_family_momenta_kg_m_s = (
+        flattened_family_velocities_m_s * coordinate_masses_kg[np.newaxis, :]
+    )
+    velocity_autocorrelation_m2_s2 = _lagged_matrix_correlation(
+        flattened_family_velocities_m_s,
+        flattened_family_velocities_m_s,
+        validated_maximum_lag_frames,
+    )
+    momentum_velocity_correlation_kg_m2_s2 = _lagged_matrix_correlation(
+        flattened_family_momenta_kg_m_s,
+        flattened_family_velocities_m_s,
+        validated_maximum_lag_frames,
+    )
+    force_velocity_correlation_N_m_s = _lagged_matrix_correlation(
+        flattened_family_forces_N,
+        flattened_family_velocities_m_s,
+        validated_maximum_lag_frames,
+    )
+    momentum_correlation_derivative_N_m_s = np.diff(
+        momentum_velocity_correlation_kg_m2_s2,
+        axis=0,
+    ) / physical_timestep_s
+    midpoint_force_velocity_correlation_N_m_s = 0.5 * (
+        force_velocity_correlation_N_m_s[:-1]
+        + force_velocity_correlation_N_m_s[1:]
+    )
+    volterra_convolution_residual_N_m_s = (
+        midpoint_force_velocity_correlation_N_m_s
+        - momentum_correlation_derivative_N_m_s
+    )
+    memory_kernel_kg_s2 = _invert_matrix_volterra_kernel(
+        velocity_autocorrelation_m2_s2,
+        volterra_convolution_residual_N_m_s,
+        physical_timestep_s,
+        regularization,
+        singular_value_tolerance,
+    )
+    cumulative_memory_integral_kg_s = np.cumsum(
+        memory_kernel_kg_s2 * physical_timestep_s,
+        axis=0,
+    )
+    integrated_memory_kernel_kg_s = cumulative_memory_integral_kg_s[-1]
+    (
+        plateau_relative_variation,
+        tail_relative_norm,
+        minimum_plateau_eigenvalue_kg_s,
+        plateau_gate_passed,
+        tail_gate_passed,
+        psd_gate_passed,
+    ) = _memory_kernel_gate_diagnostics(
+        memory_kernel_kg_s2,
+        cumulative_memory_integral_kg_s,
+        validated_plateau_window_frames,
+        plateau_tolerance,
+        tail_tolerance,
+        psd_tolerance,
+    )
+    not_complete_reasons: list[str] = []
+    if not plateau_gate_passed:
+        not_complete_reasons.append("stable memory-integral plateau")
+    if not tail_gate_passed:
+        not_complete_reasons.append("decayed memory-kernel tail")
+    if not psd_gate_passed:
+        not_complete_reasons.append("positive semidefinite")
+    markov_diffusion_available = not not_complete_reasons
+    diffusion_tensor_m2_s = np.empty((0, 0), dtype=float)
+    if markov_diffusion_available:
+        diffusion_tensor_m2_s = (
+            K_B
+            * physical_temperature_K
+            * _psd_pseudoinverse_with_relative_tolerance(
+                integrated_memory_kernel_kg_s,
+                psd_tolerance,
+                singular_value_tolerance,
+            )
+        )
+
+    return MolecularFamilyMemoryKernelEstimate(
+        replica_count=1,
+        molecule_ids=ordered_molecule_ids,
+        molecular_family_labels=family_labels_by_molecule,
+        family_labels=family_labels,
+        molecular_masses_kg=molecular_masses_kg,
+        family_masses_kg=family_masses_kg,
+        molecular_com_velocities_m_s=molecular_com_velocities_m_s,
+        molecular_total_forces_N=molecular_total_forces_N,
+        family_com_velocities_m_s=family_com_velocities_m_s,
+        family_total_forces_N=family_total_forces_N,
+        correlation_lag_times_s=(
+            np.arange(validated_maximum_lag_frames + 1, dtype=float)
+            * physical_timestep_s
+        ),
+        memory_kernel_lag_times_s=(
+            (np.arange(validated_maximum_lag_frames, dtype=float) + 0.5)
+            * physical_timestep_s
+        ),
+        velocity_autocorrelation_m2_s2=velocity_autocorrelation_m2_s2,
+        force_velocity_correlation_N_m_s=force_velocity_correlation_N_m_s,
+        memory_kernel_kg_s2=memory_kernel_kg_s2,
+        cumulative_memory_integral_kg_s=cumulative_memory_integral_kg_s,
+        integrated_memory_kernel_kg_s=integrated_memory_kernel_kg_s,
+        diffusion_tensor_m2_s=diffusion_tensor_m2_s,
+        markov_diffusion_available=markov_diffusion_available,
+        plateau_relative_variation=plateau_relative_variation,
+        tail_relative_norm=tail_relative_norm,
+        minimum_plateau_eigenvalue_kg_s=minimum_plateau_eigenvalue_kg_s,
+        plateau_gate_passed=plateau_gate_passed,
+        tail_gate_passed=tail_gate_passed,
+        psd_gate_passed=psd_gate_passed,
+        not_complete_reasons=tuple(not_complete_reasons),
+    )
+
+
+def estimate_molecular_family_memory_kernel_from_replicas(
+    atomic_velocity_replicas_m_s: tuple[Array, ...],
+    atomic_force_replicas_N: tuple[Array, ...],
+    atomic_masses_kg: Array,
+    atom_molecule_ids: Array,
+    molecular_family_labels: tuple[str, ...],
+    temperature_K: float,
+    timestep_s: float,
+    maximum_lag_frames: int,
+    plateau_window_frames: int,
+    maximum_plateau_relative_variation: float,
+    maximum_tail_relative_norm: float,
+    psd_relative_tolerance: float,
+    volterra_regularization: float,
+    singular_value_relative_tolerance: float,
+) -> MolecularFamilyMemoryKernelEstimate:
+    """Invert one kernel from independently averaged replica correlations."""
+
+    if not atomic_velocity_replicas_m_s:
+        raise ValueError("at least one velocity replica is required")
+    if len(atomic_velocity_replicas_m_s) != len(atomic_force_replicas_N):
+        raise ValueError("velocity and force replica counts must match")
+    replica_estimates = tuple(
+        estimate_molecular_family_memory_kernel(
+            atomic_velocities_m_s=velocity_replica_m_s,
+            atomic_forces_N=force_replica_N,
+            atomic_masses_kg=atomic_masses_kg,
+            atom_molecule_ids=atom_molecule_ids,
+            molecular_family_labels=molecular_family_labels,
+            temperature_K=temperature_K,
+            timestep_s=timestep_s,
+            maximum_lag_frames=maximum_lag_frames,
+            plateau_window_frames=plateau_window_frames,
+            maximum_plateau_relative_variation=maximum_plateau_relative_variation,
+            maximum_tail_relative_norm=maximum_tail_relative_norm,
+            psd_relative_tolerance=psd_relative_tolerance,
+            volterra_regularization=volterra_regularization,
+            singular_value_relative_tolerance=singular_value_relative_tolerance,
+        )
+        for velocity_replica_m_s, force_replica_N in zip(
+            atomic_velocity_replicas_m_s,
+            atomic_force_replicas_N,
+            strict=True,
+        )
+    )
+    reference_estimate = replica_estimates[0]
+    for replica_estimate in replica_estimates[1:]:
+        if replica_estimate.molecule_ids != reference_estimate.molecule_ids:
+            raise ValueError("replica molecule identities must match")
+        if replica_estimate.family_labels != reference_estimate.family_labels:
+            raise ValueError("replica molecular families must match")
+        if not np.array_equal(
+            replica_estimate.molecular_masses_kg,
+            reference_estimate.molecular_masses_kg,
+        ):
+            raise ValueError("replica molecular masses must match")
+
+    velocity_autocorrelation_m2_s2 = np.mean(
+        np.stack(
+            tuple(
+                replica_estimate.velocity_autocorrelation_m2_s2
+                for replica_estimate in replica_estimates
+            ),
+            axis=0,
+        ),
+        axis=0,
+    )
+    force_velocity_correlation_N_m_s = np.mean(
+        np.stack(
+            tuple(
+                replica_estimate.force_velocity_correlation_N_m_s
+                for replica_estimate in replica_estimates
+            ),
+            axis=0,
+        ),
+        axis=0,
+    )
+    coordinate_masses_kg = np.repeat(reference_estimate.family_masses_kg, CARTESIAN)
+    momentum_velocity_correlation_kg_m2_s2 = (
+        velocity_autocorrelation_m2_s2 * coordinate_masses_kg[np.newaxis, :, np.newaxis]
+    )
+    physical_timestep_s = _positive_float(timestep_s, "timestep_s")
+    momentum_correlation_derivative_N_m_s = np.diff(
+        momentum_velocity_correlation_kg_m2_s2,
+        axis=0,
+    ) / physical_timestep_s
+    midpoint_force_velocity_correlation_N_m_s = 0.5 * (
+        force_velocity_correlation_N_m_s[:-1]
+        + force_velocity_correlation_N_m_s[1:]
+    )
+    memory_kernel_kg_s2 = _invert_matrix_volterra_kernel(
+        velocity_autocorrelation_m2_s2,
+        midpoint_force_velocity_correlation_N_m_s
+        - momentum_correlation_derivative_N_m_s,
+        physical_timestep_s,
+        _nonnegative_float(volterra_regularization, "volterra_regularization"),
+        _positive_float(
+            singular_value_relative_tolerance,
+            "singular_value_relative_tolerance",
+        ),
+    )
+    cumulative_memory_integral_kg_s = np.cumsum(
+        memory_kernel_kg_s2 * physical_timestep_s,
+        axis=0,
+    )
+    integrated_memory_kernel_kg_s = cumulative_memory_integral_kg_s[-1]
+    plateau_tolerance = _nonnegative_float(
+        maximum_plateau_relative_variation,
+        "maximum_plateau_relative_variation",
+    )
+    tail_tolerance = _nonnegative_float(
+        maximum_tail_relative_norm,
+        "maximum_tail_relative_norm",
+    )
+    psd_tolerance = _nonnegative_float(
+        psd_relative_tolerance,
+        "psd_relative_tolerance",
+    )
+    (
+        plateau_relative_variation,
+        tail_relative_norm,
+        minimum_plateau_eigenvalue_kg_s,
+        plateau_gate_passed,
+        tail_gate_passed,
+        psd_gate_passed,
+    ) = _memory_kernel_gate_diagnostics(
+        memory_kernel_kg_s2,
+        cumulative_memory_integral_kg_s,
+        _memory_kernel_plateau_count(plateau_window_frames, maximum_lag_frames),
+        plateau_tolerance,
+        tail_tolerance,
+        psd_tolerance,
+    )
+    not_complete_reasons = tuple(
+        reason
+        for passed, reason in (
+            (plateau_gate_passed, "stable memory-integral plateau"),
+            (tail_gate_passed, "decayed memory-kernel tail"),
+            (psd_gate_passed, "positive semidefinite"),
+        )
+        if not passed
+    )
+    markov_diffusion_available = not not_complete_reasons
+    diffusion_tensor_m2_s = np.empty((0, 0), dtype=float)
+    if markov_diffusion_available:
+        diffusion_tensor_m2_s = (
+            K_B
+            * _positive_float(temperature_K, "temperature_K")
+            * _psd_pseudoinverse_with_relative_tolerance(
+                integrated_memory_kernel_kg_s,
+                psd_tolerance,
+                _positive_float(
+                    singular_value_relative_tolerance,
+                    "singular_value_relative_tolerance",
+                ),
+            )
+        )
+
+    return MolecularFamilyMemoryKernelEstimate(
+        replica_count=len(replica_estimates),
+        molecule_ids=reference_estimate.molecule_ids,
+        molecular_family_labels=reference_estimate.molecular_family_labels,
+        family_labels=reference_estimate.family_labels,
+        molecular_masses_kg=reference_estimate.molecular_masses_kg,
+        family_masses_kg=reference_estimate.family_masses_kg,
+        molecular_com_velocities_m_s=np.concatenate(
+            tuple(
+                replica_estimate.molecular_com_velocities_m_s
+                for replica_estimate in replica_estimates
+            ),
+            axis=0,
+        ),
+        molecular_total_forces_N=np.concatenate(
+            tuple(
+                replica_estimate.molecular_total_forces_N
+                for replica_estimate in replica_estimates
+            ),
+            axis=0,
+        ),
+        family_com_velocities_m_s=np.concatenate(
+            tuple(
+                replica_estimate.family_com_velocities_m_s
+                for replica_estimate in replica_estimates
+            ),
+            axis=0,
+        ),
+        family_total_forces_N=np.concatenate(
+            tuple(
+                replica_estimate.family_total_forces_N
+                for replica_estimate in replica_estimates
+            ),
+            axis=0,
+        ),
+        correlation_lag_times_s=reference_estimate.correlation_lag_times_s,
+        memory_kernel_lag_times_s=reference_estimate.memory_kernel_lag_times_s,
+        velocity_autocorrelation_m2_s2=velocity_autocorrelation_m2_s2,
+        force_velocity_correlation_N_m_s=force_velocity_correlation_N_m_s,
+        memory_kernel_kg_s2=memory_kernel_kg_s2,
+        cumulative_memory_integral_kg_s=cumulative_memory_integral_kg_s,
+        integrated_memory_kernel_kg_s=integrated_memory_kernel_kg_s,
+        diffusion_tensor_m2_s=diffusion_tensor_m2_s,
+        markov_diffusion_available=markov_diffusion_available,
+        plateau_relative_variation=plateau_relative_variation,
+        tail_relative_norm=tail_relative_norm,
+        minimum_plateau_eigenvalue_kg_s=minimum_plateau_eigenvalue_kg_s,
+        plateau_gate_passed=plateau_gate_passed,
+        tail_gate_passed=tail_gate_passed,
+        psd_gate_passed=psd_gate_passed,
+        not_complete_reasons=not_complete_reasons,
+    )
+
+
+def _validated_force_complete_atomic_trajectory(
+    atomic_velocities_m_s: Array,
+    atomic_forces_N: Array,
+    atomic_masses_kg: Array,
+    atom_molecule_ids: Array,
+) -> tuple[Array, Array, Array, Array]:
+    velocities_m_s = np.asarray(atomic_velocities_m_s, dtype=float)
+    forces_N = np.asarray(atomic_forces_N, dtype=float)
+    masses_kg = np.asarray(atomic_masses_kg, dtype=float)
+    unparsed_molecule_ids = np.asarray(atom_molecule_ids)
+    molecule_ids = np.asarray(atom_molecule_ids, dtype=int)
+    if velocities_m_s.ndim != 3 or velocities_m_s.shape[2] != CARTESIAN:
+        raise ValueError("atomic_velocities_m_s must have shape (frames, atoms, 3)")
+    if forces_N.shape != velocities_m_s.shape:
+        raise ValueError("atomic_forces_N must match atomic_velocities_m_s")
+    atom_count = velocities_m_s.shape[1]
+    if masses_kg.shape != (atom_count,):
+        raise ValueError("atomic_masses_kg must have one value per atom")
+    if molecule_ids.shape != (atom_count,):
+        raise ValueError("atom_molecule_ids must have one value per atom")
+    if not np.array_equal(unparsed_molecule_ids, molecule_ids):
+        raise ValueError("atom_molecule_ids must contain exact integers")
+    if velocities_m_s.shape[0] < 3:
+        raise ValueError("memory-kernel estimation requires at least three frames")
+    if not np.all(np.isfinite(velocities_m_s)):
+        raise ValueError("atomic_velocities_m_s must be finite")
+    if not np.all(np.isfinite(forces_N)):
+        raise ValueError("atomic_forces_N must be finite")
+    if not np.all(np.isfinite(masses_kg)) or np.any(masses_kg <= 0.0):
+        raise ValueError("atomic_masses_kg must be finite and positive")
+    return velocities_m_s, forces_N, masses_kg, molecule_ids
+
+
+def _memory_kernel_lag_count(maximum_lag_frames: int, frame_count: int) -> int:
+    if isinstance(maximum_lag_frames, (bool, np.bool_)) or not isinstance(
+        maximum_lag_frames,
+        (int, np.integer),
+    ):
+        raise ValueError("maximum_lag_frames must be an integer")
+    lag_count = int(maximum_lag_frames)
+    if lag_count < 2 or lag_count >= frame_count:
+        raise ValueError(
+            "maximum_lag_frames must be at least two and less than frame count"
+        )
+    return lag_count
+
+
+def _memory_kernel_plateau_count(
+    plateau_window_frames: int,
+    maximum_lag_frames: int,
+) -> int:
+    if isinstance(plateau_window_frames, (bool, np.bool_)) or not isinstance(
+        plateau_window_frames,
+        (int, np.integer),
+    ):
+        raise ValueError("plateau_window_frames must be an integer")
+    plateau_count = int(plateau_window_frames)
+    if plateau_count < 2 or plateau_count > maximum_lag_frames:
+        raise ValueError(
+            "plateau_window_frames must be at least two and no greater than maximum lag"
+        )
+    return plateau_count
+
+
+def _validated_molecular_family_labels(
+    molecular_family_labels: tuple[str, ...],
+    molecule_count: int,
+) -> tuple[str, ...]:
+    if len(molecular_family_labels) != molecule_count:
+        raise ValueError(
+            "molecular_family_labels must align with sorted unique molecule IDs"
+        )
+    if any(not isinstance(label, str) or not label for label in molecular_family_labels):
+        raise ValueError("molecular_family_labels must contain non-empty strings")
+    return tuple(molecular_family_labels)
+
+
+def _project_atoms_to_molecules(
+    atomic_velocities_m_s: Array,
+    atomic_forces_N: Array,
+    atomic_masses_kg: Array,
+    atom_molecule_ids: Array,
+    ordered_molecule_ids: tuple[int, ...],
+) -> tuple[Array, Array, Array]:
+    molecular_masses_kg = np.asarray(
+        tuple(
+            float(np.sum(atomic_masses_kg[atom_molecule_ids == molecule_id]))
+            for molecule_id in ordered_molecule_ids
+        ),
+        dtype=float,
+    )
+    molecular_com_velocities_m_s = np.stack(
+        tuple(
+            np.einsum(
+                "a,fac->fc",
+                atomic_masses_kg[atom_molecule_ids == molecule_id],
+                atomic_velocities_m_s[:, atom_molecule_ids == molecule_id, :],
+            )
+            / molecular_masses_kg[molecule_index]
+            for molecule_index, molecule_id in enumerate(ordered_molecule_ids)
+        ),
+        axis=1,
+    )
+    molecular_total_forces_N = np.stack(
+        tuple(
+            np.sum(
+                atomic_forces_N[:, atom_molecule_ids == molecule_id, :],
+                axis=1,
+            )
+            for molecule_id in ordered_molecule_ids
+        ),
+        axis=1,
+    )
+    return (
+        molecular_masses_kg,
+        molecular_com_velocities_m_s,
+        molecular_total_forces_N,
+    )
+
+
+def _project_molecules_to_families(
+    molecular_masses_kg: Array,
+    molecular_com_velocities_m_s: Array,
+    molecular_total_forces_N: Array,
+    molecular_family_labels: tuple[str, ...],
+    family_labels: tuple[str, ...],
+) -> tuple[Array, Array, Array]:
+    family_masks = tuple(
+        np.asarray(
+            tuple(label == family_label for label in molecular_family_labels),
+            dtype=bool,
+        )
+        for family_label in family_labels
+    )
+    family_masses_kg = np.asarray(
+        tuple(float(np.sum(molecular_masses_kg[mask])) for mask in family_masks),
+        dtype=float,
+    )
+    family_com_velocities_m_s = np.stack(
+        tuple(
+            np.einsum(
+                "m,fmc->fc",
+                molecular_masses_kg[mask],
+                molecular_com_velocities_m_s[:, mask, :],
+            )
+            / family_masses_kg[family_index]
+            for family_index, mask in enumerate(family_masks)
+        ),
+        axis=1,
+    )
+    family_total_forces_N = np.stack(
+        tuple(
+            np.sum(molecular_total_forces_N[:, mask, :], axis=1)
+            for mask in family_masks
+        ),
+        axis=1,
+    )
+    return family_masses_kg, family_com_velocities_m_s, family_total_forces_N
+
+
+def _lagged_matrix_correlation(
+    future_values: Array,
+    origin_values: Array,
+    maximum_lag_frames: int,
+) -> Array:
+    return np.asarray(
+        tuple(
+            np.einsum(
+                "ti,tj->ij",
+                future_values[lag_frames:],
+                origin_values[: future_values.shape[0] - lag_frames],
+            )
+            / float(future_values.shape[0] - lag_frames)
+            for lag_frames in range(maximum_lag_frames + 1)
+        ),
+        dtype=float,
+    )
+
+
+def _invert_matrix_volterra_kernel(
+    velocity_autocorrelation_m2_s2: Array,
+    volterra_convolution_residual_N_m_s: Array,
+    timestep_s: float,
+    volterra_regularization: float,
+    singular_value_relative_tolerance: float,
+) -> Array:
+    lag_count = velocity_autocorrelation_m2_s2.shape[0] - 1
+    midpoint_velocity_correlations_m2_s2 = 0.5 * (
+        velocity_autocorrelation_m2_s2[:-1]
+        + velocity_autocorrelation_m2_s2[1:]
+    )
+    zero_lag_correlation_m2_s2 = midpoint_velocity_correlations_m2_s2[0]
+    left_vectors, singular_values, right_vectors_transpose = np.linalg.svd(
+        zero_lag_correlation_m2_s2,
+        full_matrices=False,
+    )
+    maximum_singular_value = float(np.max(singular_values))
+    retained = singular_values > (
+        singular_value_relative_tolerance * maximum_singular_value
+    )
+    inverse_weights = np.where(
+        retained,
+        singular_values
+        / (
+            singular_values * singular_values
+            + volterra_regularization
+            * maximum_singular_value
+            * maximum_singular_value
+        ),
+        0.0,
+    )
+    zero_lag_pseudoinverse_s2_m2 = (
+        right_vectors_transpose.T
+        @ np.diag(inverse_weights)
+        @ left_vectors.T
+    )
+    kernel_values: list[Array] = []
+    for interval_index in range(lag_count):
+        prior_convolution_N_m_s = sum(
+            (
+                kernel_values[kernel_index]
+                @ midpoint_velocity_correlations_m2_s2[
+                    interval_index - kernel_index
+                ]
+                * timestep_s
+            )
+            for kernel_index in range(interval_index)
+        )
+        remaining_convolution_N_m_s = (
+            volterra_convolution_residual_N_m_s[interval_index]
+            - prior_convolution_N_m_s
+        )
+        kernel_values.append(
+            remaining_convolution_N_m_s
+            @ zero_lag_pseudoinverse_s2_m2
+            / timestep_s
+        )
+    unsymmetrized_kernel_kg_s2 = np.asarray(kernel_values, dtype=float)
+    return 0.5 * (
+        unsymmetrized_kernel_kg_s2
+        + unsymmetrized_kernel_kg_s2.transpose(0, 2, 1)
+    )
+
+
+def _memory_kernel_gate_diagnostics(
+    memory_kernel_kg_s2: Array,
+    cumulative_memory_integral_kg_s: Array,
+    plateau_window_frames: int,
+    maximum_plateau_relative_variation: float,
+    maximum_tail_relative_norm: float,
+    psd_relative_tolerance: float,
+) -> tuple[float, float, float, bool, bool, bool]:
+    plateau_integrals_kg_s = cumulative_memory_integral_kg_s[-plateau_window_frames:]
+    integrated_memory_kernel_kg_s = cumulative_memory_integral_kg_s[-1]
+    integrated_scale_kg_s = max(
+        float(np.linalg.norm(integrated_memory_kernel_kg_s, ord="fro")),
+        np.finfo(float).tiny,
+    )
+    plateau_relative_variation = max(
+        float(
+            np.linalg.norm(
+                plateau_value_kg_s - integrated_memory_kernel_kg_s,
+                ord="fro",
+            )
+            / integrated_scale_kg_s
+        )
+        for plateau_value_kg_s in plateau_integrals_kg_s
+    )
+    kernel_norms_kg_s2 = np.linalg.norm(memory_kernel_kg_s2, axis=(1, 2))
+    tail_relative_norm = float(
+        np.max(kernel_norms_kg_s2[-plateau_window_frames:])
+        / max(float(np.max(kernel_norms_kg_s2)), np.finfo(float).tiny)
+    )
+    plateau_eigenvalues_kg_s = tuple(
+        np.linalg.eigvalsh(plateau_value_kg_s)
+        for plateau_value_kg_s in plateau_integrals_kg_s
+    )
+    minimum_plateau_eigenvalue_kg_s = min(
+        float(np.min(eigenvalues_kg_s))
+        for eigenvalues_kg_s in plateau_eigenvalues_kg_s
+    )
+    psd_gate_passed = all(
+        float(np.min(eigenvalues_kg_s))
+        >= -psd_relative_tolerance
+        * max(float(np.max(np.abs(eigenvalues_kg_s))), np.finfo(float).tiny)
+        for eigenvalues_kg_s in plateau_eigenvalues_kg_s
+    )
+    return (
+        plateau_relative_variation,
+        tail_relative_norm,
+        minimum_plateau_eigenvalue_kg_s,
+        plateau_relative_variation <= maximum_plateau_relative_variation,
+        tail_relative_norm <= maximum_tail_relative_norm,
+        psd_gate_passed,
+    )
+
+
+def _psd_pseudoinverse_with_relative_tolerance(
+    matrix: Array,
+    psd_relative_tolerance: float,
+    singular_value_relative_tolerance: float,
+) -> Array:
+    numeric_matrix = np.asarray(matrix, dtype=float)
+    symmetric_matrix = 0.5 * (numeric_matrix + numeric_matrix.T)
+    eigenvalues, eigenvectors = np.linalg.eigh(symmetric_matrix)
+    eigenvalue_scale = max(
+        float(np.max(np.abs(eigenvalues))),
+        np.finfo(float).tiny,
+    )
+    if float(np.min(eigenvalues)) < -psd_relative_tolerance * eigenvalue_scale:
+        raise ValueError("integrated memory kernel must be positive semidefinite")
+    retained_eigenvalues = eigenvalues > (
+        singular_value_relative_tolerance * eigenvalue_scale
+    )
+    inverse_eigenvalues = np.where(
+        retained_eigenvalues,
+        1.0 / np.maximum(eigenvalues, np.finfo(float).tiny),
+        0.0,
+    )
+    pseudoinverse = eigenvectors @ np.diag(inverse_eigenvalues) @ eigenvectors.T
+    return 0.5 * (pseudoinverse + pseudoinverse.T)
 
 
 def _extract_committed_transition_events(

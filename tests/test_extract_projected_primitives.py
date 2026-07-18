@@ -1,12 +1,14 @@
 import numpy as np
 import pytest
+from scipy.signal import lfilter
 
-from constants import T_REF_K
+from constants import K_B, T_REF_K
 from conductivity.extract_projected_primitives import main
 from conductivity.physical_library.extract_projected_primitives import (
     AssociationThresholds,
     ChargedCenterCatalog,
     ChargedCenterFrame,
+    _canonical_atom_column_indices,
     _charge_displacements_by_step_m,
     _primitive_arrays_from_projected_set,
     _projected_recipe_record_from_composition_record,
@@ -16,9 +18,45 @@ from conductivity.physical_library.trajectory_primitives import (
     _extract_committed_transition_events,
     _find_diffusive_covariance_window,
     _self_current_tensors,
+    estimate_molecular_family_memory_kernel,
+    estimate_molecular_family_memory_kernel_from_replicas,
     project_sampled_trajectory_to_generator_primitives,
     refine_trajectory_basis_from_state_current_samples,
 )
+
+
+def test_force_complete_lammps_columns_are_canonicalized_by_name() -> None:
+    source_columns = (
+        "id",
+        "mol",
+        "type",
+        "q",
+        "xu",
+        "yu",
+        "zu",
+        "vx",
+        "vy",
+        "vz",
+        "fx",
+        "fy",
+        "fz",
+    )
+
+    canonical_columns, source_indices = _canonical_atom_column_indices(source_columns)
+
+    assert canonical_columns[:9] == (
+        "id",
+        "mol",
+        "q",
+        "xu",
+        "yu",
+        "zu",
+        "vx",
+        "vy",
+        "vz",
+    )
+    assert canonical_columns[9:] == ("type", "fx", "fy", "fz")
+    assert source_indices == (0, 1, 3, 4, 5, 6, 7, 8, 9, 2, 10, 11, 12)
 
 
 def test_aba_recrossing_emits_no_committed_transition() -> None:
@@ -376,6 +414,234 @@ def test_zero_frequency_plateau_rejects_terminal_transient() -> None:
     assert not converged
     assert convergence.convergence_status == "not_converged"
     assert "stable final plateau" in convergence.not_complete_reason
+
+
+def test_memory_kernel_uses_molecular_com_velocity_and_total_force() -> None:
+    frame_count = 32
+    timestep_s = 2.0e-15
+    frame_phase = np.arange(frame_count, dtype=float)[:, np.newaxis, np.newaxis]
+    first_atom_velocity_m_s = (
+        30.0 * np.cos(0.2 * frame_phase) * np.ones((1, 1, 3))
+    )
+    second_atom_velocity_m_s = (
+        -30.0 * np.cos(0.2 * frame_phase) * np.ones((1, 1, 3))
+    )
+    third_atom_velocity_m_s = (
+        20.0 * np.sin(0.3 * frame_phase) * np.ones((1, 1, 3))
+    )
+    atomic_velocities_m_s = np.concatenate(
+        (
+            first_atom_velocity_m_s,
+            second_atom_velocity_m_s,
+            third_atom_velocity_m_s,
+        ),
+        axis=1,
+    )
+    atomic_forces_N = np.broadcast_to(
+        np.asarray(
+            (
+                (1.0e-12, 2.0e-12, 3.0e-12),
+                (4.0e-12, 5.0e-12, 6.0e-12),
+                (-2.0e-12, 1.0e-12, 3.0e-12),
+            )
+        ),
+        (frame_count, 3, 3),
+    ).copy()
+    atomic_masses_kg = np.asarray((1.0e-26, 3.0e-26, 2.0e-26))
+
+    estimate = estimate_molecular_family_memory_kernel(
+        atomic_velocities_m_s=atomic_velocities_m_s,
+        atomic_forces_N=atomic_forces_N,
+        atomic_masses_kg=atomic_masses_kg,
+        atom_molecule_ids=np.asarray((7, 7, 11), dtype=int),
+        molecular_family_labels=("solvent", "anion"),
+        temperature_K=T_REF_K,
+        timestep_s=timestep_s,
+        maximum_lag_frames=8,
+        plateau_window_frames=3,
+        maximum_plateau_relative_variation=1.0,
+        maximum_tail_relative_norm=1.0,
+        psd_relative_tolerance=1.0,
+        volterra_regularization=1.0e-6,
+        singular_value_relative_tolerance=1.0e-10,
+    )
+
+    expected_first_molecule_velocity_m_s = (
+        atomic_velocities_m_s[:, 0, :] + 3.0 * atomic_velocities_m_s[:, 1, :]
+    ) / 4.0
+    assert estimate.molecule_ids == (7, 11)
+    assert estimate.molecular_com_velocities_m_s[:, 0, :] == pytest.approx(
+        expected_first_molecule_velocity_m_s
+    )
+    assert estimate.molecular_total_forces_N[:, 0, :] == pytest.approx(
+        atomic_forces_N[:, 0, :] + atomic_forces_N[:, 1, :]
+    )
+
+
+def test_memory_kernel_recovers_ornstein_uhlenbeck_diffusivity() -> None:
+    random_generator = np.random.default_rng(20260718)
+    temperature_K = T_REF_K
+    timestep_s = 5.0e-15
+    relaxation_rate_s_inv = 4.0e12
+    expected_diffusivity_m2_s = 1.2e-9
+    molecular_mass_kg = K_B * temperature_K / (
+        expected_diffusivity_m2_s * relaxation_rate_s_inv
+    )
+    autoregressive_coefficient = np.exp(-relaxation_rate_s_inv * timestep_s)
+    equilibrium_velocity_variance_m2_s2 = K_B * temperature_K / molecular_mass_kg
+    innovation_standard_deviation_m_s = np.sqrt(
+        equilibrium_velocity_variance_m2_s2
+        * (1.0 - autoregressive_coefficient**2)
+    )
+    frame_count = 50_000
+    burn_in_frame_count = 2_000
+    velocity_innovations_m_s = random_generator.normal(
+        scale=innovation_standard_deviation_m_s,
+        size=(frame_count + burn_in_frame_count, 3),
+    )
+    filtered_velocities_m_s = lfilter(
+        (1.0,),
+        (1.0, -autoregressive_coefficient),
+        velocity_innovations_m_s,
+        axis=0,
+    )[burn_in_frame_count:]
+    atomic_velocities_m_s = filtered_velocities_m_s[:, np.newaxis, :]
+
+    estimate = estimate_molecular_family_memory_kernel(
+        atomic_velocities_m_s=atomic_velocities_m_s,
+        atomic_forces_N=np.zeros_like(atomic_velocities_m_s),
+        atomic_masses_kg=np.asarray((molecular_mass_kg,)),
+        atom_molecule_ids=np.asarray((19,), dtype=int),
+        molecular_family_labels=("ion",),
+        temperature_K=temperature_K,
+        timestep_s=timestep_s,
+        maximum_lag_frames=120,
+        plateau_window_frames=24,
+        maximum_plateau_relative_variation=0.25,
+        maximum_tail_relative_norm=0.25,
+        psd_relative_tolerance=0.15,
+        volterra_regularization=2.0e-4,
+        singular_value_relative_tolerance=1.0e-10,
+    )
+
+    assert estimate.velocity_autocorrelation_m2_s2.shape == (121, 3, 3)
+    assert estimate.force_velocity_correlation_N_m_s.shape == (121, 3, 3)
+    assert estimate.memory_kernel_kg_s2.shape == (120, 3, 3)
+    assert estimate.plateau_gate_passed
+    assert estimate.tail_gate_passed
+    assert estimate.psd_gate_passed
+    assert estimate.markov_diffusion_available
+    recovered_isotropic_diffusivity_m2_s = float(
+        np.trace(estimate.diffusion_tensor_m2_s) / 3.0
+    )
+    assert recovered_isotropic_diffusivity_m2_s == pytest.approx(
+        expected_diffusivity_m2_s,
+        rel=0.3,
+    )
+
+
+def test_memory_kernel_averages_independent_replica_correlations() -> None:
+    random_generator = np.random.default_rng(20260719)
+    temperature_K = T_REF_K
+    timestep_s = 5.0e-15
+    relaxation_rate_s_inv = 4.0e12
+    expected_diffusivity_m2_s = 1.2e-9
+    molecular_mass_kg = K_B * temperature_K / (
+        expected_diffusivity_m2_s * relaxation_rate_s_inv
+    )
+    autoregressive_coefficient = np.exp(-relaxation_rate_s_inv * timestep_s)
+    equilibrium_velocity_variance_m2_s2 = K_B * temperature_K / molecular_mass_kg
+    innovation_standard_deviation_m_s = np.sqrt(
+        equilibrium_velocity_variance_m2_s2
+        * (1.0 - autoregressive_coefficient**2)
+    )
+    replica_velocities = tuple(
+        lfilter(
+            (1.0,),
+            (1.0, -autoregressive_coefficient),
+            random_generator.normal(
+                scale=innovation_standard_deviation_m_s,
+                size=(22_000, 3),
+            ),
+            axis=0,
+        )[2_000:, np.newaxis, :]
+        for _replica_index in range(3)
+    )
+
+    estimate = estimate_molecular_family_memory_kernel_from_replicas(
+        atomic_velocity_replicas_m_s=replica_velocities,
+        atomic_force_replicas_N=tuple(
+            np.zeros_like(velocities_m_s) for velocities_m_s in replica_velocities
+        ),
+        atomic_masses_kg=np.asarray((molecular_mass_kg,)),
+        atom_molecule_ids=np.asarray((19,), dtype=int),
+        molecular_family_labels=("ion",),
+        temperature_K=temperature_K,
+        timestep_s=timestep_s,
+        maximum_lag_frames=120,
+        plateau_window_frames=24,
+        maximum_plateau_relative_variation=0.25,
+        maximum_tail_relative_norm=0.25,
+        psd_relative_tolerance=0.15,
+        volterra_regularization=2.0e-4,
+        singular_value_relative_tolerance=1.0e-10,
+    )
+
+    assert estimate.replica_count == 3
+    assert estimate.markov_diffusion_available
+    assert np.trace(estimate.diffusion_tensor_m2_s) / 3.0 == pytest.approx(
+        expected_diffusivity_m2_s,
+        rel=0.25,
+    )
+
+
+def test_memory_kernel_psd_gate_withholds_markov_diffusion() -> None:
+    random_generator = np.random.default_rng(314159)
+    frame_count = 20_000
+    burn_in_frame_count = 2_000
+    timestep_s = 1.0e-14
+    molecular_mass_kg = 2.0e-25
+    relaxation_rate_s_inv = 2.0e12
+    autoregressive_coefficient = np.exp(-relaxation_rate_s_inv * timestep_s)
+    velocity_innovations = random_generator.normal(
+        scale=np.sqrt(1.0 - autoregressive_coefficient**2),
+        size=(frame_count + burn_in_frame_count, 3),
+    )
+    filtered_velocities_m_s = lfilter(
+        (1.0,),
+        (1.0, -autoregressive_coefficient),
+        velocity_innovations,
+        axis=0,
+    )[burn_in_frame_count:]
+    atomic_velocities_m_s = filtered_velocities_m_s[:, np.newaxis, :]
+    anti_dissipative_forces_N = (
+        -3.0
+        * molecular_mass_kg
+        * relaxation_rate_s_inv
+        * atomic_velocities_m_s
+    )
+
+    estimate = estimate_molecular_family_memory_kernel(
+        atomic_velocities_m_s=atomic_velocities_m_s,
+        atomic_forces_N=anti_dissipative_forces_N,
+        atomic_masses_kg=np.asarray((molecular_mass_kg,)),
+        atom_molecule_ids=np.asarray((0,), dtype=int),
+        molecular_family_labels=("ion",),
+        temperature_K=T_REF_K,
+        timestep_s=timestep_s,
+        maximum_lag_frames=80,
+        plateau_window_frames=16,
+        maximum_plateau_relative_variation=1.0,
+        maximum_tail_relative_norm=1.0,
+        psd_relative_tolerance=1.0e-8,
+        volterra_regularization=1.0e-4,
+        singular_value_relative_tolerance=1.0e-10,
+    )
+
+    assert not estimate.psd_gate_passed
+    assert not estimate.markov_diffusion_available
+    assert estimate.diffusion_tensor_m2_s.shape == (0, 0)
+    assert "positive semidefinite" in estimate.not_complete_reasons
 
 
 def _two_center_catalog() -> ChargedCenterCatalog:

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<SMIRNOFF version="0.3" aromaticity_model="OEAroModel_MDL">
+  <vdW version="0.4" potential="Lennard-Jones-12-6" combining_rules="Lorentz-Berthelot" scale12="0.0" scale13="0.0" scale14="0.5" scale15="1.0" cutoff="9.0 * angstrom ** 1" switch_width="1.0 * angstrom ** 1" periodic_method="cutoff" nonperiodic_method="no-cutoff">
+    <Atom smirks="[#14X4:1]" id="gaff2-tmspi-si" epsilon="0.1078 * mole ** -1 * kilocalorie ** 1" rmin_half="1.9069 * angstrom ** 1"/>
+  </vdW>
+  <Bonds version="0.4" potential="harmonic" fractional_bondorder_method="AM1-Wiberg" fractional_bondorder_interpolation="linear">
+    <Bond smirks="[#14X4:1]-[#6X4:2]" id="gaff2-tmspi-sic" length="1.535 * angstrom" k="228.89 * kilocalorie_per_mole/angstrom**2"/>
+    <Bond smirks="[#14X4:1]-[#8X2:2]" id="gaff2-tmspi-sio" length="1.427 * angstrom" k="282.27 * kilocalorie_per_mole/angstrom**2"/>
+  </Bonds>
+  <Angles version="0.3" potential="harmonic">
+    <Angle smirks="[#6X4:1]-[#14X4:2]-[#6X4:3]" id="gaff2-tmspi-csic" angle="112.63 * degree" k="59.87 * kilocalorie_per_mole/radian**2"/>
+    <Angle smirks="[#6X4:1]-[#14X4:2]-[#8X2:3]" id="gaff2-tmspi-csio" angle="107.62 * degree" k="77.44 * kilocalorie_per_mole/radian**2"/>
+    <Angle smirks="[#14X4:1]-[#6X4:2]-[#1:3]" id="gaff2-tmspi-sich" angle="109.68 * degree" k="43.27 * kilocalorie_per_mole/radian**2"/>
+    <Angle smirks="[#14X4:1]-[#8X2:2]-[#15X3:3]" id="gaff2-tmspi-siop" angle="119.90 * degree" k="55.39 * kilocalorie_per_mole/radian**2"/>
+  </Angles>
+  <ProperTorsions version="0.4" potential="k*(1+cos(periodicity*theta-phase))" default_idivf="auto">
+    <Proper smirks="[#6X4:1]-[#14X4:2]-[#6X4:3]-[#1:4]" id="gaff2-tmspi-csich" periodicity1="3" phase1="0.0 * degree" k1="0.130 * kilocalorie_per_mole"/>
+    <Proper smirks="[#6X4:1]-[#14X4:2]-[#8X2:3]-[#15X3:4]" id="gaff2-tmspi-csiop" periodicity1="3" phase1="0.0 * degree" k1="0.383 * kilocalorie_per_mole" periodicity2="1" phase2="180.0 * degree" k2="3.950 * kilocalorie_per_mole"/>
+    <Proper smirks="[#8X2:1]-[#14X4:2]-[#6X4:3]-[#1:4]" id="gaff2-tmspi-osich" periodicity1="1" phase1="0.0 * degree" k1="0.250 * kilocalorie_per_mole"/>
+  </ProperTorsions>
+</SMIRNOFF>
