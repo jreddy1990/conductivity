@@ -8,11 +8,11 @@ nested basis of smooth full-configuration observables.
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
+from itertools import combinations_with_replacement
 import math
 from pathlib import Path
 import sys
-from typing import Protocol, runtime_checkable
 import warnings
 
 import numpy as np
@@ -32,14 +32,10 @@ from conductivity.physical_library.physical_objects import (
 from electrolyte_model import ElectrolyteRecipeModel
 from species_data import ADDITIVES, SALTS
 from utils.strict_validation import read_json_object, write_json_object
-from utils.time_series_statistics import linear_fit, select_stationary_suffix
+from utils.time_series_statistics import select_stationary_suffix
 
 Array = np.ndarray
 CARTESIAN_DIMENSION = 3
-STOKES_SPHERE_DRAG_FACTOR = 6.0  # Exact no-slip spherical Stokes drag factor.
-GAUSSIAN_BLOB_VARIANCE_DENOMINATOR = (
-    2.0 * CARTESIAN_DIMENSION
-)  # Isotropic three-dimensional sphere form-factor scale.
 INITIAL_RELAXATION_FORCE_MARGIN = 0.5  # Resolve below the final force criterion.
 TORCH_DTYPE = torch.float64
 MILP_FEASIBILITY_TOLERANCE = 100.0 * math.sqrt(np.finfo(float).eps)
@@ -75,11 +71,13 @@ class DynamicsSettings:
     translation_proposal_m: float
     rotation_proposal_rad: float
     internal_proposal_m: float
-    overdamped_timestep_s: float
-    overdamped_steps: int
-    overdamped_sample_stride: int
-    solvent_viscosity_Pa_s: float
-    minimum_overdamped_acceptance_fraction: float
+    logarithmic_volume_proposal: float
+    hamiltonian_timestep_s: float
+    memory_equilibration_steps: int
+    memory_production_steps: int
+    memory_sample_stride: int
+    memory_laplace_rate_per_s: float
+    maximum_relative_energy_drift: float
 
 
 @dataclass(frozen=True)
@@ -92,19 +90,20 @@ class NumericalSettings:
     force_consistency_relative_tolerance: float
     basis_radial_count: int
     basis_fourier_shell: int
+    basis_angular_order: int
+    basis_cluster_depth: int
+    basis_correlation_order: int
     basis_radial_cutoff_m: float
     maximum_basis_size: int
     eigenvalue_relative_tolerance: float
+    memory_psd_relative_tolerance: float
+    memory_plateau_relative_tolerance: float
+    memory_diffusive_exponent_tolerance: float
+    memory_lag_window_count: int
     residual_tolerance: float
     conductivity_tolerance_S_m: float
-    projected_gk_tolerance_S_m: float
     minimum_effective_sample_size: float
-    helfand_fit_start_fraction: float
-    helfand_maximum_lag_fraction: float
-    gk_noise_window: int
-    gk_noise_standard_error_multiplier: float
     minimum_interatomic_contact_ratio: float
-    density_relative_tolerance: float
     stationarity_standard_error_limit: float
 
 
@@ -113,15 +112,17 @@ class ConductivityResult:
     conductivity_S_m: float
     direct_current_term_S_m: float
     projected_correction_S_m: float
-    green_kubo_conductivity_S_m: float
-    einstein_helfand_conductivity_S_m: float
+    equilibrium_volume_m3: float
+    equilibrium_density_kg_m3: float
+    integrated_memory_eigenvalues_kg_s: tuple[float, ...]
+    diffusion_eigenvalues_m2_s: tuple[float, ...]
     basis_size: int
     basis_conductivities_S_m: tuple[float, ...]
     residual_history: tuple[float, ...]
     maximum_residual_score: float
-    sample_count: int
+    equilibrium_sample_count: int
+    memory_sample_count: int
     effective_sample_size: float
-    overdamped_acceptance_fraction: float
 
 
 @dataclass(frozen=True)
@@ -132,10 +133,10 @@ class MolecularSystem:
     charges_C: Array
     lj_sigma_m: Array
     lj_epsilon_J: Array
-    hydrodynamic_radii_m: Array
     polarizabilities_SI: Array
     molecule_index: Array
     molecule_atom_indices: tuple[Array, ...]
+    molecule_species_names: tuple[str, ...]
     bonds: Array
     bond_force_constants_J_m2: Array
     bond_lengths_m: Array
@@ -146,124 +147,17 @@ class MolecularSystem:
     nonbonded_mask: Array
 
 
-@runtime_checkable
-class InteratomicModel(Protocol):
-    def energy_J(self, positions_m: Array, box_vectors_m: Array) -> float: ...
-
-    def forces_N(self, positions_m: Array, box_vectors_m: Array) -> Array: ...
-
-
 @dataclass(frozen=True)
-class PeriodicDiffusionOperator:
-    """Block-diagonal local diffusion plus periodic transverse Fourier modes."""
-
-    local_blocks_m2_s: Array
-    spectral_factor_m_sqrt_s: Array
-
-    def matrix(self) -> Array:
-        atom_count = self.local_blocks_m2_s.shape[0]
-        diffusion = np.zeros((3 * atom_count, 3 * atom_count))
-        for atom_index, local_block in enumerate(self.local_blocks_m2_s):
-            atom_slice = slice(3 * atom_index, 3 * atom_index + 3)
-            diffusion[atom_slice, atom_slice] = local_block
-        return diffusion + self.spectral_factor_m_sqrt_s @ self.spectral_factor_m_sqrt_s.T
-
-    def apply(self, vectors: Array) -> Array:
-        vector_array = np.asarray(vectors)
-        original_shape = vector_array.shape
-        flattened = vector_array.reshape((-1, original_shape[-1]))
-        atom_count = self.local_blocks_m2_s.shape[0]
-        local = np.einsum(
-            "aij,naj->nai",
-            self.local_blocks_m2_s,
-            flattened.reshape((-1, atom_count, CARTESIAN_DIMENSION)),
-        ).reshape(flattened.shape)
-        spectral = (
-            flattened @ self.spectral_factor_m_sqrt_s
-        ) @ self.spectral_factor_m_sqrt_s.T
-        return (local + spectral).reshape(original_shape)
-
-    def sample_increment(
-        self, random_generator: np.random.Generator
-    ) -> Array:
-        local_noise = np.concatenate(
-            tuple(
-                np.linalg.cholesky(local_block)
-                @ random_generator.normal(size=CARTESIAN_DIMENSION)
-                for local_block in self.local_blocks_m2_s
-            )
-        )
-        spectral_noise = self.spectral_factor_m_sqrt_s @ random_generator.normal(
-            size=self.spectral_factor_m_sqrt_s.shape[1]
-        )
-        return local_noise + spectral_noise
-
-    def solve(self, vector: Array) -> Array:
-        reshaped = np.asarray(vector).reshape((-1, CARTESIAN_DIMENSION))
-        local_solution_blocks: list[Array] = []
-        local_inverse_factor_blocks: list[Array] = []
-        factor_blocks = self.spectral_factor_m_sqrt_s.reshape(
-            (self.local_blocks_m2_s.shape[0], CARTESIAN_DIMENSION, -1)
-        )
-        for local_block, vector_block, factor_block in zip(
-            self.local_blocks_m2_s,
-            reshaped,
-            factor_blocks,
-            strict=True,
-        ):
-            local_cholesky = np.linalg.cholesky(local_block)
-            local_solution_blocks.append(
-                np.linalg.solve(
-                    local_cholesky.T,
-                    np.linalg.solve(local_cholesky, vector_block),
-                )
-            )
-            local_inverse_factor_blocks.append(
-                np.linalg.solve(
-                    local_cholesky.T,
-                    np.linalg.solve(local_cholesky, factor_block),
-                )
-            )
-        local_solution = np.concatenate(local_solution_blocks)
-        local_inverse_factor = np.asarray(
-            local_inverse_factor_blocks
-        ).reshape(self.spectral_factor_m_sqrt_s.shape)
-        reduced_operator = (
-            np.eye(self.spectral_factor_m_sqrt_s.shape[1])
-            + self.spectral_factor_m_sqrt_s.T @ local_inverse_factor
-        )
-        reduced_rhs = self.spectral_factor_m_sqrt_s.T @ local_solution
-        return local_solution - local_inverse_factor @ np.linalg.solve(
-            reduced_operator, reduced_rhs
-        )
-
-    def log_determinant(self) -> float:
-        local_log_determinant = 0.0
-        whitened_factor_blocks: list[Array] = []
-        factor_blocks = self.spectral_factor_m_sqrt_s.reshape(
-            (self.local_blocks_m2_s.shape[0], CARTESIAN_DIMENSION, -1)
-        )
-        for local_block, factor_block in zip(
-            self.local_blocks_m2_s, factor_blocks, strict=True
-        ):
-            local_cholesky = np.linalg.cholesky(local_block)
-            local_log_determinant += 2.0 * float(
-                np.sum(np.log(np.diag(local_cholesky)))
-            )
-            whitened_factor_blocks.append(
-                np.linalg.solve(local_cholesky, factor_block)
-            )
-        whitened_factor = np.asarray(whitened_factor_blocks).reshape(
-            self.spectral_factor_m_sqrt_s.shape
-        )
-        reduced_operator = (
-            np.eye(self.spectral_factor_m_sqrt_s.shape[1])
-            + whitened_factor.T @ whitened_factor
-        )
-        reduced_cholesky = np.linalg.cholesky(reduced_operator)
-        return local_log_determinant + 2.0 * float(
-            np.sum(np.log(np.diag(reduced_cholesky)))
-        )
+class MolecularMemoryOperator:
+    integrated_friction_kg_s: Array
+    diffusion_m2_s: Array
+    physical_range_projector: Array
+    memory_scale_radial_edges_m: Array
+    memory_scale_coefficients: Array
+    lag_times_s: tuple[float, ...]
+    diffusion_plateau_relative_change: float
+    displacement_growth_exponent: float
+    sample_count: int
 
 
 def minimum_image_displacement(displacement_m: Array, box_vectors_m: Array) -> Array:
@@ -272,36 +166,449 @@ def minimum_image_displacement(displacement_m: Array, box_vectors_m: Array) -> A
     return fractional @ box_vectors_m
 
 
-def total_charge_current_density_A_m2(
-    velocities_m_s: Array, charges_C: Array, volume_m3: float
-) -> Array:
-    return np.sum(charges_C[:, None] * velocities_m_s, axis=0) / volume_m3
-
-
-def molecular_com_current_density_A_m2(
-    velocities_m_s: Array, system: MolecularSystem
-) -> Array:
-    volume_m3 = abs(np.linalg.det(system.box_vectors_m))
-    current_density_A_m2 = np.zeros(CARTESIAN_DIMENSION)
-    for molecule_atom_indices in system.molecule_atom_indices:
-        molecule_masses_kg = system.masses_kg[molecule_atom_indices]
-        center_of_mass_velocity_m_s = np.average(
-            velocities_m_s[molecule_atom_indices],
-            axis=0,
-            weights=molecule_masses_kg,
+def molecular_translation_projector(system: MolecularSystem) -> Array:
+    molecule_count = len(system.molecule_atom_indices)
+    translation_modes = np.zeros(
+        (CARTESIAN_DIMENSION * molecule_count, CARTESIAN_DIMENSION)
+    )
+    for molecule_index in range(molecule_count):
+        molecule_slice = slice(
+            CARTESIAN_DIMENSION * molecule_index,
+            CARTESIAN_DIMENSION * (molecule_index + 1),
         )
-        molecular_charge_C = float(np.sum(system.charges_C[molecule_atom_indices]))
-        current_density_A_m2 += molecular_charge_C * center_of_mass_velocity_m_s
-    return current_density_A_m2 / volume_m3
+        translation_modes[molecule_slice] = np.eye(CARTESIAN_DIMENSION)
+    mode_gram_inverse = np.linalg.inv(translation_modes.T @ translation_modes)
+    return (
+        np.eye(CARTESIAN_DIMENSION * molecule_count)
+        - translation_modes @ mode_gram_inverse @ translation_modes.T
+    )
 
 
-def internal_polarization_current_density_A_m2(
-    velocities_m_s: Array, system: MolecularSystem
+def estimate_molecular_memory_operator(
+    molecular_velocities_m_s: Array,
+    system: MolecularSystem,
+    temperature_K: float,
+    sample_interval_s: float,
+    laplace_rate_per_s: float,
+    eigenvalue_relative_tolerance: float,
+    psd_relative_tolerance: float,
+    plateau_relative_tolerance: float,
+    diffusive_exponent_tolerance: float,
+    lag_window_count: int,
+) -> MolecularMemoryOperator:
+    velocities = np.asarray(molecular_velocities_m_s, dtype=float)
+    expected_shape = (
+        velocities.shape[0],
+        len(system.molecule_atom_indices),
+        CARTESIAN_DIMENSION,
+    )
+    if velocities.shape != expected_shape or velocities.shape[0] < 2:
+        raise ValueError(
+            "molecular_velocities_m_s must contain at least two frames with "
+            "shape (frames, molecules, 3)"
+        )
+    if not np.all(np.isfinite(velocities)):
+        raise ValueError("molecular velocities must be finite")
+    if temperature_K <= 0.0 or sample_interval_s <= 0.0:
+        raise ValueError("temperature and memory sample interval must be positive")
+    if laplace_rate_per_s <= 0.0:
+        raise ValueError("memory Laplace rate must be positive")
+    if lag_window_count < 2:
+        raise ValueError("memory lag window count must be at least two")
+    physical_range_projector = molecular_translation_projector(system)
+    flattened_velocities = velocities.reshape((velocities.shape[0], -1))
+    flattened_velocities -= np.mean(flattened_velocities, axis=0, keepdims=True)
+    projected_velocities = flattened_velocities @ physical_range_projector
+    maximum_lag_frames = min(
+        velocities.shape[0] // 2,
+        max(1, int(round(1.0 / (laplace_rate_per_s * sample_interval_s)))),
+    )
+    if maximum_lag_frames < lag_window_count:
+        raise ValueError("trajectory is too short for the requested memory lag ladder")
+    integrated_displacements_m = np.vstack(
+        (
+            np.zeros((1, projected_velocities.shape[1])),
+            np.cumsum(projected_velocities * sample_interval_s, axis=0),
+        )
+    )
+    lag_frames = np.unique(
+        np.rint(
+            np.linspace(
+                maximum_lag_frames / lag_window_count,
+                maximum_lag_frames,
+                lag_window_count,
+            )
+        ).astype(int)
+    )
+    diffusion_sequence: list[Array] = []
+    mean_square_displacements_m2: list[float] = []
+    for lag_frame_count in lag_frames:
+        displacement_samples_m = (
+            integrated_displacements_m[lag_frame_count:]
+            - integrated_displacements_m[:-lag_frame_count]
+        )
+        displacement_samples_m -= np.mean(
+            displacement_samples_m, axis=0, keepdims=True
+        )
+        lag_time_s = lag_frame_count * sample_interval_s
+        displacement_covariance_m2 = (
+            displacement_samples_m.T
+            @ displacement_samples_m
+            / displacement_samples_m.shape[0]
+        )
+        diffusion_at_lag = displacement_covariance_m2 / (2.0 * lag_time_s)
+        diffusion_sequence.append(0.5 * (diffusion_at_lag + diffusion_at_lag.T))
+        mean_square_displacements_m2.append(float(np.trace(displacement_covariance_m2)))
+    diffusion = diffusion_sequence[-1]
+    diffusion_scale = max(float(np.linalg.norm(diffusion)), np.finfo(float).tiny)
+    diffusion_plateau_relative_change = float(
+        np.linalg.norm(diffusion_sequence[-1] - diffusion_sequence[-2])
+        / diffusion_scale
+    )
+    lag_times_s = sample_interval_s * lag_frames
+    displacement_growth_exponent = float(
+        np.log(
+            mean_square_displacements_m2[-1]
+            / mean_square_displacements_m2[-2]
+        )
+        / np.log(lag_times_s[-1] / lag_times_s[-2])
+    )
+    if (
+        diffusion_plateau_relative_change > plateau_relative_tolerance
+        or abs(displacement_growth_exponent - 1.0) > diffusive_exponent_tolerance
+    ):
+        raise ValueError(
+            "molecular displacement has no diffusive plateau: relative diffusion "
+            f"change={diffusion_plateau_relative_change:.6g}, growth "
+            f"exponent={displacement_growth_exponent:.6g}"
+        )
+    diffusion_eigenvalues, diffusion_eigenvectors = np.linalg.eigh(diffusion)
+    diffusion_scale = max(
+        float(np.max(np.abs(diffusion_eigenvalues))), np.finfo(float).tiny
+    )
+    if float(np.min(diffusion_eigenvalues)) < (
+        -psd_relative_tolerance * diffusion_scale
+    ):
+        raise ValueError("zero-frequency molecular diffusion is not positive semidefinite")
+    retained_modes = diffusion_eigenvalues > (
+        eigenvalue_relative_tolerance * diffusion_scale
+    )
+    diffusion_inverse = (
+        diffusion_eigenvectors[:, retained_modes]
+        / diffusion_eigenvalues[retained_modes]
+    ) @ diffusion_eigenvectors[:, retained_modes].T
+    integrated_friction = (
+        K_B
+        * temperature_K
+        * physical_range_projector
+        @ diffusion_inverse
+        @ physical_range_projector
+    )
+    integrated_friction = 0.5 * (integrated_friction + integrated_friction.T)
+    return MolecularMemoryOperator(
+        integrated_friction_kg_s=integrated_friction,
+        diffusion_m2_s=diffusion,
+        physical_range_projector=physical_range_projector,
+        memory_scale_radial_edges_m=np.empty(0),
+        memory_scale_coefficients=np.asarray((0.0,)),
+        lag_times_s=tuple(float(value) for value in lag_times_s),
+        diffusion_plateau_relative_change=diffusion_plateau_relative_change,
+        displacement_growth_exponent=displacement_growth_exponent,
+        sample_count=velocities.shape[0],
+    )
+
+
+def _matching_lammps_operator(
+    system: MolecularSystem,
+    temperature_K: float,
+    operator_data_root: Path,
+) -> tuple[Path, dict]:
+    if temperature_K <= 0.0:
+        raise ValueError("temperature must be positive")
+    operator_paths = tuple(
+        sorted(operator_data_root.glob("*/replica_averaged_operator.npz"))
+    )
+    if not operator_paths:
+        raise ValueError("LAMMPS operator corpus contains no averaged operators")
+    system_labels = tuple(dict.fromkeys(system.molecule_species_names))
+    system_family_indices = np.asarray(
+        tuple(system_labels.index(label) for label in system.molecule_species_names),
+        dtype=int,
+    )
+    system_family_counts = np.bincount(
+        system_family_indices, minlength=len(system_labels)
+    )
+    matching_operators: list[tuple[Path, dict]] = []
+    for operator_path in operator_paths:
+        report_path = operator_path.with_suffix(".json")
+        report = read_json_object(report_path, "LAMMPS averaged molecular operator")
+        if report["admitted"] is not True:
+            continue
+        if report["diffusion_plateau_gate_passed"] is not True:
+            raise ValueError(f"admitted operator lacks diffusion plateau: {operator_path}")
+        if report["diffusion_psd_gate_passed"] is not True:
+            raise ValueError(f"admitted operator is not PSD: {operator_path}")
+        with np.load(operator_path) as operator:
+            family_labels = tuple(str(value) for value in operator["family_labels"])
+            operator_family_indices = np.asarray(
+                operator["molecule_family_indices"], dtype=int
+            )
+        if set(family_labels) != set(system_labels):
+            continue
+        operator_family_counts = np.bincount(
+            operator_family_indices, minlength=len(family_labels)
+        )
+        reordered_counts = np.asarray(
+            tuple(
+                operator_family_counts[family_labels.index(label)]
+                for label in system_labels
+            )
+        )
+        if not np.allclose(
+            reordered_counts / np.sum(reordered_counts),
+            system_family_counts / np.sum(system_family_counts),
+            rtol=MILP_FEASIBILITY_TOLERANCE,
+            atol=MILP_FEASIBILITY_TOLERANCE,
+        ):
+            continue
+        if not math.isclose(
+            float(report["temperature_K"]),
+            temperature_K,
+            rel_tol=MILP_FEASIBILITY_TOLERANCE,
+        ):
+            continue
+        matching_operators.append((operator_path, report))
+    if len(matching_operators) != 1:
+        raise ValueError(
+            "LAMMPS operator corpus must contain exactly one admitted operator "
+            "matching molecular composition and temperature"
+        )
+    return matching_operators[0]
+
+
+def molecular_memory_from_lammps_operator_data(
+    system: MolecularSystem,
+    temperature_K: float,
+    operator_data_root: Path,
+    eigenvalue_relative_tolerance: float,
+) -> MolecularMemoryOperator:
+    operator_path, report = _matching_lammps_operator(
+        system=system,
+        temperature_K=temperature_K,
+        operator_data_root=operator_data_root,
+    )
+    system_labels = tuple(dict.fromkeys(system.molecule_species_names))
+    system_family_indices = np.asarray(
+        tuple(system_labels.index(label) for label in system.molecule_species_names),
+        dtype=int,
+    )
+    system_family_counts = np.bincount(
+        system_family_indices, minlength=len(system_labels)
+    )
+    with np.load(operator_path) as operator:
+        family_labels = tuple(str(value) for value in operator["family_labels"])
+        collective_diffusion = np.asarray(operator["diffusion_tensor_m2_s"])
+        self_diffusion = np.asarray(
+            operator["molecular_self_memory_diffusion_m2_s"]
+        )
+        lag_times_s = np.asarray(operator["lag_times_s"])
+        lag_sample_counts = np.asarray(operator["lag_sample_counts"])
+        memory_scale_radial_edges_m = (
+            np.asarray(operator["geometry_radial_bin_edges_A"], dtype=float) * 1.0e-10
+        )
+        memory_scale_coefficients = np.asarray(
+            operator["conditional_memory_scale_coefficients"], dtype=float
+        )
+    family_order = tuple(family_labels.index(label) for label in system_labels)
+    coordinate_order = np.concatenate(
+        tuple(
+            np.arange(3 * family_index, 3 * (family_index + 1))
+            for family_index in family_order
+        )
+    )
+    collective_diffusion = collective_diffusion[
+        np.ix_(coordinate_order, coordinate_order)
+    ]
+    self_diffusion = self_diffusion[np.asarray(family_order)]
+    molecule_count = len(system.molecule_atom_indices)
+    unprojected_diffusion = np.zeros((3 * molecule_count, 3 * molecule_count))
+    for first_molecule_index, first_family_index in enumerate(system_family_indices):
+        first_slice = slice(3 * first_molecule_index, 3 * (first_molecule_index + 1))
+        for second_molecule_index, second_family_index in enumerate(
+            system_family_indices
+        ):
+            second_slice = slice(
+                3 * second_molecule_index, 3 * (second_molecule_index + 1)
+            )
+            if first_molecule_index == second_molecule_index:
+                block = self_diffusion[first_family_index]
+            elif first_family_index == second_family_index:
+                family_count = system_family_counts[first_family_index]
+                family_slice = slice(
+                    3 * first_family_index, 3 * (first_family_index + 1)
+                )
+                block = (
+                    family_count
+                    * collective_diffusion[family_slice, family_slice]
+                    - self_diffusion[first_family_index]
+                ) / (family_count - 1)
+            else:
+                block = collective_diffusion[
+                    3 * first_family_index : 3 * (first_family_index + 1),
+                    3 * second_family_index : 3 * (second_family_index + 1),
+                ]
+            unprojected_diffusion[first_slice, second_slice] = block
+    physical_range_projector = molecular_translation_projector(system)
+    diffusion = (
+        physical_range_projector
+        @ unprojected_diffusion
+        @ physical_range_projector
+    )
+    diffusion = 0.5 * (diffusion + diffusion.T)
+    diffusion_inverse = symmetric_psd_pseudoinverse(
+        diffusion, eigenvalue_relative_tolerance
+    )
+    integrated_friction = K_B * temperature_K * diffusion_inverse
+    return MolecularMemoryOperator(
+        integrated_friction_kg_s=integrated_friction,
+        diffusion_m2_s=diffusion,
+        physical_range_projector=physical_range_projector,
+        memory_scale_radial_edges_m=memory_scale_radial_edges_m,
+        memory_scale_coefficients=memory_scale_coefficients,
+        lag_times_s=tuple(float(value) for value in lag_times_s),
+        diffusion_plateau_relative_change=float(
+            report["maximum_lag_ladder_relative_change"]
+        ),
+        displacement_growth_exponent=1.0,
+        sample_count=int(lag_sample_counts[0]),
+    )
+
+
+def configuration_conditioned_molecular_diffusion(
+    positions_m: Array,
+    system: MolecularSystem,
+    molecular_memory: MolecularMemoryOperator,
 ) -> Array:
-    volume_m3 = abs(np.linalg.det(system.box_vectors_m))
-    return total_charge_current_density_A_m2(
-        velocities_m_s, system.charges_C, volume_m3
-    ) - molecular_com_current_density_A_m2(velocities_m_s, system)
+    radial_edges_m = np.asarray(
+        molecular_memory.memory_scale_radial_edges_m, dtype=float
+    )
+    coefficients = np.asarray(molecular_memory.memory_scale_coefficients, dtype=float)
+    if radial_edges_m.size == 0:
+        return molecular_memory.diffusion_m2_s
+    if coefficients.shape != (radial_edges_m.size,):
+        raise ValueError("memory scale coefficients do not match radial bins")
+    molecule_centers_m = np.asarray(
+        tuple(
+            np.average(
+                positions_m[molecule_atom_indices],
+                axis=0,
+                weights=system.masses_kg[molecule_atom_indices],
+            )
+            for molecule_atom_indices in system.molecule_atom_indices
+        )
+    )
+    first_indices, second_indices = np.triu_indices(molecule_centers_m.shape[0], k=1)
+    displacements_m = minimum_image_displacement(
+        molecule_centers_m[second_indices] - molecule_centers_m[first_indices],
+        system.box_vectors_m,
+    )
+    distances_m = np.linalg.norm(displacements_m, axis=1)
+    radial_bins = np.searchsorted(radial_edges_m, distances_m, side="right") - 1
+    admitted = (radial_bins >= 0) & (radial_bins < radial_edges_m.size - 1)
+    local_environment = np.zeros(
+        (molecule_centers_m.shape[0], radial_edges_m.size - 1), dtype=float
+    )
+    np.add.at(local_environment, (first_indices[admitted], radial_bins[admitted]), 1.0)
+    np.add.at(local_environment, (second_indices[admitted], radial_bins[admitted]), 1.0)
+    logarithmic_friction_scale = coefficients[0] + local_environment @ coefficients[1:]
+    logarithmic_friction_scale -= np.mean(logarithmic_friction_scale)
+    inverse_sqrt_scale = np.repeat(
+        np.exp(-0.5 * logarithmic_friction_scale), CARTESIAN_DIMENSION
+    )
+    conditioned_diffusion = (
+        inverse_sqrt_scale[:, None]
+        * molecular_memory.diffusion_m2_s
+        * inverse_sqrt_scale[None, :]
+    )
+    conditioned_diffusion = (
+        molecular_memory.physical_range_projector
+        @ conditioned_diffusion
+        @ molecular_memory.physical_range_projector
+    )
+    conditioned_diffusion = 0.5 * (
+        conditioned_diffusion + conditioned_diffusion.T
+    )
+    if not np.all(np.isfinite(conditioned_diffusion)):
+        raise ValueError("configuration-conditioned diffusion is non-finite")
+    return conditioned_diffusion
+
+
+def lammps_equilibrium_projection_data(
+    composition_system: MolecularSystem,
+    temperature_K: float,
+    operator_data_root: Path,
+    eigenvalue_relative_tolerance: float,
+) -> tuple[MolecularSystem, Array, MolecularMemoryOperator]:
+    operator_path, _report = _matching_lammps_operator(
+        system=composition_system,
+        temperature_K=temperature_K,
+        operator_data_root=operator_data_root,
+    )
+    with np.load(operator_path) as operator:
+        family_labels = tuple(str(value) for value in operator["family_labels"])
+        family_indices = np.asarray(operator["molecule_family_indices"], dtype=int)
+        configurations_m = (
+            np.asarray(operator["geometry_sample_molecular_com_A"], dtype=float)
+            * 1.0e-10
+        )
+        box_vectors_m = (
+            np.asarray(operator["geometry_sample_box_vectors_A"], dtype=float)
+            * 1.0e-10
+        )
+        molecular_masses_kg = np.asarray(operator["molecular_masses_kg"], dtype=float)
+        molecular_charges_C = np.asarray(operator["molecular_charges_C"], dtype=float)
+    if configurations_m.ndim != 3 or configurations_m.shape[2] != 3:
+        raise ValueError("LAMMPS equilibrium configurations have invalid shape")
+    if box_vectors_m.shape != (configurations_m.shape[0], 3, 3):
+        raise ValueError("LAMMPS equilibrium boxes do not match configurations")
+    molecule_count = configurations_m.shape[1]
+    if molecular_masses_kg.shape != (molecule_count,):
+        raise ValueError("LAMMPS molecular masses do not match configurations")
+    if molecular_charges_C.shape != (molecule_count,):
+        raise ValueError("LAMMPS molecular charges do not match configurations")
+    equilibrium_box_vectors_m = np.mean(box_vectors_m, axis=0)
+    scaled_configurations_m = configurations_m @ np.linalg.inv(box_vectors_m)
+    scaled_configurations_m = scaled_configurations_m @ equilibrium_box_vectors_m
+    projection_system = MolecularSystem(
+        positions_m=scaled_configurations_m[0],
+        box_vectors_m=equilibrium_box_vectors_m,
+        masses_kg=molecular_masses_kg,
+        charges_C=molecular_charges_C,
+        lj_sigma_m=np.zeros(molecule_count),
+        lj_epsilon_J=np.zeros(molecule_count),
+        polarizabilities_SI=np.zeros(molecule_count),
+        molecule_index=np.arange(molecule_count),
+        molecule_atom_indices=tuple(
+            np.asarray((molecule_index,), dtype=int)
+            for molecule_index in range(molecule_count)
+        ),
+        molecule_species_names=tuple(family_labels[index] for index in family_indices),
+        bonds=np.empty((0, 2), dtype=int),
+        bond_force_constants_J_m2=np.empty(0),
+        bond_lengths_m=np.empty(0),
+        angles=np.empty((0, 3), dtype=int),
+        angle_force_constants_J_rad2=np.empty(0),
+        angle_values_rad=np.empty(0),
+        torsions=(),
+        nonbonded_mask=~np.eye(molecule_count, dtype=bool),
+    )
+    memory = molecular_memory_from_lammps_operator_data(
+        system=projection_system,
+        temperature_K=temperature_K,
+        operator_data_root=operator_data_root,
+        eigenvalue_relative_tolerance=eigenvalue_relative_tolerance,
+    )
+    return projection_system, scaled_configurations_m, memory
 
 
 def _torch_minimum_image(displacement_m: torch.Tensor, box_m: torch.Tensor) -> torch.Tensor:
@@ -411,7 +718,6 @@ def charge_neutral_integer_counts(
 
 def build_periodic_molecular_system(
     recipe: ElectrolyteRecipeModel,
-    density_kg_m3: float,
     molecule_count: int,
     minimum_interatomic_contact_ratio: float,
     initial_placement_attempts_per_molecule: int,
@@ -441,12 +747,13 @@ def build_periodic_molecular_system(
     molecular_charges_e = np.asarray([float(record["formal_charge_e"]) for record in species_records])
     fractions = np.asarray([mole_weights[name] for name in species_names])
     counts = charge_neutral_integer_counts(fractions, molecular_charges_e, molecule_count)
-    total_mass_kg = sum(
-        int(count)
-        * sum(float(site["mass_kg"]) for site in record["sites"])
+    initial_volume_m3 = sum(
+        int(count) * float(record["partial_molar_volume_m3_mol"]) / N_A
         for count, record in zip(counts, species_records, strict=True)
     )
-    box_length_m = (total_mass_kg / density_kg_m3) ** (1.0 / 3.0)
+    if initial_volume_m3 <= 0.0:
+        raise ValueError("species partial molar volumes do not define a positive cell")
+    box_length_m = initial_volume_m3 ** (1.0 / CARTESIAN_DIMENSION)
     box_vectors_m = np.eye(3) * box_length_m
     random_generator = np.random.default_rng(random_seed)
     positions: list[Array] = []
@@ -454,10 +761,10 @@ def build_periodic_molecular_system(
     charges: list[float] = []
     lj_sigma: list[float] = []
     lj_epsilon: list[float] = []
-    radii: list[float] = []
     polarizabilities: list[float] = []
     molecule_indices: list[int] = []
     molecule_atom_indices: list[Array] = []
+    molecule_species_names: list[str] = []
     bonds: list[tuple[int, int]] = []
     bond_constants: list[float] = []
     bond_lengths: list[float] = []
@@ -467,7 +774,9 @@ def build_periodic_molecular_system(
     torsions: list[tuple[int, int, int, int, tuple[tuple[float, int, float], ...]]] = []
     atom_offset = 0
     molecule_index = 0
-    for count, record in zip(counts, species_records, strict=True):
+    for count, species_name, record in zip(
+        counts, species_names, species_records, strict=True
+    ):
         reference = np.asarray(record["reference_conformer_coordinates_m"], dtype=float)
         reference -= np.mean(reference, axis=0)
         for _ in range(int(count)):
@@ -509,12 +818,12 @@ def build_periodic_molecular_system(
             positions.extend(molecule_positions)
             atom_indices = np.arange(atom_offset, atom_offset + len(record["sites"]))
             molecule_atom_indices.append(atom_indices)
+            molecule_species_names.append(species_name)
             for site in record["sites"]:
                 masses.append(float(site["mass_kg"]))
                 charges.append(float(site["charge_number"]) * E_CHARGE)
                 lj_sigma.append(float(site["lj_sigma_m"]))
                 lj_epsilon.append(float(site["lj_epsilon_J"]))
-                radii.append(float(site["hydrodynamic_radius_m"]))
                 polarizabilities.append(float(site["polarizability_SI"]))
                 molecule_indices.append(molecule_index)
             for bond in record["bonds"]:
@@ -542,9 +851,11 @@ def build_periodic_molecular_system(
         raise ValueError("constructed periodic system is not charge neutral")
     return MolecularSystem(
         positions_m=np.asarray(positions), box_vectors_m=box_vectors_m, masses_kg=np.asarray(masses), charges_C=np.asarray(charges),
-        lj_sigma_m=np.asarray(lj_sigma), lj_epsilon_J=np.asarray(lj_epsilon), hydrodynamic_radii_m=np.asarray(radii),
+        lj_sigma_m=np.asarray(lj_sigma), lj_epsilon_J=np.asarray(lj_epsilon),
         polarizabilities_SI=np.asarray(polarizabilities), molecule_index=np.asarray(molecule_indices),
-        molecule_atom_indices=tuple(molecule_atom_indices), bonds=np.asarray(bonds, dtype=int).reshape((-1, 2)),
+        molecule_atom_indices=tuple(molecule_atom_indices),
+        molecule_species_names=tuple(molecule_species_names),
+        bonds=np.asarray(bonds, dtype=int).reshape((-1, 2)),
         bond_force_constants_J_m2=np.asarray(bond_constants), bond_lengths_m=np.asarray(bond_lengths),
         angles=np.asarray(angles, dtype=int).reshape((-1, 3)), angle_force_constants_J_rad2=np.asarray(angle_constants),
         angle_values_rad=np.asarray(angle_values), torsions=tuple(torsions), nonbonded_mask=nonbonded_mask,
@@ -623,6 +934,28 @@ class AnalyticalPeriodicInteratomicModel:
         )
         charges = torch.as_tensor(system.charges_C)
         ewald_alpha = self.numerics.ewald_splitting_per_m
+        electrostatic_pair_i, electrostatic_pair_j = np.triu_indices(
+            positions_m.shape[0], 1
+        )
+        electrostatic_pair_i_tensor = torch.as_tensor(electrostatic_pair_i)
+        electrostatic_pair_j_tensor = torch.as_tensor(electrostatic_pair_j)
+        electrostatic_pair_distances_m = distance[
+            electrostatic_pair_i_tensor, electrostatic_pair_j_tensor
+        ]
+        real_pair_energies_J = (
+            charges[electrostatic_pair_i_tensor]
+            * charges[electrostatic_pair_j_tensor]
+            * torch.special.erfc(
+                ewald_alpha * electrostatic_pair_distances_m
+            )
+            / (
+                4.0
+                * math.pi
+                * EPS_0
+                * electrostatic_pair_distances_m
+            )
+        )
+        energy += torch.sum(real_pair_energies_J)
         reciprocal = (
             2.0
             * math.pi
@@ -641,9 +974,39 @@ class AnalyticalPeriodicInteratomicModel:
         energy += 0.5 * torch.sum(
             green_weights * (structure_real**2 + structure_imaginary**2)
         )
+        energy -= (
+            ewald_alpha
+            * torch.sum(charges**2)
+            / (4.0 * math.pi * math.sqrt(math.pi) * EPS_0)
+        )
+        excluded_pair_mask = ~system.nonbonded_mask[
+            electrostatic_pair_i, electrostatic_pair_j
+        ]
+        if np.any(excluded_pair_mask):
+            excluded_pair_indices = np.flatnonzero(excluded_pair_mask)
+            excluded_i = electrostatic_pair_i[excluded_pair_indices]
+            excluded_j = electrostatic_pair_j[excluded_pair_indices]
+            excluded_displacements_m = displacement[excluded_i, excluded_j]
+            excluded_phases = excluded_displacements_m @ reciprocal.T
+            excluded_reciprocal_energies_J = (
+                torch.as_tensor(system.charges_C[excluded_i])
+                * torch.as_tensor(system.charges_C[excluded_j])
+                * torch.sum(
+                    green_weights[None, :] * torch.cos(excluded_phases),
+                    dim=1,
+                )
+            )
+            energy -= torch.sum(
+                real_pair_energies_J[torch.as_tensor(excluded_pair_indices)]
+                + excluded_reciprocal_energies_J
+            )
         if np.any(system.polarizabilities_SI > 0.0):
             energy += self._polarization_energy(
-                positions_m, reciprocal, green_weights
+                positions_m,
+                reciprocal,
+                green_weights,
+                ewald_alpha,
+                box_vectors_m,
             )
         return energy
 
@@ -652,6 +1015,8 @@ class AnalyticalPeriodicInteratomicModel:
         positions_m: torch.Tensor,
         reciprocal_m_inv: torch.Tensor,
         green_weights_J_m_C2: torch.Tensor,
+        ewald_splitting_per_m: float,
+        box_vectors_m: torch.Tensor,
     ) -> torch.Tensor:
         active = np.flatnonzero(self.system.polarizabilities_SI > 0.0)
         charges = torch.as_tensor(self.system.charges_C)
@@ -666,6 +1031,50 @@ class AnalyticalPeriodicInteratomicModel:
             green_weights_J_m_C2,
             reciprocal_m_inv,
         )
+        displacement_m = _torch_minimum_image(
+            positions_m[:, None, :] - positions_m[None, :, :],
+            box_vectors_m,
+        )
+        distance_m = torch.linalg.norm(displacement_m, dim=2)
+        nonzero_distance_m = torch.where(
+            torch.eye(distance_m.shape[0], dtype=torch.bool),
+            torch.ones_like(distance_m),
+            distance_m,
+        )
+        real_field_coefficient = (
+            torch.special.erfc(ewald_splitting_per_m * nonzero_distance_m)
+            / nonzero_distance_m**3
+            + 2.0
+            * ewald_splitting_per_m
+            * torch.exp(
+                -(ewald_splitting_per_m * nonzero_distance_m) ** 2
+            )
+            / (math.sqrt(math.pi) * nonzero_distance_m**2)
+        ) / (4.0 * math.pi * EPS_0)
+        real_field_coefficient = torch.where(
+            torch.as_tensor(self.system.nonbonded_mask),
+            real_field_coefficient,
+            torch.zeros_like(real_field_coefficient),
+        )
+        electric_fields += torch.einsum(
+            "ij,j,ijd->id",
+            real_field_coefficient,
+            charges,
+            displacement_m,
+        )
+        excluded_mask = ~self.system.nonbonded_mask
+        np.fill_diagonal(excluded_mask, False)
+        if np.any(excluded_mask):
+            excluded_mask_tensor = torch.as_tensor(excluded_mask)
+            excluded_reciprocal_fields = torch.einsum(
+                "ijk,k,kd,j->id",
+                torch.sin(phase_differences)
+                * excluded_mask_tensor[:, :, None],
+                green_weights_J_m_C2,
+                reciprocal_m_inv,
+                charges,
+            )
+            electric_fields -= excluded_reciprocal_fields
         active_tensor = torch.as_tensor(active)
         active_phase_differences = phase_differences[active_tensor][:, active_tensor]
         interaction_blocks = -torch.einsum(
@@ -674,6 +1083,83 @@ class AnalyticalPeriodicInteratomicModel:
             green_weights_J_m_C2,
             reciprocal_m_inv,
             reciprocal_m_inv,
+        )
+        active_displacements_m = displacement_m[active_tensor][:, active_tensor]
+        active_distances_m = nonzero_distance_m[active_tensor][:, active_tensor]
+        active_allowed = torch.as_tensor(
+            self.system.nonbonded_mask[np.ix_(active, active)]
+        )
+        radial_first_derivative = -(
+            torch.special.erfc(
+                ewald_splitting_per_m * active_distances_m
+            )
+            / active_distances_m**2
+            + 2.0
+            * ewald_splitting_per_m
+            * torch.exp(
+                -(ewald_splitting_per_m * active_distances_m) ** 2
+            )
+            / (math.sqrt(math.pi) * active_distances_m)
+        ) / (4.0 * math.pi * EPS_0)
+        radial_second_derivative = (
+            2.0
+            * torch.special.erfc(
+                ewald_splitting_per_m * active_distances_m
+            )
+            / active_distances_m**3
+            + 4.0
+            * ewald_splitting_per_m
+            * torch.exp(
+                -(ewald_splitting_per_m * active_distances_m) ** 2
+            )
+            / (math.sqrt(math.pi) * active_distances_m**2)
+            + 4.0
+            * ewald_splitting_per_m**3
+            * torch.exp(
+                -(ewald_splitting_per_m * active_distances_m) ** 2
+            )
+            / math.sqrt(math.pi)
+        ) / (4.0 * math.pi * EPS_0)
+        unit_displacements = (
+            active_displacements_m / active_distances_m[:, :, None]
+        )
+        radial_outer = (
+            unit_displacements[:, :, :, None]
+            * unit_displacements[:, :, None, :]
+        )
+        identity = torch.eye(CARTESIAN_DIMENSION)
+        real_hessian = (
+            radial_second_derivative[:, :, None, None] * radial_outer
+            + (radial_first_derivative / active_distances_m)[:, :, None, None]
+            * (identity[None, None, :, :] - radial_outer)
+        )
+        real_hessian = torch.where(
+            active_allowed[:, :, None, None],
+            real_hessian,
+            torch.zeros_like(real_hessian),
+        )
+        interaction_blocks += real_hessian
+        active_excluded = ~self.system.nonbonded_mask[np.ix_(active, active)]
+        np.fill_diagonal(active_excluded, False)
+        if np.any(active_excluded):
+            excluded_active_tensor = torch.as_tensor(active_excluded)
+            reciprocal_excluded_hessian = -torch.einsum(
+                "ijk,k,kd,ke->ijde",
+                torch.cos(active_phase_differences)
+                * excluded_active_tensor[:, :, None],
+                green_weights_J_m_C2,
+                reciprocal_m_inv,
+                reciprocal_m_inv,
+            )
+            interaction_blocks -= reciprocal_excluded_hessian
+        self_hessian = (
+            -4.0
+            * ewald_splitting_per_m**3
+            / (3.0 * math.sqrt(math.pi) * 4.0 * math.pi * EPS_0)
+        )
+        diagonal_indices = torch.arange(active.size)
+        interaction_blocks[diagonal_indices, diagonal_indices] += (
+            self_hessian * identity
         )
         interaction = interaction_blocks.permute(0, 2, 1, 3).reshape(
             3 * active.size, 3 * active.size
@@ -699,94 +1185,6 @@ class AnalyticalPeriodicInteratomicModel:
         positions = torch.tensor(positions_m, dtype=TORCH_DTYPE, requires_grad=True)
         energy = self._energy_tensor(positions, torch.as_tensor(box_vectors_m))
         return -torch.autograd.grad(energy, positions)[0].detach().numpy()
-
-
-def periodic_diffusion_operator(
-    system: MolecularSystem,
-    positions_m: Array,
-    temperature_K: float,
-    viscosity_Pa_s: float,
-    reciprocal_shell: int,
-) -> PeriodicDiffusionOperator:
-    """Return the periodic Gaussian-regularized transverse diffusion operator.
-
-    Every Fourier block is proportional to ``I - kk.T / |k|^2``. Its
-    configuration divergence therefore vanishes analytically, so the reversible
-    Itô drift is ``D F / (k_B T)`` without an additional thermal-drift term.
-    """
-    atom_count = positions_m.shape[0]
-    identity = np.eye(CARTESIAN_DIMENSION)
-    volume_m3 = abs(np.linalg.det(system.box_vectors_m))
-    reciprocal_basis = 2.0 * math.pi * np.linalg.inv(system.box_vectors_m)
-    spectral_columns: list[Array] = []
-    spectral_self_blocks = np.zeros(
-        (atom_count, CARTESIAN_DIMENSION, CARTESIAN_DIMENSION)
-    )
-    reciprocal_indices = (
-        (first, second, third)
-        for first in range(-reciprocal_shell, reciprocal_shell + 1)
-        for second in range(-reciprocal_shell, reciprocal_shell + 1)
-        for third in range(-reciprocal_shell, reciprocal_shell + 1)
-        if (first, second, third) != (0, 0, 0)
-    )
-    for reciprocal_index in reciprocal_indices:
-        wavevector = np.asarray(reciprocal_index, dtype=float) @ reciprocal_basis
-        wavevector_squared = float(wavevector @ wavevector)
-        transverse_projector = identity - np.outer(wavevector, wavevector) / wavevector_squared
-        projector_eigenvalues, projector_eigenvectors = eigh(
-            transverse_projector
-        )
-        transverse_directions = projector_eigenvectors[
-            :, projector_eigenvalues > 0.5
-        ]
-        phases = positions_m @ wavevector
-        attenuation = np.exp(
-            -wavevector_squared
-            * system.hydrodynamic_radii_m**2
-            / GAUSSIAN_BLOB_VARIANCE_DENOMINATOR
-        )
-        cosine_amplitudes = attenuation * np.cos(phases)
-        sine_amplitudes = attenuation * np.sin(phases)
-        mode_scale = math.sqrt(
-            K_B
-            * temperature_K
-            / (viscosity_Pa_s * volume_m3 * wavevector_squared)
-        )
-        for amplitudes in (cosine_amplitudes, sine_amplitudes):
-            for transverse_direction in transverse_directions.T:
-                spectral_columns.append(
-                    (
-                        mode_scale
-                        * amplitudes[:, None]
-                        * transverse_direction[None, :]
-                    ).reshape(-1)
-                )
-        spectral_self_blocks += (
-            K_B
-            * temperature_K
-            * attenuation[:, None, None] ** 2
-            * transverse_projector[None, :, :]
-            / (viscosity_Pa_s * volume_m3 * wavevector_squared)
-        )
-    spectral_factor = np.column_stack(spectral_columns)
-    local_blocks = np.empty_like(spectral_self_blocks)
-    for atom_index, radius_m in enumerate(system.hydrodynamic_radii_m):
-        target_self_diffusion = K_B * temperature_K * identity / (
-            STOKES_SPHERE_DRAG_FACTOR * math.pi * viscosity_Pa_s * radius_m
-        )
-        local_blocks[atom_index] = (
-            target_self_diffusion - spectral_self_blocks[atom_index]
-        )
-        remainder_eigenvalues = np.linalg.eigvalsh(local_blocks[atom_index])
-        if remainder_eigenvalues[0] <= 0.0:
-            raise ValueError(
-                "spectral RPY shell exceeds Stokes self mobility; reduce the "
-                "reciprocal shell or increase the box"
-            )
-    return PeriodicDiffusionOperator(
-        local_blocks_m2_s=local_blocks,
-        spectral_factor_m_sqrt_s=spectral_factor,
-    )
 
 
 def sample_equilibrium_configurations(
@@ -828,6 +1226,265 @@ def sample_equilibrium_configurations(
         if sweep_index >= dynamics.equilibrium_burn_in_sweeps and (sweep_index - dynamics.equilibrium_burn_in_sweeps) % dynamics.equilibrium_sweeps_per_sample == 0:
             samples.append(positions.copy())
     return np.asarray(samples)
+
+
+def sample_isothermal_isobaric_equilibrium(
+    model: AnalyticalPeriodicInteratomicModel,
+    temperature_K: float,
+    pressure_Pa: float,
+    dynamics: DynamicsSettings,
+    random_seed: int,
+) -> tuple[AnalyticalPeriodicInteratomicModel, Array, Array]:
+    if pressure_Pa <= 0.0:
+        raise ValueError("pressure_Pa must be positive")
+    random_generator = np.random.default_rng(random_seed)
+    positions_m = relax_initial_configuration(model, temperature_K, dynamics)
+    box_vectors_m = model.system.box_vectors_m.copy()
+    inverse_thermal_energy_J = 1.0 / (K_B * temperature_K)
+    energy_J = model.energy_J(positions_m, box_vectors_m)
+    molecule_count = len(model.system.molecule_atom_indices)
+    sampled_volumes_m3: list[float] = []
+    sampled_positions_m: list[Array] = []
+    total_sweeps = (
+        dynamics.equilibrium_burn_in_sweeps
+        + dynamics.equilibrium_sample_count
+        * dynamics.equilibrium_sweeps_per_sample
+    )
+    for sweep_index in range(total_sweeps):
+        for molecule_atom_indices in model.system.molecule_atom_indices:
+            proposal_positions_m = positions_m.copy()
+            proposal_positions_m[molecule_atom_indices] += random_generator.normal(
+                scale=dynamics.translation_proposal_m,
+                size=CARTESIAN_DIMENSION,
+            )
+            proposal_positions_m %= np.diag(box_vectors_m)
+            proposal_energy_J = model.energy_J(
+                proposal_positions_m, box_vectors_m
+            )
+            log_acceptance = -inverse_thermal_energy_J * (
+                proposal_energy_J - energy_J
+            )
+            if math.log(random_generator.random()) < log_acceptance:
+                positions_m = proposal_positions_m
+                energy_J = proposal_energy_J
+
+        current_volume_m3 = abs(np.linalg.det(box_vectors_m))
+        logarithmic_volume_change = random_generator.normal(
+            scale=dynamics.logarithmic_volume_proposal
+        )
+        proposal_volume_m3 = current_volume_m3 * math.exp(
+            logarithmic_volume_change
+        )
+        length_scale = (proposal_volume_m3 / current_volume_m3) ** (
+            1.0 / CARTESIAN_DIMENSION
+        )
+        proposal_box_vectors_m = box_vectors_m * length_scale
+        proposal_positions_m = positions_m.copy()
+        for molecule_atom_indices in model.system.molecule_atom_indices:
+            molecule_positions_m = positions_m[molecule_atom_indices]
+            anchor_m = molecule_positions_m[0]
+            unwrapped_molecule_positions_m = anchor_m + minimum_image_displacement(
+                molecule_positions_m - anchor_m,
+                box_vectors_m,
+            )
+            molecule_masses_kg = model.system.masses_kg[molecule_atom_indices]
+            center_of_mass_m = np.average(
+                unwrapped_molecule_positions_m,
+                axis=0,
+                weights=molecule_masses_kg,
+            )
+            proposal_positions_m[molecule_atom_indices] = (
+                unwrapped_molecule_positions_m
+                - center_of_mass_m
+                + length_scale * center_of_mass_m
+            )
+        proposal_positions_m %= np.diag(proposal_box_vectors_m)
+        proposal_energy_J = model.energy_J(
+            proposal_positions_m, proposal_box_vectors_m
+        )
+        log_volume_acceptance = (
+            -inverse_thermal_energy_J
+            * (
+                proposal_energy_J
+                - energy_J
+                + pressure_Pa * (proposal_volume_m3 - current_volume_m3)
+            )
+            + molecule_count * logarithmic_volume_change
+        )
+        if math.log(random_generator.random()) < log_volume_acceptance:
+            positions_m = proposal_positions_m
+            box_vectors_m = proposal_box_vectors_m
+            energy_J = proposal_energy_J
+
+        sample_offset = sweep_index - dynamics.equilibrium_burn_in_sweeps
+        if (
+            sample_offset >= 0
+            and sample_offset % dynamics.equilibrium_sweeps_per_sample == 0
+        ):
+            sampled_volumes_m3.append(abs(np.linalg.det(box_vectors_m)))
+            sampled_positions_m.append(positions_m.copy())
+
+    volume_series_m3 = np.asarray(sampled_volumes_m3)
+    stationary_volume = select_stationary_suffix(
+        values=volume_series_m3,
+        maximum_split_mean_difference_standard_errors=(
+            model.numerics.stationarity_standard_error_limit
+        ),
+        maximum_linear_drift_standard_errors=(
+            model.numerics.stationarity_standard_error_limit
+        ),
+        minimum_effective_sample_size=model.numerics.minimum_effective_sample_size,
+    )
+    stationary_volumes_m3 = volume_series_m3[stationary_volume.start_index :]
+    equilibrium_volume_m3 = float(np.mean(stationary_volumes_m3))
+    equilibrium_length_m = equilibrium_volume_m3 ** (
+        1.0 / CARTESIAN_DIMENSION
+    )
+    equilibrium_box_vectors_m = np.eye(CARTESIAN_DIMENSION) * equilibrium_length_m
+    source_positions_m = sampled_positions_m[-1]
+    source_box_vectors_m = box_vectors_m
+    volume_scale = (
+        equilibrium_volume_m3 / abs(np.linalg.det(source_box_vectors_m))
+    ) ** (1.0 / CARTESIAN_DIMENSION)
+    equilibrium_positions_m = source_positions_m.copy()
+    for molecule_atom_indices in model.system.molecule_atom_indices:
+        molecule_positions_m = source_positions_m[molecule_atom_indices]
+        anchor_m = molecule_positions_m[0]
+        unwrapped_molecule_positions_m = anchor_m + minimum_image_displacement(
+            molecule_positions_m - anchor_m,
+            source_box_vectors_m,
+        )
+        molecule_masses_kg = model.system.masses_kg[molecule_atom_indices]
+        center_of_mass_m = np.average(
+            unwrapped_molecule_positions_m,
+            axis=0,
+            weights=molecule_masses_kg,
+        )
+        equilibrium_positions_m[molecule_atom_indices] = (
+            unwrapped_molecule_positions_m
+            - center_of_mass_m
+            + volume_scale * center_of_mass_m
+        )
+    equilibrium_positions_m %= equilibrium_length_m
+    equilibrium_system = replace(
+        model.system,
+        positions_m=equilibrium_positions_m,
+        box_vectors_m=equilibrium_box_vectors_m,
+    )
+    equilibrium_model = AnalyticalPeriodicInteratomicModel(
+        equilibrium_system, model.numerics
+    )
+    configurations_m = sample_equilibrium_configurations(
+        equilibrium_model,
+        temperature_K,
+        dynamics,
+        random_seed + 1,
+    )
+    return equilibrium_model, configurations_m, stationary_volumes_m3
+
+
+def remove_center_of_mass_momentum(
+    velocities_m_s: Array, masses_kg: Array
+) -> Array:
+    center_of_mass_velocity_m_s = np.sum(
+        masses_kg[:, None] * velocities_m_s, axis=0
+    ) / float(np.sum(masses_kg))
+    return velocities_m_s - center_of_mass_velocity_m_s
+
+
+def velocity_verlet_step(
+    model: AnalyticalPeriodicInteratomicModel,
+    positions_m: Array,
+    velocities_m_s: Array,
+    timestep_s: float,
+) -> tuple[Array, Array]:
+    if timestep_s <= 0.0:
+        raise ValueError("Hamiltonian timestep must be positive")
+    forces_N = model.forces_N(positions_m, model.system.box_vectors_m)
+    half_step_velocities_m_s = velocities_m_s + (
+        0.5 * timestep_s * forces_N / model.system.masses_kg[:, None]
+    )
+    next_positions_m = (
+        positions_m + timestep_s * half_step_velocities_m_s
+    ) % np.diag(model.system.box_vectors_m)
+    next_forces_N = model.forces_N(
+        next_positions_m, model.system.box_vectors_m
+    )
+    next_velocities_m_s = half_step_velocities_m_s + (
+        0.5
+        * timestep_s
+        * next_forces_N
+        / model.system.masses_kg[:, None]
+    )
+    return next_positions_m, next_velocities_m_s
+
+
+def sample_hamiltonian_molecular_velocities(
+    model: AnalyticalPeriodicInteratomicModel,
+    initial_positions_m: Array,
+    temperature_K: float,
+    dynamics: DynamicsSettings,
+    random_seed: int,
+) -> tuple[Array, float]:
+    random_generator = np.random.default_rng(random_seed)
+    thermal_velocity_scales_m_s = np.sqrt(
+        K_B * temperature_K / model.system.masses_kg
+    )
+    velocities_m_s = random_generator.normal(
+        scale=thermal_velocity_scales_m_s[:, None],
+        size=initial_positions_m.shape,
+    )
+    velocities_m_s = remove_center_of_mass_momentum(
+        velocities_m_s, model.system.masses_kg
+    )
+    positions_m = np.asarray(initial_positions_m, dtype=float).copy()
+    initial_energy_J = model.energy_J(
+        positions_m, model.system.box_vectors_m
+    ) + 0.5 * float(
+        np.sum(model.system.masses_kg[:, None] * velocities_m_s**2)
+    )
+    molecular_velocity_samples_m_s: list[Array] = []
+    total_steps = (
+        dynamics.memory_equilibration_steps + dynamics.memory_production_steps
+    )
+    for step_index in range(total_steps):
+        positions_m, velocities_m_s = velocity_verlet_step(
+            model,
+            positions_m,
+            velocities_m_s,
+            dynamics.hamiltonian_timestep_s,
+        )
+        production_step_index = step_index - dynamics.memory_equilibration_steps
+        if (
+            production_step_index >= 0
+            and production_step_index % dynamics.memory_sample_stride == 0
+        ):
+            molecular_velocities_m_s = np.asarray(
+                tuple(
+                    np.average(
+                        velocities_m_s[molecule_atom_indices],
+                        axis=0,
+                        weights=model.system.masses_kg[molecule_atom_indices],
+                    )
+                    for molecule_atom_indices in model.system.molecule_atom_indices
+                )
+            )
+            molecular_velocity_samples_m_s.append(molecular_velocities_m_s)
+    final_energy_J = model.energy_J(
+        positions_m, model.system.box_vectors_m
+    ) + 0.5 * float(
+        np.sum(model.system.masses_kg[:, None] * velocities_m_s**2)
+    )
+    relative_energy_drift = abs(final_energy_J - initial_energy_J) / max(
+        abs(initial_energy_J), K_B * temperature_K
+    )
+    if relative_energy_drift > dynamics.maximum_relative_energy_drift:
+        raise ValueError(
+            "Hamiltonian trajectory relative energy drift "
+            f"{relative_energy_drift:.6e} exceeds "
+            f"{dynamics.maximum_relative_energy_drift:.6e}"
+        )
+    return np.asarray(molecular_velocity_samples_m_s), relative_energy_drift
 
 
 def relax_initial_configuration(
@@ -888,14 +1545,18 @@ def relax_initial_configuration(
     return positions
 
 
-def _basis_values_tensor(positions_m: torch.Tensor, system: MolecularSystem, numerics: NumericalSettings) -> torch.Tensor:
+def _basis_values_tensor(
+    positions_m: torch.Tensor,
+    system: MolecularSystem,
+    numerics: NumericalSettings,
+) -> torch.Tensor:
     box = torch.as_tensor(system.box_vectors_m)
     displacement = _torch_minimum_image(positions_m[:, None, :] - positions_m[None, :, :], box)
     distance = torch.linalg.norm(displacement + torch.eye(positions_m.shape[0])[:, :, None], dim=2)
     pair_i, pair_j = np.triu_indices(positions_m.shape[0], 1)
     pair_distance = distance[torch.as_tensor(pair_i), torch.as_tensor(pair_j)]
     pair_charge = torch.as_tensor(system.charges_C[pair_i] * system.charges_C[pair_j])
-    features: list[torch.Tensor] = []
+    primitive_features: list[torch.Tensor] = []
     charges = torch.as_tensor(system.charges_C)
     masses = torch.as_tensor(system.masses_kg)
     total_internal_polarization = torch.zeros(
@@ -916,7 +1577,7 @@ def _basis_values_tensor(positions_m: torch.Tensor, system: MolecularSystem, num
             * (local_positions - center_of_mass),
             dim=0,
         )
-    features.extend(torch.unbind(total_internal_polarization))
+    primitive_features.extend(torch.unbind(total_internal_polarization))
     cutoff = 0.5 * (torch.cos(math.pi * torch.clamp(pair_distance / numerics.basis_radial_cutoff_m, 0.0, 1.0)) + 1.0)
     cutoff = cutoff * (pair_distance < numerics.basis_radial_cutoff_m)
     for radial_mode_index in range(1, numerics.basis_radial_count + 1):
@@ -929,21 +1590,111 @@ def _basis_values_tensor(positions_m: torch.Tensor, system: MolecularSystem, num
             )
             * cutoff
         )
-        features.extend((torch.sum(radial), torch.sum(pair_charge * radial)))
+        primitive_features.extend(
+            (torch.sum(radial), torch.sum(pair_charge * radial))
+        )
+    molecule_centers: list[torch.Tensor] = []
+    molecule_axes: list[torch.Tensor] = []
+    molecule_charges: list[torch.Tensor] = []
+    for molecule_atom_indices in system.molecule_atom_indices:
+        molecule_indices = torch.as_tensor(molecule_atom_indices)
+        anchor = positions_m[molecule_indices[0]]
+        local_positions = anchor + _torch_minimum_image(
+            positions_m[molecule_indices] - anchor, box
+        )
+        molecule_masses = masses[molecule_indices]
+        center_of_mass = torch.sum(
+            molecule_masses[:, None] * local_positions, dim=0
+        ) / torch.sum(molecule_masses)
+        molecule_centers.append(center_of_mass)
+        molecule_charges.append(torch.sum(charges[molecule_indices]))
+        if len(molecule_atom_indices) > 1:
+            molecular_axis = local_positions[-1] - local_positions[0]
+            molecule_axes.append(
+                molecular_axis
+                / torch.sqrt(
+                    torch.sum(molecular_axis**2) + torch.finfo(TORCH_DTYPE).tiny
+                )
+            )
+        else:
+            molecule_axes.append(torch.zeros(3, dtype=TORCH_DTYPE))
+    center_tensor = torch.stack(molecule_centers)
+    axis_tensor = torch.stack(molecule_axes)
+    molecular_charge_tensor = torch.stack(molecule_charges)
+    center_displacements = _torch_minimum_image(
+        center_tensor[:, None, :] - center_tensor[None, :, :], box
+    )
+    center_distances = torch.linalg.norm(
+        center_displacements
+        + torch.eye(len(molecule_centers), dtype=TORCH_DTYPE)[:, :, None],
+        dim=2,
+    )
+    center_pair_i, center_pair_j = np.triu_indices(len(molecule_centers), 1)
+    center_pair_i_tensor = torch.as_tensor(center_pair_i)
+    center_pair_j_tensor = torch.as_tensor(center_pair_j)
+    pair_directions = center_displacements[
+        center_pair_i_tensor, center_pair_j_tensor
+    ] / center_distances[center_pair_i_tensor, center_pair_j_tensor, None]
+    pair_axis_projection = torch.sum(
+        axis_tensor[center_pair_i_tensor] * pair_directions, dim=1
+    )
+    pair_axis_alignment = torch.sum(
+        axis_tensor[center_pair_i_tensor] * axis_tensor[center_pair_j_tensor],
+        dim=1,
+    )
+    for angular_order in range(1, numerics.basis_angular_order + 1):
+        primitive_features.extend(
+            (
+                torch.sum(pair_axis_projection**angular_order),
+                torch.sum(pair_axis_alignment**angular_order),
+            )
+        )
+    cluster_adjacency = torch.exp(
+        -(
+            center_distances
+            / numerics.basis_radial_cutoff_m
+        ) ** 2
+    ) * (1.0 - torch.eye(len(molecule_centers), dtype=TORCH_DTYPE))
+    cluster_power = cluster_adjacency
+    for _cluster_depth in range(1, numerics.basis_cluster_depth + 1):
+        primitive_features.extend(
+            (
+                torch.trace(cluster_power),
+                molecular_charge_tensor
+                @ cluster_power
+                @ molecular_charge_tensor,
+            )
+        )
+        cluster_power = cluster_power @ cluster_adjacency
     reciprocal_base = 2.0 * math.pi * torch.linalg.inv(box)
     for shell in range(1, numerics.basis_fourier_shell + 1):
         for axis in range(3):
             reciprocal = shell * reciprocal_base[axis]
             phases = positions_m @ reciprocal
-            features.extend((torch.sum(torch.cos(phases)), torch.sum(torch.sin(phases)), torch.sum(charges * torch.cos(phases)), torch.sum(charges * torch.sin(phases))))
-    return torch.stack(features)
-
-
-def atomic_charge_polarization_gradients(system: MolecularSystem) -> Array:
-    gradients = np.zeros((CARTESIAN_DIMENSION, 3 * system.charges_C.size))
-    for axis in range(CARTESIAN_DIMENSION):
-        gradients[axis, axis::CARTESIAN_DIMENSION] = system.charges_C
-    return gradients
+            primitive_features.extend(
+                (
+                    torch.sum(torch.cos(phases)),
+                    torch.sum(torch.sin(phases)),
+                    torch.sum(charges * torch.cos(phases)),
+                    torch.sum(charges * torch.sin(phases)),
+                )
+            )
+    normalized_primitives = [
+        feature / (torch.abs(feature.detach()) + 1.0)
+        for feature in primitive_features
+    ]
+    features = list(normalized_primitives)
+    for correlation_order in range(2, numerics.basis_correlation_order + 1):
+        for feature_indices in combinations_with_replacement(
+            range(len(normalized_primitives)), correlation_order
+        ):
+            product = torch.ones((), dtype=TORCH_DTYPE)
+            for feature_index in feature_indices:
+                product = product * normalized_primitives[feature_index]
+            features.append(product)
+            if len(features) >= numerics.maximum_basis_size:
+                return torch.stack(features)
+    return torch.stack(features[: numerics.maximum_basis_size])
 
 
 def molecular_com_charge_polarization_gradients(system: MolecularSystem) -> Array:
@@ -961,6 +1712,42 @@ def molecular_com_charge_polarization_gradients(system: MolecularSystem) -> Arra
                     charge_weight_C
                 )
     return gradients
+
+
+def molecular_diffusion_in_atomic_coordinates(
+    system: MolecularSystem, molecular_diffusion_m2_s: Array
+) -> Array:
+    molecule_count = len(system.molecule_atom_indices)
+    expected_shape = (
+        CARTESIAN_DIMENSION * molecule_count,
+        CARTESIAN_DIMENSION * molecule_count,
+    )
+    diffusion = np.asarray(molecular_diffusion_m2_s, dtype=float)
+    if diffusion.shape != expected_shape:
+        raise ValueError(
+            f"molecular diffusion must have shape {expected_shape}, got "
+            f"{diffusion.shape}"
+        )
+    translation_lift = np.zeros(
+        (CARTESIAN_DIMENSION * system.charges_C.size, expected_shape[0])
+    )
+    for molecule_index, molecule_atom_indices in enumerate(
+        system.molecule_atom_indices
+    ):
+        molecule_slice = slice(
+            CARTESIAN_DIMENSION * molecule_index,
+            CARTESIAN_DIMENSION * (molecule_index + 1),
+        )
+        for atom_index in molecule_atom_indices:
+            atom_slice = slice(
+                CARTESIAN_DIMENSION * int(atom_index),
+                CARTESIAN_DIMENSION * (int(atom_index) + 1),
+            )
+            translation_lift[atom_slice, molecule_slice] = np.eye(
+                CARTESIAN_DIMENSION
+            )
+    atomic_diffusion = translation_lift @ diffusion @ translation_lift.T
+    return 0.5 * (atomic_diffusion + atomic_diffusion.T)
 
 
 def molecular_charge_com_polarization(
@@ -1007,7 +1794,7 @@ def projected_conductivity_sequence(
     configurations_m: Array,
     system: MolecularSystem,
     temperature_K: float,
-    dynamics: DynamicsSettings,
+    molecular_memory: MolecularMemoryOperator,
     numerics: NumericalSettings,
 ) -> tuple[float, float, tuple[float, ...], tuple[float, ...], int]:
     minimum_partition_count = 2
@@ -1017,7 +1804,7 @@ def projected_conductivity_sequence(
         configurations_m, system, numerics
     )
     basis_count = min(gradients.shape[1], numerics.maximum_basis_size)
-    polarization_gradients = atomic_charge_polarization_gradients(system)
+    polarization_gradients = molecular_com_charge_polarization_gradients(system)
     split_index = configurations_m.shape[0] // 2
     statistics: list[tuple[Array, Array, Array]] = []
     for sample_indices in (
@@ -1029,19 +1816,20 @@ def projected_conductivity_sequence(
         coupling = np.zeros((basis_count, CARTESIAN_DIMENSION))
         direct_axes = np.zeros(CARTESIAN_DIMENSION)
         for sample_index in sample_indices_tuple:
-            diffusion_operator = periodic_diffusion_operator(
-                system,
-                configurations_m[sample_index],
-                temperature_K,
-                dynamics.solvent_viscosity_Pa_s,
-                numerics.ewald_reciprocal_shell,
+            molecular_diffusion_m2_s = configuration_conditioned_molecular_diffusion(
+                positions_m=configurations_m[sample_index],
+                system=system,
+                molecular_memory=molecular_memory,
+            )
+            atomic_diffusion_m2_s = molecular_diffusion_in_atomic_coordinates(
+                system, molecular_diffusion_m2_s
             )
             sample_gradients = gradients[sample_index, :basis_count]
-            diffused_gradients = diffusion_operator.apply(sample_gradients)
+            diffused_gradients = sample_gradients @ atomic_diffusion_m2_s
             dirichlet += diffused_gradients @ sample_gradients.T
             coupling += diffused_gradients @ polarization_gradients.T
-            diffused_polarization = diffusion_operator.apply(
-                polarization_gradients
+            diffused_polarization = (
+                polarization_gradients @ atomic_diffusion_m2_s
             )
             for axis in range(CARTESIAN_DIMENSION):
                 direct_axes[axis] += (
@@ -1195,173 +1983,6 @@ def projected_conductivity_sequence(
     )
 
 
-def simulate_overdamped_polarization(
-    model: AnalyticalPeriodicInteratomicModel,
-    initial_positions_m: Array,
-    temperature_K: float,
-    dynamics: DynamicsSettings,
-    random_seed: int,
-) -> tuple[Array, float, float]:
-    random_generator = np.random.default_rng(random_seed)
-    unwrapped = initial_positions_m.copy()
-    polarization: list[Array] = []
-    timestep_s = dynamics.overdamped_timestep_s
-    inverse_thermal_energy_J = 1.0 / (K_B * temperature_K)
-    energy_J = model.energy_J(unwrapped, model.system.box_vectors_m)
-    accepted_step_count = 0
-    for step_index in range(dynamics.overdamped_steps):
-        diffusion_operator = periodic_diffusion_operator(
-            model.system,
-            unwrapped,
-            temperature_K,
-            dynamics.solvent_viscosity_Pa_s,
-            model.numerics.ewald_reciprocal_shell,
-        )
-        forces = model.forces_N(
-            unwrapped, model.system.box_vectors_m
-        ).reshape(-1)
-        forward_mean = (
-            timestep_s
-            * diffusion_operator.apply(forces)
-            * inverse_thermal_energy_J
-        )
-        noise = (
-            math.sqrt(2.0 * timestep_s)
-            * diffusion_operator.sample_increment(random_generator)
-        )
-        proposal_displacement = forward_mean + noise
-        proposal_unwrapped = unwrapped + proposal_displacement.reshape(
-            (-1, CARTESIAN_DIMENSION)
-        )
-        proposal_energy_J = model.energy_J(
-            proposal_unwrapped, model.system.box_vectors_m
-        )
-        proposal_diffusion_operator = periodic_diffusion_operator(
-            model.system,
-            proposal_unwrapped,
-            temperature_K,
-            dynamics.solvent_viscosity_Pa_s,
-            model.numerics.ewald_reciprocal_shell,
-        )
-        proposal_forces = model.forces_N(
-            proposal_unwrapped, model.system.box_vectors_m
-        ).reshape(-1)
-        reverse_mean = (
-            timestep_s
-            * proposal_diffusion_operator.apply(proposal_forces)
-            * inverse_thermal_energy_J
-        )
-        forward_residual = proposal_displacement - forward_mean
-        reverse_residual = -proposal_displacement - reverse_mean
-        forward_log_determinant = diffusion_operator.log_determinant()
-        reverse_log_determinant = (
-            proposal_diffusion_operator.log_determinant()
-        )
-        forward_quadratic = float(
-            forward_residual @ diffusion_operator.solve(forward_residual)
-        )
-        reverse_quadratic = float(
-            reverse_residual
-            @ proposal_diffusion_operator.solve(reverse_residual)
-        )
-        log_acceptance = (
-            -inverse_thermal_energy_J * (proposal_energy_J - energy_J)
-            - 0.5 * reverse_log_determinant
-            - reverse_quadratic / (4.0 * timestep_s)
-            + 0.5 * forward_log_determinant
-            + forward_quadratic / (4.0 * timestep_s)
-        )
-        if math.log(random_generator.random()) < min(0.0, log_acceptance):
-            unwrapped = proposal_unwrapped
-            energy_J = proposal_energy_J
-            accepted_step_count += 1
-        if step_index % dynamics.overdamped_sample_stride == 0:
-            polarization.append(
-                np.sum(model.system.charges_C[:, None] * unwrapped, axis=0)
-            )
-    acceptance_fraction = accepted_step_count / dynamics.overdamped_steps
-    if acceptance_fraction < dynamics.minimum_overdamped_acceptance_fraction:
-        raise ValueError(
-            "overdamped acceptance fraction "
-            f"{acceptance_fraction:.6g} is below "
-            f"{dynamics.minimum_overdamped_acceptance_fraction:.6g}"
-        )
-    return (
-        np.asarray(polarization),
-        timestep_s * dynamics.overdamped_sample_stride,
-        acceptance_fraction,
-    )
-
-
-def einstein_helfand_conductivity(
-    polarization_C_m: Array,
-    sample_interval_s: float,
-    volume_m3: float,
-    temperature_K: float,
-    fit_start_fraction: float,
-    maximum_lag_fraction: float,
-) -> float:
-    sample_count = polarization_C_m.shape[0]
-    maximum_lag = int(maximum_lag_fraction * sample_count)
-    if maximum_lag < 2:
-        raise ValueError("Helfand trajectory is too short for the lag window")
-    lags = np.unique(np.linspace(1, maximum_lag, min(maximum_lag, 64), dtype=int))
-    mean_square = np.asarray([np.mean(np.sum((polarization_C_m[lag:] - polarization_C_m[:-lag]) ** 2, axis=1)) for lag in lags])
-    times = lags * sample_interval_s
-    start = max(1, int(fit_start_fraction * times.size))
-    slope = linear_fit(times[start:], mean_square[start:]).slope
-    if slope <= 0.0:
-        raise ValueError("Helfand charge displacement has no positive diffusive slope")
-    return slope / (6.0 * K_B * temperature_K * volume_m3)
-
-
-def current_autocorrelation(current_C_m_s: Array) -> Array:
-    centered = current_C_m_s - np.mean(current_C_m_s, axis=0)
-    sample_count = centered.shape[0]
-    padded_count = 2 * sample_count
-    transforms = np.fft.rfft(centered, n=padded_count, axis=0)
-    correlations = np.fft.irfft(
-        transforms * np.conjugate(transforms), n=padded_count, axis=0
-    )[:sample_count]
-    normalization = np.arange(sample_count, 0, -1)[:, None]
-    return np.sum(correlations / normalization, axis=1)
-
-
-def integrated_green_kubo_conductivity(
-    polarization_C_m: Array,
-    sample_interval_s: float,
-    volume_m3: float,
-    temperature_K: float,
-    noise_window: int,
-    noise_standard_error_multiplier: float,
-) -> float:
-    current_C_m_s = np.diff(polarization_C_m, axis=0) / sample_interval_s
-    autocorrelation = current_autocorrelation(current_C_m_s)
-    sample_count = current_C_m_s.shape[0]
-    zero_lag_standard_error = abs(float(autocorrelation[0])) / math.sqrt(
-        sample_count
-    )
-    cutoff_lag = autocorrelation.size
-    for lag in range(1, autocorrelation.size - noise_window + 1):
-        lag_window = autocorrelation[lag : lag + noise_window]
-        lag_standard_error = zero_lag_standard_error * math.sqrt(
-            sample_count / (sample_count - lag)
-        )
-        if np.all(
-            np.abs(lag_window)
-            <= noise_standard_error_multiplier * lag_standard_error
-        ):
-            cutoff_lag = lag
-            break
-    integral_C2_m2_s = sample_interval_s * (
-        0.5 * float(autocorrelation[0])
-        + float(np.sum(autocorrelation[1:cutoff_lag]))
-    )
-    if integral_C2_m2_s <= 0.0:
-        raise ValueError("Green-Kubo current integral is not positive")
-    return integral_C2_m2_s / (3.0 * K_B * temperature_K * volume_m3)
-
-
 def validate_force_consistency(
     model: AnalyticalPeriodicInteratomicModel,
     positions_m: Array,
@@ -1404,116 +2025,84 @@ def _validate_settings(
     if any(float(value) <= 0.0 for value in values):
         raise ValueError("all dynamics settings and numerical settings must be positive")
     fractions = (
-        numerics.helfand_fit_start_fraction,
-        numerics.helfand_maximum_lag_fraction,
+        dynamics.logarithmic_volume_proposal,
+        dynamics.maximum_relative_energy_drift,
+        numerics.memory_psd_relative_tolerance,
         numerics.minimum_interatomic_contact_ratio,
-        numerics.density_relative_tolerance,
     )
     if any(value >= 1.0 for value in fractions):
         raise ValueError("fractional numerical settings must be below one")
-    if dynamics.overdamped_sample_stride > dynamics.overdamped_steps:
-        raise ValueError("overdamped sample stride exceeds trajectory length")
+    if dynamics.memory_sample_stride > dynamics.memory_production_steps:
+        raise ValueError("memory sample stride exceeds production trajectory")
 
 
 def compute_first_principles_conductivity(
     recipe: ElectrolyteRecipeModel,
-    interatomic_model: InteratomicModel,
     temperature_K: float,
-    density_kg_m3: float,
+    pressure_Pa: float,
     molecule_count: int,
     dynamics: DynamicsSettings,
     numerics: NumericalSettings,
     random_seed: int,
 ) -> ConductivityResult:
     _validate_settings(dynamics, numerics)
-    if not isinstance(interatomic_model, AnalyticalPeriodicInteratomicModel):
-        raise TypeError("interatomic_model must be AnalyticalPeriodicInteratomicModel")
-    system = interatomic_model.system
-    actual_molecule_count = len(system.molecule_atom_indices)
-    if actual_molecule_count != molecule_count:
-        raise ValueError(
-            f"model has {actual_molecule_count} molecules; requested {molecule_count}"
-        )
-    actual_density_kg_m3 = float(
-        np.sum(system.masses_kg) / abs(np.linalg.det(system.box_vectors_m))
-    )
-    density_relative_error = abs(actual_density_kg_m3 - density_kg_m3) / density_kg_m3
-    if density_relative_error > numerics.density_relative_tolerance:
-        raise ValueError(
-            f"model density {actual_density_kg_m3:.9g} kg/m3 differs from "
-            f"requested {density_kg_m3:.9g} kg/m3"
-        )
-    configurations = sample_equilibrium_configurations(interatomic_model, temperature_K, dynamics, random_seed)
-    validate_force_consistency(
-        interatomic_model, configurations[-1], numerics, random_seed
-    )
-    energy_series = np.asarray([interatomic_model.energy_J(configuration, interatomic_model.system.box_vectors_m) for configuration in configurations])
-    stationary_suffix = select_stationary_suffix(
-        values=energy_series,
-        maximum_split_mean_difference_standard_errors=(
-            numerics.stationarity_standard_error_limit
+    if temperature_K <= 0.0 or pressure_Pa <= 0.0 or molecule_count <= 0:
+        raise ValueError("temperature, pressure, and molecule count must be positive")
+    system = build_periodic_molecular_system(
+        recipe=recipe,
+        molecule_count=molecule_count,
+        minimum_interatomic_contact_ratio=(
+            numerics.minimum_interatomic_contact_ratio
         ),
-        maximum_linear_drift_standard_errors=(
-            numerics.stationarity_standard_error_limit
+        initial_placement_attempts_per_molecule=(
+            numerics.initial_placement_attempts_per_molecule
         ),
-        minimum_effective_sample_size=numerics.minimum_effective_sample_size,
+        random_seed=random_seed,
     )
-    configurations = configurations[stationary_suffix.start_index :]
-    effective_sample_size = (
-        stationary_suffix.autocorrelation.effective_sample_size
+    equilibrium_system, configurations, molecular_memory = (
+        lammps_equilibrium_projection_data(
+            composition_system=system,
+            temperature_K=temperature_K,
+            operator_data_root=(
+                Path(__file__).parent / "physical_library" / "lammps_operator_data"
+            ),
+            eigenvalue_relative_tolerance=numerics.eigenvalue_relative_tolerance,
+        )
     )
     conductivity, direct, history, residuals, basis_size = projected_conductivity_sequence(
-        configurations, interatomic_model.system, temperature_K, dynamics, numerics
+        configurations_m=configurations,
+        system=equilibrium_system,
+        temperature_K=temperature_K,
+        molecular_memory=molecular_memory,
+        numerics=numerics,
     )
-    polarization, interval, acceptance_fraction = simulate_overdamped_polarization(
-        interatomic_model,
-        configurations[-1],
-        temperature_K,
-        dynamics,
-        random_seed + 1,
+    equilibrium_volume_m3 = float(abs(np.linalg.det(equilibrium_system.box_vectors_m)))
+    equilibrium_density_kg_m3 = float(
+        np.sum(equilibrium_system.masses_kg) / equilibrium_volume_m3
     )
-    volume_m3 = abs(np.linalg.det(interatomic_model.system.box_vectors_m))
-    green_kubo = integrated_green_kubo_conductivity(
-        polarization,
-        interval,
-        volume_m3,
-        temperature_K,
-        numerics.gk_noise_window,
-        numerics.gk_noise_standard_error_multiplier,
-    )
-    einstein_helfand = einstein_helfand_conductivity(
-        polarization,
-        interval,
-        volume_m3,
-        temperature_K,
-        numerics.helfand_fit_start_fraction,
-        numerics.helfand_maximum_lag_fraction,
-    )
-    projected_gk_difference_S_m = abs(conductivity - green_kubo)
-    if projected_gk_difference_S_m > numerics.projected_gk_tolerance_S_m:
-        raise ValueError(
-            "projected/Green-Kubo conductivity difference "
-            f"{projected_gk_difference_S_m:.6e} S/m exceeds "
-            f"{numerics.projected_gk_tolerance_S_m:.6e} S/m"
-        )
-    gk_helfand_difference_S_m = abs(green_kubo - einstein_helfand)
-    if gk_helfand_difference_S_m > numerics.projected_gk_tolerance_S_m:
-        raise ValueError(
-            "Green-Kubo/Einstein-Helfand conductivity difference "
-            f"{gk_helfand_difference_S_m:.6e} S/m exceeds "
-            f"{numerics.projected_gk_tolerance_S_m:.6e} S/m"
-        )
     return ConductivityResult(
         conductivity_S_m=conductivity,
         direct_current_term_S_m=direct,
         projected_correction_S_m=direct - conductivity,
-        green_kubo_conductivity_S_m=green_kubo,
-        einstein_helfand_conductivity_S_m=einstein_helfand,
+        equilibrium_volume_m3=equilibrium_volume_m3,
+        equilibrium_density_kg_m3=equilibrium_density_kg_m3,
+        integrated_memory_eigenvalues_kg_s=tuple(
+            float(value)
+            for value in np.linalg.eigvalsh(
+                molecular_memory.integrated_friction_kg_s
+            )
+        ),
+        diffusion_eigenvalues_m2_s=tuple(
+            float(value)
+            for value in np.linalg.eigvalsh(molecular_memory.diffusion_m2_s)
+        ),
         basis_size=basis_size,
         basis_conductivities_S_m=history,
-        residual_history=residuals, maximum_residual_score=residuals[-1], sample_count=configurations.shape[0],
-        effective_sample_size=effective_sample_size,
-        overdamped_acceptance_fraction=acceptance_fraction,
+        residual_history=residuals,
+        maximum_residual_score=residuals[-1],
+        equilibrium_sample_count=configurations.shape[0],
+        memory_sample_count=molecular_memory.sample_count,
+        effective_sample_size=float(configurations.shape[0]),
     )
 
 
@@ -1524,45 +2113,37 @@ def _settings_from_record(record: dict) -> tuple[DynamicsSettings, NumericalSett
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--recipe-json", required=True, type=Path)
-    parser.add_argument("--interatomic-model-json", required=True, type=Path)
     parser.add_argument("--numerics-json", required=True, type=Path)
     parser.add_argument("--output-json", required=True, type=Path)
     arguments = parser.parse_args()
     recipe = ElectrolyteRecipeModel.model_validate(read_json_object(arguments.recipe_json, "electrolyte recipe"))
-    model_record = read_json_object(arguments.interatomic_model_json, "analytical molecular model")
     settings_record = read_json_object(arguments.numerics_json, "conductivity numerics")
-    if model_record["model_type"] != "analytical_periodic_smoluchowski":
-        raise ValueError("model_type must be analytical_periodic_smoluchowski")
     dynamics, numerics = _settings_from_record(settings_record)
     temperature_K = float(settings_record["temperature_K"])
-    density_kg_m3 = float(settings_record["density_kg_m3"])
+    pressure_Pa = float(settings_record["pressure_Pa"])
     molecule_count = int(settings_record["molecule_count"])
     random_seed = int(settings_record["random_seed"])
-    system = build_periodic_molecular_system(
-        recipe,
-        density_kg_m3,
-        molecule_count,
-        numerics.minimum_interatomic_contact_ratio,
-        numerics.initial_placement_attempts_per_molecule,
-        random_seed,
+    result = compute_first_principles_conductivity(
+        recipe=recipe,
+        temperature_K=temperature_K,
+        pressure_Pa=pressure_Pa,
+        molecule_count=molecule_count,
+        dynamics=dynamics,
+        numerics=numerics,
+        random_seed=random_seed,
     )
-    model = AnalyticalPeriodicInteratomicModel(system, numerics)
-    result = compute_first_principles_conductivity(recipe, model, temperature_K, density_kg_m3, molecule_count, dynamics, numerics, random_seed)
     write_json_object(arguments.output_json, asdict(result), "conductivity result")
     print(f"conductivity = {result.conductivity_S_m:.8g} S/m ({result.conductivity_S_m * S_M_TO_MS_CM:.8g} mS/cm)")
     print(f"direct = {result.direct_current_term_S_m:.8g} S/m")
     print(f"projected correction = {result.projected_correction_S_m:.8g} S/m")
-    print(f"same-generator Green-Kubo = {result.green_kubo_conductivity_S_m:.8g} S/m")
-    print(
-        "same-generator Einstein-Helfand = "
-        f"{result.einstein_helfand_conductivity_S_m:.8g} S/m"
-    )
+    print(f"equilibrium volume = {result.equilibrium_volume_m3:.8g} m3")
+    print(f"equilibrium density = {result.equilibrium_density_kg_m3:.8g} kg/m3")
     print(f"basis sequence = {result.basis_conductivities_S_m}")
     print(f"residual sequence = {result.residual_history}")
-    print(f"basis size = {result.basis_size}; samples = {result.sample_count}; ESS = {result.effective_sample_size:.6g}")
     print(
-        "overdamped acceptance fraction = "
-        f"{result.overdamped_acceptance_fraction:.6g}"
+        f"basis size = {result.basis_size}; equilibrium samples = "
+        f"{result.equilibrium_sample_count}; memory samples = "
+        f"{result.memory_sample_count}; ESS = {result.effective_sample_size:.6g}"
     )
     return 0
 

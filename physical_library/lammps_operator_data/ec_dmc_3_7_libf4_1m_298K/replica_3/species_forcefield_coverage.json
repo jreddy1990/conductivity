@@ -1,0 +1,71 @@
+{
+  "EC": {
+    "atom_count": 10,
+    "bond_count": 10,
+    "net_charge_e": -5.551115123125783e-17,
+    "forcefield_files": [
+      "openff-2.2.0.offxml"
+    ],
+    "collections": [
+      "Angles",
+      "Bonds",
+      "Constraints",
+      "Electrostatics",
+      "ImproperTorsions",
+      "ProperTorsions",
+      "vdW"
+    ]
+  },
+  "DMC": {
+    "atom_count": 12,
+    "bond_count": 11,
+    "net_charge_e": -9.71445146547012e-17,
+    "forcefield_files": [
+      "openff-2.2.0.offxml"
+    ],
+    "collections": [
+      "Angles",
+      "Bonds",
+      "Constraints",
+      "Electrostatics",
+      "ImproperTorsions",
+      "ProperTorsions",
+      "vdW"
+    ]
+  },
+  "Li+": {
+    "atom_count": 1,
+    "bond_count": 0,
+    "net_charge_e": 1.0,
+    "forcefield_files": [
+      "openff-2.2.0.offxml"
+    ],
+    "collections": [
+      "Angles",
+      "Bonds",
+      "Constraints",
+      "Electrostatics",
+      "ImproperTorsions",
+      "ProperTorsions",
+      "vdW"
+    ]
+  },
+  "BF4-": {
+    "atom_count": 5,
+    "bond_count": 4,
+    "net_charge_e": -1.0,
+    "forcefield_files": [
+      "openff-2.2.0.offxml",
+      "conductivity/fm_data/forcefields/bf4_clp_sage_overlay.offxml"
+    ],
+    "collections": [
+      "Angles",
+      "Bonds",
+      "Constraints",
+      "Electrostatics",
+      "ImproperTorsions",
+      "ProperTorsions",
+      "vdW"
+    ]
+  }
+}

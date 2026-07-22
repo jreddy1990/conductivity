@@ -1,0 +1,49 @@
+{
+  "copies_per_species": {
+    "EC": 31,
+    "DMC": 57,
+    "Li+": 6,
+    "BOB-": 6
+  },
+  "atoms_per_species": {
+    "EC": 10,
+    "DMC": 12,
+    "Li+": 1,
+    "BOB-": 13
+  },
+  "charges_per_species": {
+    "EC": 0.0,
+    "DMC": 0.0,
+    "Li+": 1.0,
+    "BOB-": -1.0
+  },
+  "total_atoms": 1078,
+  "total_net_charge_e": 0.0,
+  "box_edge_angstrom": 23.31421222430975,
+  "species_ranges": [
+    {
+      "name": "EC",
+      "first_mol_id": 1,
+      "last_mol_id": 31,
+      "role": "neutral"
+    },
+    {
+      "name": "DMC",
+      "first_mol_id": 32,
+      "last_mol_id": 88,
+      "role": "neutral"
+    },
+    {
+      "name": "Li+",
+      "first_mol_id": 89,
+      "last_mol_id": 94,
+      "role": "cation"
+    },
+    {
+      "name": "BOB-",
+      "first_mol_id": 95,
+      "last_mol_id": 100,
+      "role": "anion"
+    }
+  ]
+}

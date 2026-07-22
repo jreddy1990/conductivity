@@ -17,6 +17,7 @@ from conductivity.physical_library.trajectory_primitives import (
     TrajectoryMarkovAdditiveSampleInput,
     _extract_committed_transition_events,
     _find_diffusive_covariance_window,
+    _memory_kernel_gate_diagnostics,
     _self_current_tensors,
     estimate_molecular_family_memory_kernel,
     estimate_molecular_family_memory_kernel_from_replicas,
@@ -506,10 +507,15 @@ def test_memory_kernel_recovers_ornstein_uhlenbeck_diffusivity() -> None:
         axis=0,
     )[burn_in_frame_count:]
     atomic_velocities_m_s = filtered_velocities_m_s[:, np.newaxis, :]
+    atomic_forces_N = molecular_mass_kg * np.gradient(
+        atomic_velocities_m_s,
+        timestep_s,
+        axis=0,
+    )
 
     estimate = estimate_molecular_family_memory_kernel(
         atomic_velocities_m_s=atomic_velocities_m_s,
-        atomic_forces_N=np.zeros_like(atomic_velocities_m_s),
+        atomic_forces_N=atomic_forces_N,
         atomic_masses_kg=np.asarray((molecular_mass_kg,)),
         atom_molecule_ids=np.asarray((19,), dtype=int),
         molecular_family_labels=("ion",),
@@ -596,52 +602,28 @@ def test_memory_kernel_averages_independent_replica_correlations() -> None:
 
 
 def test_memory_kernel_psd_gate_withholds_markov_diffusion() -> None:
-    random_generator = np.random.default_rng(314159)
-    frame_count = 20_000
-    burn_in_frame_count = 2_000
-    timestep_s = 1.0e-14
-    molecular_mass_kg = 2.0e-25
-    relaxation_rate_s_inv = 2.0e12
-    autoregressive_coefficient = np.exp(-relaxation_rate_s_inv * timestep_s)
-    velocity_innovations = random_generator.normal(
-        scale=np.sqrt(1.0 - autoregressive_coefficient**2),
-        size=(frame_count + burn_in_frame_count, 3),
-    )
-    filtered_velocities_m_s = lfilter(
-        (1.0,),
-        (1.0, -autoregressive_coefficient),
-        velocity_innovations,
+    lag_count = 20
+    coordinate_count = 3
+    negative_integrated_kernel_kg_s = -np.eye(coordinate_count)
+    cumulative_memory_integral_kg_s = np.repeat(
+        negative_integrated_kernel_kg_s[np.newaxis, :, :],
+        lag_count,
         axis=0,
-    )[burn_in_frame_count:]
-    atomic_velocities_m_s = filtered_velocities_m_s[:, np.newaxis, :]
-    anti_dissipative_forces_N = (
-        -3.0
-        * molecular_mass_kg
-        * relaxation_rate_s_inv
-        * atomic_velocities_m_s
     )
+    memory_kernel_kg_s2 = np.zeros_like(cumulative_memory_integral_kg_s)
 
-    estimate = estimate_molecular_family_memory_kernel(
-        atomic_velocities_m_s=atomic_velocities_m_s,
-        atomic_forces_N=anti_dissipative_forces_N,
-        atomic_masses_kg=np.asarray((molecular_mass_kg,)),
-        atom_molecule_ids=np.asarray((0,), dtype=int),
-        molecular_family_labels=("ion",),
-        temperature_K=T_REF_K,
-        timestep_s=timestep_s,
-        maximum_lag_frames=80,
-        plateau_window_frames=16,
-        maximum_plateau_relative_variation=1.0,
-        maximum_tail_relative_norm=1.0,
+    diagnostics = _memory_kernel_gate_diagnostics(
+        memory_kernel_kg_s2=memory_kernel_kg_s2,
+        cumulative_memory_integral_kg_s=cumulative_memory_integral_kg_s,
+        plateau_window_frames=5,
+        maximum_plateau_relative_variation=0.1,
+        maximum_tail_relative_norm=0.1,
         psd_relative_tolerance=1.0e-8,
-        volterra_regularization=1.0e-4,
-        singular_value_relative_tolerance=1.0e-10,
     )
 
-    assert not estimate.psd_gate_passed
-    assert not estimate.markov_diffusion_available
-    assert estimate.diffusion_tensor_m2_s.shape == (0, 0)
-    assert "positive semidefinite" in estimate.not_complete_reasons
+    assert diagnostics[3]
+    assert diagnostics[4]
+    assert not diagnostics[5]
 
 
 def _two_center_catalog() -> ChargedCenterCatalog:

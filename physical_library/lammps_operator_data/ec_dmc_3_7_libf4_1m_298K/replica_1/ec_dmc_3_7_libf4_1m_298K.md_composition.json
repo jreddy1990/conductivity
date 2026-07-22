@@ -1,0 +1,36 @@
+{
+  "tag": "ec_dmc_3_7_libf4_1m_298K",
+  "species_list": [
+    "EC",
+    "DMC",
+    "Li+",
+    "BF4-"
+  ],
+  "mole_fractions": [
+    0.3014566715471245,
+    0.5564509346245704,
+    0.07104619691415257,
+    0.07104619691415257
+  ],
+  "temperature_K": 298.15,
+  "target_density_g_cm3": 1.1729163390243902,
+  "source_recipe": {
+    "solvents": {
+      "EC": 0.3,
+      "DMC": 0.7
+    },
+    "salts": {
+      "LiBF4": 1.0
+    },
+    "additives": {}
+  },
+  "molecule_counts": {
+    "EC": 30,
+    "DMC": 56,
+    "Li+": 7,
+    "BF4-": 7
+  },
+  "sim_time_ps": 500.0,
+  "eq_time_ps": 5.0,
+  "velocity_seed": 104729
+}

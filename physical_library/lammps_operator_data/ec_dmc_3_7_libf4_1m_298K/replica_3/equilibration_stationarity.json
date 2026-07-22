@@ -1,0 +1,53 @@
+{
+  "accepted_restart": "ec_dmc_3_7_libf4_1m_298K.npt.3.restart",
+  "controls": {
+    "maximum_linear_drift_standard_errors": 2.0,
+    "maximum_split_mean_difference_standard_errors": 2.0,
+    "minimum_effective_sample_size": 8.0
+  },
+  "observables": {
+    "density_g_cm3": {
+      "early_variance": 5.3992567647058984e-05,
+      "effective_sample_size": 10.483167745193878,
+      "integrated_autocorrelation_time_samples": 3.5294675139547445,
+      "late_variance": 0.00018279158823529375,
+      "linear_drift_standard_errors": 0.043554475271110546,
+      "mean": 1.1257891891891894,
+      "split_mean_difference_standard_errors": 0.3818648697154635,
+      "standard_deviation": 0.010596978442089141,
+      "stationary": true,
+      "truncation_lag_samples": 2
+    },
+    "pressure_atm": {
+      "mean": -25.252794594594608,
+      "standard_deviation": 1578.9298929806882
+    },
+    "temperature_K": {
+      "early_variance": 60.90369741176472,
+      "effective_sample_size": 33.76349047093278,
+      "integrated_autocorrelation_time_samples": 1.0958582623989528,
+      "late_variance": 48.66477944117656,
+      "linear_drift_standard_errors": 1.3661433258480737,
+      "mean": 298.64616216216217,
+      "split_mean_difference_standard_errors": 0.5100898246268548,
+      "standard_deviation": 7.537266346161121,
+      "stationary": true,
+      "truncation_lag_samples": 2
+    },
+    "volume_A3": {
+      "mean": 12306.22162162162,
+      "standard_deviation": 115.8043372224008
+    }
+  },
+  "sample_count": 150,
+  "stationary": true,
+  "stationary_end_step": 15800,
+  "stationary_sample_count": 37,
+  "stationary_start_sample_index": 113,
+  "stationary_start_step": 12200,
+  "trace_files": [
+    "npt_thermo.1.dat",
+    "npt_thermo.2.dat",
+    "npt_thermo.3.dat"
+  ]
+}

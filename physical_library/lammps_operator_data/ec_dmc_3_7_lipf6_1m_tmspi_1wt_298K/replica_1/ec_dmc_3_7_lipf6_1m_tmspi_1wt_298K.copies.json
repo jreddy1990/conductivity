@@ -1,0 +1,58 @@
+{
+  "copies_per_species": {
+    "EC": 30,
+    "DMC": 55,
+    "Li+": 7,
+    "PF6-": 7,
+    "TMSPi": 1
+  },
+  "atoms_per_species": {
+    "EC": 10,
+    "DMC": 12,
+    "Li+": 1,
+    "PF6-": 7,
+    "TMSPi": 43
+  },
+  "charges_per_species": {
+    "EC": 0.0,
+    "DMC": 0.0,
+    "Li+": 1.0,
+    "PF6-": -1.0,
+    "TMSPi": 0.0
+  },
+  "total_atoms": 1059,
+  "total_net_charge_e": 0.0,
+  "box_edge_angstrom": 23.2955479338066,
+  "species_ranges": [
+    {
+      "name": "EC",
+      "first_mol_id": 1,
+      "last_mol_id": 30,
+      "role": "neutral"
+    },
+    {
+      "name": "DMC",
+      "first_mol_id": 31,
+      "last_mol_id": 85,
+      "role": "neutral"
+    },
+    {
+      "name": "Li+",
+      "first_mol_id": 86,
+      "last_mol_id": 92,
+      "role": "cation"
+    },
+    {
+      "name": "PF6-",
+      "first_mol_id": 93,
+      "last_mol_id": 99,
+      "role": "anion"
+    },
+    {
+      "name": "TMSPi",
+      "first_mol_id": 100,
+      "last_mol_id": 100,
+      "role": "neutral"
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "tag": "ec_dmc_3_7_libob_0p8m_298K",
+  "species_list": [
+    "EC",
+    "DMC",
+    "Li+",
+    "BOB-"
+  ],
+  "mole_fractions": [
+    0.3084742091966381,
+    0.5694044226458979,
+    0.061060684078732025,
+    0.061060684078732025
+  ],
+  "temperature_K": 298.15,
+  "target_density_g_cm3": 1.1828710421052582,
+  "source_recipe": {
+    "solvents": {
+      "EC": 0.3,
+      "DMC": 0.7
+    },
+    "salts": {},
+    "additives": {
+      "LiBOB": 0.1310032915542375
+    }
+  },
+  "molecule_counts": {
+    "EC": 31,
+    "DMC": 57,
+    "Li+": 6,
+    "BOB-": 6
+  },
+  "sim_time_ps": 500.0,
+  "eq_time_ps": 5.0,
+  "velocity_seed": 155933
+}

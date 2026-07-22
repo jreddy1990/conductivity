@@ -1,0 +1,18 @@
+{
+  "compact_bytes": 34880866,
+  "family_labels": [
+    "EC",
+    "DMC",
+    "Li+",
+    "PF6-",
+    "TMSPi"
+  ],
+  "force_acceleration_relative_error": 0.14965750418402451,
+  "frame_count": 50000,
+  "maximum_lag_frames": 10000,
+  "raw_bytes": 5370059581,
+  "reduction_ratio": 153.95430781449062,
+  "relative_total_energy_drift": 0.0005090403108522218,
+  "temperature_K": 298.15,
+  "validated": true
+}

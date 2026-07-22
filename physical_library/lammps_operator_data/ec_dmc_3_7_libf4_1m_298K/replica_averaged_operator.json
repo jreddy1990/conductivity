@@ -1,0 +1,26 @@
+{
+  "admitted": false,
+  "diffusion_plateau_gate_passed": false,
+  "diffusion_psd_gate_passed": true,
+  "family_labels": [
+    "EC",
+    "DMC",
+    "Li+",
+    "BF4-"
+  ],
+  "lag_ladder_gate_passed": false,
+  "lag_ladder_relative_changes": [
+    0.5546357817938603,
+    0.3994379883981057
+  ],
+  "maximum_lag_ladder_relative_change": 0.5546357817938603,
+  "minimum_plateau_eigenvalue_kg_s": -8.485321905955946e-11,
+  "plateau_gate_passed": true,
+  "plateau_relative_variation": 0.0038709127683705055,
+  "psd_gate_passed": false,
+  "replica_count": 3,
+  "tail_gate_passed": true,
+  "tail_relative_norm": 0.015958325692609007,
+  "temperature_K": 298.15,
+  "uniform_translation_null_space_removed": true
+}

@@ -1,0 +1,23 @@
+{
+  "admitted": false,
+  "family_labels": [
+    "EC",
+    "DMC",
+    "Li+",
+    "BOB-"
+  ],
+  "lag_ladder_gate_passed": false,
+  "lag_ladder_relative_changes": [
+    0.5196841283136713,
+    0.37650536930145745
+  ],
+  "maximum_lag_ladder_relative_change": 0.5196841283136713,
+  "minimum_plateau_eigenvalue_kg_s": -5.6053419348956926e-11,
+  "plateau_gate_passed": true,
+  "plateau_relative_variation": 0.0046472938075427335,
+  "psd_gate_passed": false,
+  "replica_count": 3,
+  "tail_gate_passed": true,
+  "tail_relative_norm": 0.018895754520751706,
+  "uniform_translation_null_space_removed": true
+}

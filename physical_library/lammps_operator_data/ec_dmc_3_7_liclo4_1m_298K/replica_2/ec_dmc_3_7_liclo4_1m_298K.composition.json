@@ -1,0 +1,36 @@
+{
+  "tag": "ec_dmc_3_7_liclo4_1m_298K",
+  "species_list": [
+    "EC",
+    "DMC",
+    "Li+",
+    "ClO4-"
+  ],
+  "mole_fractions": [
+    0.3020490603543768,
+    0.5575444095301512,
+    0.07020326505773597,
+    0.07020326505773597
+  ],
+  "temperature_K": 298.15,
+  "target_density_g_cm3": 1.200670167768595,
+  "source_recipe": {
+    "solvents": {
+      "EC": 0.3,
+      "DMC": 0.7
+    },
+    "salts": {
+      "LiClO4": 1.0
+    },
+    "additives": {}
+  },
+  "molecule_counts": {
+    "EC": 30,
+    "DMC": 56,
+    "Li+": 7,
+    "ClO4-": 7
+  },
+  "sim_time_ps": 500.0,
+  "eq_time_ps": 5.0,
+  "velocity_seed": 130367
+}

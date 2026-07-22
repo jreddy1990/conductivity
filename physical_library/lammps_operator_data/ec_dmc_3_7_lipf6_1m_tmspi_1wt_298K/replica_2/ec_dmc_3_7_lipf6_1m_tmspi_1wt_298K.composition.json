@@ -1,0 +1,41 @@
+{
+  "tag": "ec_dmc_3_7_lipf6_1m_tmspi_1wt_298K",
+  "species_list": [
+    "EC",
+    "DMC",
+    "Li+",
+    "PF6-",
+    "TMSPi"
+  ],
+  "mole_fractions": [
+    0.29792034850375376,
+    0.5499233290070897,
+    0.0748014054533106,
+    0.0748014054533106,
+    0.0025535115825352597
+  ],
+  "temperature_K": 298.15,
+  "target_density_g_cm3": 1.1766414908041003,
+  "source_recipe": {
+    "solvents": {
+      "EC": 0.3,
+      "DMC": 0.7
+    },
+    "salts": {
+      "LiPF6": 1.0
+    },
+    "additives": {
+      "TMSPi": 0.01
+    }
+  },
+  "molecule_counts": {
+    "EC": 30,
+    "DMC": 55,
+    "Li+": 7,
+    "PF6-": 7,
+    "TMSPi": 1
+  },
+  "sim_time_ps": 500.0,
+  "eq_time_ps": 5.0,
+  "velocity_seed": 181087
+}

@@ -2,7 +2,7 @@
 \usepackage[paperwidth=11in,paperheight=17in,margin=0.6in]{geometry}
 \usepackage[T1]{fontenc}
 \usepackage{mathpazo}
-\usepackage{amsmath,amssymb,mathtools}
+\usepackage{amsmath,amssymb,bm,mathtools}
 \usepackage{booktabs,array,tabularx,multicol}
 \usepackage{xcolor,colortbl}
 \usepackage[skip=4pt plus 1pt]{parskip}
@@ -14,6 +14,8 @@
 \definecolor{lithioxfontblue}{HTML}{001F3F}
 \definecolor{lithioxfontgreen}{HTML}{32B641}
 \definecolor{formteal}{HTML}{0891B2}
+\definecolor{reportgrey}{HTML}{374151}
+\definecolor{greytext}{HTML}{6B7280}
 \hypersetup{colorlinks=true,linkcolor=lithioxfontblue,urlcolor=formteal}
 \pagestyle{empty}
 \AtBeginDocument{\RaggedRight}
@@ -27,18 +29,21 @@
 \makeatother
 \newcommand{\dd}{\,\mathrm d}
 \newcommand{\tr}{\operatorname{tr}}
+\newcommand{\pinv}{^{\#}}
 
 \begin{document}
 
 \noindent\colorbox{lithioxbggreen!15}{%
 \hspace{10pt}\begin{minipage}{\dimexpr\textwidth-2\fboxsep-20pt}
 \vspace{10pt}
-{\LARGE\sffamily\bfseries\color{lithioxfontblue} First-Principles Molecular Conductivity}
+{\LARGE\sffamily\bfseries\color{lithioxfontblue} Full Molecular Electrolyte Conductivity}
+\vspace{4pt}\RaggedRight
 
-{\large\sffamily\color{lithioxfontgreen} Recipe and nuclear species data to the exact charge-response operator}
-\vspace{5pt}
-
-The complete physical model is the nonrelativistic Coulomb theory of the electrons and nuclei in the electrolyte. A recipe fixes how many nuclei of each species are present. Temperature and density or pressure fix the thermodynamic state. The Hamiltonian generates the equilibrium state, molecular structure, charge flux, and conductivity. Solvation, ion pairing, aggregation, polarization, packing, and correlated charge motion are consequences of this one Hamiltonian rather than separately configured transport models.
+This document specifies one computational system that maps an electrolyte recipe,
+temperature, pressure, and molecular species data to one bulk scalar conductivity.
+The model resolves the complete periodic molecular liquid. Ion pairs, aggregates,
+solvent shells, cages, and concentration fluctuations are sampled configurations.
+They are not configured populations or conductivity corrections.
 \vspace{10pt}
 \end{minipage}\hspace{10pt}}
 
@@ -46,297 +51,508 @@ The complete physical model is the nonrelativistic Coulomb theory of the electro
 \begin{multicols}{2}
 \RaggedRight\raggedcolumns
 
-\section{Inputs and the complete mapping}
+\section{Complete input and output}
 
-The physical calculation requires four inputs:
-\begin{enumerate}[leftmargin=*,nosep]
-\item an electrolyte recipe giving molecular identities and loadings;
-\item species records giving each molecule's nuclei, isotope masses, nuclear charges, and stoichiometry;
-\item temperature \(T\);
-\item either cell volume or mass density, or an external pressure defining an isothermal--isobaric state.
-\end{enumerate}
-The physical constants \(e\), \(m_e\), \(\hbar\), \(k_B\), and \(\varepsilon_0\) are universal. No viscosity, partial-charge model, force field, association constant, ion-pair population, diffusivity, cage rate, or conductivity coefficient is an input to the exact theory.
+The physical input is
+\[
+\mathcal I=(\mathcal R,T,p,\mathcal S,\Theta).
+\]
+The recipe \(\mathcal R\) gives solvent volume ratios, salt molarities, and additive
+mass fractions. The species data \(\mathcal S\) give molecular topology, isotope
+masses, formal molecular charge, interaction sites, and parameters for the common
+interaction equations. The shared parameter set \(\Theta\) is fixed over the supported
+chemical domain.
 
-Finite cell size, electronic basis size, reciprocal-space resolution, resolvent broadening, and sampling duration control numerical approximation. They are taken to limits and do not define new electrolyte physics.
+The numerical arguments are finite-cell scale \(m\), equilibrium integration
+resolution \(r\), memory resolution \(\ell\), and basis level \(n\). The complete
+calculation is
+\[
+\boxed{\begin{aligned}
+(\mathcal R,T,p,\mathcal S,\Theta)
+&\longmapsto \{N_s^{(m)}\},V_m^\star,q\\
+&\longmapsto U_\Theta,\rho_\Theta\\
+&\longmapsto K_{\Theta,0}(q),D_\Theta(q),L_\Theta,P\\
+&\longmapsto A_n,h_n,C^{\rm dir}\\
+&\longmapsto \sigma_{m,r,\ell,n}
+\longmapsto \sigma(\mathcal R,T,p).
+\end{aligned}}
+\]
 
-The complete map is
+\section{Neutral periodic molecular system}
+
+Let \(x_s(\mathcal R)\) be the molecular amount of component \(s\) after converting
+the recipe units and expanding salts into molecular ions. At cell scale \(m\), choose
+nonnegative integers
+\[
+\{N_s^{(m)}\}
+=\arg\min_{\{n_s\}\subset\mathbb N_0}
+\sum_s w_s\left(\frac{n_s}{m}-x_s(\mathcal R)\right)^2
+\]
+subject to
+\[
+\sum_s n_sQ_s=0,\qquad \mathbf Bn=\mathbf b_m.
+\]
+The first constraint imposes exact molecular electroneutrality. The matrix
+\(\mathbf B\) contains exact stoichiometric constraints. The sequence obeys
+\[
+N_s^{(m)}/m\longrightarrow x_s(\mathcal R).
+\]
+
+For periodic cell matrix \(H\), volume \(V=\det H\), and constrained molecular
+configuration space \(\Omega_V\), define
+\[
+Z_V(T,\{N_s\})=\int_{\Omega_V}
+e^{-\beta U_\Theta(q;H)}\dd q,\qquad \beta=(k_BT)^{-1}.
+\]
+At pressure \(p\),
+\[
+\Delta(T,p,\{N_s\})=\int_0^\infty
+e^{-\beta pV}Z_V(T,\{N_s\})\dd V,
+\]
+\[
+V_m^\star=\Delta^{-1}\int_0^\infty
+V e^{-\beta pV}Z_V(T,\{N_s^{(m)}\})\dd V.
+\]
+Density is therefore an output:
+\[
+\rho_{\rm mass}=
+\frac{\sum_sN_s^{(m)}M_s}{N_A V_m^\star}.
+\]
+
+\section{Molecular energy operator}
+
+One interaction form applies to every recipe:
+\[
+\boxed{\begin{aligned}
+U_\Theta={}&
+U_{\rm bond}+U_{\rm angle}+U_{\rm torsion}+U_{\rm improper}\\
+&+U_{\rm rep}+U_{\rm disp}+U_{\rm elec}+U_{\rm pol}+U_{\rm mb}.
+\end{aligned}}
+\]
+The bonded terms are
+\[
+U_{\rm bond}=\sum_b\frac{k_b}{2}(r_b-r_b^0)^2,\qquad
+U_{\rm angle}=\sum_a\frac{k_a}{2}(\theta_a-\theta_a^0)^2,
+\]
+\[
+U_{\rm torsion}=\sum_d\sum_k
+k_{dk}\left[1+\cos(n_{dk}\varphi_d-\delta_{dk})\right],
+\]
+with one declared improper functional form. For the Lennard--Jones realization,
+\[
+U_{\rm rep}+U_{\rm disp}=
+\sum_{i<j}^{\rm nonbonded}4\epsilon_{ij}
+\left[\left(\frac{\sigma_{ij}}{r_{ij}}\right)^{12}
+-\left(\frac{\sigma_{ij}}{r_{ij}}\right)^6\right],
+\]
+\[
+\sigma_{ij}=\frac{\sigma_i+\sigma_j}{2},\qquad
+\epsilon_{ij}=\sqrt{\epsilon_i\epsilon_j}.
+\]
+
+All periodic electrostatic blocks use the same zero-average Green function:
+\[
+-\nabla^2G_H(x)=4\pi\left[
+\sum_{z\in\mathbb Z^3}\delta(x-Hz)-V^{-1}\right].
+\]
+Permanent electrostatics are
+\[
+U_{\rm elec}=
+\frac{1}{8\pi\varepsilon_0}\sum_{i\ne j}
+q_iq_jG_H(r_i-r_j)+U_{\rm self}+U_{\rm excl}.
+\]
+The exclusion term applies bonded exclusions and 1--4 scaling to the same periodic
+Green function, including its reciprocal-space correction.
+
+For induced dipoles \(\mu\), define the periodic field \(E_H(q)\) and interaction
+matrix \(T_H(q)\) from derivatives of \(G_H\):
+\[
+U_{\rm pol}(q,\mu)=
+\frac12\mu^\top\alpha^{-1}\mu-\mu^\top E_H(q)
+-\frac12\mu^\top T_H(q)\mu.
+\]
+The same declared short-range damping applies to charge--dipole and dipole--dipole
+blocks. The physical induced dipoles and energy are
+\[
+\mu^\star(q)=\arg\min_\mu U_{\rm pol}(q,\mu),\qquad
+U_{\rm pol}(q)=U_{\rm pol}(q,\mu^\star(q)).
+\]
+The many-body term \(U_{\rm mb}\) is a declared permutation-, rotation-, and
+translation-invariant function of atomic geometry. Forces and virial derive from this
+single energy:
+\[
+F_i=-\nabla_{r_i}U_\Theta,\qquad
+\Xi=-\frac{\partial U_\Theta}{\partial H}H^\top.
+\]
+
+\section{Equilibrium measure}
+
+At \(V_m^\star\),
 \[
 \boxed{
-(\text{recipe},\text{nuclei},T,V\text{ or }p)
-\longmapsto H\longmapsto(\rho,\mathcal L,\mathcal J)
-\longmapsto\sigma_{\rm dc}.}
+\rho_\Theta(q)\dd q=
+Z^{-1}e^{-\beta U_\Theta(q;V_m^\star)}\dd q.}
 \]
-
-\section{Recipe to nuclei and thermodynamic state}
-
-A species record lists the nuclear charge \(Z_Ie\), isotope mass \(M_I\), and number of each nucleus in one molecule. The recipe is converted into integer molecular counts \(N_s\) that reproduce its solvent ratios, salt concentrations, and additive fractions while satisfying exact nuclear stoichiometry and electrical neutrality. Increasing the cell scale improves this rational approximation without changing intensive composition.
-
-At fixed volume, the state is \((T,h,\{N_s\})\), where the cell matrix \(h\) has volume \(V=\det h\). At fixed pressure, the state is \((T,p,\{N_s\})\), and volume is integrated over the isothermal--isobaric partition function. These quantities remove the apparent ambiguity in molecule counts: a recipe defines ratios and concentrations, while \(V\) or \(p\) fixes the amount of matter represented by one finite cell.
-
-After the nuclei have been enumerated, molecular names no longer enter the physical equations. Chemical bonding and molecular identity emerge from the nuclear charges, masses, quantum statistics, and Coulomb interactions. Molecular graph data may be used to construct an initial basis or initial nuclear arrangement, but it does not alter the Hamiltonian.
-
-\section{Periodic Coulomb theory}
-
-Let
+Rigid constraints \(g(q)=0\) restrict this measure to the constraint manifold with its
+induced volume element. Equilibrium integration uses a sequence \(\mathcal Q_r\) with
 \[
-\Lambda_h=\mathbb R^3/h\mathbb Z^3,\qquad V=\det h.
+\mathcal Q_r[f]\longrightarrow
+\langle f\rangle_{\rho_\Theta}
+=\int f(q)\rho_\Theta(q)\dd q.
 \]
-The zero-average periodic Coulomb Green function is defined by
-\[
--\nabla^2G_h(x)=4\pi\left[\sum_{n\in\mathbb Z^3}\delta(x-hn)-V^{-1}\right],
-\qquad \int_{\Lambda_h}G_h(x)\dd x=0.
-\]
-This definition fixes the real-space, reciprocal-space, self, surface, and zero-wavevector terms through one periodic boundary-value problem. The finite cell is neutral, so no artificial neutralizing background is required.
+Pair basins, coordination shells, aggregates, cages, and ligand states are smooth
+observables of \(q\). They do not alter \(\rho_\Theta\).
 
-Index all electrons and nuclei by \(\alpha=1,\ldots,N_{\rm p}\), with
-\[
-(q_\alpha,m_\alpha)=
-\begin{cases}
-(-e,m_e),&\alpha\text{ electron},\\
-(Z_Ie,M_I),&\alpha\text{ nucleus }I.
-\end{cases}
-\]
-The many-particle Hilbert space is antisymmetric under exchange of electrons and has the correct bosonic or fermionic symmetry for each nuclear isotope.
+\section{Molecular coordinates and null modes}
 
-\section{Exact electron--nuclear Hamiltonian}
-
-A uniform vector potential \(A\) is introduced as a boundary twist. The Hamiltonian is
+For molecule \(a\),
 \[
-\boxed{
-\widehat H_h(A)=
-\sum_{\alpha=1}^{N_{\rm p}}
-\frac{[-i\hbar\nabla_\alpha-q_\alpha A]^2}{2m_\alpha}
-+\widehat V_{C,h}+\widehat H_{\rm corr}.}
+R_a=\frac{1}{M_a}\sum_{i\in a}m_ir_i,\quad
+V_a=\frac{1}{M_a}\sum_{i\in a}m_iv_i,\quad
+F_a=\sum_{i\in a}F_i.
 \]
-The periodic Coulomb operator is
+Collect the molecular translational and rotational velocities in \(V\), with
+mass--inertia matrix \(M\). Let the columns of \(B\) span uniform translation and exact
+rigid-constraint null modes. The physical-range projector is
 \[
-\widehat V_{C,h}=
-\frac{1}{4\pi\varepsilon_0}
-\sum_{\alpha<\gamma}q_\alpha q_\gamma
-G_h(\widehat x_\alpha-\widehat x_\gamma)
-+E_{\rm self}(h,\{q_\alpha\}).
+\boxed{\Pi=I-B(B^\top B)\pinv B^\top.}
 \]
-The optional correction operator declares relativistic, spin--orbit, finite-nuclear-size, or other chosen corrections. Setting \(\widehat H_{\rm corr}=0\) defines the nonrelativistic Coulomb model exactly.
+Memory, friction, diffusion, and Poisson operators act on \(\operatorname{ran}\Pi\).
 
-This Hamiltonian contains electron--electron, electron--nuclear, and nuclear--nuclear interactions. Bonding, charge transfer, electronic polarization, solvation, association, dissociation, packing, and correlated ion motion follow from its eigenstates and dynamics. They are not separate closures.
+\section{Microscopic dynamics for molecular memory}
 
-\section{Microscopic generator and equilibrium state}
-
-The observable Liouvillian is
+The memory kernel is generated before the configuration diffusion and therefore
+cannot be evolved by \(L_\Theta\).  Introduce constrained atomic momenta \(p\), mass
+matrix \(M_{\rm at}\), and the phase-space Hamiltonian
 \[
-\boxed{\mathcal L_h\widehat B=\frac{i}{\hbar}[\widehat H_h(0),\widehat B]},
+\mathcal H_\Theta(q,p)=
+\frac12p^\top M_{\rm at}^{-1}p+U_\Theta(q).
 \]
-so \(\widehat B(t)=e^{t\mathcal L_h}\widehat B\). The adjoint generator acting on density operators is
+Write \(G(q)=\nabla_qg(q)\), \(v=M_{\rm at}^{-1}p\), and
+\(A_g(q)=G(q)M_{\rm at}^{-1}G(q)^\top\).  On the cotangent bundle of the
+molecular constraint manifold,
 \[
-\boxed{\mathcal L_h^*\widehat\rho=-\frac{i}{\hbar}[\widehat H_h(0),\widehat\rho]}.
+\dot q=v,\qquad
+\dot p=-\nabla_qU_\Theta-G(q)^\top\lambda,
 \]
-At fixed particle numbers, volume, and temperature, equilibrium is
+where the acceleration constraint determines the multiplier without an additional
+physical parameter:
+\[
+\lambda=A_g(q)\pinv
+\left[\dot G(q;v)v-G(q)M_{\rm at}^{-1}\nabla_qU_\Theta\right].
+\]
+The microscopic generator is therefore
 \[
 \boxed{
-\widehat\rho_{\beta,h}=
-\frac{e^{-\beta\widehat H_h(0)}}{\operatorname{Tr}e^{-\beta\widehat H_h(0)}},
-\qquad \beta=(k_BT)^{-1}.}
+\mathcal G_\Theta f=
+(M_{\rm at}^{-1}p)^\top\nabla_q f
+-\left(\nabla_qU_\Theta+G^\top\lambda\right)^\top\nabla_p f,}
 \]
-The driven generator uses \(E(t)=-\dot A(t)\):
-\[
-\mathcal L_{h,A(t)}^*\widehat\rho
-=-\frac{i}{\hbar}[\widehat H_h(A(t)),\widehat\rho].
-\]
-Conductivity is the derivative of the induced charge flux with respect to this field at zero field.
-
-\section{Hamiltonian-generated charge flux}
-
-The cell-integrated charge flux is generated by the same vector potential:
+on \(g(q)=0\) and \(G(q)M_{\rm at}^{-1}p=0\).  Its invariant canonical measure is
 \[
 \boxed{
-\widehat{\mathcal J}_{h,a}(A)
-=-\frac{\partial\widehat H_h(A)}{\partial A_a}.}
+\varrho_\Theta(q,p)\dd q\dd p=
+\mathcal Z^{-1}e^{-\beta\mathcal H_\Theta(q,p)}
+\dd\lambda_g(q)\dd\lambda_{T_q}(p).}
 \]
-At zero field,
+Here \(\lambda_g\) and \(\lambda_{T_q}\) are the induced configuration and tangent
+momentum measures.  This phase-space dynamics uses exactly the energy, masses,
+cell, and constraints that define \(\rho_\Theta\).  It is used to evaluate molecular
+memory; it is not the later homogenized configuration process.
+
+\section{Conditional memory and diffusion}
+
+Let \(\mathcal P\) be conditional expectation in
+\(L^2(\varrho_\Theta)\) onto the resolved molecular centers, orientations, and their
+conjugate translational and rotational momenta.  Set
+\(\mathcal Q=I-\mathcal P\).  The orthogonal molecular force and its orthogonal
+evolution are
+\[
+F^\perp=\mathcal QF,\qquad
+F^\perp(t)=e^{t\mathcal Q\mathcal G_\Theta\mathcal Q}F^\perp.
+\]
+The fluctuation--dissipation definition of the conditional memory kernel is
 \[
 \boxed{
-\widehat{\mathcal J}_{h,a}
-=\sum_\alpha\frac{q_\alpha}{m_\alpha}\widehat p_{\alpha,a},
-\qquad \widehat j_{h,a}=V^{-1}\widehat{\mathcal J}_{h,a}.}
+K_\Theta(q,t)=\beta\,
+\mathbb E_{\varrho_\Theta}\!\left[
+\Pi F^\perp(t)F^\perp(0)^\top\Pi\mid q(0)=q
+\right].}
 \]
-The contact operator follows from the second derivative,
+The conditional expectation integrates canonical momenta and unresolved molecular
+coordinates at fixed resolved configuration.  Thus \(K_\Theta\) is determined by
+\((U_\Theta,M_{\rm at},\varrho_\Theta,\mathcal P)\), independently of
+\(D_\Theta\) and \(L_\Theta\).
+Define
 \[
-\widehat{\mathcal K}_{h,ab}
-=\left.\frac{\partial^2\widehat H_h(A)}{\partial A_a\partial A_b}\right|_{A=0}
-=\delta_{ab}\sum_\alpha\frac{q_\alpha^2}{m_\alpha}.
+C_{VV}(q,t)=
+\mathbb E[\Pi V(t)V(0)^\top\Pi\mid q(0)=q],
+\qquad C_{PV}(q,t)=MC_{VV}(q,t).
 \]
-This term is retained in the full frequency-dependent response. For regular dissipative DC conductivity, let \(\Pi_0\) project onto conserved or ballistic zero-frequency current modes and define
+These obey the matrix Volterra equation
 \[
-\widehat{\mathcal J}_a^\perp=(1-\Pi_0)\widehat{\mathcal J}_a.
+\frac{\partial C_{PV}(q,t)}{\partial t}
+=-\int_0^tK_\Theta(q,\tau)C_{VV}(q,t-\tau)\dd\tau.
 \]
-
-\section{Exact Kubo response}
-
-The Kubo--Mori inner product is
-\[
-(\widehat A,\widehat B)_{\beta,h}
-=\frac1\beta\int_0^\beta
-\operatorname{Tr}\!\left[
-\widehat\rho_{\beta,h}e^{\lambda\widehat H_h}
-\widehat A^\dagger e^{-\lambda\widehat H_h}\widehat B
-\right]\dd\lambda.
-\]
-For broadening \(\eta>0\), solve
-\[
-\boxed{(\eta-\mathcal L_h)\widehat U_{h,b}^{(\eta)}
-=\widehat{\mathcal J}_{h,b}^\perp.}
-\]
-The regular conductivity tensor is
+For \(s>0\),
 \[
 \boxed{
-\sigma_{h,ab}^{(\eta)}
-=\frac{\beta}{V}\operatorname{Re}
-(\widehat{\mathcal J}_{h,a}^\perp,
-\widehat U_{h,b}^{(\eta)})_{\beta,h}.}
+\widetilde K_\Theta(q,s)=
+\left[C_{PV}(q,0)-s\widetilde C_{PV}(q,s)\right]
+\widetilde C_{VV}(q,s)\pinv.}
+\]
+The zero-frequency friction and molecular diffusion are
+\[
+\boxed{\begin{aligned}
+K_{\Theta,0}(q)&=\lim_{s\downarrow0}
+\Pi\widetilde K_\Theta(q,s)\Pi,\\
+D_\Theta(q)&=k_BT\,\Pi K_{\Theta,0}(q)\pinv\Pi.
+\end{aligned}}
+\]
+For finite trajectory resolution \(\ell\), evaluate the same zero-frequency
+operator through the positive covariance-growth form
+\[
+\boxed{
+D_{\Theta,\ell}(q)=\frac{1}{2t_\ell}
+\mathbb E\!\left[
+\Delta R_\ell\Delta R_\ell^\top\mid q(0)=q
+\right],\qquad
+K_{\Theta,0,\ell}=k_BT\,D_{\Theta,\ell}\pinv,}
+\]
+where
+\(
+\Delta R_\ell=\int_0^{t_\ell}\Pi V(t)\dd t
+\)
+and the conditional mean displacement is removed.  This form is positive
+semidefinite at every finite resolution and converges to the same zero-frequency
+mobility as the Laplace--Volterra expression when the velocity correlation is
+integrable.  It avoids replacing a noisy indefinite kernel estimate by clipped
+eigenvalues.
+The limit is evaluated on the physical range. Conserved and explicitly resolved slow
+coordinates remain outside the inversion.
+
+The replacement of the non-Markovian molecular equation by \(D_\Theta(q)\) is its
+zero-frequency homogenization.  When the orthogonal-force kernel is integrable and
+the eliminated variables mix on a finite time scale, this homogenized operator has
+the same zero-frequency molecular mobility as the generalized Langevin equation.
+
+\section{Constrained reversible generator}
+
+Let \(T_q\) project Cartesian molecular increments onto the tangent space of the rigid
+constraints. Replace \(D_\Theta\) by \(T_qD_\Theta T_q^\top\) and retain the same
+symbol. The production generator is
+\[
+\boxed{
+L_\Theta f=\rho_\Theta^{-1}\nabla_q\!\cdot
+\left(\rho_\Theta D_\Theta\nabla_qf\right).}
+\]
+In coordinates,
+\[
+L_\Theta f=
+-\beta\nabla U_\Theta^\top D_\Theta\nabla f
++(\nabla\!\cdot D_\Theta)^\top\nabla f
++D_\Theta:\nabla^2f.
+\]
+The associated stochastic dynamics is
+\[
+\dd q_t=
+\left[-\beta D_\Theta\nabla U_\Theta
++\nabla\!\cdot D_\Theta\right]\dd t
++\sqrt{2D_\Theta}\dd W_t.
+\]
+The divergence drift and correlated noise belong to the same operator. For smooth
+constraint-compatible functions,
+\[
+-\langle f,L_\Theta g\rangle_{\rho_\Theta}
+=\left\langle\nabla f^\top D_\Theta\nabla g\right\rangle_{\rho_\Theta}.
+\]
+Thus \(L_\Theta\) is reversible and negative semidefinite on mean-zero functions.
+
+\section{Charge polarization}
+
+Use formal molecular charges and unwrapped molecular centers:
+\[
+\boxed{P(q)=\sum_aQ_aR_a^{\rm unwrap}.}
+\]
+Molecular translation carries unbounded charge displacement. Intramolecular rotation,
+vibration, and induced polarization are bounded unless molecular charge topology
+changes. The drift current is
+\[
+j_i(q)=L_\Theta P_i(q).
+\]
+The stochastic quadratic variation supplies
+\[
+\boxed{
+C^{\rm dir}_{ij}=
+\left\langle\nabla P_i^\top D_\Theta\nabla P_j
+\right\rangle_{\rho_\Theta}.}
+\]
+
+\section{Poisson corrector and scalar conductivity}
+
+For each Cartesian component solve
+\[
+\boxed{
+-L_\Theta\chi_i=L_\Theta P_i,\qquad
+\langle\chi_i\rangle_{\rho_\Theta}=0.}
+\]
+The weak equation is
+\[
+\left\langle\nabla\varphi^\top D_\Theta\nabla\chi_i\right\rangle
+=-\left\langle\nabla\varphi^\top D_\Theta\nabla P_i\right\rangle
+\]
+for every admissible mean-zero test function \(\varphi\). The homogenized charge
+diffusion is
+\[
+\boxed{
+\mathcal D^Q_{ij}=C^{\rm dir}_{ij}
+-\left\langle L_\Theta P_i,
+(-L_\Theta)\pinv L_\Theta P_j\right\rangle_{\rho_\Theta}.}
 \]
 Equivalently,
 \[
-\sigma_{h,ab}^{(\eta)}
-=\frac{\beta}{V}\int_0^\infty e^{-\eta t}
-\operatorname{Re}
-(\widehat{\mathcal J}_{h,a}^\perp,
-e^{t\mathcal L_h}\widehat{\mathcal J}_{h,b}^\perp)_{\beta,h}\dd t.
+\mathcal D^Q_{ii}=
+\min_{\chi\in\mathcal H_E}
+\left\langle(\nabla P_i+\nabla\chi)^\top
+D_\Theta(\nabla P_i+\nabla\chi)\right\rangle_{\rho_\Theta}.
 \]
-The isotropic macroscopic DC value is
+With \(P\) measured in \(\mathrm{C\,m}\),
 \[
 \boxed{
-\sigma_{\rm dc}=\frac13\tr\left[
-\lim_{\eta\downarrow0}\lim_{V\to\infty}
-\boldsymbol\sigma_h^{(\eta)}\right].}
+\sigma(\mathcal R,T,p)=
+\frac{1}{3k_BTV_m^\star}\tr\mathcal D^Q
+\quad[\mathrm{S\,m^{-1}}].}
 \]
-The thermodynamic limit precedes the zero-frequency limit because a finite isolated quantum cell has a discrete spectrum.
 
-\section{Finite numerical Liouvillian}
+\section{Constructive nested basis}
 
-Choose a systematically complete many-particle basis \(\{|\Phi_\mu^{(K)}\rangle\}_{\mu=1}^{D_K}\). Its Hamiltonian and current matrices are
+Generate smooth permutation-, translation-, and rotation-compatible functions from
+radial atomic densities, angular invariants, molecular orientations, coordination
+numbers, charge-density Fourier modes, concentration modes, cluster graphs, and
+hierarchical products. Let \(\mathcal G_n\) include radial and angular order, reciprocal
+wavevector norm, correlation order, and cluster depth at most \(n\). After centering
+and removal of exact null functions,
 \[
-H_{\mu\nu}^{(K)}(A)=\langle\Phi_\mu^{(K)}|\widehat H_h(A)|\Phi_\nu^{(K)}\rangle,
-\quad
-\mathcal J_{a,\mu\nu}^{(K)}=-\left.\partial_{A_a}H_{\mu\nu}^{(K)}(A)\right|_0.
+V_n=\operatorname{span}\mathcal G_n,\qquad V_n\subset V_{n+1}.
 \]
-On the operator basis \(|\Phi_\mu\rangle\langle\Phi_\nu|\), the numerical generator is
+The hierarchy obeys
 \[
-\boxed{
-\mathbf L_K=\frac{i}{\hbar}
-\left(I\otimes H_K-H_K^{\mathsf T}\otimes I\right).}
+\overline{\bigcup_{n=1}^\infty V_n}^{\|\cdot\|_E}=\mathcal H_E,\qquad
+\|f\|_E^2=\langle\nabla f^\top D_\Theta\nabla f\rangle.
 \]
-The equilibrium matrix and resolvent system are
-\[
-\mathbf R_{\beta,K}=\frac{e^{-\beta H_K}}{\tr e^{-\beta H_K}},
-\qquad
-(\eta I-\mathbf L_K)\mathbf u_b=\mathbf j_b^\perp.
-\]
-The finite conductivity is the Kubo--Mori weighted bilinear form between \(\mathbf j_a^\perp\) and \(\mathbf u_b\). This is an explicit linear algebra problem once the basis matrix elements have been evaluated.
 
-\subsection{Spectral form}
-
-For \(H_K|n\rangle=E_n|n\rangle\) and \(p_n=e^{-\beta E_n}/\sum_re^{-\beta E_r}\), define
+For basis \(\Phi_n=(\phi_1,\ldots,\phi_{d_n})\), compute
 \[
-w_{mn}=\begin{cases}
-\dfrac{p_m-p_n}{\beta(E_n-E_m)},&E_m\ne E_n,\\[2mm]
-p_m,&E_m=E_n.
-\end{cases}
+A_{\mu\nu}^{(n)}=
+\left\langle\nabla\phi_\mu^\top D_\Theta\nabla\phi_\nu\right\rangle,
 \]
-Then
+\[
+h_{\mu i}^{(n)}=
+\left\langle\nabla\phi_\mu^\top D_\Theta\nabla P_i\right\rangle.
+\]
+The coefficient vector solves
+\[
+\boxed{A^{(n)}c_i^{(n)}=-h_i^{(n)}.}
+\]
+The finite charge diffusion and conductivity are
 \[
 \boxed{
-\sigma_{ab}^{(K,h,\eta)}
-=\frac{\beta}{V}\operatorname{Re}\sum_{m,n}
-w_{mn}\frac{(\mathcal J_a^\perp)_{mn}^*(\mathcal J_b^\perp)_{mn}}
-{\eta-i(E_m-E_n)/\hbar}.}
+\mathcal D^{Q,n}_{ij}=C^{\rm dir}_{ij}
+-(h_i^{(n)})^\top(A^{(n)})\pinv h_j^{(n)},}
 \]
-The exact result is the ordered limit
 \[
 \boxed{
-\sigma_{\rm dc}=\frac13\tr
-\lim_{\eta\downarrow0}\lim_{V\to\infty}\lim_{K\to\infty}
-\boldsymbol\sigma^{(K,h,\eta)}.}
+\sigma_{m,r,\ell,n}=
+\frac{\tr[C^{\rm dir}-h_n^\top A_n\pinv h_n]}
+{3k_BTV_m^\star}.}
 \]
-Basis completion, thermodynamic size, and zero-frequency response are separate numerical limits of the same Hamiltonian.
 
-\section{Born--Oppenheimer approximation}
+\section{Residual-driven enrichment}
 
-The exact operator system is closed but exponentially expensive. The standard first-principles molecular approximation solves the electronic problem at fixed nuclear positions:
+For \(g\in V_{n+1}\setminus V_n\), define
 \[
-\widehat H_{e,h}(R)\Psi_0(R)=E_0(R)\Psi_0(R),
-\qquad U_{\rm BO,h}(R)=E_0(R)+V_{nn,h}(R).
+\widetilde A_{gg}
+=A_{gg}-A_{g\Phi}A_{\Phi\Phi}\pinv A_{\Phi g},
 \]
-The classical nuclear Hamiltonian is
 \[
-H_{\rm BO,h}(R,P)=\sum_I\frac{|P_I|^2}{2M_I}+U_{\rm BO,h}(R),
+\widetilde h_{g,i}
+=h_{g,i}-A_{g\Phi}A_{\Phi\Phi}\pinv h_{\Phi,i}.
 \]
-with phase-space generator
+When \(\widetilde A_{gg}>0\), the exact gain in the variational correction is
 \[
-\boxed{
-\mathcal G_{\rm BO,h}f
-=\sum_I\frac{P_I}{M_I}\cdot\nabla_{R_I}f
--\sum_I\nabla_{R_I}U_{\rm BO,h}\cdot\nabla_{P_I}f.}
+S(g)=\sum_{i=1}^3
+\frac{|\widetilde h_{g,i}|^2}{\widetilde A_{gg}}.
 \]
-The canonical measure \(Z^{-1}e^{-\beta H_{\rm BO,h}}\dd R\dd P\) is invariant under this Hamiltonian flow. Canonical initial conditions may be prepared by an auxiliary sampler, but production dynamics use \(\mathcal G_{\rm BO,h}\). A thermostat used during production defines a different transport generator.
+Candidates come from the next declared hierarchy level. Exhausting one finite
+dictionary does not establish convergence.
 
-\section{Periodic BO charge flux}
+\section{Galerkin convergence}
 
-Periodic electronic polarization is defined by a Berry-phase many-body polarization \(\mu_{\rm BO}(R)\). Its time derivative is the adiabatic charge flux:
+Let \(\chi_i^\star\) solve the full Poisson problem and \(\chi_{n,i}\) be its Galerkin
+projection. Galerkin orthogonality gives
 \[
-\boxed{
-\mathcal J_a^{\rm BO}(R,P)
-=\sum_{I,b}\frac{\partial\mu_{{\rm BO},a}}{\partial R_{I,b}}
-\frac{P_{I,b}}{M_I}
-=\sum_{I,b}Z_{I,ab}^*(R)V_{I,b}.}
+\langle\nabla(\chi_i^\star-\chi_{n,i})^\top
+D_\Theta\nabla\phi\rangle=0,\qquad \phi\in V_n.
 \]
-Born effective charges \(Z_I^*\) therefore come from the electronic polarization derivative. Fixed molecular partial charges are not the fundamental current. Integer oxidation-number currents are equivalent only when the liquid remains electronically insulating and their polarization differs from the Berry-phase polarization by a bounded quantity.
-
-The BO conductivity is
+Expanding the variational energy gives
 \[
 \boxed{
-\sigma_{ab}^{\rm BO}=\frac{\beta}{V}\int_0^\infty
-\langle\mathcal J_a^{\rm BO}(t)\mathcal J_b^{\rm BO}(0)\rangle\dd t.}
+\sigma_{m,r,\ell,n}-\sigma_{m,r,\ell,\infty}
+=\frac{1}{3k_BTV_m^\star}
+\sum_{i=1}^3\|\chi_i^\star-\chi_{n,i}\|_E^2\ge0.}
 \]
-Its Einstein--Helfand form is
+Therefore
+\[
+\sigma_{m,r,\ell,n}\downarrow\sigma_{m,r,\ell,\infty}.
+\]
+When equilibrium integration converges, the zero-frequency memory limit exists on the
+physical range, the basis hierarchy is energy-norm dense, and the thermodynamic limit
+exists,
 \[
 \boxed{
-\sigma^{\rm BO}=\frac{\beta}{6V}\lim_{t\to\infty}
-\frac{\langle|\mu_{\rm BO}(t)-\mu_{\rm BO}(0)|^2\rangle}{t}.}
+\sigma(\mathcal R,T,p)=
+\lim_{m\to\infty}\lim_{r\to\infty}
+\lim_{\ell\to\infty}\lim_{n\to\infty}
+\sigma_{m,r,\ell,n}.}
 \]
+Every limit refines a named numerical approximation while
+\(U_\Theta,K_\Theta,P,T,p\), and the intensive recipe remain fixed.
 
-\section{What is proved and what must be computed}
+\section{Executable calculation order}
 
-The quantum equations above close the mapping from recipe, nuclei, temperature, and thermodynamic state to conductivity. For each finite \((K,V,\eta)\), they define a concrete matrix calculation. Under convergence of the many-particle basis and existence of the thermodynamic and regular DC limits, the ordered sequence converges to the conductivity of the declared nonrelativistic Coulomb theory.
-
-The BO equations define a controlled physical approximation to the electron--nuclear theory. Their numerical result must converge with electronic basis and self-consistency tolerance, nuclear timestep, cell size, trajectory duration, and independent initial conditions while the BO Hamiltonian and charge-flux definition remain fixed.
-
-Neither operator convergence nor the BO approximation proves agreement with an experiment. Experimental agreement tests the adequacy of the nonrelativistic corrections, BO separation, electronic-structure approximation, finite-temperature nuclear treatment, and achieved numerical limits. A predictive claim requires calculated conductivity values and uncertainties for held-out recipes with fully specified temperature and thermodynamic state.
-
-\section{Final model statement}
-
-The fundamental generator is
-\[
-\boxed{\mathcal L_h\widehat B=\frac{i}{\hbar}[\widehat H_h,\widehat B]},
-\]
-the microscopic flux is
-\[
-\boxed{\widehat{\mathcal J}_a=-\left.\partial_{A_a}\widehat H_h(A)\right|_{A=0}},
-\]
-and the conductivity is
+\begin{enumerate}[leftmargin=*,nosep]
+\item Decode \(\mathcal R\) and construct neutral integer counts.
+\item Evaluate \(U_\Theta\) and equilibrate at \((T,p)\) to obtain \(V_m^\star\)
+      and samples of \(\rho_\Theta\).
+\item Construct \(\mathcal G_\Theta\) from the same energy, masses, cell, and
+      molecular constraints; sample its canonical phase-space measure.
+\item Project atomic coordinates, momenta, velocities, and forces to constrained
+      molecular variables and form \(\mathcal P\) and \(\mathcal Q\).
+\item Evolve orthogonal forces with
+      \(e^{t\mathcal Q\mathcal G_\Theta\mathcal Q}\), evaluate their conditional
+      correlations, and solve for
+      \(K_{\Theta,0}(q)\) on the physical range.
+\item Form \(D_\Theta(q)=k_BT K_{\Theta,0}(q)\pinv\).
+\item Evaluate \(C^{\rm dir}\), \(A_n\), and \(h_n\) over the same equilibrium measure.
+\item Solve \(A_nc_{n,i}=-h_{n,i}\) after removing exact null modes.
+\item Return
 \[
 \boxed{
-\sigma_{ab}^{(\eta)}=\frac{\beta}{V}\operatorname{Re}
-(\mathcal J_a^\perp,(\eta-\mathcal L_h)^{-1}\mathcal J_b^\perp)_{\beta,h}.}
+\sigma_{m,r,\ell,n}=
+\frac{\tr(C^{\rm dir}-h_n^\top A_n\pinv h_n)}
+{3k_BTV_m^\star}.}
 \]
-The practical BO generator and Berry-phase current are explicit approximations to these objects. No Smoluchowski mobility, viscosity closure, configured association population, or species-level conductivity term is part of this first-principles mapping.
+\item Refine \((m,r,\ell,n)\) without changing the physical model.
+\end{enumerate}
 
-\section{References}
+\section{Model boundary}
 
-R. Kubo, ``Statistical-Mechanical Theory of Irreversible Processes I,'' \emph{J. Phys. Soc. Jpn.} \textbf{12}, 570 (1957), \href{https://doi.org/10.1143/JPSJ.12.570}{doi:10.1143/JPSJ.12.570}.
-
-R. Resta, ``The quantum-mechanical position operator and the polarization problem,'' \href{https://arxiv.org/abs/cond-mat/9802004}{arXiv:cond-mat/9802004}.
-
-F. Grasselli and S. Baroni, ``Topological quantisation and gauge invariance of charge transport in liquid insulators,'' \href{https://arxiv.org/abs/1902.07256}{arXiv:1902.07256}.
+The equations contain no configured SSIP or CIP fractions, mass-action population
+allocation, species conductivity bonus, terminal conductivity multiplier, or
+recipe-specific transport branch. Species data determine molecular construction and
+interaction parameters. The equilibrium measure determines structure. Conditional
+memory determines diffusion. The Poisson corrector determines correlated charge
+transport. Their composition returns the scalar conductivity.
 
 \end{multicols}
 \end{document}

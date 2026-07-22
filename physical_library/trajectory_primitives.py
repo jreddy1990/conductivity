@@ -318,17 +318,8 @@ def estimate_molecular_family_memory_kernel(
         centered_family_forces_N.shape[0],
         -1,
     )
-    coordinate_masses_kg = np.repeat(family_masses_kg, CARTESIAN)
-    flattened_family_momenta_kg_m_s = (
-        flattened_family_velocities_m_s * coordinate_masses_kg[np.newaxis, :]
-    )
     velocity_autocorrelation_m2_s2 = _lagged_matrix_correlation(
         flattened_family_velocities_m_s,
-        flattened_family_velocities_m_s,
-        validated_maximum_lag_frames,
-    )
-    momentum_velocity_correlation_kg_m2_s2 = _lagged_matrix_correlation(
-        flattened_family_momenta_kg_m_s,
         flattened_family_velocities_m_s,
         validated_maximum_lag_frames,
     )
@@ -337,18 +328,7 @@ def estimate_molecular_family_memory_kernel(
         flattened_family_velocities_m_s,
         validated_maximum_lag_frames,
     )
-    momentum_correlation_derivative_N_m_s = np.diff(
-        momentum_velocity_correlation_kg_m2_s2,
-        axis=0,
-    ) / physical_timestep_s
-    midpoint_force_velocity_correlation_N_m_s = 0.5 * (
-        force_velocity_correlation_N_m_s[:-1]
-        + force_velocity_correlation_N_m_s[1:]
-    )
-    volterra_convolution_residual_N_m_s = (
-        midpoint_force_velocity_correlation_N_m_s
-        - momentum_correlation_derivative_N_m_s
-    )
+    volterra_convolution_residual_N_m_s = -force_velocity_correlation_N_m_s[:-1]
     memory_kernel_kg_s2 = _invert_matrix_volterra_kernel(
         velocity_autocorrelation_m2_s2,
         volterra_convolution_residual_N_m_s,
@@ -509,23 +489,10 @@ def estimate_molecular_family_memory_kernel_from_replicas(
         ),
         axis=0,
     )
-    coordinate_masses_kg = np.repeat(reference_estimate.family_masses_kg, CARTESIAN)
-    momentum_velocity_correlation_kg_m2_s2 = (
-        velocity_autocorrelation_m2_s2 * coordinate_masses_kg[np.newaxis, :, np.newaxis]
-    )
     physical_timestep_s = _positive_float(timestep_s, "timestep_s")
-    momentum_correlation_derivative_N_m_s = np.diff(
-        momentum_velocity_correlation_kg_m2_s2,
-        axis=0,
-    ) / physical_timestep_s
-    midpoint_force_velocity_correlation_N_m_s = 0.5 * (
-        force_velocity_correlation_N_m_s[:-1]
-        + force_velocity_correlation_N_m_s[1:]
-    )
     memory_kernel_kg_s2 = _invert_matrix_volterra_kernel(
         velocity_autocorrelation_m2_s2,
-        midpoint_force_velocity_correlation_N_m_s
-        - momentum_correlation_derivative_N_m_s,
+        -force_velocity_correlation_N_m_s[:-1],
         physical_timestep_s,
         _nonnegative_float(volterra_regularization, "volterra_regularization"),
         _positive_float(
@@ -649,7 +616,7 @@ def _validated_force_complete_atomic_trajectory(
     atomic_forces_N: Array,
     atomic_masses_kg: Array,
     atom_molecule_ids: Array,
-) -> tuple[Array, Array, Array, Array]:
+) -> tuple[Array, Array, Array]:
     velocities_m_s = np.asarray(atomic_velocities_m_s, dtype=float)
     forces_N = np.asarray(atomic_forces_N, dtype=float)
     masses_kg = np.asarray(atomic_masses_kg, dtype=float)
@@ -821,6 +788,109 @@ def _lagged_matrix_correlation(
         ),
         dtype=float,
     )
+
+
+def fit_conditional_force_memory_operator(
+    geometry_force_basis: Array,
+    molecular_forces_N: Array,
+    residual_observation_projection: Array,
+    translation_projector: Array,
+    sample_interval_s: float,
+    temperature_K: float,
+    maximum_lag_frames: int,
+    singular_value_relative_tolerance: float,
+) -> tuple[Array, Array, Array, Array]:
+    """Project resolved force and derive the zero-frequency Mori operator."""
+    basis = np.asarray(geometry_force_basis, dtype=float)
+    forces = np.asarray(molecular_forces_N, dtype=float)
+    if basis.ndim != 4 or basis.shape[3] != CARTESIAN:
+        raise ValueError("geometry force basis must have shape (frames, molecules, basis, 3)")
+    if forces.shape != (basis.shape[0], basis.shape[1], CARTESIAN):
+        raise ValueError("molecular forces do not match the geometry force basis")
+    coordinate_count = basis.shape[1] * CARTESIAN
+    observation_projection = np.asarray(residual_observation_projection, dtype=float)
+    if (
+        observation_projection.ndim != 2
+        or observation_projection.shape[1] != coordinate_count
+    ):
+        raise ValueError(
+            "residual observation projection must act on molecular coordinates"
+        )
+    if translation_projector.shape != (coordinate_count, coordinate_count):
+        raise ValueError("translation projector does not match molecular coordinates")
+    if sample_interval_s <= 0.0 or temperature_K <= 0.0:
+        raise ValueError("sample interval and temperature must be positive")
+    if maximum_lag_frames <= 0 or maximum_lag_frames >= basis.shape[0]:
+        raise ValueError("memory lag must be positive and shorter than the trajectory")
+    design = basis.transpose(0, 1, 3, 2).reshape((-1, basis.shape[2]))
+    force_vector = forces.reshape(-1)
+    force_gram = design.T @ design
+    force_coupling = design.T @ force_vector
+    left_vectors, singular_values, right_vectors_transpose = np.linalg.svd(
+        force_gram, full_matrices=False
+    )
+    singular_scale = max(float(np.max(singular_values)), np.finfo(float).tiny)
+    retained = singular_values > singular_value_relative_tolerance * singular_scale
+    coefficients_N = (
+        right_vectors_transpose.T[:, retained]
+        @ ((left_vectors[:, retained].T @ force_coupling) / singular_values[retained])
+    )
+    residual = forces - np.einsum("tmka,k->tma", basis, coefficients_N)
+    flattened_residual = residual.reshape((residual.shape[0], coordinate_count))
+    projected_residual = (
+        flattened_residual @ translation_projector @ observation_projection.T
+    )
+    centered_residual = projected_residual - np.mean(
+        projected_residual, axis=0, keepdims=True
+    )
+    transform_size = 1 << (2 * centered_residual.shape[0] - 1).bit_length()
+    residual_transform = np.fft.rfft(centered_residual, n=transform_size, axis=0)
+    spectral_products = residual_transform[:, :, None] * np.conjugate(
+        residual_transform[:, None, :]
+    )
+    correlation_sums = np.fft.irfft(
+        spectral_products, n=transform_size, axis=0
+    )[: maximum_lag_frames + 1]
+    lag_counts = centered_residual.shape[0] - np.arange(maximum_lag_frames + 1)
+    residual_correlation_N2 = correlation_sums / lag_counts[:, None, None]
+    return coefficients_N, residual, residual_correlation_N2
+
+
+def integrated_memory_and_diffusion_from_residual_force_correlation(
+    residual_force_autocorrelation_N2: Array,
+    sample_interval_s: float,
+    temperature_K: float,
+    singular_value_relative_tolerance: float,
+) -> tuple[Array, Array]:
+    residual_correlation_N2 = np.asarray(
+        residual_force_autocorrelation_N2, dtype=float
+    )
+    if (
+        residual_correlation_N2.ndim != 3
+        or residual_correlation_N2.shape[1] != residual_correlation_N2.shape[2]
+        or residual_correlation_N2.shape[0] < 2
+    ):
+        raise ValueError("residual-force correlation must have shape (lags, n, n)")
+    if sample_interval_s <= 0.0 or temperature_K <= 0.0:
+        raise ValueError("sample interval and temperature must be positive")
+    memory_kernel_kg_s2 = residual_correlation_N2 / (K_B * temperature_K)
+    integrated_memory_kg_s = sample_interval_s * (
+        0.5 * memory_kernel_kg_s2[0]
+        + np.sum(memory_kernel_kg_s2[1:-1], axis=0)
+        + 0.5 * memory_kernel_kg_s2[-1]
+    )
+    integrated_memory_kg_s = 0.5 * (
+        integrated_memory_kg_s + integrated_memory_kg_s.T
+    )
+    eigenvalues, eigenvectors = np.linalg.eigh(integrated_memory_kg_s)
+    eigenvalue_scale = max(float(np.max(np.abs(eigenvalues))), np.finfo(float).tiny)
+    if float(np.min(eigenvalues)) < -singular_value_relative_tolerance * eigenvalue_scale:
+        raise ValueError("integrated residual-force memory is not positive semidefinite")
+    active = eigenvalues > singular_value_relative_tolerance * eigenvalue_scale
+    diffusion_m2_s = K_B * temperature_K * (
+        eigenvectors[:, active] / eigenvalues[active]
+    ) @ eigenvectors[:, active].T
+    return integrated_memory_kg_s, diffusion_m2_s
 
 
 def _invert_matrix_volterra_kernel(

@@ -1,0 +1,49 @@
+{
+  "copies_per_species": {
+    "EC": 30,
+    "DMC": 56,
+    "Li+": 7,
+    "BF4-": 7
+  },
+  "atoms_per_species": {
+    "EC": 10,
+    "DMC": 12,
+    "Li+": 1,
+    "BF4-": 5
+  },
+  "charges_per_species": {
+    "EC": 0.0,
+    "DMC": 0.0,
+    "Li+": 1.0,
+    "BF4-": -1.0
+  },
+  "total_atoms": 1014,
+  "total_net_charge_e": 0.0,
+  "box_edge_angstrom": 22.773291630683445,
+  "species_ranges": [
+    {
+      "name": "EC",
+      "first_mol_id": 1,
+      "last_mol_id": 30,
+      "role": "neutral"
+    },
+    {
+      "name": "DMC",
+      "first_mol_id": 31,
+      "last_mol_id": 86,
+      "role": "neutral"
+    },
+    {
+      "name": "Li+",
+      "first_mol_id": 87,
+      "last_mol_id": 93,
+      "role": "cation"
+    },
+    {
+      "name": "BF4-",
+      "first_mol_id": 94,
+      "last_mol_id": 100,
+      "role": "anion"
+    }
+  ]
+}

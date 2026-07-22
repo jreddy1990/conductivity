@@ -1,0 +1,17 @@
+{
+  "compact_bytes": 28888037,
+  "family_labels": [
+    "EC",
+    "DMC",
+    "Li+",
+    "BF4-"
+  ],
+  "force_acceleration_relative_error": 0.15417971086809015,
+  "frame_count": 50000,
+  "maximum_lag_frames": 10000,
+  "raw_bytes": 5128105382,
+  "reduction_ratio": 177.51657483684338,
+  "relative_total_energy_drift": 0.0045254265715799265,
+  "temperature_K": 298.15,
+  "validated": true
+}
