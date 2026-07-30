@@ -1,5 +1,5 @@
 {
-  "compact_bytes": 34880866,
+  "compact_bytes": 145401378,
   "family_labels": [
     "EC",
     "DMC",
@@ -7,12 +7,12 @@
     "PF6-",
     "TMSPi"
   ],
-  "force_acceleration_relative_error": 0.14965750418402451,
+  "force_acceleration_relative_error": 0.14687830450057127,
   "frame_count": 50000,
   "maximum_lag_frames": 10000,
-  "raw_bytes": 5370059581,
-  "reduction_ratio": 153.95430781449062,
-  "relative_total_energy_drift": 0.0005090403108522218,
+  "raw_bytes": 463798385,
+  "reduction_ratio": 3.18977984514012,
+  "relative_total_energy_drift": 0.0004980686692096371,
   "temperature_K": 298.15,
   "validated": true
 }

@@ -1,17 +1,17 @@
 {
-  "compact_bytes": 27916722,
+  "compact_bytes": 131558274,
   "family_labels": [
     "EC",
     "DMC",
     "Li+",
     "BF4-"
   ],
-  "force_acceleration_relative_error": 0.1541870015369059,
+  "force_acceleration_relative_error": 0.15238223826152697,
   "frame_count": 50000,
   "maximum_lag_frames": 10000,
-  "raw_bytes": 5129266188,
-  "reduction_ratio": 183.73454404854553,
-  "relative_total_energy_drift": 0.004397513844704697,
+  "raw_bytes": 462787406,
+  "reduction_ratio": 3.5177369839923562,
+  "relative_total_energy_drift": 0.0025811498067061477,
   "temperature_K": 298.15,
   "validated": true
 }

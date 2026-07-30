@@ -1,17 +1,17 @@
 {
-  "compact_bytes": 27919566,
+  "compact_bytes": 132223371,
   "family_labels": [
     "EC",
     "DMC",
     "Li+",
     "ClO4-"
   ],
-  "force_acceleration_relative_error": 0.1536790884663171,
+  "force_acceleration_relative_error": 0.15524861003115387,
   "frame_count": 50000,
   "maximum_lag_frames": 10000,
-  "raw_bytes": 5130917506,
-  "reduction_ratio": 183.7749736510947,
-  "relative_total_energy_drift": 0.0005628152240994191,
+  "raw_bytes": 462804803,
+  "reduction_ratio": 3.500173982101848,
+  "relative_total_energy_drift": 0.000475335118353524,
   "temperature_K": 298.15,
   "validated": true
 }

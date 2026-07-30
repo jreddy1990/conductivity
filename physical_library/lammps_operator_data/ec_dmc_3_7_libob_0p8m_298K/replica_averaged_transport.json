@@ -1,6 +1,6 @@
 {
-  "green_kubo_endpoint_S_m": 1.8353009316713254,
-  "helfand_endpoint_S_m": 0.7158100848827216,
+  "green_kubo_endpoint_S_m": 1.6416929066783608,
+  "helfand_endpoint_S_m": 0.5086299207550894,
   "replica_count": 3,
   "replica_frame_counts": [
     500001,

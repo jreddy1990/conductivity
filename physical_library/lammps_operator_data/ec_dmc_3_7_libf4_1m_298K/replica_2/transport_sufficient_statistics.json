@@ -1,5 +1,5 @@
 {
-  "compact_bytes": 8918748,
+  "compact_bytes": 8922500,
   "current_columns": [
     "TimeStep",
     "c_JX_ALL",
@@ -17,10 +17,10 @@
   ],
   "frame_count": 500001,
   "frame_interval_s": 1e-15,
-  "green_kubo_endpoint_S_m": 1.477866492654635,
-  "helfand_endpoint_S_m": 1.2121908377564796,
-  "raw_bytes": 269181519,
-  "reduction_ratio": 30.181536578900985,
+  "green_kubo_endpoint_S_m": 1.181379075367612,
+  "helfand_endpoint_S_m": 1.154946595471065,
+  "raw_bytes": 269221570,
+  "reduction_ratio": 30.173333706920705,
   "response_columns": [
     "TimeStep",
     "c_RHO_KX_RE",

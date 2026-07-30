@@ -212,6 +212,18 @@ class MolecularFamilyMemoryKernelEstimate:
     not_complete_reasons: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class ConditionalMolecularResidualForceStatistics:
+    self_fit_weight_sums: Array
+    self_fit_force_products_N2: Array
+    self_heldout_weight_sums: Array
+    self_heldout_force_products_N2: Array
+    pair_fit_weight_sums: Array
+    pair_fit_force_products_N2: Array
+    pair_heldout_weight_sums: Array
+    pair_heldout_force_products_N2: Array
+
+
 def estimate_molecular_family_memory_kernel(
     atomic_velocities_m_s: Array,
     atomic_forces_N: Array,
@@ -787,6 +799,173 @@ def _lagged_matrix_correlation(
             for lag_frames in range(maximum_lag_frames + 1)
         ),
         dtype=float,
+    )
+
+
+def conditional_molecular_residual_force_sufficient_statistics(
+    local_descriptor_weights: Array,
+    pair_origin_frame_indices: Array,
+    pair_source_molecule_indices: Array,
+    pair_target_molecule_indices: Array,
+    pair_descriptor_weights: Array,
+    molecular_residual_forces_N: Array,
+    maximum_lag_frames: int,
+    fit_origin_mask: Array,
+) -> ConditionalMolecularResidualForceStatistics:
+    local_weights = np.asarray(local_descriptor_weights, dtype=float)
+    pair_origin_frames = np.asarray(pair_origin_frame_indices, dtype=int)
+    pair_sources = np.asarray(pair_source_molecule_indices, dtype=int)
+    pair_targets = np.asarray(pair_target_molecule_indices, dtype=int)
+    pair_weights = np.asarray(pair_descriptor_weights, dtype=float)
+    residual_forces = np.asarray(molecular_residual_forces_N, dtype=float)
+    fit_mask = np.asarray(fit_origin_mask, dtype=bool)
+    if local_weights.ndim != 3:
+        raise ValueError(
+            "local descriptor weights must have shape (frames, molecules, descriptors)"
+        )
+    if (
+        residual_forces.ndim != 3
+        or residual_forces.shape[:2] != local_weights.shape[:2]
+        or residual_forces.shape[2] != CARTESIAN
+    ):
+        raise ValueError(
+            "molecular residual forces must have shape (frames, molecules, 3)"
+        )
+    frame_count, molecule_count, self_descriptor_count = local_weights.shape
+    if fit_mask.shape != (frame_count,):
+        raise ValueError("fit origin mask must contain one value per frame")
+    pair_record_count = pair_origin_frames.size
+    if (
+        pair_origin_frames.shape != (pair_record_count,)
+        or pair_sources.shape != (pair_record_count,)
+        or pair_targets.shape != (pair_record_count,)
+        or pair_weights.ndim != 2
+        or pair_weights.shape[0] != pair_record_count
+    ):
+        raise ValueError("pair descriptor records have inconsistent shapes")
+    if maximum_lag_frames < 0 or maximum_lag_frames >= frame_count:
+        raise ValueError("conditional-memory lag must be shorter than the trajectory")
+    if (
+        np.any(local_weights < 0.0)
+        or np.any(pair_weights < 0.0)
+        or not np.all(np.isfinite(local_weights))
+        or not np.all(np.isfinite(pair_weights))
+        or not np.all(np.isfinite(residual_forces))
+    ):
+        raise ValueError(
+            "descriptor weights and molecular residual forces must be finite, "
+            "with nonnegative weights"
+        )
+    if (
+        np.any(pair_origin_frames < 0)
+        or np.any(pair_origin_frames >= frame_count)
+        or np.any(pair_sources < 0)
+        or np.any(pair_sources >= molecule_count)
+        or np.any(pair_targets < 0)
+        or np.any(pair_targets >= molecule_count)
+        or np.any(pair_sources == pair_targets)
+    ):
+        raise ValueError("pair descriptor indices are outside the molecular trajectory")
+    lag_count = maximum_lag_frames + 1
+    pair_descriptor_count = pair_weights.shape[1]
+    self_output_shape = (
+        lag_count,
+        self_descriptor_count,
+        CARTESIAN,
+        CARTESIAN,
+    )
+    pair_output_shape = (
+        lag_count,
+        pair_descriptor_count,
+        CARTESIAN,
+        CARTESIAN,
+    )
+    transform_size = 1 << (2 * frame_count - 1).bit_length()
+    future_force_transform = np.fft.rfft(
+        residual_forces, n=transform_size, axis=0
+    )
+    origin_stop_indices = frame_count - np.arange(lag_count) - 1
+    partition_outputs = []
+    for origin_mask in (fit_mask, ~fit_mask):
+        masked_local_weights = local_weights * origin_mask[:, None, None]
+        self_frame_weight_sums = np.sum(masked_local_weights, axis=1)
+        self_weight_sums = np.cumsum(
+            self_frame_weight_sums, axis=0
+        )[origin_stop_indices]
+        self_products = np.zeros(self_output_shape)
+        for descriptor_index in range(self_descriptor_count):
+            weighted_origin_forces = (
+                masked_local_weights[:, :, descriptor_index, None]
+                * residual_forces
+            )
+            origin_force_transform = np.fft.rfft(
+                weighted_origin_forces, n=transform_size, axis=0
+            )
+            spectral_products = np.einsum(
+                "fma,fmb->fab",
+                future_force_transform,
+                np.conjugate(origin_force_transform),
+            )
+            self_products[:, descriptor_index] = np.fft.irfft(
+                spectral_products, n=transform_size, axis=0
+            )[:lag_count]
+        selected_pair_records = origin_mask[pair_origin_frames]
+        selected_origin_frames = pair_origin_frames[selected_pair_records]
+        selected_sources = pair_sources[selected_pair_records]
+        selected_targets = pair_targets[selected_pair_records]
+        selected_pair_weights = pair_weights[selected_pair_records]
+        pair_frame_weight_sums = np.zeros(
+            (frame_count, pair_descriptor_count), dtype=float
+        )
+        np.add.at(
+            pair_frame_weight_sums,
+            selected_origin_frames,
+            selected_pair_weights,
+        )
+        pair_weight_sums = np.cumsum(
+            pair_frame_weight_sums, axis=0
+        )[origin_stop_indices]
+        pair_products = np.zeros(pair_output_shape)
+        for descriptor_index in range(pair_descriptor_count):
+            contracted_origin_forces = np.zeros_like(residual_forces)
+            weighted_target_forces = (
+                selected_pair_weights[:, descriptor_index, None]
+                * residual_forces[selected_origin_frames, selected_targets]
+            )
+            np.add.at(
+                contracted_origin_forces,
+                (selected_origin_frames, selected_sources),
+                weighted_target_forces,
+            )
+            contracted_origin_transform = np.fft.rfft(
+                contracted_origin_forces, n=transform_size, axis=0
+            )
+            spectral_products = np.einsum(
+                "fma,fmb->fab",
+                future_force_transform,
+                np.conjugate(contracted_origin_transform),
+            )
+            pair_products[:, descriptor_index] = np.fft.irfft(
+                spectral_products, n=transform_size, axis=0
+            )[:lag_count]
+        partition_outputs.append(
+            (
+                self_weight_sums,
+                self_products,
+                pair_weight_sums,
+                pair_products,
+            )
+        )
+    fit_outputs, heldout_outputs = partition_outputs
+    return ConditionalMolecularResidualForceStatistics(
+        self_fit_weight_sums=fit_outputs[0],
+        self_fit_force_products_N2=fit_outputs[1],
+        self_heldout_weight_sums=heldout_outputs[0],
+        self_heldout_force_products_N2=heldout_outputs[1],
+        pair_fit_weight_sums=fit_outputs[2],
+        pair_fit_force_products_N2=fit_outputs[3],
+        pair_heldout_weight_sums=heldout_outputs[2],
+        pair_heldout_force_products_N2=heldout_outputs[3],
     )
 
 

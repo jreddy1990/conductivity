@@ -7,36 +7,36 @@
   },
   "observables": {
     "density_g_cm3": {
-      "early_variance": 0.0001360375259999997,
-      "effective_sample_size": 13.361009334515924,
-      "integrated_autocorrelation_time_samples": 3.7422322481905166,
-      "late_variance": 8.019037499999987e-05,
-      "linear_drift_standard_errors": 0.6712052611356886,
-      "mean": 1.1646303999999998,
-      "split_mean_difference_standard_errors": 0.058212720829008434,
-      "standard_deviation": 0.01029150233177342,
+      "early_variance": 0.00011677566933333303,
+      "effective_sample_size": 15.295807055724037,
+      "integrated_autocorrelation_time_samples": 3.2688696855187427,
+      "late_variance": 4.7921035999999996e-05,
+      "linear_drift_standard_errors": 0.22039850046013917,
+      "mean": 1.163045,
+      "split_mean_difference_standard_errors": 0.9458116898937033,
+      "standard_deviation": 0.009064830502597179,
       "stationary": true,
-      "truncation_lag_samples": 4
+      "truncation_lag_samples": 2
     },
     "pressure_atm": {
-      "mean": -136.02543399999996,
-      "standard_deviation": 2026.3026167148564
+      "mean": -125.13119199999997,
+      "standard_deviation": 1748.8888634810821
     },
     "temperature_K": {
-      "early_variance": 42.476249376666644,
-      "effective_sample_size": 50.0,
-      "integrated_autocorrelation_time_samples": 1.0,
-      "late_variance": 74.53318295666661,
-      "linear_drift_standard_errors": 0.06474332692648543,
-      "mean": 296.70088000000004,
-      "split_mean_difference_standard_errors": 0.7748479613060416,
-      "standard_deviation": 7.617584363584461,
+      "early_variance": 73.31014742666669,
+      "effective_sample_size": 20.757299568949104,
+      "integrated_autocorrelation_time_samples": 2.408791174107981,
+      "late_variance": 95.51758403999993,
+      "linear_drift_standard_errors": 0.7962753175625871,
+      "mean": 296.42024000000004,
+      "split_mean_difference_standard_errors": 0.3811789404713721,
+      "standard_deviation": 9.107219236788952,
       "stationary": true,
-      "truncation_lag_samples": 0
+      "truncation_lag_samples": 2
     },
     "volume_A3": {
-      "mean": 12773.45,
-      "standard_deviation": 112.99679831115311
+      "mean": 12790.632,
+      "standard_deviation": 99.17774487026324
     }
   },
   "sample_count": 200,

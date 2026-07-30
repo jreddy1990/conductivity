@@ -1,17 +1,17 @@
 {
-  "compact_bytes": 22373058,
+  "compact_bytes": 131838793,
   "family_labels": [
     "EC",
     "DMC",
     "Li+",
     "BOB-"
   ],
-  "force_acceleration_relative_error": 0.14963917758415304,
+  "force_acceleration_relative_error": 0.1505238454254872,
   "frame_count": 50000,
   "maximum_lag_frames": 10000,
-  "raw_bytes": 5452363348,
-  "reduction_ratio": 243.70219520281938,
-  "relative_total_energy_drift": 9.617663182546662e-05,
+  "raw_bytes": 463960389,
+  "reduction_ratio": 3.5191492461554925,
+  "relative_total_energy_drift": 5.310791286881356e-05,
   "temperature_K": 298.15,
   "validated": true
 }

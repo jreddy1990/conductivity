@@ -80,13 +80,35 @@ calculation is
 
 \section{Neutral periodic molecular system}
 
-Let \(x_s(\mathcal R)\) be the molecular amount of component \(s\) after converting
-the recipe units and expanding salts into molecular ions. At cell scale \(m\), choose
+For solvent \(s\), let \(\varphi_s\) be its declared volume ratio,
+\(\bar v_s\) its pure-component molar volume, and \(M_s\) its molar mass.  Choose a
+reference solvent volume \(V_0\) and set
+\[
+n_s^{\rm solv}=\frac{\varphi_sV_0}{\bar v_s}.
+\]
+For salt formula \(a\) at molarity \(c_a\), expand its stoichiometric vector
+\(\nu_{as}\) over molecular ions and set
+\[
+n_s^{\rm salt}=10^3V_0\sum_a\nu_{as}c_a .
+\]
+For additive \(b\) with electrolyte mass fraction \(w_b\), solve the exact mass
+fraction equation
+\[
+n_bM_b=w_b\left[
+\sum_sn_s^{\rm solv}M_s+\sum_sn_s^{\rm salt}M_s+\sum_{b'}n_{b'}M_{b'}
+\right].
+\]
+This linear system is solved simultaneously for all additives.  The resulting
+molecular amounts define \(x_s(\mathcal R)\).  Salts are represented by their
+component ions; no undissociated population is prescribed.
+
+At cell scale \(m\), choose
 nonnegative integers
 \[
 \{N_s^{(m)}\}
 =\arg\min_{\{n_s\}\subset\mathbb N_0}
-\sum_s w_s\left(\frac{n_s}{m}-x_s(\mathcal R)\right)^2
+\sum_s\frac{1}{\max(x_s,\,m^{-1})}
+\left(\frac{n_s}{m}-x_s(\mathcal R)\right)^2
 \]
 subject to
 \[
@@ -96,6 +118,23 @@ The first constraint imposes exact molecular electroneutrality. The matrix
 \(\mathbf B\) contains exact stoichiometric constraints. The sequence obeys
 \[
 N_s^{(m)}/m\longrightarrow x_s(\mathcal R).
+\]
+The integer problem is solved exactly by branch-and-bound.  A lexicographic
+secondary objective on the ordered count vector makes the result deterministic.
+
+Each of the \(N_s^{(m)}\) copies instantiates the topology, masses, interaction
+sites, formal molecular charge, flexible coordinates, and constraint list stored
+for species \(s\).  Indistinguishable copies share parameters and are integrated
+with the \(1/N_s!\) Gibbs factor.  Initial molecular conformers are placed in a
+cubic trial cell by deterministic low-discrepancy translations and rotations.
+A placement is accepted only when every nonbonded intersite distance exceeds the
+sum of the corresponding hard initialization radii.  Increasing the trial cell
+is an initialization operation only; the final volume is determined by the NPT
+measure below.  The complete constraint set is denoted \(\mathcal C\), and the
+constructed initial state is
+\[
+(\mathcal R,T,p,\mathcal S,m)\longmapsto
+\bigl(\{N_s^{(m)}\},H_m^{(0)},q_m^{(0)},\mathcal C_m\bigr).
 \]
 
 For periodic cell matrix \(H\), volume \(V=\det H\), and constrained molecular
@@ -138,10 +177,16 @@ U_{\rm angle}=\sum_a\frac{k_a}{2}(\theta_a-\theta_a^0)^2,
 U_{\rm torsion}=\sum_d\sum_k
 k_{dk}\left[1+\cos(n_{dk}\varphi_d-\delta_{dk})\right],
 \]
-with one declared improper functional form. For the Lennard--Jones realization,
+\[
+U_{\rm improper}=\sum_u\sum_k
+k_{uk}\left[1+\cos(n_{uk}\omega_u-\delta_{uk})\right].
+\]
+The topology assigns every bonded tuple exactly once.  Holonomic constraints
+replace, rather than duplicate, the corresponding bonded energy.  For the
+nonbonded realization,
 \[
 U_{\rm rep}+U_{\rm disp}=
-\sum_{i<j}^{\rm nonbonded}4\epsilon_{ij}
+\sum_{i<j}s^{\rm LJ}_{ij}4\epsilon_{ij}
 \left[\left(\frac{\sigma_{ij}}{r_{ij}}\right)^{12}
 -\left(\frac{\sigma_{ij}}{r_{ij}}\right)^6\right],
 \]
@@ -149,6 +194,20 @@ U_{\rm rep}+U_{\rm disp}=
 \sigma_{ij}=\frac{\sigma_i+\sigma_j}{2},\qquad
 \epsilon_{ij}=\sqrt{\epsilon_i\epsilon_j}.
 \]
+The factors are \(s^{\rm LJ}_{ij}=0\) for 1--2 and 1--3 pairs,
+\(s^{\rm LJ}_{ij}=s^{\rm LJ}_{14}\) for 1--4 pairs, and one otherwise.
+The repulsive \(r^{-12}\) term is evaluated in real space.  The \(r^{-6}\)
+dispersion term uses the same periodic Ewald decomposition at every cell size:
+\[
+\frac{1}{r^6}=g^{(6)}_{\alpha}(r)
++\frac{1}{V}\sum_{k\ne0}\widehat g^{(6)}_{\alpha}(k)e^{ik\cdot r}
++g^{(6)}_{\rm self}.
+\]
+The analytical functions \(g^{(6)}_\alpha\) and
+\(\widehat g^{(6)}_\alpha\) are the real and Fourier transforms obtained by
+splitting \(r^{-6}\) with \(e^{-\alpha^2r^2}\).  The same \(\alpha\), real cutoff,
+reciprocal cutoff, self term, and 1--4 reciprocal correction are used in energy,
+force, virial, and parameter fitting.
 
 All periodic electrostatic blocks use the same zero-average Green function:
 \[
@@ -159,10 +218,29 @@ Permanent electrostatics are
 \[
 U_{\rm elec}=
 \frac{1}{8\pi\varepsilon_0}\sum_{i\ne j}
-q_iq_jG_H(r_i-r_j)+U_{\rm self}+U_{\rm excl}.
+s^{\rm C}_{ij}q_iq_jG_H(r_i-r_j)+U_{\rm self}.
 \]
-The exclusion term applies bonded exclusions and 1--4 scaling to the same periodic
-Green function, including its reciprocal-space correction.
+Here \(s^{\rm C}_{ij}=0\) for 1--2 and 1--3 pairs,
+\(s^{\rm C}_{ij}=s^{\rm C}_{14}\) for 1--4 pairs, and one otherwise.
+The periodic Green function is evaluated with conducting boundary conditions:
+\[
+\begin{aligned}
+G_H(r)={}&
+\sum_{n\in\mathbb Z^3}
+\frac{\operatorname{erfc}(\alpha|r+Hn|)}{|r+Hn|}\\
+&+\frac{4\pi}{V}\sum_{k\ne0}
+\frac{e^{-k^2/(4\alpha^2)}}{k^2}\cos(k\cdot r)
+-\frac{\pi}{\alpha^2V}.
+\end{aligned}
+\]
+The charge self energy is
+\[
+U_{\rm self}=-\frac{\alpha}{4\pi^{3/2}\varepsilon_0}\sum_iq_i^2.
+\]
+Scaled exclusions are implemented by adding
+\((s^{\rm C}_{ij}-1)q_iq_jG_H(r_{ij})/(4\pi\varepsilon_0)\), including real,
+reciprocal, and self-consistent image contributions.  The cell is exactly neutral,
+so no uniform compensating background is present.
 
 For induced dipoles \(\mu\), define the periodic field \(E_H(q)\) and interaction
 matrix \(T_H(q)\) from derivatives of \(G_H\):
@@ -171,15 +249,34 @@ U_{\rm pol}(q,\mu)=
 \frac12\mu^\top\alpha^{-1}\mu-\mu^\top E_H(q)
 -\frac12\mu^\top T_H(q)\mu.
 \]
-The same declared short-range damping applies to charge--dipole and dipole--dipole
-blocks. The physical induced dipoles and energy are
+For sites \(i,j\), let
+\[
+u_{ij}=\frac{r_{ij}}{(\alpha_i\alpha_j)^{1/6}},\qquad
+f_{3,ij}=1-e^{-a_{ij}u_{ij}^3},\qquad
+f_{5,ij}=1-(1+a_{ij}u_{ij}^3)e^{-a_{ij}u_{ij}^3}.
+\]
+The charge--dipole tensor multiplies the periodic first derivative of \(G_H\)
+by \(f_3\), and the dipole--dipole tensor multiplies its radial and transverse
+second-derivative components by \(f_5\) and \(f_3\), respectively.  The same
+\(a_{ij}=\sqrt{a_ia_j}\) is used in energy and derivatives.  Sites with
+\(\alpha_i=0\) carry no induced dipole.  The physical induced dipoles and energy are
 \[
 \mu^\star(q)=\arg\min_\mu U_{\rm pol}(q,\mu),\qquad
 U_{\rm pol}(q)=U_{\rm pol}(q,\mu^\star(q)).
 \]
-The many-body term \(U_{\rm mb}\) is a declared permutation-, rotation-, and
-translation-invariant function of atomic geometry. Forces and virial derive from this
-single energy:
+The production model contains no additional \(U_{\rm mb}\) closure:
+\[
+\boxed{U_{\rm mb}\equiv0.}
+\]
+Many-body induction is already present through the global induced-dipole solve.
+Any future nonzero many-body interaction defines a different \(\Theta\) and must
+replace this equation rather than being appended as an unspecified correction.
+
+All nonbonded parameters are site parameters.  Bonded parameters and 1--4 scales
+come from the common SMIRNOFF assignment over molecular graphs.  Permanent charges
+come from one common electronic-structure charge procedure, and
+\((\alpha_i,a_i)\) come from the common molecular response fit specified below.
+Forces and virial derive from this single energy:
 \[
 F_i=-\nabla_{r_i}U_\Theta,\qquad
 \Xi=-\frac{\partial U_\Theta}{\partial H}H^\top.
@@ -203,6 +300,55 @@ induced volume element. Equilibrium integration uses a sequence \(\mathcal Q_r\)
 Pair basins, coordination shells, aggregates, cages, and ligand states are smooth
 observables of \(q\). They do not alter \(\rho_\Theta\).
 
+\subsection{NPT integration}
+
+Use fractional molecular coordinates \(s\), an upper-triangular cell matrix \(H\)
+with positive diagonal, constrained momenta \(p\), cell momentum \(P_H\), and
+barostat mass \(W_H\).  The sampled extended density is
+\[
+\begin{aligned}
+\pi_{\rm NPT}(s,p,H,P_H)
+&\propto(\det H)^{N_m}\delta(g)\delta(\dot g)\\
+&\quad{}\times
+\exp\left\{-\beta\left[
+\mathcal H_\Theta(Hs,p)+p_{\rm ext}\det H+
+\frac{\tr(P_H^\top P_H)}{2W_H}
+\right]\right\}.
+\end{aligned}
+\]
+The factor \((\det H)^{N_m}\) is the molecular-coordinate volume Jacobian.
+Translations, rotations, and internal flexible moves use Metropolis proposals in
+fractional coordinates.  The cell proposal is
+\[
+H'=H\exp(\varepsilon S),
+\]
+where \(S\) is a symmetric trace-plus-shear proposal.  The acceptance probability
+is
+\[
+\min\left\{1,
+\exp[-\beta(\Delta U+p_{\rm ext}\Delta V)]
+\left(\frac{V'}{V}\right)^{N_m}
+\frac{J(H'\!\to H)}{J(H\!\to H')}
+\right\}.
+\]
+Constraint moves use RATTLE projection and the induced constraint measure.  A
+Metropolis correction removes finite-step bias.  Independent chains start from
+distinct low-discrepancy placements and Maxwell-distributed tangent momenta.
+
+For integration level \(r\), halve every proposal scale and double accepted
+samples, equilibration sweeps, and independent chains:
+\[
+\delta_r=\delta_02^{-r},\quad
+N_r=N_02^r,\quad
+R_r=R_0+r.
+\]
+The stationary suffix of energy, volume, density, and each retained slow
+coordination observable defines the production average.  The equilibrium volume
+is the mean stationary volume.  Configurations are mapped to that mean cell in
+fractional coordinates before fixed-volume Dirichlet quadrature.  This sequence
+converges to the NPT measure because every proposal is reversible, irreducible on
+each connected constraint component, and Metropolis corrected.
+
 \section{Molecular coordinates and null modes}
 
 For molecule \(a\),
@@ -212,10 +358,11 @@ V_a=\frac{1}{M_a}\sum_{i\in a}m_iv_i,\quad
 F_a=\sum_{i\in a}F_i.
 \]
 Collect the molecular translational and rotational velocities in \(V\), with
-mass--inertia matrix \(M\). Let the columns of \(B\) span uniform translation and exact
-rigid-constraint null modes. The physical-range projector is
+mass--inertia matrix \(M\). Let the columns of \(B(q)\) span uniform translation and
+exact rigid-constraint null modes. The physical-range projector in the kinetic-energy
+metric is
 \[
-\boxed{\Pi=I-B(B^\top B)\pinv B^\top.}
+\boxed{\Pi(q)=I-B(q)\left[B(q)^\top M B(q)\right]\pinv B(q)^\top M.}
 \]
 Memory, friction, diffusion, and Poisson operators act on \(\operatorname{ran}\Pi\).
 
@@ -262,60 +409,216 @@ memory; it is not the later homogenized configuration process.
 
 \section{Conditional memory and diffusion}
 
-Let \(\mathcal P\) be conditional expectation in
-\(L^2(\varrho_\Theta)\) onto the resolved molecular centers, orientations, and their
-conjugate translational and rotational momenta.  Set
-\(\mathcal Q=I-\mathcal P\).  The orthogonal molecular force and its orthogonal
+Let
+\[
+\xi=\Xi(q)
+\]
+contain the resolved molecular centers, orientations, and the complete hierarchy of
+local density, coordination, angular, and charge-density observables defined below.
+The symbol \(q\) continues to denote the full constrained atomic configuration.
+Let \(\mathcal P_\Xi\) be conditional expectation in
+\(L^2(\varrho_\Theta)\) onto \((\xi,\mathsf V)\), where \(\mathsf V\) contains the
+resolved conjugate translational and rotational velocities. Set
+\(\mathcal Q_\Xi=I-\mathcal P_\Xi\). The orthogonal molecular force and its orthogonal
 evolution are
 \[
-F^\perp=\mathcal QF,\qquad
-F^\perp(t)=e^{t\mathcal Q\mathcal G_\Theta\mathcal Q}F^\perp.
+F^\perp=\mathcal Q_\Xi F,\qquad
+F^\perp(t)=
+e^{t\mathcal Q_\Xi\mathcal G_\Theta\mathcal Q_\Xi}F^\perp.
 \]
 The fluctuation--dissipation definition of the conditional memory kernel is
 \[
 \boxed{
-K_\Theta(q,t)=\beta\,
+K_\Theta(\xi,t)=\beta\,
 \mathbb E_{\varrho_\Theta}\!\left[
-\Pi F^\perp(t)F^\perp(0)^\top\Pi\mid q(0)=q
+\Pi F^\perp(t)F^\perp(0)^\top\Pi\mid \Xi(q(0))=\xi
 \right].}
 \]
-The conditional expectation integrates canonical momenta and unresolved molecular
-coordinates at fixed resolved configuration.  Thus \(K_\Theta\) is determined by
-\((U_\Theta,M_{\rm at},\varrho_\Theta,\mathcal P)\), independently of
+The conditional expectation integrates canonical momenta and all atomic coordinates
+within the fiber \(\Xi^{-1}(\xi)\). Thus \(K_\Theta\) is determined by
+\((U_\Theta,M_{\rm at},\varrho_\Theta,\mathcal P_\Xi)\), independently of
 \(D_\Theta\) and \(L_\Theta\).
 Define
 \[
-C_{VV}(q,t)=
-\mathbb E[\Pi V(t)V(0)^\top\Pi\mid q(0)=q],
-\qquad C_{PV}(q,t)=MC_{VV}(q,t).
+C_{VV}(\xi,t)=
+\mathbb E[\Pi V(t)V(0)^\top\Pi\mid \Xi(q(0))=\xi],
+\qquad C_{PV}(\xi,t)=MC_{VV}(\xi,t).
 \]
 These obey the matrix Volterra equation
 \[
-\frac{\partial C_{PV}(q,t)}{\partial t}
-=-\int_0^tK_\Theta(q,\tau)C_{VV}(q,t-\tau)\dd\tau.
+\frac{\partial C_{PV}(\xi,t)}{\partial t}
+=-\int_0^tK_\Theta(\xi,\tau)C_{VV}(\xi,t-\tau)\dd\tau.
 \]
 For \(s>0\),
 \[
 \boxed{
-\widetilde K_\Theta(q,s)=
-\left[C_{PV}(q,0)-s\widetilde C_{PV}(q,s)\right]
-\widetilde C_{VV}(q,s)\pinv.}
+\widetilde K_\Theta(\xi,s)=
+\left[C_{PV}(\xi,0)-s\widetilde C_{PV}(\xi,s)\right]
+\widetilde C_{VV}(\xi,s)\pinv.}
 \]
 The zero-frequency friction and molecular diffusion are
 \[
 \boxed{\begin{aligned}
-K_{\Theta,0}(q)&=\lim_{s\downarrow0}
-\Pi\widetilde K_\Theta(q,s)\Pi,\\
-D_\Theta(q)&=k_BT\,\Pi K_{\Theta,0}(q)\pinv\Pi.
+K_{\Theta,0}(\xi)&=\lim_{s\downarrow0}
+\Pi\widetilde K_\Theta(\xi,s)\Pi,\\
+D_\Theta(q)&=k_BT\,\Pi K_{\Theta,0}(\Xi(q))\pinv\Pi.
 \end{aligned}}
 \]
-For finite trajectory resolution \(\ell\), evaluate the same zero-frequency
-operator through the positive covariance-growth form
+The finite production representation is a positive matrix exponential expansion.
+For \(N_m\) molecules, order generalized molecular velocities as
+\[
+\mathsf V=(V_1,\Omega_1,\ldots,V_{N_m},\Omega_{N_m})\in\mathbb R^{6N_m}.
+\]
+For a linear molecule, remove rotation about its molecular axis.  For a point ion,
+remove all rotational coordinates.  Let \(d_m\) be the resulting generalized
+dimension.  The kernel is
 \[
 \boxed{
-D_{\Theta,\ell}(q)=\frac{1}{2t_\ell}
+K_\Theta(q,t)=
+\Pi(q)\sum_{\ell=0}^{L}
+B_{\Theta,\ell}(q)B_{\Theta,\ell}(q)^\top
+e^{-t/\tau_\ell}\Pi(q),}
+\]
+\[
+\tau_\ell=\tau_{\min}
+\left(\frac{\tau_{\max}}{\tau_{\min}}\right)^{\ell/L},
+\qquad \ell=0,\ldots,L.
+\]
+The endpoints \(\tau_{\min}\) and \(\tau_{\max}\) are the trajectory sampling
+interval and retained kernel horizon.  Increasing \(\ell\) refines this fixed
+interval; it does not change the physical model.
+
+The columns of \(B_{\Theta,\ell}\) are generated from one geometry map.  For
+molecules \(a,b\), define
+\[
+r_{ab}=|R_b-R_a|_H,\qquad
+\widehat r_{ab}=(R_b-R_a)_H/r_{ab},
+\]
+\[
+R_k(r)=
+\begin{cases}
+\sqrt{2/r_c}\,
+\sin(k\pi r/r_c)\,f_c(r),&0<r<r_c,\\
+0,&r\ge r_c,
+\end{cases}
+\quad
+f_c(r)=\frac12[1+\cos(\pi r/r_c)].
+\]
+The molecular environment descriptor contains
+\[
+\begin{aligned}
+\zeta_a(q)=\{&
+M_a,\ Q_a,\ \mathcal I_a,\ \alpha_a,\ 
+\sum_{b\ne a}R_k(r_{ab})\,s_b,\\
+&\sum_{b\ne a}R_k(r_{ab})Y_{\lambda m}(\widehat r_{ab})\,s_b,\ 
+\sum_{b,c\ne a}R_k(r_{ab})R_{k'}(r_{ac})
+P_\lambda(\widehat r_{ab}\cdot\widehat r_{ac})s_bs_c,\\
+&\rho_a^{(k)},\ \rho_{Q,a}^{(k)},\
+\mathcal O_a^{(\lambda)},\ \mathcal G_a^{(d)}\}.
+\end{aligned}
+\]
+Here \(s_b=(1,Q_b/e,M_b/M_0,\alpha_b/\alpha_0)\);
+\(\rho_a^{(k)}\) and \(\rho_{Q,a}^{(k)}\) are local number and charge densities;
+\(\mathcal O_a^{(\lambda)}\) are molecular orientation invariants; and
+\(\mathcal G_a^{(d)}\) are powers through depth \(d\) of the smooth adjacency
+\[
+\mathcal A_{ab}^{(k)}=R_k(r_{ab})
+\left[1+\exp\{-\gamma(C_{ab}-C_0)\}\right]^{-1},
+\]
+with smooth coordination
+\[
+C_{ab}=\sum_{i\in a}\sum_{j\in b}
+\left[1+(r_{ij}/r_0)^p\right]^{-1}.
+\]
+All constants in these expressions belong to \(\Theta_{\rm memory}\).  Atomic
+numbers, masses, charges, polarizabilities, topology, and geometry enter the map.
+Species names and recipe indices do not.
+
+At hierarchy level \(n\), enumerate all translationally invariant,
+rotation-equivariant matrix features
+\(\{\mathsf E_\nu^{(n)}(q)\}_{\nu=1}^{p_n}\) generated from the listed
+descriptors with radial order, angular order, graph depth, and product degree at
+most \(n\).  The enumeration is cumulative, so
+\(\mathsf E^{(n)}\subset\mathsf E^{(n+1)}\).  For generalized molecular velocity
+dimension \(d_m\), define the memory factors explicitly by
+\[
+B_{\Theta,\ell}^{(n)}(q)
+=\sum_{\nu=1}^{p_n}\theta_{\ell\nu}\mathsf E_\nu^{(n)}(q),
+\qquad
+B_{\Theta,\ell}^{(n)}(q)\in\mathbb R^{d_m\times d_m}.
+\]
+The coefficient tensors \(\theta_{\ell\nu}\) are the learned entries of
+\(\Theta_{\rm memory}\).  Self-block features depend on \(\zeta_a\); cross-block
+features depend on
+\((\zeta_a,\zeta_b,R_k(r_{ab}),Y_{\lambda m}(\widehat r_{ab}))\) and satisfy
+\[
+B_{ab,\ell}(q)=B_{ba,\ell}(q)^\top.
+\]
+Permutation-equivariant assembly of these blocks produces
+\(B_{\Theta,\ell}^{(n)}(q)\).  Multiplication by its transpose gives a positive
+semidefinite kernel before null-space projection.
+The projector removes uniform translation, constrained rotations, and every
+holonomic constraint velocity:
+\[
+\Pi(q)=I-\mathsf B(q)
+\left[\mathsf B(q)^\top\mathsf M\mathsf B(q)\right]\pinv
+\mathsf B(q)^\top\mathsf M.
+\]
+The zero-frequency operators are therefore constructive:
+\[
+\boxed{\begin{aligned}
+K_{\Theta,0}(q)
+&=\Pi(q)\sum_{\ell=0}^{L}
+\tau_\ell B_{\Theta,\ell}(q)B_{\Theta,\ell}(q)^\top\Pi(q),\\
+D_\Theta(q)&=k_BT\,\Pi(q)K_{\Theta,0}(q)\pinv\Pi(q).
+\end{aligned}}
+\]
+
+For each force-complete trajectory, evaluate \(\xi_n=\Xi(q_n)\), fit the
+conditional mean force on the training frames only, and form
+\[
+\widehat F_n^\perp
+=\Pi_n\left[F_n-\widehat{\mathbb E}(F\mid\xi_n,\mathsf V_n)\right].
+\]
+Let \(w_b(\xi)\) be a normalized compactly supported partition of unity on descriptor
+space, refined by level \(b\). The finite conditional target is
+\[
+\boxed{
+\widehat K_b(\xi,t_j)=
+\beta\,
+\frac{\sum_n w_b(\xi-\xi_n)
+\widehat F_{n+j}^\perp\widehat F_n^{\perp\top}}
+{\sum_n w_b(\xi-\xi_n)}.}
+\]
+Lag pairs crossing trajectory or replica boundaries are excluded. Self and cross
+blocks are retained in one matrix. Conditional cells below the configured effective
+sample count are unresolved and trigger additional sampling. They are never replaced
+by a recipe average. With recipe-disjoint training
+set \(\mathcal T\) and held-out set \(\mathcal V\), fit
+\[
+\Theta_{\rm memory}^\star
+=\arg\min_\Theta
+\sum_{r\in\mathcal T}\sum_{b,j}
+\frac{N_{rbj}}{\|\widehat K_b^{(r)}(0)\|_F^2}
+\left\|
+W_{rb}^{1/2}
+\left[K_\Theta(\xi_{rb},t_j)-\widehat K_b^{(r)}(t_j)\right]
+W_{rb}^{1/2}
+\right\|_F^2 .
+\]
+\(W_{rb}\) is the inverse covariance of the molecular generalized velocities after
+removing null modes.  Rank-revealing SVD removes descriptor columns and target
+directions below the numerical singular-value tolerance.  Model selection uses
+only held-out kernel error, integrated-friction error, and force-correlation error.
+Measured conductivity never enters this objective.
+
+The independent zero-frequency mobility check uses the positive covariance-growth
+form
+\[
+\boxed{
+D_{\Theta,\ell}(\xi)=\frac{1}{2t_\ell}
 \mathbb E\!\left[
-\Delta R_\ell\Delta R_\ell^\top\mid q(0)=q
+\Delta R_\ell\Delta R_\ell^\top\mid \Xi(q(0))=\xi
 \right],\qquad
 K_{\Theta,0,\ell}=k_BT\,D_{\Theta,\ell}\pinv,}
 \]
@@ -323,7 +626,9 @@ where
 \(
 \Delta R_\ell=\int_0^{t_\ell}\Pi V(t)\dd t
 \)
-and the conditional mean displacement is removed.  This form is positive
+and the conditional mean displacement is removed. This estimator validates the
+zero-frequency integral. Lag-resolved orthogonal-force targets remain the source of
+the fitted kernel. This form is positive
 semidefinite at every finite resolution and converges to the same zero-frequency
 mobility as the Laplace--Volterra expression when the velocity correlation is
 integrable.  It avoids replacing a noisy indefinite kernel estimate by clipped
@@ -426,16 +731,55 @@ With \(P\) measured in \(\mathrm{C\,m}\),
 
 \section{Constructive nested basis}
 
-Generate smooth permutation-, translation-, and rotation-compatible functions from
-radial atomic densities, angular invariants, molecular orientations, coordination
-numbers, charge-density Fourier modes, concentration modes, cluster graphs, and
-hierarchical products. Let \(\mathcal G_n\) include radial and angular order, reciprocal
-wavevector norm, correlation order, and cluster depth at most \(n\). After centering
-and removal of exact null functions,
+At level \(n\), use cutoff \(r_c^{(n)}=\min(r_{\max},nr_0)\), radial order
+\(1\le k\le n\), angular order \(0\le\lambda\le n\), reciprocal vectors
+\[
+\mathcal K_n=\{2\pi H^{-\top}z:z\in\mathbb Z^3,\ 0<|z|_\infty\le n\},
+\]
+graph depth \(0\le d\le n\), and product degree \(1\le d_p\le n\).  The primitive
+scalar functions are:
+\[
+\rho_{a,k,s}=\sum_{b\ne a}R_k(r_{ab})s_b,\qquad
+c_{a,k\lambda}=\sum_{b,c\ne a}
+R_k(r_{ab})R_k(r_{ac})
+P_\lambda(\widehat r_{ab}\cdot\widehat r_{ac}),
+\]
+\[
+\rho_z=\sum_a e^{iz\cdot R_a},\qquad
+\rho_z^Q=\sum_aQ_ae^{iz\cdot R_a},\qquad z\in\mathcal K_n,
+\]
+\[
+o_{a,\lambda\lambda'}=
+\sum_{m=-\lambda}^{\lambda}
+\mathcal O_{a,\lambda m}\mathcal O_{a,\lambda' m}^\ast,\qquad
+g_{a,k,d}=(\mathcal A_k^d\mathbf1)_a .
+\]
+Coordination functions use
+\[
+c_{ab}^{(k)}=\sum_{i\in a,j\in b}
+R_k(r_{ij}),
+\]
+and include powers and cross-products through degree \(n\).  Real and imaginary
+Fourier parts are stored separately after removing the zero wavevector.
+Molecular orientation tensors \(\mathcal O_{a,\lambda m}\) are spherical harmonics
+of the principal inertia frame, symmetrized over degenerate axes.  Point ions have
+only the \(\lambda=0\) component.
+
+Order primitive functions lexicographically by family, cutoff, radial order,
+angular order, wavevector, graph depth, and molecular index.  Form every
+symmetry-compatible monomial of total degree at most \(n\).  Sum molecular-indexed
+monomials over indistinguishable molecules.  Center each function with its
+equilibrium mean and remove columns whose Dirichlet norm vanishes or whose
+rank-revealing QR pivot is below the level tolerance.  Denote the surviving ordered
+set by \(\mathcal G_n\).  Since level \(n+1\) repeats every index range from level
+\(n\) before adding new functions,
 \[
 V_n=\operatorname{span}\mathcal G_n,\qquad V_n\subset V_{n+1}.
 \]
-The hierarchy obeys
+Smooth compactly supported radial functions, trigonometric polynomials on the
+periodic cell, spherical harmonics, and their products form a separating algebra
+on every compact collision-free constraint component.  Stone--Weierstrass density,
+followed by smooth approximation in the weighted Sobolev norm, gives
 \[
 \overline{\bigcup_{n=1}^\infty V_n}^{\|\cdot\|_E}=\mathcal H_E,\qquad
 \|f\|_E^2=\langle\nabla f^\top D_\Theta\nabla f\rangle.
@@ -469,6 +813,30 @@ The finite charge diffusion and conductivity are
 
 \section{Residual-driven enrichment}
 
+Split independent equilibrium chains into fit and held-out sets before evaluating
+any basis matrix.  On held-out configuration \(q\), evaluate the generator action
+analytically:
+\[
+L_\Theta\phi=
+-\beta\nabla U_\Theta^\top D_\Theta\nabla\phi
++(\nabla\cdot D_\Theta)^\top\nabla\phi
++D_\Theta:\nabla^2\phi .
+\]
+The divergence is obtained by automatic differentiation of the matrix kernel
+representation, and the Hessian-vector contraction is evaluated without forming
+the full Hessian.  For the fitted corrector
+\(\chi_{n,i}=\sum_\mu c_{\mu i}\phi_\mu\), the held-out residual is
+\[
+r_{n,i}(q)=L_\Theta P_i(q)+L_\Theta\chi_{n,i}(q).
+\]
+Its graph norm is
+\[
+\|r_n\|_{-1,n+1}^2=
+\sum_{i=1}^3
+b_{n,i}^\top A_{n+1}\pinv b_{n,i},\qquad
+(b_{n,i})_\mu=\langle\phi_\mu,r_{n,i}\rangle_{\rm heldout}.
+\]
+
 For \(g\in V_{n+1}\setminus V_n\), define
 \[
 \widetilde A_{gg}
@@ -484,7 +852,11 @@ S(g)=\sum_{i=1}^3
 \frac{|\widetilde h_{g,i}|^2}{\widetilde A_{gg}}.
 \]
 Candidates come from the next declared hierarchy level. Exhausting one finite
-dictionary does not establish convergence.
+dictionary does not establish convergence.  Select the candidate with maximum
+held-out \(S(g)\), refit on the fit chains, and recompute the held-out residual.
+When all candidates at level \(n+1\) fall below the residual tolerance, construct
+the complete level \(n+2\).  Stop only when the held-out graph norm and the
+conductivity change both pass their tolerances on two successive hierarchy levels.
 
 \section{Galerkin convergence}
 
@@ -515,8 +887,73 @@ exists,
 \lim_{\ell\to\infty}\lim_{n\to\infty}
 \sigma_{m,r,\ell,n}.}
 \]
+For each finite cell, the basis limit \(n\to\infty\) is taken first, followed by
+the memory-resolution limit \(\ell\to\infty\), the equilibrium-integration limit
+\(r\to\infty\), and finally the composition-preserving thermodynamic limit
+\(m\to\infty\).
 Every limit refines a named numerical approximation while
 \(U_\Theta,K_\Theta,P,T,p\), and the intensive recipe remain fixed.
+
+\section{Shared parameter set}
+
+The complete parameter vector is
+\[
+\boxed{
+\Theta=(\Theta_{\rm bonded},\Theta_{\rm nonbonded},
+\Theta_{\rm electrostatic},\Theta_{\rm polarization},
+\Theta_{\rm memory}).}
+\]
+\(\Theta_{\rm bonded}\) contains, in SI units, atom-pattern assignments,
+\((k_b,r_b^0)\), \((k_a,\theta_a^0)\), and every
+\((k,n,\delta)\) tuple for proper and improper torsions.
+\(\Theta_{\rm nonbonded}\) contains site \((\sigma_i,\epsilon_i)\), the two 1--4
+scales, dispersion Ewald splitting, and real and reciprocal cutoffs.
+\(\Theta_{\rm electrostatic}\) contains permanent site charges, Coulomb Ewald
+splitting, and its cutoffs.  \(\Theta_{\rm polarization}\) contains site
+polarizability tensors, Thole parameters, and induced-dipole solve tolerance.
+\(\Theta_{\rm memory}\) contains descriptor cutoffs, radial and angular orders,
+coordination switching parameters, graph depth, correlation-product order,
+decay times, and every coefficient of \(B_{\Theta,\ell}\).
+
+Bonded and nonbonded interaction parameters are fit once to
+\(\omega\)B97M--V/def2--TZVPPD electronic-structure energies, forces, optimized
+geometries, torsion scans, electrostatic potentials, finite-field dipole response,
+molecular polarizabilities, and virials.  Counterpoise correction is applied to
+intermolecular dimers.  Permanent charges are MBIS charges constrained to the
+formal molecular charge.  For reference configurations \(x_r\), minimize
+\[
+\begin{aligned}
+\mathcal L_U={}&
+w_E\sum_r|U_\Theta(x_r)-E_r|^2
++w_F\sum_r\|\nabla U_\Theta(x_r)+F_r\|^2\\
+&+w_\Xi\sum_r\|\Xi_\Theta(x_r)-\Xi_r\|_F^2
++w_\mu\sum_r\|\mu_\Theta(x_r)-\mu_r\|^2 .
+\end{aligned}
+\]
+The weights are \(w_E=(N_{\rm at}E_0^2)^{-1}\),
+\(w_F=(3N_{\rm at}F_0^2)^{-1}\),
+\(w_\Xi=(9\Xi_0^2)^{-1}\), and \(w_\mu=(3\mu_0^2)^{-1}\), where each zero-subscript
+scale is the root-mean-square magnitude of that target over the training split.
+The electronic-structure chemistry split is by complete molecule, so
+held-out molecules do not contribute configurations to the fit.
+
+The memory parameters use the force-correlation objective given above.  Its split
+is by complete recipe, concentration, and temperature.  A molecule or recipe may
+appear in only one split.  The supported domain is the closure of elemental,
+topological, charge, temperature, pressure, and descriptor ranges represented in
+the interaction and memory training sets.  Inputs outside any range terminate with
+an unsupported-domain result.  They do not select alternate equations.
+
+Fixed parameters are physical constants, molecular topology, isotope masses,
+formal molecular charges, the interaction functional forms, periodic boundary
+conditions, and null-space definitions.  Learned parameters are the numerical
+entries of the five blocks of \(\Theta\).  Experimental conductivity is reserved
+for external evaluation of the completed map:
+\[
+(\mathcal R,T,p,\mathcal S,\Theta)\longmapsto\sigma.
+\]
+It is absent from \(\mathcal L_U\), the memory loss, basis selection, and every
+intermediate operator.
 
 \section{Executable calculation order}
 

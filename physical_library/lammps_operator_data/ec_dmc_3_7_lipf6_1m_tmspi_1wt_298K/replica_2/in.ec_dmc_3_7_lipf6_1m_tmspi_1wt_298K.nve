@@ -88,8 +88,16 @@ compute         P_4_Y RESPONSE_SPECIES_4 reduce sum v_p_4_y
 variable        p_4_z atom mass*vz
 compute         P_4_Z RESPONSE_SPECIES_4 reduce sum v_p_4_z
 fix             RESPONSE all ave/time 1 1 1 c_RHO_KX_RE c_RHO_KX_IM c_RHO_KY_RE c_RHO_KY_IM c_RHO_KZ_RE c_RHO_KZ_IM c_P_0_X c_P_0_Y c_P_0_Z c_P_1_X c_P_1_Y c_P_1_Z c_J_2_X c_J_2_Y c_J_2_Z c_J_3_X c_J_3_Y c_J_3_Z c_P_4_X c_P_4_Y c_P_4_Z file response.dat format " %.10e"
-dump            TRAJECTORY all custom 10 trajectory.lammpstrj id mol type q xu yu zu vx vy vz fx fy fz
-dump_modify     TRAJECTORY sort id
+compute         MOL_CHUNK all chunk/atom molecule nchunk once ids once
+compute         MOL_COM all com/chunk MOL_CHUNK
+compute         MOL_VCOM all vcm/chunk MOL_CHUNK
+variable        MOLECULAR_FORCE_X atom fx
+variable        MOLECULAR_FORCE_Y atom fy
+variable        MOLECULAR_FORCE_Z atom fz
+compute         MOL_FORCE all reduce/chunk MOL_CHUNK sum v_MOLECULAR_FORCE_X v_MOLECULAR_FORCE_Y v_MOLECULAR_FORCE_Z
+fix             MOLECULAR_TRANSPORT all ave/time 10 1 10 c_MOL_COM[*] c_MOL_VCOM[*] c_MOL_FORCE[*] mode vector file molecular_transport.dat
+dump            GEOMETRY all custom 1000 trajectory.lammpstrj id mol type q xu yu zu
+dump_modify     GEOMETRY sort id
 
 thermo_style    custom step time temp press vol density pe ke etotal
 thermo          2000

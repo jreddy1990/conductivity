@@ -1,5 +1,7 @@
 {
   "admitted": false,
+  "diffusion_plateau_gate_passed": false,
+  "diffusion_psd_gate_passed": true,
   "family_labels": [
     "EC",
     "DMC",
@@ -8,16 +10,17 @@
   ],
   "lag_ladder_gate_passed": false,
   "lag_ladder_relative_changes": [
-    0.47438583629989245,
-    0.3727317603414567
+    0.6521308125699976,
+    0.377652606132061
   ],
-  "maximum_lag_ladder_relative_change": 0.47438583629989245,
-  "minimum_plateau_eigenvalue_kg_s": -2.2491472480390564e-11,
+  "maximum_lag_ladder_relative_change": 0.6521308125699976,
+  "minimum_plateau_eigenvalue_kg_s": -2.951715810285686e-11,
   "plateau_gate_passed": true,
-  "plateau_relative_variation": 0.004064968438878038,
-  "psd_gate_passed": true,
+  "plateau_relative_variation": 0.01575895480757593,
+  "psd_gate_passed": false,
   "replica_count": 3,
   "tail_gate_passed": true,
-  "tail_relative_norm": 0.018602344664436332,
+  "tail_relative_norm": 0.016182904935220517,
+  "temperature_K": 298.15,
   "uniform_translation_null_space_removed": true
 }
