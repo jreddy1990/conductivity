@@ -1,5 +1,5 @@
 {
-  "admitted": false,
+  "admitted": true,
   "diffusion_plateau_gate_passed": false,
   "diffusion_psd_gate_passed": true,
   "family_labels": [
@@ -14,13 +14,13 @@
     0.3698036053748701
   ],
   "maximum_lag_ladder_relative_change": 0.7296059774033693,
-  "minimum_plateau_eigenvalue_kg_s": -3.3581299841748655e-11,
+  "minimum_plateau_eigenvalue_kg_s": -1.8433481886733346e-25,
   "plateau_gate_passed": true,
-  "plateau_relative_variation": 0.006696899245218869,
-  "psd_gate_passed": false,
+  "plateau_relative_variation": 0.00045511218730796593,
+  "psd_gate_passed": true,
   "replica_count": 3,
   "tail_gate_passed": true,
-  "tail_relative_norm": 0.016279375819309813,
+  "tail_relative_norm": 0.054987798276114705,
   "temperature_K": 298.15,
   "uniform_translation_null_space_removed": true
 }

@@ -1034,7 +1034,7 @@ def test_property_db_validator_requires_explicit_numerical_configuration() -> No
     )
 
     assert completed.returncode != 0
-    assert "requires explicit numerical arguments" in completed.stderr
+    assert "requires --settings-json and --output-json" in completed.stderr
 
 
 def test_direct_primitive_audit_closes_tensor_and_drift_identities() -> None:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
@@ -14,6 +14,7 @@ from conductivity.physical_library.speciation_equilibrium import (
     SpeciationEquilibriumResult,
     solve_speciation_equilibrium,
 )
+from utils.strict_validation import read_json_object, write_json_object
 
 SPECIES_REQUIRED_FIELDS = (
     "schema",
@@ -602,42 +603,18 @@ def main() -> int:
         type=Path,
         default=Path("conductivity/physical_library"),
     )
-    parser.add_argument("--reference-box-length-m", type=float)
-    parser.add_argument("--volume-m3", type=float)
-    parser.add_argument("--state-quadrature-order", type=int)
-    parser.add_argument("--transition-grid-count", type=int)
-    parser.add_argument("--property-db-worker-count", type=int)
+    parser.add_argument("--settings-json", type=Path)
+    parser.add_argument("--output-json", type=Path)
     parsed_arguments = parser.parse_args()
     if parsed_arguments.command == "validate-library":
         return _main_validate_library(parsed_arguments.library_root)
     if parsed_arguments.command == "validate-property-db":
-        required_numerical_arguments = {
-            "reference_box_length_m": parsed_arguments.reference_box_length_m,
-            "volume_m3": parsed_arguments.volume_m3,
-            "state_quadrature_order": parsed_arguments.state_quadrature_order,
-            "transition_grid_count": parsed_arguments.transition_grid_count,
-            "property_db_worker_count": parsed_arguments.property_db_worker_count,
-        }
-        missing_argument_names = tuple(
-            argument_name
-            for argument_name, argument_value in required_numerical_arguments.items()
-            if argument_value is None
-        )
-        if missing_argument_names:
-            parser.error(
-                "validate-property-db requires explicit numerical arguments: "
-                + ", ".join(
-                    f"--{argument_name.replace('_', '-')}"
-                    for argument_name in missing_argument_names
-                )
-            )
+        if parsed_arguments.settings_json is None or parsed_arguments.output_json is None:
+            parser.error("validate-property-db requires --settings-json and --output-json")
         return _main_validate_property_db(
             library_root=parsed_arguments.library_root,
-            reference_box_length_m=parsed_arguments.reference_box_length_m,
-            volume_m3=parsed_arguments.volume_m3,
-            state_quadrature_order=parsed_arguments.state_quadrature_order,
-            transition_grid_count=parsed_arguments.transition_grid_count,
-            property_db_worker_count=parsed_arguments.property_db_worker_count,
+            settings_json_path=parsed_arguments.settings_json,
+            output_json_path=parsed_arguments.output_json,
         )
     raise ValueError(f"unsupported command {parsed_arguments.command}")
 
@@ -653,31 +630,31 @@ def _main_validate_library(library_root: Path) -> int:
 
 def _main_validate_property_db(
     library_root: Path,
-    reference_box_length_m: float,
-    volume_m3: float,
-    state_quadrature_order: int,
-    transition_grid_count: int,
-    property_db_worker_count: int,
+    settings_json_path: Path,
+    output_json_path: Path,
 ) -> int:
-    from conductivity.physical_library.generator_construction import NumericalOptions
+    from conductivity.first_principles_conductivity import _settings_from_record
     from conductivity.physical_library.property_db_validation import (
         validate_property_db_supported_conductivity_rows,
     )
     from data.electrolyte_property_db import DATA
 
-    numerical_options = NumericalOptions(
-        reference_box_lengths_m=np.full(3, reference_box_length_m, dtype=float),
-        volume_m3=volume_m3,
-        state_quadrature_order=state_quadrature_order,
-        transition_grid_count=transition_grid_count,
+    settings_record = read_json_object(
+        settings_json_path, "property DB first-principles settings"
     )
+    dynamics, numerics = _settings_from_record(settings_record)
     summary = validate_property_db_supported_conductivity_rows(
         property_db_entries=DATA,
         physical_library_root=library_root,
-        numerical_options=numerical_options,
-        worker_count=property_db_worker_count,
+        pressure_Pa=float(settings_record["pressure_Pa"]),
+        molecule_count=int(settings_record["molecule_count"]),
+        dynamics=dynamics,
+        numerics=numerics,
+        random_seed=int(settings_record["random_seed"]),
+        worker_count=1,
         progress_callback=_print_property_db_validation_progress,
     )
+    write_json_object(output_json_path, asdict(summary), "property DB validation")
     print(f"total_entry_count={summary.total_entry_count}")
     print(f"evaluated_entry_count={summary.evaluated_entry_count}")
     print(f"skipped_entry_count={summary.skipped_entry_count}")

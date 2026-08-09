@@ -7,9 +7,15 @@ import threading
 from types import SimpleNamespace
 
 import pytest
-import yaml
 
 from data.electrolyte_property_db import DATA as PROPERTY_DB
+from data.species_data import (
+    ADDITIVE_SPECIES,
+    ADDITIVES,
+    ELECTROLYTE_SPECIES,
+    SALT_SPECIES,
+    SALTS,
+)
 from conductivity.physical_library import generator_construction
 from conductivity.physical_library.library_io import load_physical_library
 from conductivity.physical_library import property_db_validation
@@ -22,6 +28,34 @@ from conductivity.physical_library.property_db_validation import (
 )
 
 PHYSICAL_LIBRARY_ROOT = Path("conductivity/physical_library")
+
+
+@pytest.mark.parametrize("species_name", ("LiDFOB", "LiBOB"))
+def test_dual_designation_species_use_one_canonical_record(species_name: str) -> None:
+    assert species_name in SALT_SPECIES
+    assert species_name in ADDITIVE_SPECIES
+    assert SALTS[species_name] is ELECTROLYTE_SPECIES[species_name]
+    assert ADDITIVES[species_name] is ELECTROLYTE_SPECIES[species_name]
+    assert "type" not in ELECTROLYTE_SPECIES[species_name]
+
+
+def test_every_additive_declares_current_collector_passivation_status() -> None:
+    expected_passivating_additives = {
+        "LiBOB",
+        "LiDFOB",
+        "LiPO2F2",
+        "NaDFOB",
+    }
+
+    assert all(
+        type(additive_record["passivation_film_former"]) is bool
+        for additive_record in ADDITIVES.values()
+    )
+    assert {
+        species_name
+        for species_name, additive_record in ADDITIVES.items()
+        if additive_record["passivation_film_former"]
+    } == expected_passivating_additives
 
 
 def test_conductivity_cache_serializes_identical_recipe_computation(
@@ -230,33 +264,53 @@ def test_supported_rows_execute_unique_recipes_and_capture_recipe_failures(
     submitted_work_count = Queue()
 
     class ImmediateProcessPoolExecutor(ThreadPoolExecutor):
-        def submit(self, function, recipe, library_root, numerical_options):
+        def submit(
+            self,
+            function,
+            supported_recipe,
+            pressure_Pa,
+            molecule_count,
+            dynamics,
+            numerics,
+            random_seed,
+        ):
             submitted_work_count.put(1)
             return super().submit(
                 function,
-                recipe,
-                library_root,
-                numerical_options,
+                supported_recipe,
+                pressure_Pa,
+                molecule_count,
+                dynamics,
+                numerics,
+                random_seed,
             )
 
     def fake_load_physical_library(physical_library_root: Path):
         return SimpleNamespace(species_records={"EC": {}, "Li+": {}, "PF6-": {}})
 
-    def fake_compute_conductivity_from_recipe(
-        recipe: Path,
-        library_root: Path,
+    def fake_compute_first_principles_conductivity(
+        recipe,
+        temperature_K: float,
+        pressure_Pa: float,
+        molecule_count: int,
+        dynamics,
+        numerics,
+        random_seed: int,
     ):
-        recipe_record = yaml.safe_load(recipe.read_text())
-        recipe_temperature_K = float(recipe_record["temperature_K"])
-        computed_recipe_temperatures_K.put(recipe_temperature_K)
-        if recipe_temperature_K == 310.0:
+        assert recipe.salts == {"LiPF6": 1.0}
+        assert pressure_Pa == 101325.0
+        assert molecule_count == 8
+        assert dynamics is dynamics_settings
+        assert numerics is numerical_settings
+        assert isinstance(random_seed, int)
+        computed_recipe_temperatures_K.put(temperature_K)
+        if temperature_K == 310.0:
             raise RuntimeError("row model failed")
         return SimpleNamespace(
-            sigma_mS_cm=12.0,
-            effect_attribution={
-                "primitive_prediction_readiness_status": "complete",
-                "primitive_prediction_scalar_label": "primitive_prediction",
-            },
+            conductivity_S_m=1.2,
+            effective_sample_size=480.0,
+            maximum_split_rhat=1.004,
+            conductivity_mcse_S_m=0.003,
         )
 
     monkeypatch.setattr(
@@ -264,8 +318,8 @@ def test_supported_rows_execute_unique_recipes_and_capture_recipe_failures(
     )
     monkeypatch.setattr(
         property_db_validation,
-        "compute_conductivity_from_recipe",
-        fake_compute_conductivity_from_recipe,
+        "compute_first_principles_conductivity",
+        fake_compute_first_principles_conductivity,
     )
     monkeypatch.setattr(
         property_db_validation,
@@ -300,10 +354,16 @@ def test_supported_rows_execute_unique_recipes_and_capture_recipe_failures(
     ]
 
     observed_progress = []
+    dynamics_settings = SimpleNamespace(name="dynamics")
+    numerical_settings = SimpleNamespace(name="numerics")
     summary = validate_property_db_supported_conductivity_rows(
         property_db_entries=entries,
         physical_library_root=tmp_path,
-        numerical_options=SimpleNamespace(),
+        pressure_Pa=101325.0,
+        molecule_count=8,
+        dynamics=dynamics_settings,
+        numerics=numerical_settings,
+        random_seed=17,
         worker_count=2,
         progress_callback=observed_progress.append,
     )
@@ -322,6 +382,12 @@ def test_supported_rows_execute_unique_recipes_and_capture_recipe_failures(
     }
     assert summary.progress[4].detail == "RuntimeError: row model failed"
     assert summary.progress[0].detail == "primitive_residual_mS_cm=2"
+    assert summary.rows[0].operator_effective_sample_size == 480.0
+    assert summary.rows[0].maximum_split_rhat == 1.004
+    assert summary.rows[0].conductivity_mcse_mS_cm == 0.03
+    assert summary.minimum_operator_effective_sample_size == 480.0
+    assert summary.maximum_split_rhat == 1.004
+    assert summary.maximum_conductivity_mcse_mS_cm == 0.03
     assert submitted_work_count.qsize() == 2
     assert sorted(
         (
@@ -336,3 +402,92 @@ def test_supported_rows_execute_unique_recipes_and_capture_recipe_failures(
         (progress.entry_index, progress.classification)
         for progress in summary.progress
     }
+
+
+def test_single_worker_validation_is_synchronous_and_reuses_canonical_prediction(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    evaluated_temperatures_K = Queue()
+
+    class ForbiddenProcessPoolExecutor:
+        def __init__(self, max_workers: int) -> None:
+            raise AssertionError(
+                f"serial validation constructed an executor with {max_workers} workers"
+            )
+
+    def fake_load_physical_library(physical_library_root: Path):
+        assert physical_library_root == tmp_path
+        return SimpleNamespace(species_records={"EC": {}, "Li+": {}, "PF6-": {}})
+
+    def fake_compute_first_principles_conductivity(
+        recipe,
+        temperature_K: float,
+        pressure_Pa: float,
+        molecule_count: int,
+        dynamics,
+        numerics,
+        random_seed: int,
+    ):
+        assert recipe.salts == {"LiPF6": 1.0}
+        assert pressure_Pa == 101325.0
+        assert molecule_count == 64
+        assert dynamics is dynamics_settings
+        assert numerics is numerical_settings
+        assert isinstance(random_seed, int)
+        evaluated_temperatures_K.put(temperature_K)
+        return SimpleNamespace(
+            conductivity_S_m=1.2,
+            effective_sample_size=510.0,
+            maximum_split_rhat=1.003,
+            conductivity_mcse_S_m=0.002,
+        )
+
+    def ignore_progress(progress) -> None:
+        assert progress.entry_index >= 0
+
+    monkeypatch.setattr(
+        property_db_validation, "load_physical_library", fake_load_physical_library
+    )
+    monkeypatch.setattr(
+        property_db_validation,
+        "compute_first_principles_conductivity",
+        fake_compute_first_principles_conductivity,
+    )
+    monkeypatch.setattr(
+        property_db_validation,
+        "ProcessPoolExecutor",
+        ForbiddenProcessPoolExecutor,
+    )
+    recipe = {
+        "solvents": {"EC": 1.0},
+        "salts": {"LiPF6": 1.0},
+        "additives": {},
+    }
+    entries = [
+        {"recipe": recipe, "properties": {"conductivity_mS_cm": 10.0}},
+        {"recipe": recipe, "properties": {"conductivity_mS_cm": 11.0}},
+    ]
+    dynamics_settings = SimpleNamespace(name="dynamics")
+    numerical_settings = SimpleNamespace(name="numerics")
+
+    summary = validate_property_db_supported_conductivity_rows(
+        property_db_entries=entries,
+        physical_library_root=tmp_path,
+        pressure_Pa=101325.0,
+        molecule_count=64,
+        dynamics=dynamics_settings,
+        numerics=numerical_settings,
+        random_seed=17,
+        worker_count=1,
+        progress_callback=ignore_progress,
+    )
+
+    assert evaluated_temperatures_K.get_nowait() == 298.15
+    assert evaluated_temperatures_K.empty()
+    assert [row.predicted_conductivity_mS_cm for row in summary.rows] == [12.0, 12.0]
+    assert summary.evaluated_entry_count == 2
+    assert summary.failed_entry_count == 0
+    assert summary.rows[0].operator_effective_sample_size == 510.0
+    assert summary.rows[0].maximum_split_rhat == 1.003
+    assert summary.rows[0].conductivity_mcse_mS_cm == 0.02

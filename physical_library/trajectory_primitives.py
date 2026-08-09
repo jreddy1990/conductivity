@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Mapping
 
 import numpy as np
+from scipy.optimize import nnls
 
 from constants import K_B
 from conductivity.physical_library.projected_analytical_conductivity import (
@@ -222,6 +223,10 @@ class ConditionalMolecularResidualForceStatistics:
     pair_fit_force_products_N2: Array
     pair_heldout_weight_sums: Array
     pair_heldout_force_products_N2: Array
+    joint_fit_origin_counts: Array
+    joint_fit_force_products_N2: Array
+    joint_heldout_origin_counts: Array
+    joint_heldout_force_products_N2: Array
 
 
 def estimate_molecular_family_memory_kernel(
@@ -868,6 +873,9 @@ def conditional_molecular_residual_force_sufficient_statistics(
         raise ValueError("pair descriptor indices are outside the molecular trajectory")
     lag_count = maximum_lag_frames + 1
     pair_descriptor_count = pair_weights.shape[1]
+    joint_descriptor_count = CARTESIAN * (
+        self_descriptor_count + pair_descriptor_count
+    )
     self_output_shape = (
         lag_count,
         self_descriptor_count,
@@ -948,24 +956,84 @@ def conditional_molecular_residual_force_sufficient_statistics(
             pair_products[:, descriptor_index] = np.fft.irfft(
                 spectral_products, n=transform_size, axis=0
             )[:lag_count]
+        joint_generalized_forces_N = np.zeros(
+            (frame_count, joint_descriptor_count), dtype=float
+        )
+        self_generalized_forces_N = np.einsum(
+            "fmd,fma->fda", local_weights, residual_forces
+        )
+        joint_generalized_forces_N[:, : CARTESIAN * self_descriptor_count] = (
+            self_generalized_forces_N.reshape(frame_count, -1)
+        )
+        pair_force_differences_N = (
+            residual_forces[pair_origin_frames, pair_sources]
+            - residual_forces[pair_origin_frames, pair_targets]
+        )
+        pair_generalized_forces_N = np.zeros(
+            (frame_count, pair_descriptor_count, CARTESIAN), dtype=float
+        )
+        np.add.at(
+            pair_generalized_forces_N,
+            pair_origin_frames,
+            pair_weights[:, :, None] * pair_force_differences_N[:, None, :],
+        )
+        joint_generalized_forces_N[
+            :, CARTESIAN * self_descriptor_count :
+        ] = pair_generalized_forces_N.reshape(frame_count, -1)
+        masked_joint_forces_N = joint_generalized_forces_N * origin_mask[:, None]
+        future_joint_transform = np.fft.rfft(
+            joint_generalized_forces_N, n=transform_size, axis=0
+        )
+        origin_joint_transform = np.fft.rfft(
+            masked_joint_forces_N, n=transform_size, axis=0
+        )
+        joint_spectral_products = np.einsum(
+            "fc,fd->fcd",
+            future_joint_transform,
+            np.conjugate(origin_joint_transform),
+        )
+        joint_force_products_N2 = np.fft.irfft(
+            joint_spectral_products, n=transform_size, axis=0
+        )[:lag_count]
+        joint_origin_counts = np.cumsum(origin_mask.astype(int))[origin_stop_indices]
         partition_outputs.append(
             (
                 self_weight_sums,
                 self_products,
                 pair_weight_sums,
                 pair_products,
+                joint_origin_counts,
+                joint_force_products_N2,
             )
         )
-    fit_outputs, heldout_outputs = partition_outputs
+    (
+        self_fit_weight_sums,
+        self_fit_force_products_N2,
+        pair_fit_weight_sums,
+        pair_fit_force_products_N2,
+        joint_fit_origin_counts,
+        joint_fit_force_products_N2,
+    ), (
+        self_heldout_weight_sums,
+        self_heldout_force_products_N2,
+        pair_heldout_weight_sums,
+        pair_heldout_force_products_N2,
+        joint_heldout_origin_counts,
+        joint_heldout_force_products_N2,
+    ) = partition_outputs
     return ConditionalMolecularResidualForceStatistics(
-        self_fit_weight_sums=fit_outputs[0],
-        self_fit_force_products_N2=fit_outputs[1],
-        self_heldout_weight_sums=heldout_outputs[0],
-        self_heldout_force_products_N2=heldout_outputs[1],
-        pair_fit_weight_sums=fit_outputs[2],
-        pair_fit_force_products_N2=fit_outputs[3],
-        pair_heldout_weight_sums=heldout_outputs[2],
-        pair_heldout_force_products_N2=heldout_outputs[3],
+        self_fit_weight_sums=self_fit_weight_sums,
+        self_fit_force_products_N2=self_fit_force_products_N2,
+        self_heldout_weight_sums=self_heldout_weight_sums,
+        self_heldout_force_products_N2=self_heldout_force_products_N2,
+        pair_fit_weight_sums=pair_fit_weight_sums,
+        pair_fit_force_products_N2=pair_fit_force_products_N2,
+        pair_heldout_weight_sums=pair_heldout_weight_sums,
+        pair_heldout_force_products_N2=pair_heldout_force_products_N2,
+        joint_fit_origin_counts=joint_fit_origin_counts,
+        joint_fit_force_products_N2=joint_fit_force_products_N2,
+        joint_heldout_origin_counts=joint_heldout_origin_counts,
+        joint_heldout_force_products_N2=joint_heldout_force_products_N2,
     )
 
 
@@ -1070,6 +1138,102 @@ def integrated_memory_and_diffusion_from_residual_force_correlation(
         eigenvectors[:, active] / eigenvalues[active]
     ) @ eigenvectors[:, active].T
     return integrated_memory_kg_s, diffusion_m2_s
+
+
+def fit_psd_exponential_memory_kernel(
+    memory_kernel_kg_s2: Array,
+    lag_times_s: Array,
+    decay_times_s: Array,
+    physical_range_projector: Array,
+    eigenvalue_relative_tolerance: float,
+    singular_value_relative_tolerance: float,
+) -> tuple[Array, Array]:
+    memory_kernel = np.asarray(memory_kernel_kg_s2, dtype=float)
+    lag_times = np.asarray(lag_times_s, dtype=float)
+    decay_times = np.asarray(decay_times_s, dtype=float)
+    projector = np.asarray(physical_range_projector, dtype=float)
+    if (
+        memory_kernel.ndim != 3
+        or memory_kernel.shape[1] != memory_kernel.shape[2]
+        or lag_times.shape != (memory_kernel.shape[0],)
+        or projector.shape != memory_kernel.shape[1:]
+    ):
+        raise ValueError("memory-kernel spectral-fit arrays have incompatible shapes")
+    if (
+        decay_times.ndim != 1
+        or decay_times.size == 0
+        or np.any(decay_times <= 0.0)
+        or np.any(np.diff(lag_times) <= 0.0)
+        or lag_times[0] != 0.0
+    ):
+        raise ValueError("memory-kernel lag and decay times must be increasing")
+    if (
+        eigenvalue_relative_tolerance <= 0.0
+        or singular_value_relative_tolerance <= 0.0
+    ):
+        raise ValueError("memory-kernel spectral tolerances must be positive")
+    if not np.allclose(projector, projector.T):
+        raise ValueError("physical-range projector must be symmetric")
+    if not np.allclose(projector @ projector, projector):
+        raise ValueError("physical-range projector must be idempotent")
+    projected_kernel = np.einsum(
+        "ij,tjk,kl->til",
+        projector,
+        memory_kernel,
+        projector,
+    )
+    projected_kernel = 0.5 * (
+        projected_kernel + np.swapaxes(projected_kernel, 1, 2)
+    )
+    zero_lag_eigenvalues, zero_lag_eigenvectors = np.linalg.eigh(
+        projected_kernel[0]
+    )
+    eigenvalue_scale = max(
+        float(np.max(np.abs(zero_lag_eigenvalues))),
+        np.finfo(float).tiny,
+    )
+    if float(np.min(zero_lag_eigenvalues)) < (
+        -eigenvalue_relative_tolerance * eigenvalue_scale
+    ):
+        raise ValueError("zero-lag residual-force covariance is not PSD")
+    retained_modes = zero_lag_eigenvalues > (
+        singular_value_relative_tolerance * eigenvalue_scale
+    )
+    if not np.any(retained_modes):
+        return np.zeros_like(projected_kernel), np.zeros(projector.shape, dtype=float)
+    exponential_basis = np.exp(-lag_times[:, None] / decay_times[None, :])
+    fitted_kernel = np.zeros_like(projected_kernel)
+    integrated_memory = np.zeros(projector.shape, dtype=float)
+    for mode_vector in zero_lag_eigenvectors[:, retained_modes].T:
+        modal_correlation = np.einsum(
+            "i,tij,j->t",
+            mode_vector,
+            projected_kernel,
+            mode_vector,
+        )
+        spectral_amplitudes_kg_s2, _fit_residual = nnls(
+            exponential_basis,
+            modal_correlation,
+        )
+        mode_outer_product = np.outer(mode_vector, mode_vector)
+        fitted_kernel += np.einsum(
+            "tl,ij,l->tij",
+            exponential_basis,
+            mode_outer_product,
+            spectral_amplitudes_kg_s2,
+        )
+        integrated_memory += (
+            float(spectral_amplitudes_kg_s2 @ decay_times)
+            * mode_outer_product
+        )
+    fitted_kernel = np.einsum(
+        "ij,tjk,kl->til",
+        projector,
+        fitted_kernel,
+        projector,
+    )
+    integrated_memory = projector @ integrated_memory @ projector
+    return fitted_kernel, 0.5 * (integrated_memory + integrated_memory.T)
 
 
 def _invert_matrix_volterra_kernel(
