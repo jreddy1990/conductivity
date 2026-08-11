@@ -184,8 +184,9 @@ class PropertyDbPrimitiveOwnerDiagnostic:
 def validate_property_db_supported_conductivity_rows(
     property_db_entries,
     physical_library_root: Path,
-    pressure_Pa: float,
-    molecule_count: int,
+    liquid_density_kg_m3: float,
+    density_source: str,
+    minimum_explicit_molecule_count: int,
     dynamics: DynamicsSettings,
     numerics: NumericalSettings,
     random_seed: int,
@@ -196,8 +197,12 @@ def validate_property_db_supported_conductivity_rows(
 
     if worker_count <= 0:
         raise ValueError("property DB validation worker_count must be positive")
-    if pressure_Pa <= 0.0 or molecule_count <= 0:
-        raise ValueError("property DB pressure and molecule count must be positive")
+    if liquid_density_kg_m3 <= 0.0 or minimum_explicit_molecule_count <= 0:
+        raise ValueError(
+            "property DB liquid density and minimum molecule count must be positive"
+        )
+    if not density_source.strip():
+        raise ValueError("property DB density source must be nonempty")
 
     physical_library_records = load_physical_library(physical_library_root)
     supported_species_names = frozenset(physical_library_records.species_records)
@@ -277,8 +282,12 @@ def validate_property_db_supported_conductivity_rows(
             for work_index, work in enumerate(canonical_recipe_work):
                 outcome = _evaluate_canonical_recipe(
                     work.supported_recipe,
-                    pressure_Pa,
-                    molecule_count,
+                    liquid_density_kg_m3,
+                    density_source,
+                    minimum_explicit_molecule_count,
+                    recipe_paths[work.recipe_digest].with_suffix(
+                        ".initialization.pkl"
+                    ),
                     dynamics,
                     numerics,
                     random_seed + work_index,
@@ -297,8 +306,12 @@ def validate_property_db_supported_conductivity_rows(
                     executor.submit(
                         _evaluate_canonical_recipe,
                         work.supported_recipe,
-                        pressure_Pa,
-                        molecule_count,
+                        liquid_density_kg_m3,
+                        density_source,
+                        minimum_explicit_molecule_count,
+                        recipe_paths[work.recipe_digest].with_suffix(
+                            ".initialization.pkl"
+                        ),
                         dynamics,
                         numerics,
                         random_seed + work_index,
@@ -436,8 +449,10 @@ def _canonical_recipe_digest(recipe_key: tuple) -> str:
 
 def _evaluate_canonical_recipe(
     supported_recipe: _SupportedRecipe,
-    pressure_Pa: float,
-    molecule_count: int,
+    liquid_density_kg_m3: float,
+    density_source: str,
+    minimum_explicit_molecule_count: int,
+    initialization_checkpoint_path: Path,
     dynamics: DynamicsSettings,
     numerics: NumericalSettings,
     random_seed: int,
@@ -447,11 +462,13 @@ def _evaluate_canonical_recipe(
     conductivity_result = compute_first_principles_conductivity(
         recipe=supported_recipe.recipe_model,
         temperature_K=supported_recipe.temperature_K,
-        pressure_Pa=pressure_Pa,
-        molecule_count=molecule_count,
+        liquid_density_kg_m3=liquid_density_kg_m3,
+        density_source=density_source,
+        minimum_explicit_molecule_count=minimum_explicit_molecule_count,
         dynamics=dynamics,
         numerics=numerics,
         random_seed=random_seed,
+        initialization_checkpoint_path=initialization_checkpoint_path,
     )
     predicted_conductivity_mS_cm = (
         float(conductivity_result.conductivity_S_m) * S_M_TO_MS_CM

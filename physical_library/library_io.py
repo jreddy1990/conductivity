@@ -646,8 +646,11 @@ def _main_validate_property_db(
     summary = validate_property_db_supported_conductivity_rows(
         property_db_entries=DATA,
         physical_library_root=library_root,
-        pressure_Pa=float(settings_record["pressure_Pa"]),
-        molecule_count=int(settings_record["molecule_count"]),
+        liquid_density_kg_m3=float(settings_record["liquid_density_kg_m3"]),
+        density_source=str(settings_record["density_source"]),
+        minimum_explicit_molecule_count=int(
+            settings_record["minimum_explicit_molecule_count"]
+        ),
         dynamics=dynamics,
         numerics=numerics,
         random_seed=int(settings_record["random_seed"]),

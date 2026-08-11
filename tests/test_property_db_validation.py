@@ -28,6 +28,8 @@ from conductivity.physical_library.property_db_validation import (
 )
 
 PHYSICAL_LIBRARY_ROOT = Path("conductivity/physical_library")
+LIQUID_DENSITY_KG_M3 = 1177.1230418423613  # Row-zero composition density estimate.
+DENSITY_SOURCE = "composition-derived partial-molar-volume estimate"
 
 
 @pytest.mark.parametrize("species_name", ("LiDFOB", "LiBOB"))
@@ -268,8 +270,10 @@ def test_supported_rows_execute_unique_recipes_and_capture_recipe_failures(
             self,
             function,
             supported_recipe,
-            pressure_Pa,
-            molecule_count,
+            liquid_density_kg_m3,
+            density_source,
+            minimum_explicit_molecule_count,
+            initialization_checkpoint_path,
             dynamics,
             numerics,
             random_seed,
@@ -278,8 +282,10 @@ def test_supported_rows_execute_unique_recipes_and_capture_recipe_failures(
             return super().submit(
                 function,
                 supported_recipe,
-                pressure_Pa,
-                molecule_count,
+                liquid_density_kg_m3,
+                density_source,
+                minimum_explicit_molecule_count,
+                initialization_checkpoint_path,
                 dynamics,
                 numerics,
                 random_seed,
@@ -291,15 +297,19 @@ def test_supported_rows_execute_unique_recipes_and_capture_recipe_failures(
     def fake_compute_first_principles_conductivity(
         recipe,
         temperature_K: float,
-        pressure_Pa: float,
-        molecule_count: int,
+        liquid_density_kg_m3: float,
+        density_source: str,
+        minimum_explicit_molecule_count: int,
         dynamics,
         numerics,
         random_seed: int,
+        initialization_checkpoint_path: Path,
     ):
         assert recipe.salts == {"LiPF6": 1.0}
-        assert pressure_Pa == 101325.0
-        assert molecule_count == 8
+        assert liquid_density_kg_m3 == LIQUID_DENSITY_KG_M3
+        assert density_source == DENSITY_SOURCE
+        assert minimum_explicit_molecule_count == 8
+        assert initialization_checkpoint_path.suffix == ".pkl"
         assert dynamics is dynamics_settings
         assert numerics is numerical_settings
         assert isinstance(random_seed, int)
@@ -359,8 +369,9 @@ def test_supported_rows_execute_unique_recipes_and_capture_recipe_failures(
     summary = validate_property_db_supported_conductivity_rows(
         property_db_entries=entries,
         physical_library_root=tmp_path,
-        pressure_Pa=101325.0,
-        molecule_count=8,
+        liquid_density_kg_m3=LIQUID_DENSITY_KG_M3,
+        density_source=DENSITY_SOURCE,
+        minimum_explicit_molecule_count=8,
         dynamics=dynamics_settings,
         numerics=numerical_settings,
         random_seed=17,
@@ -423,15 +434,19 @@ def test_single_worker_validation_is_synchronous_and_reuses_canonical_prediction
     def fake_compute_first_principles_conductivity(
         recipe,
         temperature_K: float,
-        pressure_Pa: float,
-        molecule_count: int,
+        liquid_density_kg_m3: float,
+        density_source: str,
+        minimum_explicit_molecule_count: int,
         dynamics,
         numerics,
         random_seed: int,
+        initialization_checkpoint_path: Path,
     ):
         assert recipe.salts == {"LiPF6": 1.0}
-        assert pressure_Pa == 101325.0
-        assert molecule_count == 64
+        assert liquid_density_kg_m3 == LIQUID_DENSITY_KG_M3
+        assert density_source == DENSITY_SOURCE
+        assert minimum_explicit_molecule_count == 64
+        assert initialization_checkpoint_path.suffix == ".pkl"
         assert dynamics is dynamics_settings
         assert numerics is numerical_settings
         assert isinstance(random_seed, int)
@@ -474,8 +489,9 @@ def test_single_worker_validation_is_synchronous_and_reuses_canonical_prediction
     summary = validate_property_db_supported_conductivity_rows(
         property_db_entries=entries,
         physical_library_root=tmp_path,
-        pressure_Pa=101325.0,
-        molecule_count=64,
+        liquid_density_kg_m3=LIQUID_DENSITY_KG_M3,
+        density_source=DENSITY_SOURCE,
+        minimum_explicit_molecule_count=64,
         dynamics=dynamics_settings,
         numerics=numerical_settings,
         random_seed=17,

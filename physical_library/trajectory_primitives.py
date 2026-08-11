@@ -20,6 +20,7 @@ ANGSTROM_TO_M = 1.0e-10
 DEFAULT_DISPLACEMENT_ZERO_TOLERANCE_M = 0.0
 TOP_COMPONENT_EDGE_CONTRIBUTION_COUNT = 5  # Compact diagnostic table, not physics.
 MINIMUM_DIFFUSIVE_WINDOW_LAG_COUNT = 4  # Two-parameter regression plus residual DOF.
+PAIR_DESCRIPTOR_COMPONENT_COUNT = 5  # Radial, unlike, like, orientation, common-neighbor.
 NORMAL_CONFIDENCE_MULTIPLIER_95_PERCENT = (
     1.959963984540054  # Standard normal 95% interval.
 )
@@ -217,16 +218,22 @@ class MolecularFamilyMemoryKernelEstimate:
 class ConditionalMolecularResidualForceStatistics:
     self_fit_weight_sums: Array
     self_fit_force_products_N2: Array
+    self_fit_family_weight_sums: Array
+    self_fit_family_force_products_N2: Array
     self_heldout_weight_sums: Array
     self_heldout_force_products_N2: Array
+    self_heldout_family_weight_sums: Array
+    self_heldout_family_force_products_N2: Array
     pair_fit_weight_sums: Array
     pair_fit_force_products_N2: Array
+    pair_fit_family_weight_sums: Array
+    pair_fit_family_force_products_N2: Array
     pair_heldout_weight_sums: Array
     pair_heldout_force_products_N2: Array
-    joint_fit_origin_counts: Array
-    joint_fit_force_products_N2: Array
-    joint_heldout_origin_counts: Array
-    joint_heldout_force_products_N2: Array
+    pair_heldout_family_weight_sums: Array
+    pair_heldout_family_force_products_N2: Array
+    family_pair_indices: Array
+    family_pair_ordered_multiplicities: Array
 
 
 def estimate_molecular_family_memory_kernel(
@@ -808,35 +815,84 @@ def _lagged_matrix_correlation(
 
 
 def conditional_molecular_residual_force_sufficient_statistics(
+    local_descriptor_origin_frame_indices: Array,
     local_descriptor_weights: Array,
     pair_origin_frame_indices: Array,
     pair_source_molecule_indices: Array,
     pair_target_molecule_indices: Array,
-    pair_descriptor_weights: Array,
+    pair_radial_bin_indices: Array,
+    pair_charge_relations: Array,
+    pair_orientation_alignments: Array,
+    pair_common_neighbor_weights: Array,
+    pair_radial_bin_count: int,
+    uniform_self_descriptor_index: int,
     molecular_residual_forces_N: Array,
+    molecule_family_indices: Array,
+    family_count: int,
     maximum_lag_frames: int,
     fit_origin_mask: Array,
 ) -> ConditionalMolecularResidualForceStatistics:
+    local_origin_frames = np.asarray(
+        local_descriptor_origin_frame_indices, dtype=int
+    )
     local_weights = np.asarray(local_descriptor_weights, dtype=float)
     pair_origin_frames = np.asarray(pair_origin_frame_indices, dtype=int)
     pair_sources = np.asarray(pair_source_molecule_indices, dtype=int)
     pair_targets = np.asarray(pair_target_molecule_indices, dtype=int)
-    pair_weights = np.asarray(pair_descriptor_weights, dtype=float)
+    pair_radial_bins = np.asarray(pair_radial_bin_indices, dtype=int)
+    pair_charge_relation_values = np.asarray(pair_charge_relations, dtype=int)
+    pair_orientation_values = np.asarray(pair_orientation_alignments, dtype=float)
+    pair_common_neighbor_values = np.asarray(
+        pair_common_neighbor_weights, dtype=float
+    )
     residual_forces = np.asarray(molecular_residual_forces_N, dtype=float)
+    family_indices = np.asarray(molecule_family_indices, dtype=int)
     fit_mask = np.asarray(fit_origin_mask, dtype=bool)
-    if local_weights.ndim != 3:
-        raise ValueError(
-            "local descriptor weights must have shape (frames, molecules, descriptors)"
-        )
-    if (
-        residual_forces.ndim != 3
-        or residual_forces.shape[:2] != local_weights.shape[:2]
-        or residual_forces.shape[2] != CARTESIAN
+    if local_weights.ndim != 3 or local_origin_frames.shape != (
+        local_weights.shape[0],
     ):
+        raise ValueError(
+            "local descriptor weights and their origin frames have inconsistent shapes"
+        )
+    if residual_forces.ndim != 3 or residual_forces.shape[2] != CARTESIAN:
         raise ValueError(
             "molecular residual forces must have shape (frames, molecules, 3)"
         )
-    frame_count, molecule_count, self_descriptor_count = local_weights.shape
+    frame_count, molecule_count, _ = residual_forces.shape
+    _, local_molecule_count, self_descriptor_count = local_weights.shape
+    if local_molecule_count != molecule_count:
+        raise ValueError("local descriptor molecules do not match residual forces")
+    if (
+        uniform_self_descriptor_index < 0
+        or uniform_self_descriptor_index >= self_descriptor_count
+        or not np.array_equal(
+            local_weights[:, :, uniform_self_descriptor_index],
+            np.ones(local_weights.shape[:2]),
+        )
+    ):
+        raise ValueError("the uniform self descriptor must be identically one")
+    if (
+        np.any(local_origin_frames < 0)
+        or np.any(local_origin_frames >= frame_count)
+        or np.any(np.diff(local_origin_frames) <= 0)
+    ):
+        raise ValueError(
+            "local descriptor origins must be strictly increasing trajectory frames"
+        )
+    if family_count <= 0:
+        raise ValueError("family count must be positive")
+    if (
+        family_indices.shape != (molecule_count,)
+        or np.any(family_indices < 0)
+        or np.any(family_indices >= family_count)
+    ):
+        raise ValueError("molecule family indices do not match the molecular trajectory")
+    family_molecule_counts = np.bincount(
+        family_indices,
+        minlength=family_count,
+    )
+    if np.any(family_molecule_counts == 0):
+        raise ValueError("every molecular family must contain a molecule")
     if fit_mask.shape != (frame_count,):
         raise ValueError("fit origin mask must contain one value per frame")
     pair_record_count = pair_origin_frames.size
@@ -844,17 +900,23 @@ def conditional_molecular_residual_force_sufficient_statistics(
         pair_origin_frames.shape != (pair_record_count,)
         or pair_sources.shape != (pair_record_count,)
         or pair_targets.shape != (pair_record_count,)
-        or pair_weights.ndim != 2
-        or pair_weights.shape[0] != pair_record_count
+        or pair_radial_bins.shape != (pair_record_count,)
+        or pair_charge_relation_values.shape != (pair_record_count,)
+        or pair_orientation_values.shape != (pair_record_count,)
+        or pair_common_neighbor_values.shape != (pair_record_count,)
     ):
         raise ValueError("pair descriptor records have inconsistent shapes")
+    if pair_radial_bin_count <= 0:
+        raise ValueError("pair radial-bin count must be positive")
     if maximum_lag_frames < 0 or maximum_lag_frames >= frame_count:
         raise ValueError("conditional-memory lag must be shorter than the trajectory")
     if (
         np.any(local_weights < 0.0)
-        or np.any(pair_weights < 0.0)
         or not np.all(np.isfinite(local_weights))
-        or not np.all(np.isfinite(pair_weights))
+        or np.any(pair_orientation_values < 0.0)
+        or not np.all(np.isfinite(pair_orientation_values))
+        or np.any(pair_common_neighbor_values < 0.0)
+        or not np.all(np.isfinite(pair_common_neighbor_values))
         or not np.all(np.isfinite(residual_forces))
     ):
         raise ValueError(
@@ -869,171 +931,328 @@ def conditional_molecular_residual_force_sufficient_statistics(
         or np.any(pair_targets < 0)
         or np.any(pair_targets >= molecule_count)
         or np.any(pair_sources == pair_targets)
+        or np.any(np.diff(pair_origin_frames) < 0)
+        or np.any(pair_radial_bins < 0)
+        or np.any(pair_radial_bins >= pair_radial_bin_count)
+        or np.any(~np.isin(pair_charge_relation_values, (-1, 0, 1)))
     ):
         raise ValueError("pair descriptor indices are outside the molecular trajectory")
     lag_count = maximum_lag_frames + 1
-    pair_descriptor_count = pair_weights.shape[1]
-    joint_descriptor_count = CARTESIAN * (
-        self_descriptor_count + pair_descriptor_count
+    pair_descriptor_count = (
+        pair_radial_bin_count * PAIR_DESCRIPTOR_COMPONENT_COUNT
     )
-    self_output_shape = (
+    family_pair_indices = np.asarray(
+        tuple(
+            (first_family_index, second_family_index)
+            for first_family_index in range(family_count)
+            for second_family_index in range(first_family_index, family_count)
+        ),
+        dtype=int,
+    )
+    family_pair_lookup = np.full((family_count, family_count), -1, dtype=int)
+    family_pair_ordered_multiplicities = np.empty(
+        family_pair_indices.shape[0],
+        dtype=int,
+    )
+    for family_pair_index, (
+        first_family_index,
+        second_family_index,
+    ) in enumerate(family_pair_indices):
+        family_pair_lookup[first_family_index, second_family_index] = (
+            family_pair_index
+        )
+        family_pair_lookup[second_family_index, first_family_index] = (
+            family_pair_index
+        )
+        first_family_count = family_molecule_counts[first_family_index]
+        second_family_count = family_molecule_counts[second_family_index]
+        if first_family_index == second_family_index:
+            family_pair_ordered_multiplicities[family_pair_index] = (
+                first_family_count * (first_family_count - 1)
+            )
+        else:
+            family_pair_ordered_multiplicities[family_pair_index] = (
+                2 * first_family_count * second_family_count
+            )
+    self_family_output_shape = (
         lag_count,
+        family_count,
         self_descriptor_count,
         CARTESIAN,
         CARTESIAN,
     )
-    pair_output_shape = (
+    pair_family_output_shape = (
         lag_count,
+        family_pair_indices.shape[0],
         pair_descriptor_count,
         CARTESIAN,
         CARTESIAN,
     )
+    family_membership = np.equal(
+        family_indices[:, None],
+        np.arange(family_count)[None, :],
+    ).astype(float)
     transform_size = 1 << (2 * frame_count - 1).bit_length()
     future_force_transform = np.fft.rfft(
         residual_forces, n=transform_size, axis=0
     )
     origin_stop_indices = frame_count - np.arange(lag_count) - 1
+    pair_record_family_indices = family_pair_lookup[
+        family_indices[pair_sources],
+        family_indices[pair_targets],
+    ]
     partition_outputs = []
     for origin_mask in (fit_mask, ~fit_mask):
-        masked_local_weights = local_weights * origin_mask[:, None, None]
-        self_frame_weight_sums = np.sum(masked_local_weights, axis=1)
-        self_weight_sums = np.cumsum(
-            self_frame_weight_sums, axis=0
-        )[origin_stop_indices]
-        self_products = np.zeros(self_output_shape)
+        masked_local_weights = local_weights * origin_mask[
+            local_origin_frames, None, None
+        ]
+        self_origin_family_weight_sums = np.einsum(
+            "gmd,mk->gkd",
+            masked_local_weights,
+            family_membership,
+        )
+        self_origin_family_weight_sums = np.cumsum(
+            self_origin_family_weight_sums, axis=0
+        )
+        self_family_weight_sums = np.zeros(
+            (lag_count, family_count, self_descriptor_count), dtype=float
+        )
+        local_origin_stop_positions = np.searchsorted(
+            local_origin_frames,
+            origin_stop_indices,
+            side="right",
+        ) - 1
+        populated_local_lags = local_origin_stop_positions >= 0
+        self_family_weight_sums[populated_local_lags] = (
+            self_origin_family_weight_sums[
+                local_origin_stop_positions[populated_local_lags]
+            ]
+        )
+        partition_origin_counts = np.cumsum(origin_mask.astype(int))[
+            origin_stop_indices
+        ]
+        self_family_weight_sums[:, :, uniform_self_descriptor_index] = (
+            partition_origin_counts[:, None] * family_molecule_counts[None, :]
+        )
+        self_family_products = np.zeros(self_family_output_shape)
         for descriptor_index in range(self_descriptor_count):
-            weighted_origin_forces = (
-                masked_local_weights[:, :, descriptor_index, None]
-                * residual_forces
-            )
+            if descriptor_index == uniform_self_descriptor_index:
+                weighted_origin_forces = (
+                    origin_mask[:, None, None] * residual_forces
+                )
+            else:
+                weighted_origin_forces = np.zeros_like(residual_forces)
+                weighted_origin_forces[local_origin_frames] = (
+                    masked_local_weights[:, :, descriptor_index, None]
+                    * residual_forces[local_origin_frames]
+                )
             origin_force_transform = np.fft.rfft(
                 weighted_origin_forces, n=transform_size, axis=0
             )
             spectral_products = np.einsum(
-                "fma,fmb->fab",
+                "fma,fmb,mk->fkab",
                 future_force_transform,
                 np.conjugate(origin_force_transform),
+                family_membership,
             )
-            self_products[:, descriptor_index] = np.fft.irfft(
+            self_family_products[:, :, descriptor_index] = np.fft.irfft(
                 spectral_products, n=transform_size, axis=0
             )[:lag_count]
-        selected_pair_records = origin_mask[pair_origin_frames]
-        selected_origin_frames = pair_origin_frames[selected_pair_records]
-        selected_sources = pair_sources[selected_pair_records]
-        selected_targets = pair_targets[selected_pair_records]
-        selected_pair_weights = pair_weights[selected_pair_records]
-        pair_frame_weight_sums = np.zeros(
-            (frame_count, pair_descriptor_count), dtype=float
+        self_weight_sums = np.sum(self_family_weight_sums, axis=1)
+        self_products = np.sum(self_family_products, axis=1)
+        pair_family_weight_sums = np.zeros(
+            (
+                lag_count,
+                family_pair_indices.shape[0],
+                pair_descriptor_count,
+            ),
+            dtype=float,
         )
-        np.add.at(
-            pair_frame_weight_sums,
-            selected_origin_frames,
-            selected_pair_weights,
-        )
-        pair_weight_sums = np.cumsum(
-            pair_frame_weight_sums, axis=0
-        )[origin_stop_indices]
-        pair_products = np.zeros(pair_output_shape)
-        for descriptor_index in range(pair_descriptor_count):
-            contracted_origin_forces = np.zeros_like(residual_forces)
-            weighted_target_forces = (
-                selected_pair_weights[:, descriptor_index, None]
-                * residual_forces[selected_origin_frames, selected_targets]
+        pair_family_products = np.zeros(pair_family_output_shape)
+        for family_pair_index in range(family_pair_indices.shape[0]):
+            family_pair_records = np.flatnonzero(
+                (pair_record_family_indices == family_pair_index)
+                & origin_mask[pair_origin_frames]
             )
-            np.add.at(
-                contracted_origin_forces,
-                (selected_origin_frames, selected_sources),
-                weighted_target_forces,
+            if family_pair_records.size == 0:
+                continue
+            family_pair_origin_frames = pair_origin_frames[family_pair_records]
+            family_pair_sources = pair_sources[family_pair_records]
+            family_pair_targets = pair_targets[family_pair_records]
+            active_source_indices, local_source_indices = np.unique(
+                family_pair_sources,
+                return_inverse=True,
             )
-            contracted_origin_transform = np.fft.rfft(
-                contracted_origin_forces, n=transform_size, axis=0
+            descriptor_batch_count = max(
+                1,
+                molecule_count // active_source_indices.size,
             )
-            spectral_products = np.einsum(
-                "fma,fmb->fab",
-                future_force_transform,
-                np.conjugate(contracted_origin_transform),
-            )
-            pair_products[:, descriptor_index] = np.fft.irfft(
-                spectral_products, n=transform_size, axis=0
-            )[:lag_count]
-        joint_generalized_forces_N = np.zeros(
-            (frame_count, joint_descriptor_count), dtype=float
-        )
-        self_generalized_forces_N = np.einsum(
-            "fmd,fma->fda", local_weights, residual_forces
-        )
-        joint_generalized_forces_N[:, : CARTESIAN * self_descriptor_count] = (
-            self_generalized_forces_N.reshape(frame_count, -1)
-        )
-        pair_force_differences_N = (
-            residual_forces[pair_origin_frames, pair_sources]
-            - residual_forces[pair_origin_frames, pair_targets]
-        )
-        pair_generalized_forces_N = np.zeros(
-            (frame_count, pair_descriptor_count, CARTESIAN), dtype=float
-        )
-        np.add.at(
-            pair_generalized_forces_N,
-            pair_origin_frames,
-            pair_weights[:, :, None] * pair_force_differences_N[:, None, :],
-        )
-        joint_generalized_forces_N[
-            :, CARTESIAN * self_descriptor_count :
-        ] = pair_generalized_forces_N.reshape(frame_count, -1)
-        masked_joint_forces_N = joint_generalized_forces_N * origin_mask[:, None]
-        future_joint_transform = np.fft.rfft(
-            joint_generalized_forces_N, n=transform_size, axis=0
-        )
-        origin_joint_transform = np.fft.rfft(
-            masked_joint_forces_N, n=transform_size, axis=0
-        )
-        joint_spectral_products = np.einsum(
-            "fc,fd->fcd",
-            future_joint_transform,
-            np.conjugate(origin_joint_transform),
-        )
-        joint_force_products_N2 = np.fft.irfft(
-            joint_spectral_products, n=transform_size, axis=0
-        )[:lag_count]
-        joint_origin_counts = np.cumsum(origin_mask.astype(int))[origin_stop_indices]
+            for descriptor_start_index in range(
+                0,
+                pair_descriptor_count,
+                descriptor_batch_count,
+            ):
+                descriptor_stop_index = min(
+                    descriptor_start_index + descriptor_batch_count,
+                    pair_descriptor_count,
+                )
+                descriptor_indices = np.arange(
+                    descriptor_start_index,
+                    descriptor_stop_index,
+                )
+                descriptor_radial_bins = (
+                    descriptor_indices // PAIR_DESCRIPTOR_COMPONENT_COUNT
+                )
+                descriptor_components = (
+                    descriptor_indices % PAIR_DESCRIPTOR_COMPONENT_COUNT
+                )
+                family_pair_descriptor_weights = (
+                    pair_radial_bins[family_pair_records, None]
+                    == descriptor_radial_bins[None, :]
+                ).astype(float)
+                for descriptor_batch_index, descriptor_component in enumerate(
+                    descriptor_components
+                ):
+                    if descriptor_component == 1:
+                        family_pair_descriptor_weights[
+                            :, descriptor_batch_index
+                        ] = family_pair_descriptor_weights[
+                            :, descriptor_batch_index
+                        ] * (pair_charge_relation_values[family_pair_records] < 0)
+                    elif descriptor_component == 2:
+                        family_pair_descriptor_weights[
+                            :, descriptor_batch_index
+                        ] = family_pair_descriptor_weights[
+                            :, descriptor_batch_index
+                        ] * (pair_charge_relation_values[family_pair_records] > 0)
+                    elif descriptor_component == 3:
+                        family_pair_descriptor_weights[
+                            :, descriptor_batch_index
+                        ] = family_pair_descriptor_weights[
+                            :, descriptor_batch_index
+                        ] * pair_orientation_values[family_pair_records]
+                    elif descriptor_component == 4:
+                        family_pair_descriptor_weights[
+                            :, descriptor_batch_index
+                        ] = family_pair_descriptor_weights[
+                            :, descriptor_batch_index
+                        ] * pair_common_neighbor_values[family_pair_records]
+                contracted_origin_forces = np.zeros(
+                    (
+                        frame_count,
+                        active_source_indices.size,
+                        descriptor_stop_index - descriptor_start_index,
+                        CARTESIAN,
+                    ),
+                    dtype=float,
+                )
+                weighted_target_forces = (
+                    family_pair_descriptor_weights[:, :, None]
+                    * residual_forces[
+                        family_pair_origin_frames,
+                        family_pair_targets,
+                        None,
+                        :,
+                    ]
+                )
+                np.add.at(
+                    contracted_origin_forces,
+                    (family_pair_origin_frames, local_source_indices),
+                    weighted_target_forces,
+                )
+                contracted_origin_transform = np.fft.rfft(
+                    contracted_origin_forces,
+                    n=transform_size,
+                    axis=0,
+                )
+                spectral_products = np.einsum(
+                    "fma,fmdb->fdab",
+                    future_force_transform[:, active_source_indices],
+                    np.conjugate(contracted_origin_transform),
+                )
+                pair_family_products[
+                    :,
+                    family_pair_index,
+                    descriptor_start_index:descriptor_stop_index,
+                ] = np.fft.irfft(
+                    spectral_products,
+                    n=transform_size,
+                    axis=0,
+                )[:lag_count]
+                cumulative_family_pair_descriptor_weights = np.cumsum(
+                    family_pair_descriptor_weights, axis=0
+                )
+                pair_origin_stop_positions = np.searchsorted(
+                    family_pair_origin_frames,
+                    origin_stop_indices,
+                    side="right",
+                ) - 1
+                populated_pair_lags = pair_origin_stop_positions >= 0
+                pair_family_weight_sums[
+                    populated_pair_lags,
+                    family_pair_index,
+                    descriptor_start_index:descriptor_stop_index,
+                ] = cumulative_family_pair_descriptor_weights[
+                    pair_origin_stop_positions[populated_pair_lags]
+                ]
+        pair_weight_sums = np.sum(pair_family_weight_sums, axis=1)
+        pair_products = np.sum(pair_family_products, axis=1)
         partition_outputs.append(
             (
                 self_weight_sums,
                 self_products,
+                self_family_weight_sums,
+                self_family_products,
                 pair_weight_sums,
                 pair_products,
-                joint_origin_counts,
-                joint_force_products_N2,
+                pair_family_weight_sums,
+                pair_family_products,
             )
         )
     (
         self_fit_weight_sums,
         self_fit_force_products_N2,
+        self_fit_family_weight_sums,
+        self_fit_family_force_products_N2,
         pair_fit_weight_sums,
         pair_fit_force_products_N2,
-        joint_fit_origin_counts,
-        joint_fit_force_products_N2,
+        pair_fit_family_weight_sums,
+        pair_fit_family_force_products_N2,
     ), (
         self_heldout_weight_sums,
         self_heldout_force_products_N2,
+        self_heldout_family_weight_sums,
+        self_heldout_family_force_products_N2,
         pair_heldout_weight_sums,
         pair_heldout_force_products_N2,
-        joint_heldout_origin_counts,
-        joint_heldout_force_products_N2,
+        pair_heldout_family_weight_sums,
+        pair_heldout_family_force_products_N2,
     ) = partition_outputs
     return ConditionalMolecularResidualForceStatistics(
         self_fit_weight_sums=self_fit_weight_sums,
         self_fit_force_products_N2=self_fit_force_products_N2,
+        self_fit_family_weight_sums=self_fit_family_weight_sums,
+        self_fit_family_force_products_N2=self_fit_family_force_products_N2,
         self_heldout_weight_sums=self_heldout_weight_sums,
         self_heldout_force_products_N2=self_heldout_force_products_N2,
+        self_heldout_family_weight_sums=self_heldout_family_weight_sums,
+        self_heldout_family_force_products_N2=(
+            self_heldout_family_force_products_N2
+        ),
         pair_fit_weight_sums=pair_fit_weight_sums,
         pair_fit_force_products_N2=pair_fit_force_products_N2,
+        pair_fit_family_weight_sums=pair_fit_family_weight_sums,
+        pair_fit_family_force_products_N2=pair_fit_family_force_products_N2,
         pair_heldout_weight_sums=pair_heldout_weight_sums,
         pair_heldout_force_products_N2=pair_heldout_force_products_N2,
-        joint_fit_origin_counts=joint_fit_origin_counts,
-        joint_fit_force_products_N2=joint_fit_force_products_N2,
-        joint_heldout_origin_counts=joint_heldout_origin_counts,
-        joint_heldout_force_products_N2=joint_heldout_force_products_N2,
+        pair_heldout_family_weight_sums=pair_heldout_family_weight_sums,
+        pair_heldout_family_force_products_N2=(
+            pair_heldout_family_force_products_N2
+        ),
+        family_pair_indices=family_pair_indices,
+        family_pair_ordered_multiplicities=(
+            family_pair_ordered_multiplicities
+        ),
     )
 
 
