@@ -318,8 +318,9 @@ def test_supported_rows_execute_unique_recipes_and_capture_recipe_failures(
             raise RuntimeError("row model failed")
         return SimpleNamespace(
             conductivity_S_m=1.2,
-            effective_sample_size=480.0,
-            maximum_split_rhat=1.004,
+            conductivity_lower_bound_S_m=1.18,
+            conductivity_upper_bound_S_m=1.22,
+            conductivity_precision_reached=True,
             conductivity_mcse_S_m=0.003,
         )
 
@@ -393,11 +394,12 @@ def test_supported_rows_execute_unique_recipes_and_capture_recipe_failures(
     }
     assert summary.progress[4].detail == "RuntimeError: row model failed"
     assert summary.progress[0].detail == "primitive_residual_mS_cm=2"
-    assert summary.rows[0].operator_effective_sample_size == 480.0
-    assert summary.rows[0].maximum_split_rhat == 1.004
+    assert summary.rows[0].conductivity_lower_bound_mS_cm == pytest.approx(11.8)
+    assert summary.rows[0].conductivity_upper_bound_mS_cm == pytest.approx(12.2)
+    assert summary.rows[0].conductivity_precision_reached
     assert summary.rows[0].conductivity_mcse_mS_cm == 0.03
-    assert summary.minimum_operator_effective_sample_size == 480.0
-    assert summary.maximum_split_rhat == 1.004
+    assert summary.maximum_conductivity_interval_width_mS_cm == pytest.approx(0.4)
+    assert summary.precision_reached_row_count == 3
     assert summary.maximum_conductivity_mcse_mS_cm == 0.03
     assert submitted_work_count.qsize() == 2
     assert sorted(
@@ -453,8 +455,9 @@ def test_single_worker_validation_is_synchronous_and_reuses_canonical_prediction
         evaluated_temperatures_K.put(temperature_K)
         return SimpleNamespace(
             conductivity_S_m=1.2,
-            effective_sample_size=510.0,
-            maximum_split_rhat=1.003,
+            conductivity_lower_bound_S_m=1.19,
+            conductivity_upper_bound_S_m=1.21,
+            conductivity_precision_reached=True,
             conductivity_mcse_S_m=0.002,
         )
 
@@ -504,6 +507,7 @@ def test_single_worker_validation_is_synchronous_and_reuses_canonical_prediction
     assert [row.predicted_conductivity_mS_cm for row in summary.rows] == [12.0, 12.0]
     assert summary.evaluated_entry_count == 2
     assert summary.failed_entry_count == 0
-    assert summary.rows[0].operator_effective_sample_size == 510.0
-    assert summary.rows[0].maximum_split_rhat == 1.003
+    assert summary.rows[0].conductivity_lower_bound_mS_cm == pytest.approx(11.9)
+    assert summary.rows[0].conductivity_upper_bound_mS_cm == pytest.approx(12.1)
+    assert summary.rows[0].conductivity_precision_reached
     assert summary.rows[0].conductivity_mcse_mS_cm == 0.02

@@ -59,8 +59,9 @@ class PropertyDbConductivityValidationRow:
     percent_error: float
     readiness_status: str
     scalar_label: str
-    operator_effective_sample_size: float
-    maximum_split_rhat: float
+    conductivity_lower_bound_mS_cm: float
+    conductivity_upper_bound_mS_cm: float
+    conductivity_precision_reached: bool
     conductivity_mcse_mS_cm: float
 
 
@@ -89,8 +90,9 @@ class _RecipePrediction:
     predicted_conductivity_mS_cm: float
     readiness_status: str
     scalar_label: str
-    operator_effective_sample_size: float
-    maximum_split_rhat: float
+    conductivity_lower_bound_mS_cm: float
+    conductivity_upper_bound_mS_cm: float
+    conductivity_precision_reached: bool
     conductivity_mcse_mS_cm: float
 
 
@@ -120,8 +122,8 @@ class PropertyDbConductivityValidationSummary:
     root_mean_square_error_mS_cm: float
     mean_absolute_percent_error: float
     max_absolute_error_mS_cm: float
-    minimum_operator_effective_sample_size: float
-    maximum_split_rhat: float
+    maximum_conductivity_interval_width_mS_cm: float
+    precision_reached_row_count: int
     maximum_conductivity_mcse_mS_cm: float
 
 
@@ -377,11 +379,15 @@ def validate_property_db_supported_conductivity_rows(
         ),
         mean_absolute_percent_error=float(np.mean(absolute_percent_errors)),
         max_absolute_error_mS_cm=float(np.max(absolute_errors_mS_cm)),
-        minimum_operator_effective_sample_size=float(
-            min(row.operator_effective_sample_size for row in validation_row_tuple)
+        maximum_conductivity_interval_width_mS_cm=float(
+            max(
+                row.conductivity_upper_bound_mS_cm
+                - row.conductivity_lower_bound_mS_cm
+                for row in validation_row_tuple
+            )
         ),
-        maximum_split_rhat=float(
-            max(row.maximum_split_rhat for row in validation_row_tuple)
+        precision_reached_row_count=sum(
+            row.conductivity_precision_reached for row in validation_row_tuple
         ),
         maximum_conductivity_mcse_mS_cm=float(
             max(row.conductivity_mcse_mS_cm for row in validation_row_tuple)
@@ -478,12 +484,23 @@ def _evaluate_canonical_recipe(
     return _EvaluatedCanonicalRecipeOutcome(
         prediction=_RecipePrediction(
             predicted_conductivity_mS_cm=predicted_conductivity_mS_cm,
-            readiness_status="complete",
-            scalar_label="first_principles_prediction",
-            operator_effective_sample_size=float(
-                conductivity_result.effective_sample_size
+            readiness_status=(
+                "complete"
+                if conductivity_result.conductivity_precision_reached
+                else "estimated"
             ),
-            maximum_split_rhat=float(conductivity_result.maximum_split_rhat),
+            scalar_label="hamiltonian_green_kubo_prediction",
+            conductivity_lower_bound_mS_cm=(
+                float(conductivity_result.conductivity_lower_bound_S_m)
+                * S_M_TO_MS_CM
+            ),
+            conductivity_upper_bound_mS_cm=(
+                float(conductivity_result.conductivity_upper_bound_S_m)
+                * S_M_TO_MS_CM
+            ),
+            conductivity_precision_reached=(
+                conductivity_result.conductivity_precision_reached
+            ),
             conductivity_mcse_mS_cm=(
                 float(conductivity_result.conductivity_mcse_S_m)
                 * S_M_TO_MS_CM
@@ -576,10 +593,13 @@ def _validation_row_from_prediction(
         ),
         readiness_status=prediction.readiness_status,
         scalar_label=prediction.scalar_label,
-        operator_effective_sample_size=(
-            prediction.operator_effective_sample_size
+        conductivity_lower_bound_mS_cm=(
+            prediction.conductivity_lower_bound_mS_cm
         ),
-        maximum_split_rhat=prediction.maximum_split_rhat,
+        conductivity_upper_bound_mS_cm=(
+            prediction.conductivity_upper_bound_mS_cm
+        ),
+        conductivity_precision_reached=prediction.conductivity_precision_reached,
         conductivity_mcse_mS_cm=prediction.conductivity_mcse_mS_cm,
     )
 

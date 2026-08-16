@@ -1,8 +1,8 @@
-"""Full-configuration reversible conductivity from an analytical molecular model.
+"""Bulk dc conductivity from the Hamiltonian Green-Kubo resolvent.
 
-The executable constructs one periodic molecular liquid, samples its Boltzmann
-measure, and solves the reversible Smoluchowski current-corrector problem in a
-nested basis of smooth full-configuration observables.
+The executable refines composition-preserving periodic cells, static canonical
+integrals, a nested phase-space basis, and the zero-frequency continuation before it
+emits the scalar conductivity.
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ import argparse
 from dataclasses import asdict, dataclass, replace
 from functools import cache
 import hashlib
-from itertools import combinations, combinations_with_replacement
+from itertools import combinations_with_replacement
 import json
 import math
 import os
@@ -20,14 +20,12 @@ import pickle
 import platform
 import sys
 import time
-from typing import Protocol
+from typing import Callable, Protocol
 import warnings
 
 import numpy as np
-from scipy.linalg import eigh
-from scipy.optimize import Bounds, LinearConstraint, milp, nnls
+from scipy.optimize import Bounds, LinearConstraint, milp
 from scipy.special import erfcinv
-from scipy.stats import norm, rankdata
 import torch
 from torch._functorch import config as functorch_config
 from torch._inductor import config as inductor_config
@@ -36,11 +34,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "data"))
 
 from constants import (
-    ANGSTROM_TO_M,
     E_CHARGE,
     EPS_0,
     K_B,
-    KCAL_TO_J,
     KG_M3_PER_G_ML,
     LITER_PER_M3,
     N_A,
@@ -54,7 +50,6 @@ from conductivity.physical_library.physical_objects import (
 from electrolyte_model import ElectrolyteRecipeModel
 from species_data import ADDITIVES, SALTS
 from utils.strict_validation import read_json_object, write_json_object
-from utils.time_series_statistics import autocorrelation_and_effective_sample_size
 
 Array = np.ndarray
 CARTESIAN_DIMENSION = 3
@@ -72,11 +67,11 @@ if platform.system() == "Darwin" and platform.machine() == "arm64":
     )
     inductor_config.cpp.cxx = (str(ARM_CROSS_COMPILER),)
     inductor_config.cpp.threads = os.cpu_count()
+    # Torch's shared Apple PCH can retain an obsolete header timestamp across runs.
+    inductor_config.cpp_cache_precompile_headers = False
 MILP_FEASIBILITY_TOLERANCE = 100.0 * math.sqrt(np.finfo(float).eps)
 # Quarter scaling separates the lambda and square-root-lambda energy coefficients.
 COMPONENT_DECOMPOSITION_LAMBDA = 0.25
-MINIMUM_OPERATOR_DIAGNOSTIC_PILOT_SAMPLES = 2 * CARTESIAN_DIMENSION
-MINIMUM_OPERATOR_DIAGNOSTIC_EVALUATION_SAMPLES = CARTESIAN_DIMENSION + 1
 # The standard C2 quintic switch is one at x=0 with zero first and second
 # derivatives at both endpoints and zero at x=1.
 QUINTIC_SWITCH_CUBIC_COEFFICIENT = 10.0  # C2 endpoint polynomial coefficient.
@@ -93,280 +88,6 @@ REST_INTERACTION_CLASS_COUNT = 3
 @cache
 def _physical_library_records():
     return load_physical_library(Path(__file__).parent / "physical_library")
-
-
-def multivariate_batch_means_effective_sample_size(
-    chain_operator_series: Array,
-) -> float:
-    chains = np.asarray(chain_operator_series, dtype=float)
-    if chains.ndim != 3 or chains.shape[0] < 2 or chains.shape[1] < 4:
-        raise ValueError("operator chains must have shape (chain, sample, observable)")
-    chain_count, sample_count, observable_count = chains.shape
-    batch_size = max(2, int(math.floor(math.sqrt(sample_count))))
-    batch_count = sample_count // batch_size
-    if batch_count < 2:
-        raise ValueError("operator chains have too few complete batches")
-    retained_sample_count = batch_count * batch_size
-    retained = chains[:, :retained_sample_count]
-    flattened = retained.reshape(-1, observable_count)
-    centered = flattened - np.mean(flattened, axis=0)
-    pooled_marginal_covariance = centered.T @ centered / (flattened.shape[0] - 1)
-    pooled_mean_covariance = np.zeros((observable_count, observable_count), dtype=float)
-    chain_weight = 1.0 / chain_count
-    for chain_samples in retained:
-        batch_means = chain_samples.reshape(
-            batch_count, batch_size, observable_count
-        ).mean(axis=1)
-        batch_centered = batch_means - np.mean(batch_means, axis=0)
-        long_run_covariance = (
-            batch_size * (batch_centered.T @ batch_centered) / (batch_count - 1)
-        )
-        pooled_mean_covariance += (
-            chain_weight**2 * long_run_covariance / retained_sample_count
-        )
-    marginal_eigenvalues = np.linalg.eigvalsh(pooled_marginal_covariance)
-    mean_covariance_eigenvalues = np.linalg.eigvalsh(pooled_mean_covariance)
-    active_count = min(
-        observable_count,
-        flattened.shape[0] - 1,
-        batch_count - 1,
-        int(np.count_nonzero(marginal_eigenvalues > np.finfo(float).eps)),
-    )
-    if active_count == 0:
-        return 0.0
-    marginal_active = marginal_eigenvalues[-active_count:]
-    mean_covariance_active = mean_covariance_eigenvalues[-active_count:]
-    if np.any(mean_covariance_active <= 0.0):
-        return 0.0
-    log_determinant_ratio = float(
-        np.sum(np.log(marginal_active)) - np.sum(np.log(mean_covariance_active))
-    )
-    effective_sample_size = math.exp(log_determinant_ratio / active_count)
-    total_sample_count = chain_count * retained_sample_count
-    return float(min(total_sample_count, max(1.0, effective_sample_size)))
-
-
-def rank_normalized_split_rhat(chain_operator_series: Array) -> float:
-    chains = np.asarray(chain_operator_series, dtype=float)
-    if chains.ndim != 3 or chains.shape[0] < 2 or chains.shape[1] < 4:
-        raise ValueError("operator chains must have shape (chain, sample, observable)")
-    half_sample_count = chains.shape[1] // 2
-    split_chains = np.concatenate(
-        (
-            chains[:, :half_sample_count, :],
-            chains[:, -half_sample_count:, :],
-        ),
-        axis=0,
-    )
-    split_chain_count, split_sample_count, observable_count = split_chains.shape
-    maximum_rhat = 1.0
-    for observable_index in range(observable_count):
-        flattened = split_chains[:, :, observable_index].reshape(-1)
-        ranks = rankdata(flattened, method="average")
-        probabilities = (ranks - 0.5) / ranks.size
-        normalized = norm.ppf(probabilities).reshape(
-            split_chain_count, split_sample_count
-        )
-        chain_means = np.mean(normalized, axis=1)
-        between_variance = split_sample_count * np.var(chain_means, ddof=1)
-        within_variance = float(np.mean(np.var(normalized, axis=1, ddof=1)))
-        if within_variance <= 0.0:
-            if float(np.var(normalized)) <= 0.0:
-                continue
-            return math.inf
-        variance_estimate = (
-            (split_sample_count - 1) * within_variance + between_variance
-        ) / split_sample_count
-        maximum_rhat = max(maximum_rhat, math.sqrt(variance_estimate / within_variance))
-    return float(maximum_rhat)
-
-
-def fit_operator_diagnostic_basis(
-    chain_operator_series: Array,
-    eigenvalue_relative_tolerance: float,
-    maximum_mode_count: int,
-) -> OperatorDiagnosticBasis:
-    chains = np.asarray(chain_operator_series, dtype=float)
-    if (
-        chains.ndim != 3
-        or chains.shape[0] < 2
-        or chains.shape[1] < MINIMUM_OPERATOR_DIAGNOSTIC_PILOT_SAMPLES
-    ):
-        raise ValueError(
-            "operator diagnostic chains must have shape (chain, sample, observable)"
-        )
-    if eigenvalue_relative_tolerance <= 0.0 or maximum_mode_count <= 0:
-        raise ValueError("operator diagnostic subspace controls must be positive")
-    selection_samples = chains.reshape(-1, chains.shape[2])
-    selection_mean = np.mean(selection_samples, axis=0)
-    centered_selection = selection_samples - selection_mean
-    covariance = (
-        centered_selection.T @ centered_selection / (centered_selection.shape[0] - 1)
-    )
-    covariance_eigenvalues, covariance_eigenvectors = np.linalg.eigh(covariance)
-    covariance_scale = max(float(np.max(covariance_eigenvalues)), np.finfo(float).tiny)
-    active_indices = np.flatnonzero(
-        covariance_eigenvalues > eigenvalue_relative_tolerance * covariance_scale
-    )
-    if active_indices.size == 0:
-        raise ValueError("operator diagnostic selection found no active modes")
-    retained_indices = active_indices[-maximum_mode_count:]
-    retained_vectors = covariance_eigenvectors[:, retained_indices]
-    return OperatorDiagnosticBasis(mean=selection_mean, loadings=retained_vectors)
-
-
-def _rank_normalized_split_statistics(
-    scalar_chains: Array,
-) -> tuple[float, tuple[float, ...], tuple[float, ...], float, float]:
-    chains = np.asarray(scalar_chains, dtype=float)
-    if chains.ndim != 2 or chains.shape[0] < 2 or chains.shape[1] < 4:
-        raise ValueError("scalar chains require at least two chains and four samples")
-    half_sample_count = chains.shape[1] // 2
-    split_chains = np.concatenate(
-        (chains[:, :half_sample_count], chains[:, -half_sample_count:]), axis=0
-    )
-    flattened = split_chains.reshape(-1)
-    ranks = rankdata(flattened, method="average")
-    normalized = norm.ppf((ranks - 0.5) / ranks.size).reshape(split_chains.shape)
-    split_means = np.mean(normalized, axis=1)
-    split_variances = np.var(normalized, axis=1, ddof=1)
-    split_sample_count = split_chains.shape[1]
-    between_variance = float(split_sample_count * np.var(split_means, ddof=1))
-    within_variance = float(np.mean(split_variances))
-    rhat = math.inf
-    if within_variance > 0.0:
-        variance_estimate = (
-            (split_sample_count - 1) * within_variance + between_variance
-        ) / split_sample_count
-        rhat = math.sqrt(variance_estimate / within_variance)
-    if within_variance <= 0.0 and float(np.var(normalized)) <= 0.0:
-        rhat = 1.0
-    return (
-        float(rhat),
-        tuple(float(value) for value in split_means),
-        tuple(float(value) for value in split_variances),
-        within_variance,
-        between_variance,
-    )
-
-
-def fixed_operator_mode_diagnostics(
-    chain_operator_series: Array,
-    diagnostic_basis: OperatorDiagnosticBasis,
-    dirichlet_diagonal_count: int,
-    coupling_count: int,
-    direct_count: int,
-) -> tuple[OperatorModeDiagnostic, ...]:
-    chains = np.asarray(chain_operator_series, dtype=float)
-    expected_observable_count = dirichlet_diagonal_count + coupling_count + direct_count
-    if chains.ndim != 3 or chains.shape[2] != expected_observable_count:
-        raise ValueError("operator chains do not match diagnostic loading partitions")
-    projected = (chains - diagnostic_basis.mean) @ diagnostic_basis.loadings
-    diagnostics: list[OperatorModeDiagnostic] = []
-    coupling_start = dirichlet_diagonal_count
-    direct_start = coupling_start + coupling_count
-    for mode_index in range(projected.shape[2]):
-        scalar_chains = projected[:, :, mode_index]
-        (
-            bulk_rhat,
-            split_means,
-            split_variances,
-            within_variance,
-            between_variance,
-        ) = _rank_normalized_split_statistics(scalar_chains)
-        folded_chains = np.abs(scalar_chains - np.median(scalar_chains))
-        folded_rhat = _rank_normalized_split_statistics(folded_chains)[0]
-        effective_sample_size = float(
-            sum(
-                autocorrelation_and_effective_sample_size(chain).effective_sample_size
-                for chain in scalar_chains
-            )
-        )
-        loadings = diagnostic_basis.loadings[:, mode_index]
-        diagnostics.append(
-            OperatorModeDiagnostic(
-                mode_index=mode_index,
-                bulk_rhat=bulk_rhat,
-                folded_rhat=folded_rhat,
-                effective_sample_size=effective_sample_size,
-                split_chain_means=split_means,
-                split_chain_variances=split_variances,
-                within_variance=within_variance,
-                between_variance=between_variance,
-                loadings_on_A_diagonal=loadings[:coupling_start].copy(),
-                loadings_on_h=loadings[coupling_start:direct_start].copy(),
-                loadings_on_direct=loadings[direct_start:].copy(),
-            )
-        )
-    return tuple(diagnostics)
-
-
-def conductivity_influence_diagnostic(
-    chain_complete_operator_series: Array,
-    basis_count: int,
-    temperature_K: float,
-    volume_m3: float,
-    eigenvalue_relative_tolerance: float,
-) -> ConductivityInfluenceDiagnostic:
-    chains = np.asarray(chain_complete_operator_series, dtype=float)
-    dirichlet_size = basis_count * basis_count
-    coupling_size = basis_count * CARTESIAN_DIMENSION
-    expected_size = dirichlet_size + coupling_size + CARTESIAN_DIMENSION
-    if chains.ndim != 3 or chains.shape[2] != expected_size:
-        raise ValueError("complete operator chains have incompatible dimensions")
-    pooled_mean = np.mean(chains.reshape(-1, expected_size), axis=0)
-    mean_dirichlet = pooled_mean[:dirichlet_size].reshape(basis_count, basis_count)
-    mean_coupling = pooled_mean[
-        dirichlet_size : dirichlet_size + coupling_size
-    ].reshape(basis_count, CARTESIAN_DIMENSION)
-    mean_direct = pooled_mean[-CARTESIAN_DIMENSION:]
-    dirichlet_inverse = symmetric_psd_pseudoinverse(
-        mean_dirichlet, eigenvalue_relative_tolerance
-    )
-    coefficient_matrix = dirichlet_inverse @ mean_coupling
-    dirichlet_sensitivity = coefficient_matrix @ coefficient_matrix.T
-    prefactor = 1.0 / (CARTESIAN_DIMENSION * K_B * temperature_K * volume_m3)
-    influence_chains = np.empty(chains.shape[:2], dtype=float)
-    for chain_index in range(chains.shape[0]):
-        chain_values = chains[chain_index]
-        centered_dirichlet = (
-            chain_values[:, :dirichlet_size].reshape(-1, basis_count, basis_count)
-            - mean_dirichlet
-        )
-        centered_coupling = (
-            chain_values[:, dirichlet_size : dirichlet_size + coupling_size].reshape(
-                -1, basis_count, CARTESIAN_DIMENSION
-            )
-            - mean_coupling
-        )
-        centered_direct = chain_values[:, -CARTESIAN_DIMENSION:] - mean_direct
-        influence_chains[chain_index] = prefactor * (
-            np.sum(centered_direct, axis=1)
-            - 2.0 * np.einsum("ba,sba->s", coefficient_matrix, centered_coupling)
-            + np.einsum("bc,sbc->s", dirichlet_sensitivity, centered_dirichlet)
-        )
-    (
-        bulk_rhat,
-        split_means,
-        split_variances,
-        _within_variance,
-        _between_variance,
-    ) = _rank_normalized_split_statistics(influence_chains)
-    folded_chains = np.abs(influence_chains - np.median(influence_chains))
-    folded_rhat = _rank_normalized_split_statistics(folded_chains)[0]
-    effective_sample_size = float(
-        sum(
-            autocorrelation_and_effective_sample_size(chain).effective_sample_size
-            for chain in influence_chains
-        )
-    )
-    return ConductivityInfluenceDiagnostic(
-        bulk_rhat=bulk_rhat,
-        folded_rhat=folded_rhat,
-        effective_sample_size=effective_sample_size,
-        split_chain_means=split_means,
-        split_chain_variances=split_variances,
-    )
 
 
 def molecule_with_explicit_hydrogens(smiles: str):
@@ -403,6 +124,7 @@ class DynamicsSettings:
     initial_relaxation_minimum_force_improvement_fraction: float
     initial_relaxation_progress_stride: int
     force_batch_size: int
+    resolvent_operator_batch_size: int
     initial_force_tolerance_N: float
     equilibrium_sample_count: int
     equilibrium_chain_count: int
@@ -436,48 +158,10 @@ class NumericalSettings:
     polarization_residual_tolerance_V_m: float
     force_difference_step_m: float
     force_consistency_relative_tolerance: float
-    basis_radial_count: int
-    basis_fourier_shell: int
-    basis_angular_order: int
-    basis_cluster_depth: int
-    basis_correlation_order: int
-    basis_radial_cutoff_m: float
-    maximum_basis_size: int
-    eigenvalue_relative_tolerance: float
-    memory_psd_relative_tolerance: float
-    memory_plateau_relative_tolerance: float
-    memory_diffusive_exponent_tolerance: float
-    memory_lag_window_count: int
-    residual_tolerance: float
+    resolvent_eta_values_s_inv: tuple[float, ...]
+    equilibrium_standard_error_multiplier: float
     conductivity_tolerance_S_m: float
-    minimum_effective_sample_size: float
     minimum_interatomic_contact_ratio: float
-    stationarity_standard_error_limit: float
-    equilibrium_observable_relative_tolerance: float
-    maximum_split_rhat: float
-    pressure_log_volume_derivative_step: float
-    pressure_log_volume_derivative_check_step: float
-    pressure_derivative_relative_tolerance: float
-    pressure_volume_relative_tolerance: float
-
-
-@dataclass(frozen=True)
-class InternalPressureResult:
-    internal_pressure_Pa: float
-    ideal_pressure_Pa: float
-    configurational_pressure_Pa: float
-    mean_energy_derivative_J: float
-    relative_derivative_mismatch: float
-    bonded_pressure_Pa: float
-    lennard_jones_repulsion_pressure_Pa: float
-    lennard_jones_attraction_pressure_Pa: float
-    real_electrostatic_pressure_Pa: float
-    reciprocal_electrostatic_pressure_Pa: float
-    ewald_self_pressure_Pa: float
-    electrostatic_exclusion_pressure_Pa: float
-    polarization_pressure_Pa: float
-    polarization_self_pressure_Pa: float
-    polarization_exclusion_pressure_Pa: float
 
 
 @dataclass(frozen=True)
@@ -497,34 +181,31 @@ class IntegerRecipeRealization:
 @dataclass(frozen=True)
 class ConductivityResult:
     conductivity_S_m: float
-    direct_current_term_S_m: float
-    projected_correction_S_m: float
+    conductivity_lower_bound_S_m: float
+    conductivity_upper_bound_S_m: float
     conditioned_volume_m3: float
     conditioned_density_g_cm3: float
     thermodynamic_state: str
     density_source: str
-    integrated_memory_eigenvalues_kg_s: tuple[float, ...]
-    diffusion_eigenvalues_m2_s: tuple[float, ...]
+    generator_name: str
+    current_definition: str
+    interval_definition: str
+    interval_is_deterministic: bool
     basis_size: int
-    basis_conductivities_S_m: tuple[float, ...]
-    residual_history: tuple[float, ...]
-    maximum_residual_score: float
+    basis_labels: tuple[str, ...]
+    resolvent_intervals_S_m: tuple[tuple[float, float, float], ...]
+    cell_conductivities_S_m: tuple[tuple[float, float, float, float], ...]
+    basis_error_S_m: float
+    eta_continuation_error_S_m: float
+    finite_cell_error_S_m: float
+    equilibrium_error_S_m: float
+    linear_solve_error_S_m: float
+    linear_solve_relative_residual: float
     equilibrium_sample_count: int
     equilibrium_chain_count: int
-    memory_sample_count: int
-    effective_sample_size: float
-    maximum_split_rhat: float
     conductivity_mcse_S_m: float
+    finite_eta_resolvent_precision_reached: bool
     conductivity_precision_reached: bool
-    basis_diagnostics_certified: bool
-    operator_diagnostics_certified: bool
-    species_direct_contributions_S_m: tuple[tuple[str, float], ...]
-    molecular_self_frictions_by_species_kg_s: tuple[tuple[str, float], ...]
-    molecular_pair_frictions_by_species_kg_s: tuple[tuple[str, float], ...]
-    memory_descriptor_leverage_by_species: tuple[tuple[str, float], ...]
-    memory_pair_descriptor_leverage_by_species: tuple[tuple[str, float], ...]
-    memory_conditional_fit_relative_error: float
-    memory_conditional_heldout_relative_error: float
     realized_formula_unit_counts: tuple[tuple[str, int], ...]
     realized_molecule_counts: tuple[tuple[str, int], ...]
     realized_atom_count: int
@@ -535,33 +216,40 @@ class ConductivityResult:
 
 
 @dataclass(frozen=True)
-class OperatorDiagnosticBasis:
-    mean: Array
-    loadings: Array
+class HamiltonianPhaseSpaceSamples:
+    configurations_m: Array
+    box_vectors_m: Array
+    momenta_kg_m_s: Array
+    forces_N: Array
+    chain_indices: Array
 
 
 @dataclass(frozen=True)
-class OperatorModeDiagnostic:
-    mode_index: int
-    bulk_rhat: float
-    folded_rhat: float
-    effective_sample_size: float
-    split_chain_means: tuple[float, ...]
-    split_chain_variances: tuple[float, ...]
-    within_variance: float
-    between_variance: float
-    loadings_on_A_diagonal: Array
-    loadings_on_h: Array
-    loadings_on_direct: Array
+class HamiltonianBasisEvaluation:
+    basis_level: int
+    basis_labels: tuple[str, ...]
+    basis_values: Array
+    generator_values: Array
+    negative_generator_squared_values: Array
+    current_values: Array
+    chain_indices: Array
 
 
 @dataclass(frozen=True)
-class ConductivityInfluenceDiagnostic:
-    bulk_rhat: float
-    folded_rhat: float
-    effective_sample_size: float
-    split_chain_means: tuple[float, ...]
-    split_chain_variances: tuple[float, ...]
+class HamiltonianResolventEstimate:
+    resolvent_iterate_S_m: float
+    lower_bound_S_m: float
+    upper_bound_S_m: float
+    intervals_S_m: tuple[tuple[float, float, float], ...]
+    basis_error_S_m: float
+    eta_continuation_error_S_m: float
+    equilibrium_error_S_m: float
+    linear_solve_error_S_m: float
+    linear_solve_relative_residual: float
+    conductivity_mcse_S_m: float
+    basis_size: int
+    basis_labels: tuple[str, ...]
+    finite_eta_precision_reached: bool
 
 
 @dataclass(frozen=True)
@@ -586,6 +274,52 @@ class MolecularSystem:
         tuple[int, int, int, int, tuple[tuple[float, int, float], ...]], ...
     ]
     nonbonded_mask: Array
+
+
+def _molecular_system_from_checkpoint_record(record: dict) -> MolecularSystem:
+    return MolecularSystem(
+        positions_m=record["positions_m"],
+        box_vectors_m=record["box_vectors_m"],
+        masses_kg=record["masses_kg"],
+        charges_C=record["charges_C"],
+        lj_sigma_m=record["lj_sigma_m"],
+        lj_epsilon_J=record["lj_epsilon_J"],
+        polarizabilities_SI=record["polarizabilities_SI"],
+        molecule_index=record["molecule_index"],
+        molecule_atom_indices=tuple(record["molecule_atom_indices"]),
+        molecule_species_names=tuple(record["molecule_species_names"]),
+        bonds=record["bonds"],
+        bond_force_constants_J_m2=record["bond_force_constants_J_m2"],
+        bond_lengths_m=record["bond_lengths_m"],
+        angles=record["angles"],
+        angle_force_constants_J_rad2=record["angle_force_constants_J_rad2"],
+        angle_values_rad=record["angle_values_rad"],
+        torsions=tuple(record["torsions"]),
+        nonbonded_mask=record["nonbonded_mask"],
+    )
+
+
+def _integer_recipe_realization_from_checkpoint_record(
+    record: dict,
+) -> IntegerRecipeRealization:
+    return IntegerRecipeRealization(
+        formula_unit_counts=tuple(record["formula_unit_counts"]),
+        explicit_species_counts=tuple(record["explicit_species_counts"]),
+        explicit_molecule_count=int(record["explicit_molecule_count"]),
+        atom_count=int(record["atom_count"]),
+        cell_mass_kg=float(record["cell_mass_kg"]),
+        density_conditioned_volume_m3=float(record["density_conditioned_volume_m3"]),
+        realized_solvent_volume_fractions=tuple(
+            record["realized_solvent_volume_fractions"]
+        ),
+        realized_salt_molarities_mol_L=tuple(
+            record["realized_salt_molarities_mol_L"]
+        ),
+        realized_additive_weight_fractions=tuple(
+            record["realized_additive_weight_fractions"]
+        ),
+        native_unit_deviations=tuple(record["native_unit_deviations"]),
+    )
 
 
 @dataclass(frozen=True)
@@ -627,1385 +361,10 @@ class BatchedPhysicalEnergyTerms:
     polarization_exclusion_energy_J: Array
 
 
-@dataclass(frozen=True)
-class MolecularMemoryOperator:
-    integrated_friction_kg_s: Array
-    diffusion_m2_s: Array
-    physical_range_projector: Array
-    molecular_self_frictions_kg_s: Array
-    molecular_pair_frictions_kg_s: Array
-    temperature_K: float
-    decay_times_s: tuple[float, ...]
-    decay_weights: tuple[float, ...]
-    self_memory_spectral_amplitudes_kg_s2: Array
-    geometry_radial_edges_m: Array
-    self_descriptor_schema: tuple[str, ...]
-    pair_descriptor_schema: tuple[str, ...]
-    self_descriptor_friction_scales: Array
-    pair_descriptor_friction_scales: Array
-    lag_times_s: tuple[float, ...]
-    diffusion_plateau_relative_change: float
-    displacement_growth_exponent: float
-    sample_count: int
-    training_family_labels: tuple[str, ...]
-    training_dataset_count: int
-    descriptor_rank: int
-    conditional_kernel_fit_relative_error: float
-    conditional_kernel_heldout_relative_error: float
-    molecular_descriptor_leverages: Array
-    molecular_pair_descriptor_leverages: Array
-
-
-@dataclass(frozen=True)
-class LammpsFamilyMetadata:
-    molecular_charge_e: float
-    atom_count: int
-    bond_count: int
-    mole_fraction: float
-    mean_lj_sigma_m: float
-    mean_lj_epsilon_J: float
-    molecule_count: int
-
-
 def minimum_image_displacement(displacement_m: Array, box_vectors_m: Array) -> Array:
     fractional = np.asarray(displacement_m) @ np.linalg.inv(box_vectors_m)
     fractional -= np.rint(fractional)
     return fractional @ box_vectors_m
-
-
-def molecular_translation_projector(system: MolecularSystem) -> Array:
-    molecule_count = len(system.molecule_atom_indices)
-    translation_modes = np.zeros(
-        (CARTESIAN_DIMENSION * molecule_count, CARTESIAN_DIMENSION)
-    )
-    for molecule_index in range(molecule_count):
-        molecule_slice = slice(
-            CARTESIAN_DIMENSION * molecule_index,
-            CARTESIAN_DIMENSION * (molecule_index + 1),
-        )
-        translation_modes[molecule_slice] = np.eye(CARTESIAN_DIMENSION)
-    mode_gram_inverse = np.linalg.inv(translation_modes.T @ translation_modes)
-    return (
-        np.eye(CARTESIAN_DIMENSION * molecule_count)
-        - translation_modes @ mode_gram_inverse @ translation_modes.T
-    )
-
-
-def fit_transferable_molecular_memory_operator(
-    system: MolecularSystem,
-    temperature_K: float,
-    operator_data_root: Path,
-    eigenvalue_relative_tolerance: float,
-) -> MolecularMemoryOperator:
-    if temperature_K <= 0.0:
-        raise ValueError("temperature must be positive")
-    feature_rows: list[Array] = []
-    logarithmic_friction_targets: list[float] = []
-    pair_feature_rows: list[Array] = []
-    logarithmic_pair_friction_targets: list[float] = []
-    radial_edge_sets_A: list[Array] = []
-    self_fit_friction_rows: list[Array] = []
-    self_fit_weight_rows: list[Array] = []
-    self_heldout_friction_rows: list[Array] = []
-    self_heldout_weight_rows: list[Array] = []
-    pair_fit_friction_rows: list[Array] = []
-    pair_fit_weight_rows: list[Array] = []
-    pair_heldout_friction_rows: list[Array] = []
-    pair_heldout_weight_rows: list[Array] = []
-    self_descriptor_schemas: list[tuple[str, ...]] = []
-    pair_descriptor_schemas: list[tuple[str, ...]] = []
-    retained_lag_times_s: set[float] = set()
-    sample_count = 0
-    maximum_plateau_change = 0.0
-    decay_weight_rows: list[Array] = []
-    training_family_labels: set[str] = set()
-    training_dataset_count = 0
-    for operator_path in sorted(
-        operator_data_root.glob("*/replica_averaged_operator.npz")
-    ):
-        report = read_json_object(
-            operator_path.with_suffix(".json"),
-            "LAMMPS averaged molecular operator",
-        )
-        if report["plateau_gate_passed"] is not True:
-            continue
-        if report["tail_gate_passed"] is not True:
-            continue
-        if report["psd_gate_passed"] is not True:
-            continue
-        training_temperature_K = float(report["temperature_K"])
-        family_metadata = _load_lammps_family_metadata(operator_path.parent)
-        with np.load(operator_path) as operator:
-            required_conditional_fields = (
-                "self_descriptor_schema",
-                "pair_descriptor_schema",
-                "conditional_self_fit_weight_sums",
-                "conditional_self_fit_force_products_N2",
-                "conditional_self_heldout_weight_sums",
-                "conditional_self_heldout_force_products_N2",
-                "conditional_pair_fit_weight_sums",
-                "conditional_pair_fit_force_products_N2",
-                "conditional_pair_heldout_weight_sums",
-                "conditional_pair_heldout_force_products_N2",
-            )
-            missing_conditional_fields = tuple(
-                field_name
-                for field_name in required_conditional_fields
-                if field_name not in operator.files
-            )
-            if missing_conditional_fields:
-                raise ValueError(
-                    "LAMMPS operator lacks conditional lagged force statistics: "
-                    f"{missing_conditional_fields}"
-                )
-            family_labels = tuple(str(value) for value in operator["family_labels"])
-            family_masses_kg = np.asarray(operator["family_masses_kg"], dtype=float)
-            memory_kernel_kg_s2 = np.asarray(
-                operator["memory_kernel_kg_s2"], dtype=float
-            )
-            conditional_lag_times_s = np.asarray(operator["lag_times_s"], dtype=float)
-            radial_edge_sets_A.append(
-                np.asarray(operator["geometry_radial_bin_edges_A"], dtype=float)
-            )
-            self_descriptor_schemas.append(
-                tuple(str(value) for value in operator["self_descriptor_schema"])
-            )
-            pair_descriptor_schemas.append(
-                tuple(str(value) for value in operator["pair_descriptor_schema"])
-            )
-            positive_conditional_lag_times_s = conditional_lag_times_s[1:]
-            conditional_relaxation_time_count = min(
-                positive_conditional_lag_times_s.size,
-                max(
-                    len(self_descriptor_schemas[-1]),
-                    len(pair_descriptor_schemas[-1]),
-                ),
-            )
-            conditional_relaxation_times_s = np.geomspace(
-                positive_conditional_lag_times_s[0],
-                positive_conditional_lag_times_s[-1],
-                conditional_relaxation_time_count,
-            )
-            conditional_exponential_basis = np.exp(
-                -conditional_lag_times_s[:, None]
-                / conditional_relaxation_times_s[None, :]
-            )
-            for (
-                weight_field,
-                product_field,
-                friction_sign,
-                target_rows,
-                weight_rows,
-            ) in (
-                (
-                    "conditional_self_fit_weight_sums",
-                    "conditional_self_fit_force_products_N2",
-                    1.0,
-                    self_fit_friction_rows,
-                    self_fit_weight_rows,
-                ),
-                (
-                    "conditional_self_heldout_weight_sums",
-                    "conditional_self_heldout_force_products_N2",
-                    1.0,
-                    self_heldout_friction_rows,
-                    self_heldout_weight_rows,
-                ),
-                (
-                    "conditional_pair_fit_weight_sums",
-                    "conditional_pair_fit_force_products_N2",
-                    -1.0,
-                    pair_fit_friction_rows,
-                    pair_fit_weight_rows,
-                ),
-                (
-                    "conditional_pair_heldout_weight_sums",
-                    "conditional_pair_heldout_force_products_N2",
-                    -1.0,
-                    pair_heldout_friction_rows,
-                    pair_heldout_weight_rows,
-                ),
-            ):
-                partition_weights = np.asarray(operator[weight_field], dtype=float)
-                partition_products = np.asarray(operator[product_field], dtype=float)
-                zero_lag_weights = partition_weights[0]
-                conditional_covariances_N2 = partition_products / np.maximum(
-                    partition_weights[:, :, np.newaxis, np.newaxis],
-                    np.finfo(float).tiny,
-                )
-                conditional_covariance_traces_N2 = np.trace(
-                    conditional_covariances_N2, axis1=2, axis2=3
-                )
-                conditional_friction_kernel_kg_s2 = (
-                    friction_sign
-                    * conditional_covariance_traces_N2
-                    / (CARTESIAN_DIMENSION * K_B * training_temperature_K)
-                )
-                integrated_partition_frictions_kg_s = np.asarray(
-                    tuple(
-                        float(
-                            nnls(
-                                conditional_exponential_basis,
-                                conditional_friction_kernel_kg_s2[:, descriptor_index],
-                            )[0]
-                            @ conditional_relaxation_times_s
-                        )
-                        for descriptor_index in range(
-                            conditional_friction_kernel_kg_s2.shape[1]
-                        )
-                    )
-                )
-                resolved_descriptors = zero_lag_weights > 0.0
-                if friction_sign > 0.0 and np.any(
-                    integrated_partition_frictions_kg_s[resolved_descriptors] <= 0.0
-                ):
-                    raise ValueError("conditional self Mori friction must be positive")
-                target_rows.append(integrated_partition_frictions_kg_s)
-                weight_rows.append(zero_lag_weights)
-            retained_lag_times_s.update(
-                float(value) for value in operator["lag_times_s"]
-            )
-            sample_count += int(operator["lag_sample_counts"][0])
-        maximum_plateau_change = max(
-            maximum_plateau_change,
-            float(report["maximum_lag_ladder_relative_change"]),
-        )
-        operator_lag_times_s = np.asarray(sorted(retained_lag_times_s))
-        operator_lag_times_s = operator_lag_times_s[: memory_kernel_kg_s2.shape[0]]
-        positive_lag_times_s = operator_lag_times_s[1:]
-        relaxation_time_count = min(
-            positive_lag_times_s.size,
-            len(self_descriptor_schemas[-1]),
-        )
-        relaxation_times_s = np.geomspace(
-            positive_lag_times_s[0],
-            positive_lag_times_s[-1],
-            relaxation_time_count,
-        )
-        exponential_basis = np.exp(
-            -operator_lag_times_s[:, None] / relaxation_times_s[None, :]
-        )
-        for family_index, _family_mass_kg in enumerate(family_masses_kg):
-            family_label = family_labels[family_index]
-            if family_label not in family_metadata:
-                raise ValueError(
-                    f"LAMMPS metadata omits operator family {family_label}"
-                )
-            family_slice = slice(
-                CARTESIAN_DIMENSION * family_index,
-                CARTESIAN_DIMENSION * (family_index + 1),
-            )
-            isotropic_memory_kernel_kg_s2 = (
-                np.trace(
-                    memory_kernel_kg_s2[:, family_slice, family_slice],
-                    axis1=1,
-                    axis2=2,
-                )
-                / CARTESIAN_DIMENSION
-            )
-            spectral_amplitudes_kg_s2, _residual_norm = nnls(
-                exponential_basis,
-                isotropic_memory_kernel_kg_s2,
-            )
-            integrated_friction_kg_s = float(
-                spectral_amplitudes_kg_s2 @ relaxation_times_s
-            )
-            if integrated_friction_kg_s <= 0.0:
-                raise ValueError("fitted molecular friction must be positive")
-            feature_rows.append(
-                _molecular_friction_features(
-                    molecular_mass_kg=float(family_masses_kg[family_index]),
-                    metadata=family_metadata[family_label],
-                    temperature_K=training_temperature_K,
-                )
-            )
-            training_family_labels.add(family_label)
-            logarithmic_friction_targets.append(math.log(integrated_friction_kg_s))
-            decay_weight_rows.append(
-                spectral_amplitudes_kg_s2
-                * relaxation_times_s
-                / integrated_friction_kg_s
-            )
-        family_features = tuple(
-            _molecular_friction_features(
-                molecular_mass_kg=float(family_masses_kg[family_index]),
-                metadata=family_metadata[family_label],
-                temperature_K=training_temperature_K,
-            )
-            for family_index, family_label in enumerate(family_labels)
-        )
-        for first_family, second_family in combinations(range(len(family_labels)), 2):
-            first_slice = slice(
-                CARTESIAN_DIMENSION * first_family,
-                CARTESIAN_DIMENSION * (first_family + 1),
-            )
-            second_slice = slice(
-                CARTESIAN_DIMENSION * second_family,
-                CARTESIAN_DIMENSION * (second_family + 1),
-            )
-            cross_kernel = (
-                -np.trace(
-                    0.5
-                    * (
-                        memory_kernel_kg_s2[:, first_slice, second_slice]
-                        + memory_kernel_kg_s2[:, second_slice, first_slice]
-                    ),
-                    axis1=1,
-                    axis2=2,
-                )
-                / CARTESIAN_DIMENSION
-            )
-            cross_amplitudes_kg_s2, _cross_residual = nnls(
-                exponential_basis, cross_kernel
-            )
-            family_pair_friction_kg_s = float(
-                cross_amplitudes_kg_s2 @ relaxation_times_s
-            )
-            if family_pair_friction_kg_s <= 0.0:
-                continue
-            pair_count = (
-                family_metadata[family_labels[first_family]].molecule_count
-                * family_metadata[family_labels[second_family]].molecule_count
-            )
-            pair_feature_rows.append(
-                _pair_friction_features(
-                    family_features[first_family],
-                    family_features[second_family],
-                )
-            )
-            logarithmic_pair_friction_targets.append(
-                math.log(family_pair_friction_kg_s / pair_count)
-            )
-        training_dataset_count += 1
-    if not feature_rows:
-        raise ValueError("LAMMPS corpus contains no shared admitted operators")
-    reference_radial_edges_A = radial_edge_sets_A[0]
-    if any(
-        not np.array_equal(radial_edges_A, reference_radial_edges_A)
-        for radial_edges_A in radial_edge_sets_A[1:]
-    ):
-        raise ValueError("shared operator corpus uses inconsistent radial bins")
-    reference_self_schema = self_descriptor_schemas[0]
-    if any(
-        descriptor_schema != reference_self_schema
-        for descriptor_schema in self_descriptor_schemas[1:]
-    ):
-        raise ValueError("shared operator corpus uses inconsistent self descriptors")
-    reference_pair_schema = pair_descriptor_schemas[0]
-    if any(
-        descriptor_schema != reference_pair_schema
-        for descriptor_schema in pair_descriptor_schemas[1:]
-    ):
-        raise ValueError("shared operator corpus uses inconsistent pair descriptors")
-    feature_matrix = np.stack(feature_rows)
-    descriptor_rank = int(np.linalg.matrix_rank(feature_matrix))
-    self_fit_friction_array = np.stack(self_fit_friction_rows)
-    self_fit_weight_array = np.stack(self_fit_weight_rows)
-    pair_fit_friction_array = np.stack(pair_fit_friction_rows)
-    pair_fit_weight_array = np.stack(pair_fit_weight_rows)
-    self_weight_totals = np.sum(self_fit_weight_array, axis=0)
-    pair_weight_totals = np.sum(pair_fit_weight_array, axis=0)
-    self_resolved_descriptors = self_weight_totals > 0.0
-    pair_resolved_descriptors = pair_weight_totals > 0.0
-    self_friction_coefficients = np.zeros_like(self_weight_totals)
-    pair_friction_coefficients = np.zeros_like(pair_weight_totals)
-    self_friction_coefficients[self_resolved_descriptors] = (
-        np.sum(self_fit_weight_array * self_fit_friction_array, axis=0)[
-            self_resolved_descriptors
-        ]
-        / self_weight_totals[self_resolved_descriptors]
-    )
-    pair_friction_coefficients[pair_resolved_descriptors] = (
-        np.sum(pair_fit_weight_array * pair_fit_friction_array, axis=0)[
-            pair_resolved_descriptors
-        ]
-        / pair_weight_totals[pair_resolved_descriptors]
-    )
-    uniform_descriptor_index = reference_self_schema.index("uniform")
-    self_descriptor_friction_scales = (
-        self_friction_coefficients
-        / self_friction_coefficients[uniform_descriptor_index]
-    )
-    pair_descriptor_friction_scales = pair_friction_coefficients / np.average(
-        pair_friction_coefficients[pair_resolved_descriptors],
-        weights=pair_weight_totals[pair_resolved_descriptors],
-    )
-    conditional_kernel_fit_relative_error = float(
-        np.sqrt(
-            np.linalg.norm(
-                np.sqrt(self_fit_weight_array)
-                * (self_friction_coefficients[None, :] - self_fit_friction_array)
-            )
-            ** 2
-            + np.linalg.norm(
-                np.sqrt(pair_fit_weight_array)
-                * (pair_friction_coefficients[None, :] - pair_fit_friction_array)
-            )
-            ** 2
-        )
-        / max(
-            float(
-                np.sqrt(
-                    np.linalg.norm(
-                        np.sqrt(self_fit_weight_array) * self_fit_friction_array
-                    )
-                    ** 2
-                    + np.linalg.norm(
-                        np.sqrt(pair_fit_weight_array) * pair_fit_friction_array
-                    )
-                    ** 2
-                )
-            ),
-            np.finfo(float).tiny,
-        )
-    )
-    self_heldout_friction_array = np.stack(self_heldout_friction_rows)
-    self_heldout_weight_array = np.stack(self_heldout_weight_rows)
-    pair_heldout_friction_array = np.stack(pair_heldout_friction_rows)
-    pair_heldout_weight_array = np.stack(pair_heldout_weight_rows)
-    conditional_kernel_heldout_relative_error = float(
-        np.sqrt(
-            np.linalg.norm(
-                np.sqrt(self_heldout_weight_array)
-                * (self_friction_coefficients[None, :] - self_heldout_friction_array)
-            )
-            ** 2
-            + np.linalg.norm(
-                np.sqrt(pair_heldout_weight_array)
-                * (pair_friction_coefficients[None, :] - pair_heldout_friction_array)
-            )
-            ** 2
-        )
-        / max(
-            float(
-                np.sqrt(
-                    np.linalg.norm(
-                        np.sqrt(self_heldout_weight_array) * self_heldout_friction_array
-                    )
-                    ** 2
-                    + np.linalg.norm(
-                        np.sqrt(pair_heldout_weight_array) * pair_heldout_friction_array
-                    )
-                    ** 2
-                )
-            ),
-            np.finfo(float).tiny,
-        )
-    )
-    species_counts = {
-        species_name: system.molecule_species_names.count(species_name)
-        for species_name in set(system.molecule_species_names)
-    }
-    molecule_count = len(system.molecule_atom_indices)
-    prediction_features = np.stack(
-        tuple(
-            _molecular_friction_features(
-                molecular_mass_kg=float(
-                    np.sum(system.masses_kg[molecule_atom_indices])
-                ),
-                metadata=_system_family_metadata(
-                    system=system,
-                    molecule_atom_indices=molecule_atom_indices,
-                    mole_fraction=species_counts[species_name] / molecule_count,
-                ),
-                temperature_K=temperature_K,
-            )
-            for species_name, molecule_atom_indices in zip(
-                system.molecule_species_names,
-                system.molecule_atom_indices,
-                strict=True,
-            )
-        )
-    )
-    predicted_log_molecular_frictions, molecular_descriptor_leverages = (
-        _regularized_log_friction_prediction(
-            training_features=feature_matrix,
-            logarithmic_training_targets=np.asarray(logarithmic_friction_targets),
-            prediction_features=prediction_features,
-        )
-    )
-    molecular_frictions_kg_s = np.exp(predicted_log_molecular_frictions)
-    molecule_pair_indices = tuple(combinations(range(molecule_count), 2))
-    pair_prediction_features = np.stack(
-        tuple(
-            _pair_friction_features(
-                prediction_features[first_molecule],
-                prediction_features[second_molecule],
-            )
-            for first_molecule, second_molecule in molecule_pair_indices
-        )
-    )
-    predicted_log_pair_frictions, molecular_pair_descriptor_leverages = (
-        _regularized_log_friction_prediction(
-            training_features=np.stack(pair_feature_rows),
-            logarithmic_training_targets=np.asarray(logarithmic_pair_friction_targets),
-            prediction_features=pair_prediction_features,
-        )
-    )
-    molecular_pair_frictions_kg_s = np.exp(predicted_log_pair_frictions)
-    positive_retained_lag_times_s = np.asarray(
-        tuple(sorted(value for value in retained_lag_times_s if value > 0.0))
-    )
-    decay_times_s = np.geomspace(
-        positive_retained_lag_times_s[0],
-        positive_retained_lag_times_s[-1],
-        len(decay_weight_rows[0]),
-    )
-    decay_weights = np.mean(np.stack(decay_weight_rows), axis=0)
-    decay_weights /= np.sum(decay_weights)
-    self_memory_spectral_amplitudes_kg_s2 = (
-        molecular_frictions_kg_s[:, None]
-        * decay_weights[None, :]
-        / decay_times_s[None, :]
-    )
-    unprojected_friction = np.diag(
-        np.repeat(molecular_frictions_kg_s, CARTESIAN_DIMENSION)
-    )
-    molecular_pair_friction_matrix_kg_s = np.zeros(
-        (molecule_count, molecule_count), dtype=float
-    )
-    for (
-        first_molecule,
-        second_molecule,
-    ), pair_friction_kg_s in zip(
-        molecule_pair_indices,
-        molecular_pair_frictions_kg_s,
-        strict=True,
-    ):
-        molecular_pair_friction_matrix_kg_s[first_molecule, second_molecule] = (
-            pair_friction_kg_s
-        )
-        molecular_pair_friction_matrix_kg_s[second_molecule, first_molecule] = (
-            pair_friction_kg_s
-        )
-        for axis in range(CARTESIAN_DIMENSION):
-            first_coordinate = CARTESIAN_DIMENSION * first_molecule + axis
-            second_coordinate = CARTESIAN_DIMENSION * second_molecule + axis
-            unprojected_friction[first_coordinate, first_coordinate] += (
-                pair_friction_kg_s
-            )
-            unprojected_friction[second_coordinate, second_coordinate] += (
-                pair_friction_kg_s
-            )
-            unprojected_friction[first_coordinate, second_coordinate] -= (
-                pair_friction_kg_s
-            )
-            unprojected_friction[second_coordinate, first_coordinate] -= (
-                pair_friction_kg_s
-            )
-    physical_range_projector = molecular_translation_projector(system)
-    integrated_friction = (
-        physical_range_projector @ unprojected_friction @ physical_range_projector
-    )
-    integrated_friction = 0.5 * (integrated_friction + integrated_friction.T)
-    diffusion = (
-        K_B
-        * temperature_K
-        * symmetric_psd_pseudoinverse(
-            integrated_friction, eigenvalue_relative_tolerance
-        )
-    )
-    return MolecularMemoryOperator(
-        integrated_friction_kg_s=integrated_friction,
-        diffusion_m2_s=diffusion,
-        physical_range_projector=physical_range_projector,
-        molecular_self_frictions_kg_s=molecular_frictions_kg_s,
-        molecular_pair_frictions_kg_s=molecular_pair_friction_matrix_kg_s,
-        temperature_K=temperature_K,
-        decay_times_s=tuple(float(value) for value in decay_times_s),
-        decay_weights=tuple(float(value) for value in decay_weights),
-        self_memory_spectral_amplitudes_kg_s2=(self_memory_spectral_amplitudes_kg_s2),
-        geometry_radial_edges_m=reference_radial_edges_A * ANGSTROM_TO_M,
-        self_descriptor_schema=reference_self_schema,
-        pair_descriptor_schema=reference_pair_schema,
-        self_descriptor_friction_scales=self_descriptor_friction_scales,
-        pair_descriptor_friction_scales=pair_descriptor_friction_scales,
-        lag_times_s=tuple(sorted(retained_lag_times_s)),
-        diffusion_plateau_relative_change=maximum_plateau_change,
-        displacement_growth_exponent=1.0,
-        sample_count=sample_count,
-        training_family_labels=tuple(sorted(training_family_labels)),
-        training_dataset_count=training_dataset_count,
-        descriptor_rank=descriptor_rank,
-        conditional_kernel_fit_relative_error=conditional_kernel_fit_relative_error,
-        conditional_kernel_heldout_relative_error=(
-            conditional_kernel_heldout_relative_error
-        ),
-        molecular_descriptor_leverages=molecular_descriptor_leverages,
-        molecular_pair_descriptor_leverages=molecular_pair_descriptor_leverages,
-    )
-
-
-def _regularized_log_friction_prediction(
-    training_features: Array,
-    logarithmic_training_targets: Array,
-    prediction_features: Array,
-) -> tuple[Array, Array]:
-    descriptor_features = np.asarray(training_features[:, 1:], dtype=float)
-    prediction_descriptors = np.asarray(prediction_features[:, 1:], dtype=float)
-    descriptor_mean = np.mean(descriptor_features, axis=0)
-    descriptor_scale = np.std(descriptor_features, axis=0)
-    active_descriptors = descriptor_scale > math.sqrt(np.finfo(float).eps)
-    if not np.any(active_descriptors):
-        return (
-            np.full(
-                prediction_features.shape[0],
-                np.mean(logarithmic_training_targets),
-            ),
-            np.zeros(prediction_features.shape[0]),
-        )
-    standardized_training = (
-        descriptor_features[:, active_descriptors] - descriptor_mean[active_descriptors]
-    ) / descriptor_scale[active_descriptors]
-    standardized_prediction = (
-        prediction_descriptors[:, active_descriptors]
-        - descriptor_mean[active_descriptors]
-    ) / descriptor_scale[active_descriptors]
-    centered_targets = logarithmic_training_targets - np.mean(
-        logarithmic_training_targets
-    )
-    descriptor_gram = standardized_training.T @ standardized_training
-    spectral_penalty = float(np.trace(descriptor_gram) / descriptor_gram.shape[0])
-    regularized_descriptor_gram = descriptor_gram + spectral_penalty * np.eye(
-        descriptor_gram.shape[0]
-    )
-    coefficients = np.linalg.solve(
-        regularized_descriptor_gram,
-        standardized_training.T @ centered_targets,
-    )
-    descriptor_leverages = np.einsum(
-        "bi,ij,bj->b",
-        standardized_prediction,
-        np.linalg.inv(regularized_descriptor_gram),
-        standardized_prediction,
-    )
-    return (
-        np.mean(logarithmic_training_targets) + standardized_prediction @ coefficients,
-        descriptor_leverages,
-    )
-
-
-def _pair_friction_features(
-    first_features: Array,
-    second_features: Array,
-) -> Array:
-    return np.concatenate(
-        (
-            np.asarray((1.0,)),
-            first_features[1:] + second_features[1:],
-            np.abs(first_features[1:] - second_features[1:]),
-        )
-    )
-
-
-def _load_lammps_family_metadata(
-    operator_directory: Path,
-) -> dict[str, LammpsFamilyMetadata]:
-    replica_directory = operator_directory / "replica_1"
-    copies_path = next(replica_directory.glob("*.copies.json"))
-    composition_paths = tuple(
-        path
-        for path in replica_directory.glob("*.composition.json")
-        if not path.name.endswith(".md_composition.json")
-    )
-    if len(composition_paths) != 1:
-        raise ValueError(
-            f"{replica_directory} must contain one recipe composition record"
-        )
-    copies = read_json_object(copies_path, "LAMMPS molecule copies")
-    composition = read_json_object(composition_paths[0], "LAMMPS recipe composition")
-    coverage = read_json_object(
-        replica_directory / "species_forcefield_coverage.json",
-        "LAMMPS force-field coverage",
-    )
-    topology_path = replica_directory / f"{operator_directory.name}.lmp"
-    pair_coefficients, molecule_atom_types = _read_lammps_lj_topology(topology_path)
-    species_list = tuple(str(value) for value in composition["species_list"])
-    mole_fractions = tuple(float(value) for value in composition["mole_fractions"])
-    if len(species_list) != len(mole_fractions):
-        raise ValueError("LAMMPS species and mole-fraction lengths differ")
-    species_ranges = {
-        str(record["name"]): int(record["first_mol_id"])
-        for record in copies["species_ranges"]
-    }
-    metadata: dict[str, LammpsFamilyMetadata] = {}
-    for species_name, mole_fraction in zip(species_list, mole_fractions, strict=True):
-        if species_name not in coverage or species_name not in species_ranges:
-            raise ValueError(f"incomplete LAMMPS metadata for {species_name}")
-        atom_types = molecule_atom_types[species_ranges[species_name]]
-        lj_coefficients = np.asarray(
-            tuple(pair_coefficients[atom_type] for atom_type in atom_types)
-        )
-        metadata[species_name] = LammpsFamilyMetadata(
-            molecular_charge_e=float(coverage[species_name]["net_charge_e"]),
-            atom_count=int(coverage[species_name]["atom_count"]),
-            bond_count=int(coverage[species_name]["bond_count"]),
-            mole_fraction=mole_fraction,
-            mean_lj_sigma_m=(float(np.mean(lj_coefficients[:, 1])) * ANGSTROM_TO_M),
-            mean_lj_epsilon_J=(float(np.mean(lj_coefficients[:, 0])) * KCAL_TO_J / N_A),
-            molecule_count=int(composition["molecule_counts"][species_name]),
-        )
-    return metadata
-
-
-def _read_lammps_lj_topology(
-    topology_path: Path,
-) -> tuple[dict[int, tuple[float, float]], dict[int, list[int]]]:
-    pair_coefficients: dict[int, tuple[float, float]] = {}
-    molecule_atom_types: dict[int, list[int]] = {}
-    section = ""
-    for line in topology_path.read_text().splitlines():
-        stripped = line.strip()
-        if stripped in {"Pair Coeffs", "Atoms"}:
-            section = stripped
-            continue
-        if stripped in {"Bond Coeffs", "Bonds"}:
-            section = ""
-            continue
-        if not stripped or stripped.startswith("#"):
-            continue
-        fields = stripped.split()
-        if section == "Pair Coeffs" and len(fields) >= 3:
-            pair_coefficients[int(fields[0])] = (
-                float(fields[1]),
-                float(fields[2]),
-            )
-        elif section == "Atoms" and len(fields) >= 4:
-            molecule_atom_types.setdefault(int(fields[1]), []).append(int(fields[2]))
-    if not pair_coefficients or not molecule_atom_types:
-        raise ValueError(f"could not read LAMMPS LJ topology from {topology_path}")
-    return pair_coefficients, molecule_atom_types
-
-
-def _system_family_metadata(
-    system: MolecularSystem,
-    molecule_atom_indices: Array,
-    mole_fraction: float,
-) -> LammpsFamilyMetadata:
-    atom_membership = np.zeros(system.positions_m.shape[0], dtype=bool)
-    atom_membership[molecule_atom_indices] = True
-    bond_count = int(
-        np.sum(
-            atom_membership[system.bonds[:, 0]] & atom_membership[system.bonds[:, 1]]
-        )
-    )
-    return LammpsFamilyMetadata(
-        molecular_charge_e=float(
-            np.sum(system.charges_C[molecule_atom_indices]) / E_CHARGE
-        ),
-        atom_count=int(molecule_atom_indices.size),
-        bond_count=bond_count,
-        mole_fraction=mole_fraction,
-        mean_lj_sigma_m=float(np.mean(system.lj_sigma_m[molecule_atom_indices])),
-        mean_lj_epsilon_J=float(np.mean(system.lj_epsilon_J[molecule_atom_indices])),
-        molecule_count=1,
-    )
-
-
-def _molecular_friction_features(
-    molecular_mass_kg: float,
-    metadata: LammpsFamilyMetadata,
-    temperature_K: float,
-) -> Array:
-    positive_values = (
-        molecular_mass_kg,
-        float(metadata.atom_count),
-        metadata.mole_fraction,
-        metadata.mean_lj_sigma_m,
-        temperature_K,
-    )
-    if any(value <= 0.0 for value in positive_values):
-        raise ValueError("molecular friction descriptors must be positive")
-    if metadata.bond_count < 0:
-        raise ValueError("molecular bond count cannot be negative")
-    if metadata.mean_lj_epsilon_J < 0.0:
-        raise ValueError("Lennard-Jones well depth cannot be negative")
-    return np.asarray(
-        (
-            1.0,
-            math.log(molecular_mass_kg),
-            metadata.molecular_charge_e,
-            abs(metadata.molecular_charge_e),
-            math.log(float(metadata.atom_count)),
-            metadata.bond_count / metadata.atom_count,
-            math.log(metadata.mole_fraction),
-            math.log(metadata.mean_lj_sigma_m),
-            metadata.mean_lj_epsilon_J / (K_B * temperature_K),
-            math.log(temperature_K),
-        )
-    )
-
-
-def configuration_conditioned_integrated_friction(
-    positions_m: Array,
-    system: MolecularSystem,
-    molecular_memory: MolecularMemoryOperator,
-) -> Array:
-    radial_edges_m = np.asarray(molecular_memory.geometry_radial_edges_m, dtype=float)
-    if radial_edges_m.size == 0:
-        return molecular_memory.integrated_friction_kg_s
-    self_scales = np.asarray(
-        molecular_memory.self_descriptor_friction_scales, dtype=float
-    )
-    pair_scales = np.asarray(
-        molecular_memory.pair_descriptor_friction_scales, dtype=float
-    )
-    if self_scales.shape != (len(molecular_memory.self_descriptor_schema),):
-        raise ValueError("self friction scales do not match descriptor schema")
-    if pair_scales.shape != (len(molecular_memory.pair_descriptor_schema),):
-        raise ValueError("pair friction scales do not match descriptor schema")
-    molecule_centers_m = np.asarray(
-        tuple(
-            np.average(
-                positions_m[molecule_atom_indices],
-                axis=0,
-                weights=system.masses_kg[molecule_atom_indices],
-            )
-            for molecule_atom_indices in system.molecule_atom_indices
-        )
-    )
-    molecule_count = molecule_centers_m.shape[0]
-    molecular_charges_C = np.asarray(
-        tuple(
-            np.sum(system.charges_C[molecule_atom_indices])
-            for molecule_atom_indices in system.molecule_atom_indices
-        )
-    )
-    molecular_radius_gyration_m2 = np.zeros(molecule_count)
-    molecular_orientation_dyads = np.zeros(
-        (molecule_count, CARTESIAN_DIMENSION, CARTESIAN_DIMENSION)
-    )
-    for molecule_index, molecule_atom_indices in enumerate(
-        system.molecule_atom_indices
-    ):
-        local_positions_m = positions_m[molecule_atom_indices]
-        anchor_m = local_positions_m[0]
-        local_positions_m = anchor_m + minimum_image_displacement(
-            local_positions_m - anchor_m, system.box_vectors_m
-        )
-        centered_positions_m = local_positions_m - molecule_centers_m[molecule_index]
-        molecule_masses_kg = system.masses_kg[molecule_atom_indices]
-        molecular_radius_gyration_m2[molecule_index] = np.average(
-            np.sum(centered_positions_m**2, axis=1),
-            weights=molecule_masses_kg,
-        )
-        if molecule_atom_indices.size > 1:
-            gyration_tensor_m2 = np.einsum(
-                "i,ia,ib->ab",
-                molecule_masses_kg,
-                centered_positions_m,
-                centered_positions_m,
-            ) / np.sum(molecule_masses_kg)
-            eigenvalues_m2, eigenvectors = np.linalg.eigh(gyration_tensor_m2)
-            if eigenvalues_m2[-1] > np.finfo(float).eps:
-                principal_axis = eigenvectors[:, -1]
-                molecular_orientation_dyads[molecule_index] = np.outer(
-                    principal_axis, principal_axis
-                )
-    first_indices, second_indices = np.where(~np.eye(molecule_count, dtype=bool))
-    displacements_m = minimum_image_displacement(
-        molecule_centers_m[second_indices] - molecule_centers_m[first_indices],
-        system.box_vectors_m,
-    )
-    distances_m = np.linalg.norm(displacements_m, axis=1)
-    radial_bins = np.searchsorted(radial_edges_m, distances_m, side="right") - 1
-    admitted = (radial_bins >= 0) & (radial_bins < radial_edges_m.size - 1)
-    source_indices = first_indices[admitted]
-    target_indices = second_indices[admitted]
-    pair_distances_m = distances_m[admitted]
-    pair_displacements_m = displacements_m[admitted]
-    radial_bins = radial_bins[admitted]
-    unit_vectors = pair_displacements_m / pair_distances_m[:, None]
-    adjacency = np.zeros((molecule_count, molecule_count), dtype=float)
-    adjacency[source_indices, target_indices] = 0.5 * (
-        1.0 + np.cos(np.pi * pair_distances_m / radial_edges_m[-1])
-    )
-    cluster_degree = np.sum(adjacency, axis=1)
-    cluster_depth_two = adjacency @ cluster_degree
-    charge_scale_C = max(
-        float(np.max(np.abs(molecular_charges_C))), np.finfo(float).tiny
-    )
-    positive_charge = np.maximum(molecular_charges_C, 0.0) / charge_scale_C
-    negative_charge = np.maximum(-molecular_charges_C, 0.0) / charge_scale_C
-    radius_scale_m2 = max(
-        float(np.max(molecular_radius_gyration_m2)), np.finfo(float).tiny
-    )
-    orientation_alignment = np.maximum(
-        np.einsum(
-            "pa,pab,pb->p",
-            unit_vectors,
-            molecular_orientation_dyads[source_indices],
-            unit_vectors,
-        ),
-        0.0,
-    )
-    common_neighbor = np.sum(
-        adjacency[source_indices] * adjacency[target_indices], axis=1
-    )
-    self_descriptor_values = np.zeros(
-        (molecule_count, len(molecular_memory.self_descriptor_schema))
-    )
-    self_descriptor_index = {
-        name: index
-        for index, name in enumerate(molecular_memory.self_descriptor_schema)
-    }
-    self_descriptor_values[:, self_descriptor_index["uniform"]] = 1.0
-    self_descriptor_values[:, self_descriptor_index["molecular_radius_gyration_A2"]] = (
-        molecular_radius_gyration_m2 / radius_scale_m2
-    )
-    self_descriptor_values[:, self_descriptor_index["smooth_cluster_degree"]] = (
-        cluster_degree
-    )
-    self_descriptor_values[:, self_descriptor_index["smooth_cluster_depth_2"]] = (
-        cluster_depth_two
-    )
-    pair_descriptor_values = np.zeros(
-        (source_indices.size, len(molecular_memory.pair_descriptor_schema))
-    )
-    pair_descriptor_index = {
-        name: index
-        for index, name in enumerate(molecular_memory.pair_descriptor_schema)
-    }
-    for pair_index, (source_index, target_index, radial_bin_index) in enumerate(
-        zip(source_indices, target_indices, radial_bins, strict=True)
-    ):
-        for descriptor_name, value in (
-            (f"number_density_bin_{radial_bin_index}", 1.0),
-            (
-                f"positive_charge_density_bin_{radial_bin_index}",
-                positive_charge[target_index],
-            ),
-            (
-                f"negative_charge_density_bin_{radial_bin_index}",
-                negative_charge[target_index],
-            ),
-            (
-                f"orientation_axis_alignment_bin_{radial_bin_index}",
-                orientation_alignment[pair_index],
-            ),
-        ):
-            self_descriptor_values[
-                source_index, self_descriptor_index[descriptor_name]
-            ] += value
-        for descriptor_name, value in (
-            (f"pair_radial_bin_{radial_bin_index}", 1.0),
-            (
-                f"pair_orientation_alignment_bin_{radial_bin_index}",
-                orientation_alignment[pair_index],
-            ),
-            (
-                f"pair_common_neighbor_bin_{radial_bin_index}",
-                common_neighbor[pair_index],
-            ),
-        ):
-            pair_descriptor_values[
-                pair_index, pair_descriptor_index[descriptor_name]
-            ] = value
-        charge_product_C2 = (
-            molecular_charges_C[source_index] * molecular_charges_C[target_index]
-        )
-        charge_descriptor = (
-            f"pair_unlike_charge_bin_{radial_bin_index}"
-            if charge_product_C2 < 0.0
-            else f"pair_like_charge_bin_{radial_bin_index}"
-        )
-        if charge_product_C2 != 0.0:
-            pair_descriptor_values[
-                pair_index, pair_descriptor_index[charge_descriptor]
-            ] = 1.0
-    self_normalization = np.sum(self_descriptor_values, axis=1)
-    pair_normalization = np.sum(pair_descriptor_values, axis=1)
-    if np.any(self_normalization <= 0.0) or np.any(pair_normalization <= 0.0):
-        raise ValueError("configuration has unresolved memory descriptors")
-    self_friction_scales = self_descriptor_values @ self_scales / self_normalization
-    pair_friction_scales = pair_descriptor_values @ pair_scales / pair_normalization
-    unprojected_friction = np.diag(
-        np.repeat(
-            molecular_memory.molecular_self_frictions_kg_s * self_friction_scales,
-            CARTESIAN_DIMENSION,
-        )
-    )
-    for pair_index, (source_index, target_index) in enumerate(
-        zip(source_indices, target_indices, strict=True)
-    ):
-        if source_index >= target_index:
-            continue
-        pair_friction_kg_s = (
-            molecular_memory.molecular_pair_frictions_kg_s[source_index, target_index]
-            * 0.5
-            * (
-                pair_friction_scales[pair_index]
-                + pair_friction_scales[
-                    np.flatnonzero(
-                        (source_indices == target_index)
-                        & (target_indices == source_index)
-                    )[0]
-                ]
-            )
-        )
-        for axis in range(CARTESIAN_DIMENSION):
-            source_coordinate = CARTESIAN_DIMENSION * source_index + axis
-            target_coordinate = CARTESIAN_DIMENSION * target_index + axis
-            unprojected_friction[source_coordinate, source_coordinate] += (
-                pair_friction_kg_s
-            )
-            unprojected_friction[target_coordinate, target_coordinate] += (
-                pair_friction_kg_s
-            )
-            unprojected_friction[source_coordinate, target_coordinate] -= (
-                pair_friction_kg_s
-            )
-            unprojected_friction[target_coordinate, source_coordinate] -= (
-                pair_friction_kg_s
-            )
-    conditioned_friction = (
-        molecular_memory.physical_range_projector
-        @ unprojected_friction
-        @ molecular_memory.physical_range_projector
-    )
-    conditioned_friction = 0.5 * (conditioned_friction + conditioned_friction.T)
-    return conditioned_friction
-
-
-def configuration_conditioned_molecular_memory_kernel(
-    positions_m: Array,
-    system: MolecularSystem,
-    molecular_memory: MolecularMemoryOperator,
-    time_s: float,
-) -> Array:
-    if time_s < 0.0:
-        raise ValueError("memory-kernel time must be nonnegative")
-    decay_times_s = np.asarray(molecular_memory.decay_times_s)
-    decay_weights = np.asarray(molecular_memory.decay_weights)
-    if decay_times_s.shape != decay_weights.shape or np.any(decay_times_s <= 0.0):
-        raise ValueError("memory decay times and weights are inconsistent")
-    if np.any(decay_weights < 0.0) or not np.isclose(np.sum(decay_weights), 1.0):
-        raise ValueError("memory decay weights must form a probability vector")
-    integrated_friction = configuration_conditioned_integrated_friction(
-        positions_m, system, molecular_memory
-    )
-    kernel_scale_per_s = float(
-        np.sum(decay_weights * np.exp(-time_s / decay_times_s) / decay_times_s)
-    )
-    return integrated_friction * kernel_scale_per_s
-
-
-def configuration_conditioned_molecular_diffusion(
-    positions_m: Array,
-    system: MolecularSystem,
-    molecular_memory: MolecularMemoryOperator,
-) -> Array:
-    return configuration_conditioned_molecular_diffusion_batch(
-        positions_batch_m=positions_m[None, :, :],
-        system=system,
-        molecular_memory=molecular_memory,
-    )[0]
-
-
-def configuration_conditioned_molecular_diffusion_batch(
-    positions_batch_m: Array,
-    system: MolecularSystem,
-    molecular_memory: MolecularMemoryOperator,
-) -> Array:
-    positions = np.asarray(positions_batch_m, dtype=float)
-    if positions.ndim != 3 or positions.shape[1:] != system.positions_m.shape:
-        raise ValueError("conditioned diffusion batch has invalid position shape")
-    radial_edges_m = np.asarray(molecular_memory.geometry_radial_edges_m, dtype=float)
-    if radial_edges_m.size == 0:
-        return np.repeat(
-            molecular_memory.diffusion_m2_s[None, :, :],
-            positions.shape[0],
-            axis=0,
-        )
-    molecule_count = len(system.molecule_atom_indices)
-    batch_size = positions.shape[0]
-    molecule_centers_m = np.stack(
-        tuple(
-            np.average(
-                positions[:, molecule_atom_indices, :],
-                axis=1,
-                weights=system.masses_kg[molecule_atom_indices],
-            )
-            for molecule_atom_indices in system.molecule_atom_indices
-        ),
-        axis=1,
-    )
-    molecular_radius_gyration_m2 = np.zeros((batch_size, molecule_count))
-    molecular_orientation_dyads = np.zeros(
-        (batch_size, molecule_count, CARTESIAN_DIMENSION, CARTESIAN_DIMENSION)
-    )
-    for molecule_index, molecule_atom_indices in enumerate(
-        system.molecule_atom_indices
-    ):
-        local_positions_m = positions[:, molecule_atom_indices, :]
-        anchor_m = local_positions_m[:, :1, :]
-        local_positions_m = anchor_m + minimum_image_displacement(
-            local_positions_m - anchor_m,
-            system.box_vectors_m,
-        )
-        centered_positions_m = (
-            local_positions_m - molecule_centers_m[:, molecule_index, None, :]
-        )
-        molecule_masses_kg = system.masses_kg[molecule_atom_indices]
-        molecular_radius_gyration_m2[:, molecule_index] = np.average(
-            np.sum(centered_positions_m**2, axis=2),
-            axis=1,
-            weights=molecule_masses_kg,
-        )
-        if molecule_atom_indices.size > 1:
-            gyration_tensors_m2 = np.einsum(
-                "i,bia,bic->bac",
-                molecule_masses_kg,
-                centered_positions_m,
-                centered_positions_m,
-            ) / np.sum(molecule_masses_kg)
-            eigenvalues_m2, eigenvectors = np.linalg.eigh(gyration_tensors_m2)
-            resolved = eigenvalues_m2[:, -1] > np.finfo(float).eps
-            principal_axes = eigenvectors[:, :, -1]
-            molecular_orientation_dyads[:, molecule_index] = np.where(
-                resolved[:, None, None],
-                np.einsum("ba,bc->bac", principal_axes, principal_axes),
-                0.0,
-            )
-    first_indices, second_indices = np.where(~np.eye(molecule_count, dtype=bool))
-    pair_displacements_m = minimum_image_displacement(
-        molecule_centers_m[:, second_indices, :]
-        - molecule_centers_m[:, first_indices, :],
-        system.box_vectors_m,
-    )
-    pair_distances_m = np.linalg.norm(pair_displacements_m, axis=2)
-    radial_bins = np.searchsorted(radial_edges_m, pair_distances_m, side="right") - 1
-    admitted = (
-        (radial_bins >= 0)
-        & (radial_bins < radial_edges_m.size - 1)
-        & (pair_distances_m > 0.0)
-    )
-    safe_pair_distances_m = np.where(admitted, pair_distances_m, 1.0)
-    pair_unit_vectors = pair_displacements_m / safe_pair_distances_m[:, :, None]
-    adjacency = np.zeros((batch_size, molecule_count, molecule_count))
-    adjacency[:, first_indices, second_indices] = np.where(
-        admitted,
-        0.5 * (1.0 + np.cos(np.pi * pair_distances_m / radial_edges_m[-1])),
-        0.0,
-    )
-    cluster_degree = np.sum(adjacency, axis=2)
-    cluster_depth_two = np.einsum("bij,bj->bi", adjacency, cluster_degree)
-    molecular_charges_C = np.asarray(
-        tuple(
-            np.sum(system.charges_C[molecule_atom_indices])
-            for molecule_atom_indices in system.molecule_atom_indices
-        )
-    )
-    charge_scale_C = max(
-        float(np.max(np.abs(molecular_charges_C))), np.finfo(float).tiny
-    )
-    positive_charge = np.maximum(molecular_charges_C, 0.0) / charge_scale_C
-    negative_charge = np.maximum(-molecular_charges_C, 0.0) / charge_scale_C
-    radius_scale_m2 = np.maximum(
-        np.max(molecular_radius_gyration_m2, axis=1), np.finfo(float).tiny
-    )
-    orientation_alignment = np.maximum(
-        np.einsum(
-            "bpa,bpac,bpc->bp",
-            pair_unit_vectors,
-            molecular_orientation_dyads[:, first_indices],
-            pair_unit_vectors,
-        ),
-        0.0,
-    )
-    common_neighbor = np.sum(
-        adjacency[:, first_indices, :] * adjacency[:, second_indices, :], axis=2
-    )
-    self_descriptor_values = np.zeros(
-        (
-            batch_size,
-            molecule_count,
-            len(molecular_memory.self_descriptor_schema),
-        )
-    )
-    self_descriptor_index = {
-        name: index
-        for index, name in enumerate(molecular_memory.self_descriptor_schema)
-    }
-    self_descriptor_values[:, :, self_descriptor_index["uniform"]] = 1.0
-    self_descriptor_values[
-        :, :, self_descriptor_index["molecular_radius_gyration_A2"]
-    ] = molecular_radius_gyration_m2 / radius_scale_m2[:, None]
-    self_descriptor_values[:, :, self_descriptor_index["smooth_cluster_degree"]] = (
-        cluster_degree
-    )
-    self_descriptor_values[:, :, self_descriptor_index["smooth_cluster_depth_2"]] = (
-        cluster_depth_two
-    )
-    pair_descriptor_values = np.zeros(
-        (
-            batch_size,
-            first_indices.size,
-            len(molecular_memory.pair_descriptor_schema),
-        )
-    )
-    pair_descriptor_index = {
-        name: index
-        for index, name in enumerate(molecular_memory.pair_descriptor_schema)
-    }
-    source_membership = np.eye(molecule_count)[first_indices]
-    radial_bin_count = radial_edges_m.size - 1
-    radial_membership = (
-        radial_bins[:, :, None] == np.arange(radial_bin_count)[None, None, :]
-    ) & admitted[:, :, None]
-    number_density = np.einsum(
-        "pm,bpr->bmr", source_membership, radial_membership.astype(float)
-    )
-    positive_density = np.einsum(
-        "pm,bpr,p->bmr",
-        source_membership,
-        radial_membership.astype(float),
-        positive_charge[second_indices],
-    )
-    negative_density = np.einsum(
-        "pm,bpr,p->bmr",
-        source_membership,
-        radial_membership.astype(float),
-        negative_charge[second_indices],
-    )
-    orientation_density = np.einsum(
-        "pm,bpr,bp->bmr",
-        source_membership,
-        radial_membership.astype(float),
-        orientation_alignment,
-    )
-    charge_products_C2 = (
-        molecular_charges_C[first_indices] * molecular_charges_C[second_indices]
-    )
-    for radial_bin_index in range(radial_bin_count):
-        radial_mask = radial_membership[:, :, radial_bin_index].astype(float)
-        for descriptor_name, values in (
-            (f"number_density_bin_{radial_bin_index}", number_density),
-            (f"positive_charge_density_bin_{radial_bin_index}", positive_density),
-            (f"negative_charge_density_bin_{radial_bin_index}", negative_density),
-            (
-                f"orientation_axis_alignment_bin_{radial_bin_index}",
-                orientation_density,
-            ),
-        ):
-            self_descriptor_values[:, :, self_descriptor_index[descriptor_name]] = (
-                values[:, :, radial_bin_index]
-            )
-        for descriptor_name, values in (
-            (f"pair_radial_bin_{radial_bin_index}", radial_mask),
-            (
-                f"pair_orientation_alignment_bin_{radial_bin_index}",
-                radial_mask * orientation_alignment,
-            ),
-            (
-                f"pair_common_neighbor_bin_{radial_bin_index}",
-                radial_mask * common_neighbor,
-            ),
-            (
-                f"pair_unlike_charge_bin_{radial_bin_index}",
-                radial_mask * (charge_products_C2 < 0.0)[None, :],
-            ),
-            (
-                f"pair_like_charge_bin_{radial_bin_index}",
-                radial_mask * (charge_products_C2 > 0.0)[None, :],
-            ),
-        ):
-            pair_descriptor_values[:, :, pair_descriptor_index[descriptor_name]] = (
-                values
-            )
-    self_normalization = np.sum(self_descriptor_values, axis=2)
-    pair_normalization = np.sum(pair_descriptor_values, axis=2)
-    if np.any(self_normalization <= 0.0) or np.any(
-        admitted & (pair_normalization <= 0.0)
-    ):
-        raise ValueError("configuration batch has unresolved memory descriptors")
-    self_friction_scales = (
-        self_descriptor_values
-        @ np.asarray(molecular_memory.self_descriptor_friction_scales)
-        / self_normalization
-    )
-    pair_friction_scales = np.divide(
-        pair_descriptor_values
-        @ np.asarray(molecular_memory.pair_descriptor_friction_scales),
-        pair_normalization,
-        out=np.zeros_like(pair_normalization),
-        where=pair_normalization > 0.0,
-    )
-    directed_pair_scales = np.zeros((batch_size, molecule_count, molecule_count))
-    directed_pair_scales[:, first_indices, second_indices] = pair_friction_scales
-    pair_frictions_kg_s = (
-        molecular_memory.molecular_pair_frictions_kg_s[None, :, :]
-        * 0.5
-        * (directed_pair_scales + np.swapaxes(directed_pair_scales, 1, 2))
-    )
-    molecular_friction_matrices_kg_s = -pair_frictions_kg_s
-    diagonal_indices = np.arange(molecule_count)
-    molecular_friction_matrices_kg_s[:, diagonal_indices, diagonal_indices] = (
-        molecular_memory.molecular_self_frictions_kg_s[None, :] * self_friction_scales
-        + np.sum(pair_frictions_kg_s, axis=2)
-    )
-    molecular_row_means_kg_s = np.mean(
-        molecular_friction_matrices_kg_s,
-        axis=2,
-        keepdims=True,
-    )
-    molecular_column_means_kg_s = np.mean(
-        molecular_friction_matrices_kg_s,
-        axis=1,
-        keepdims=True,
-    )
-    molecular_grand_means_kg_s = np.mean(
-        molecular_friction_matrices_kg_s,
-        axis=(1, 2),
-        keepdims=True,
-    )
-    conditioned_molecular_frictions_kg_s = (
-        molecular_friction_matrices_kg_s
-        - molecular_row_means_kg_s
-        - molecular_column_means_kg_s
-        + molecular_grand_means_kg_s
-    )
-    conditioned_molecular_frictions_kg_s = 0.5 * (
-        conditioned_molecular_frictions_kg_s
-        + np.swapaxes(conditioned_molecular_frictions_kg_s, 1, 2)
-    )
-    friction_eigenvalues_kg_s, friction_eigenvectors = np.linalg.eigh(
-        conditioned_molecular_frictions_kg_s
-    )
-    friction_scales_kg_s = np.maximum(
-        np.max(friction_eigenvalues_kg_s, axis=1), np.finfo(float).tiny
-    )
-    retained_friction_modes = friction_eigenvalues_kg_s > (
-        math.sqrt(np.finfo(float).eps) * friction_scales_kg_s[:, None]
-    )
-    inverse_friction_eigenvalues_s_kg = np.divide(
-        1.0,
-        friction_eigenvalues_kg_s,
-        out=np.zeros_like(friction_eigenvalues_kg_s),
-        where=retained_friction_modes,
-    )
-    conditioned_molecular_diffusions_m2_s = (
-        K_B
-        * molecular_memory.temperature_K
-        * np.einsum(
-            "bik,bk,bjk->bij",
-            friction_eigenvectors,
-            inverse_friction_eigenvalues_s_kg,
-            friction_eigenvectors,
-        )
-    )
-    conditioned_diffusions_m2_s = np.einsum(
-        "bij,ac->biajc",
-        conditioned_molecular_diffusions_m2_s,
-        np.eye(CARTESIAN_DIMENSION),
-    ).reshape(
-        batch_size,
-        CARTESIAN_DIMENSION * molecule_count,
-        CARTESIAN_DIMENSION * molecule_count,
-    )
-    if not np.all(np.isfinite(conditioned_diffusions_m2_s)):
-        raise ValueError("configuration-conditioned diffusion batch is non-finite")
-    return conditioned_diffusions_m2_s
 
 
 def _torch_minimum_image(
@@ -3472,24 +1831,6 @@ class AnalyticalPeriodicInteratomicModel:
         )
         return tuple(component[0] for component in component_batch)
 
-    def _energy_batch_tensor(
-        self,
-        positions_batch_m: torch.Tensor,
-        box_vectors_batch_m: torch.Tensor,
-        lambda_values: torch.Tensor,
-    ) -> torch.Tensor:
-        (
-            fixed_energies,
-            ion_ion_energies,
-            ion_neutral_energies,
-            _polarization_residuals,
-        ) = self._energy_components_batch_tensor(positions_batch_m, box_vectors_batch_m)
-        return (
-            fixed_energies
-            + lambda_values * ion_ion_energies
-            + torch.sqrt(lambda_values) * ion_neutral_energies
-        )
-
     def _energy_components_batch_tensor(
         self,
         positions_batch_m: torch.Tensor,
@@ -4012,7 +2353,7 @@ class AnalyticalPeriodicInteratomicModel:
         reciprocal_m_inv: torch.Tensor,
         green_weights_J_m_C2: torch.Tensor,
         ewald_splitting_per_m: float,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         phase_cosines = torch.cos(phases)
         phase_sines = torch.sin(phases)
         charge_structure_cosine = torch.sum(
@@ -4398,7 +2739,12 @@ class AnalyticalPeriodicInteratomicModel:
             ),
             dim=1,
         )
-        return polarization_energy_matrix, residual, physical_polarization_terms
+        return (
+            polarization_energy_matrix,
+            residual,
+            physical_polarization_terms,
+            physical_dipoles,
+        )
 
     def _polarization_energy_components_batch(
         self,
@@ -4417,7 +2763,7 @@ class AnalyticalPeriodicInteratomicModel:
         torch.Tensor,
         torch.Tensor,
     ]:
-        energy_matrix, residual, physical_polarization_terms = (
+        energy_matrix, residual, physical_polarization_terms, _physical_dipoles = (
             self._polarization_energy_matrix_batch(
                 charge_columns=torch.stack((neutral_charges_C, ionic_charges_C), dim=2),
                 phases=phases,
@@ -4435,6 +2781,57 @@ class AnalyticalPeriodicInteratomicModel:
             residual,
             physical_polarization_terms,
         )
+
+    def _induced_polarization_batch_tensor(
+        self,
+        positions_batch_m: torch.Tensor,
+        box_vectors_batch_m: torch.Tensor,
+    ) -> torch.Tensor:
+        if self._polarizable_atom_count == 0:
+            return torch.zeros(
+                (positions_batch_m.shape[0], CARTESIAN_DIMENSION),
+                dtype=TORCH_DTYPE,
+            )
+        (
+            _fixed_energies,
+            _ion_ion_energies,
+            _ion_neutral_energies,
+            neutral_charges,
+            ionic_charges,
+            phases,
+            displacements,
+            distances,
+            reciprocal_vectors,
+            green_weights,
+            _nonpolar_physical_energy_terms,
+        ) = torch.vmap(self._nonpolar_energy_components_tensor)(
+            positions_batch_m,
+            box_vectors_batch_m,
+        )
+        (
+            _energy_matrix,
+            residuals_V_m,
+            _physical_polarization_terms,
+            physical_dipoles_C_m,
+        ) = self._polarization_energy_matrix_batch(
+            charge_columns=torch.stack(
+                (neutral_charges, ionic_charges),
+                dim=2,
+            ),
+            phases=phases,
+            displacement_m=displacements,
+            distance_m=distances,
+            reciprocal_m_inv=reciprocal_vectors,
+            green_weights_J_m_C2=green_weights,
+            ewald_splitting_per_m=self.numerics.ewald_splitting_per_m,
+        )
+        if float(torch.max(residuals_V_m)) > (
+            self.numerics.polarization_residual_tolerance_V_m
+        ):
+            raise RuntimeError(
+                "induced polarization current uses an unconverged dipole solve"
+            )
+        return torch.sum(physical_dipoles_C_m, dim=1)
 
     def energy_J(self, positions_m: Array, box_vectors_m: Array) -> float:
         self._validate_periodic_accuracy(box_vectors_m[None, :, :])
@@ -4752,167 +3149,6 @@ class AnalyticalPeriodicInteratomicModel:
         )
 
 
-def _scale_molecular_centers_to_box(
-    positions_m: Array,
-    source_box_vectors_m: Array,
-    target_box_vectors_m: Array,
-    system: MolecularSystem,
-) -> Array:
-    length_scale = (
-        abs(np.linalg.det(target_box_vectors_m))
-        / abs(np.linalg.det(source_box_vectors_m))
-    ) ** (1.0 / CARTESIAN_DIMENSION)
-    scaled_positions_m = positions_m.copy()
-    for molecule_atom_indices in system.molecule_atom_indices:
-        anchor_position_m = positions_m[molecule_atom_indices[0]]
-        unwrapped_positions_m = anchor_position_m + minimum_image_displacement(
-            positions_m[molecule_atom_indices] - anchor_position_m,
-            source_box_vectors_m,
-        )
-        molecule_masses_kg = system.masses_kg[molecule_atom_indices]
-        center_of_mass_m = np.average(
-            unwrapped_positions_m,
-            axis=0,
-            weights=molecule_masses_kg,
-        )
-        scaled_positions_m[molecule_atom_indices] = (
-            unwrapped_positions_m - center_of_mass_m + length_scale * center_of_mass_m
-        )
-    return scaled_positions_m % np.diag(target_box_vectors_m)
-
-
-def molecular_center_internal_pressure(
-    model: AnalyticalPeriodicInteratomicModel,
-    positions_by_ladder_m: Array,
-    box_vectors_by_ladder_m: Array,
-    temperature_K: float,
-) -> InternalPressureResult:
-    if temperature_K <= 0.0:
-        raise ValueError("pressure temperature must be positive")
-    volumes_m3 = np.abs(np.linalg.det(box_vectors_by_ladder_m))
-    if not np.allclose(volumes_m3, volumes_m3[0], rtol=1.0e-12, atol=0.0):
-        raise ValueError("internal-pressure chains must share one candidate volume")
-    scaled_positions: list[Array] = []
-    scaled_boxes: list[Array] = []
-    derivative_steps = (
-        model.numerics.pressure_log_volume_derivative_step,
-        model.numerics.pressure_log_volume_derivative_check_step,
-    )
-    for logarithmic_volume_step in derivative_steps:
-        for direction in (1.0, -1.0):
-            length_scale = math.exp(
-                direction * logarithmic_volume_step / CARTESIAN_DIMENSION
-            )
-            for positions_m, box_vectors_m in zip(
-                positions_by_ladder_m, box_vectors_by_ladder_m, strict=True
-            ):
-                target_box_vectors_m = box_vectors_m * length_scale
-                scaled_positions.append(
-                    _scale_molecular_centers_to_box(
-                        positions_m=positions_m,
-                        source_box_vectors_m=box_vectors_m,
-                        target_box_vectors_m=target_box_vectors_m,
-                        system=model.system,
-                    )
-                )
-                scaled_boxes.append(target_box_vectors_m)
-    energy_terms = model.physical_energy_terms_batch(
-        positions_batch_m=np.asarray(scaled_positions),
-        box_vectors_batch_m=np.asarray(scaled_boxes),
-    )
-    energy_term_matrix_J = np.column_stack(
-        (
-            energy_terms.bonded_energy_J,
-            energy_terms.lennard_jones_repulsion_energy_J,
-            energy_terms.lennard_jones_attraction_energy_J,
-            energy_terms.real_electrostatic_energy_J,
-            energy_terms.reciprocal_electrostatic_energy_J,
-            energy_terms.ewald_self_energy_J,
-            energy_terms.electrostatic_exclusion_energy_J,
-            energy_terms.polarization_energy_J,
-            energy_terms.polarization_self_energy_J,
-            energy_terms.polarization_exclusion_energy_J,
-        )
-    )
-    ladder_count = positions_by_ladder_m.shape[0]
-    derivative_rows: list[Array] = []
-    batch_offset = 0
-    for logarithmic_volume_step in derivative_steps:
-        expanded_term_energies_J = energy_term_matrix_J[
-            batch_offset : batch_offset + ladder_count
-        ]
-        contracted_term_energies_J = energy_term_matrix_J[
-            batch_offset + ladder_count : batch_offset + 2 * ladder_count
-        ]
-        derivative_rows.append(
-            np.mean(
-                expanded_term_energies_J - contracted_term_energies_J,
-                axis=0,
-            )
-            / (2.0 * logarithmic_volume_step)
-        )
-        batch_offset += 2 * ladder_count
-    primary_term_derivatives_J, check_term_derivatives_J = derivative_rows
-    mean_derivative_J = float(np.sum(primary_term_derivatives_J))
-    check_derivative_J = float(np.sum(check_term_derivatives_J))
-    derivative_mismatch = abs(mean_derivative_J - check_derivative_J) / max(
-        abs(mean_derivative_J),
-        abs(check_derivative_J),
-        K_B * temperature_K,
-    )
-    if derivative_mismatch > model.numerics.pressure_derivative_relative_tolerance:
-        raise ValueError(
-            "internal-pressure finite differences disagree: "
-            f"relative_mismatch={derivative_mismatch:.12g}, "
-            "tolerance="
-            f"{model.numerics.pressure_derivative_relative_tolerance:.12g}"
-        )
-    mean_volume_m3 = float(np.mean(volumes_m3))
-    configurational_pressures_Pa = -primary_term_derivatives_J / mean_volume_m3
-    ideal_pressure_Pa = (
-        len(model.system.molecule_atom_indices) * K_B * temperature_K / mean_volume_m3
-    )
-    configurational_pressure_Pa = float(np.sum(configurational_pressures_Pa))
-    internal_pressure_Pa = ideal_pressure_Pa + configurational_pressure_Pa
-    if not math.isfinite(internal_pressure_Pa):
-        raise FloatingPointError(
-            "internal-pressure evaluation produced a nonfinite value"
-        )
-    (
-        bonded_pressure_Pa,
-        lennard_jones_repulsion_pressure_Pa,
-        lennard_jones_attraction_pressure_Pa,
-        real_electrostatic_pressure_Pa,
-        reciprocal_electrostatic_pressure_Pa,
-        ewald_self_pressure_Pa,
-        electrostatic_exclusion_pressure_Pa,
-        polarization_pressure_Pa,
-        polarization_self_pressure_Pa,
-        polarization_exclusion_pressure_Pa,
-    ) = configurational_pressures_Pa
-    return InternalPressureResult(
-        internal_pressure_Pa=float(internal_pressure_Pa),
-        ideal_pressure_Pa=float(ideal_pressure_Pa),
-        configurational_pressure_Pa=configurational_pressure_Pa,
-        mean_energy_derivative_J=mean_derivative_J,
-        relative_derivative_mismatch=float(derivative_mismatch),
-        bonded_pressure_Pa=float(bonded_pressure_Pa),
-        lennard_jones_repulsion_pressure_Pa=float(lennard_jones_repulsion_pressure_Pa),
-        lennard_jones_attraction_pressure_Pa=float(
-            lennard_jones_attraction_pressure_Pa
-        ),
-        real_electrostatic_pressure_Pa=float(real_electrostatic_pressure_Pa),
-        reciprocal_electrostatic_pressure_Pa=float(
-            reciprocal_electrostatic_pressure_Pa
-        ),
-        ewald_self_pressure_Pa=float(ewald_self_pressure_Pa),
-        electrostatic_exclusion_pressure_Pa=float(electrostatic_exclusion_pressure_Pa),
-        polarization_pressure_Pa=float(polarization_pressure_Pa),
-        polarization_self_pressure_Pa=float(polarization_self_pressure_Pa),
-        polarization_exclusion_pressure_Pa=float(polarization_exclusion_pressure_Pa),
-    )
-
-
 def _report_hrex_block(
     stage: str,
     block_index: int,
@@ -5021,12 +3257,13 @@ def relax_initial_configurations(
 
     def write_relaxation_checkpoint(
         stage: str,
-        positions_m: torch.Tensor,
-        velocities_m_s: torch.Tensor,
+        accepted_positions_m: torch.Tensor,
         timesteps_s: Array,
         damping: Array,
         positive_power_steps: Array,
         best_maximum_forces_N: Array,
+        accepted_energies_J: Array,
+        has_accepted_energy: Array,
         stagnant_iterations: Array,
         converged: Array,
         force_evaluation_count: int,
@@ -5034,18 +3271,27 @@ def relax_initial_configurations(
         elapsed_s: float,
     ) -> None:
         checkpoint_payload = {
+            "schema": "hamiltonian_initialization_v2",
             "fingerprint": checkpoint_fingerprint,
             "metadata": checkpoint_metadata,
             "stage": stage,
             "systems": tuple(
-                replace(system, positions_m=positions_m[index].detach().numpy())
+                asdict(
+                    replace(
+                        system,
+                        positions_m=accepted_positions_m[index].detach().numpy(),
+                    )
+                )
                 for index, system in enumerate(initial_systems)
             ),
-            "velocities_m_s": velocities_m_s.detach().numpy(),
+            "accepted_positions_m": accepted_positions_m.detach().numpy(),
+            "velocities_m_s": np.zeros_like(accepted_positions_m.detach().numpy()),
             "timesteps_s": timesteps_s,
             "damping": damping,
             "positive_power_steps": positive_power_steps,
             "best_maximum_forces_N": best_maximum_forces_N,
+            "accepted_energies_J": accepted_energies_J,
+            "has_accepted_energy": has_accepted_energy,
             "stagnant_iterations": stagnant_iterations,
             "converged": converged,
             "force_evaluation_count": force_evaluation_count,
@@ -5057,32 +3303,65 @@ def relax_initial_configurations(
         os.replace(checkpoint_temporary_path, checkpoint_path)
 
     positions = torch.as_tensor(initial_positions_by_chain_m, dtype=TORCH_DTYPE).clone()
+    accepted_positions = positions.clone()
     velocities = torch.zeros_like(positions)
     timesteps_s = np.full(chain_count, dynamics.initial_relaxation_timestep_s)
     damping = np.full(chain_count, dynamics.initial_relaxation_initial_damping)
     positive_power_steps = np.zeros(chain_count, dtype=int)
     best_maximum_forces_N = np.full(chain_count, np.inf)
+    accepted_energies_J = np.zeros(chain_count)
+    has_accepted_energy = np.zeros(chain_count, dtype=bool)
     stagnant_iterations = np.zeros(chain_count, dtype=int)
     converged = np.zeros(chain_count, dtype=bool)
     force_evaluation_count = 0
     invocation_force_evaluation_count = 0
     starting_iteration = 0
-    previous_energies_J = np.zeros(chain_count)
-    has_previous_energies = False
     previous_elapsed_s = 0.0
     if checkpoint_path.is_file():
         with checkpoint_path.open("rb") as checkpoint_file:
             checkpoint_payload = pickle.load(checkpoint_file)
+        if (
+            "schema" not in checkpoint_payload
+            or checkpoint_payload["schema"] != "hamiltonian_initialization_v2"
+        ):
+            raise ValueError(
+                "initialization checkpoint uses a retired serialization schema"
+            )
         if checkpoint_payload["fingerprint"] != checkpoint_fingerprint:
             raise ValueError(
                 "initialization checkpoint does not match the requested recipe, "
                 "topology, or numerical settings"
             )
-        checkpoint_systems = tuple(checkpoint_payload["systems"])
+        checkpoint_systems = tuple(
+            _molecular_system_from_checkpoint_record(system_record)
+            for system_record in checkpoint_payload["systems"]
+        )
         positions = torch.as_tensor(
             np.stack(tuple(system.positions_m for system in checkpoint_systems)),
             dtype=TORCH_DTYPE,
         )
+        if checkpoint_payload["stage"] == "packed":
+            accepted_positions = positions.clone()
+        else:
+            required_checkpoint_fields = (
+                "accepted_positions_m",
+                "accepted_energies_J",
+                "has_accepted_energy",
+            )
+            missing_checkpoint_fields = tuple(
+                field_name
+                for field_name in required_checkpoint_fields
+                if field_name not in checkpoint_payload
+            )
+            if missing_checkpoint_fields:
+                raise ValueError(
+                    "initialization checkpoint predates rollback-safe FIRE state: "
+                    f"missing_fields={missing_checkpoint_fields}"
+                )
+            accepted_positions = torch.as_tensor(
+                checkpoint_payload["accepted_positions_m"],
+                dtype=TORCH_DTYPE,
+            )
         velocities = torch.as_tensor(
             checkpoint_payload["velocities_m_s"],
             dtype=TORCH_DTYPE,
@@ -5095,6 +3374,13 @@ def relax_initial_configurations(
         best_maximum_forces_N = np.asarray(
             checkpoint_payload["best_maximum_forces_N"], dtype=float
         )
+        if checkpoint_payload["stage"] != "packed":
+            accepted_energies_J = np.asarray(
+                checkpoint_payload["accepted_energies_J"], dtype=float
+            )
+            has_accepted_energy = np.asarray(
+                checkpoint_payload["has_accepted_energy"], dtype=bool
+            )
         stagnant_iterations = np.asarray(
             checkpoint_payload["stagnant_iterations"], dtype=int
         )
@@ -5135,7 +3421,6 @@ def relax_initial_configurations(
             break
         energies_J = torch.zeros(chain_count, dtype=TORCH_DTYPE)
         forces_N = torch.zeros_like(positions)
-        force_call_durations_s: list[float] = []
         for chunk_start in range(
             0,
             active_chain_indices.size,
@@ -5145,34 +3430,22 @@ def relax_initial_configurations(
                 chunk_start : chunk_start + dynamics.force_batch_size
             ]
             chunk_tensor = torch.as_tensor(chunk_indices, dtype=torch.long)
-            force_call_start_time = time.perf_counter()
             chunk_energies_J, chunk_forces_N, _polarization_residuals = (
                 model.physical_energy_force_batch_tensor(
                     positions[chunk_tensor],
                     box_vectors[chunk_tensor],
                 )
             )
-            force_call_durations_s.append(time.perf_counter() - force_call_start_time)
             energies_J[chunk_tensor] = chunk_energies_J
             forces_N[chunk_tensor] = chunk_forces_N
             force_evaluation_count += 1
             invocation_force_evaluation_count += 1
         invocation_elapsed_s = time.perf_counter() - relaxation_start_time
         elapsed_s = previous_elapsed_s + invocation_elapsed_s
-        seconds_per_force_call = float(np.mean(force_call_durations_s))
         if iteration == starting_iteration:
             initial_forces_N = forces_N.detach().numpy()
             initial_maximum_forces_N = np.max(
                 np.linalg.norm(initial_forces_N, axis=2), axis=1
-            )
-            remaining_force_calls = 0
-            if np.any(initial_maximum_forces_N > dynamics.initial_force_tolerance_N):
-                remaining_force_calls = (
-                    dynamics.initial_relaxation_maximum_force_evaluations
-                    - invocation_force_evaluation_count
-                )
-            projected_maximum_elapsed_s = (
-                invocation_elapsed_s + remaining_force_calls * seconds_per_force_call
             )
             initial_positions_m = positions.detach().numpy()
             initial_displacements_m = minimum_image_displacement(
@@ -5188,42 +3461,67 @@ def relax_initial_configurations(
                 "[relaxation preflight] "
                 f"atoms={positions.shape[1]} chains={chain_count} "
                 f"force_batch_size={dynamics.force_batch_size} "
-                f"seconds_per_force_call={seconds_per_force_call:.6f} "
-                f"projected_maximum_elapsed_s={projected_maximum_elapsed_s:.6f} "
                 f"maximum_forces_N={tuple(initial_maximum_forces_N)} "
                 f"minimum_contact_ratios={tuple(initial_contact_ratios)}",
                 flush=True,
             )
-            if (
-                projected_maximum_elapsed_s
-                > dynamics.initial_relaxation_maximum_elapsed_s
-            ):
-                write_relaxation_checkpoint(
-                    "relaxing",
-                    positions,
-                    velocities,
-                    timesteps_s,
-                    damping,
-                    positive_power_steps,
-                    best_maximum_forces_N,
-                    stagnant_iterations,
-                    converged,
-                    force_evaluation_count,
-                    iteration,
-                    elapsed_s,
-                )
-                raise RuntimeError(
-                    "exact-shape relaxation preflight exceeds the configured runtime: "
-                    f"projected_s={projected_maximum_elapsed_s:.12g}, "
-                    f"limit_s={dynamics.initial_relaxation_maximum_elapsed_s:.12g}, "
-                    f"checkpoint={checkpoint_path}"
-                )
+        evaluated_positions_m = positions.detach().numpy()
+        evaluated_pair_displacements_m = minimum_image_displacement(
+            evaluated_positions_m[:, pair_i] - evaluated_positions_m[:, pair_j],
+            model.system.box_vectors_m,
+        )
+        evaluated_minimum_contact_ratios = np.min(
+            np.linalg.norm(evaluated_pair_displacements_m, axis=2)
+            / contact_distances_m[None, :],
+            axis=1,
+        )
+        evaluated_energies_J = energies_J.detach().numpy()
+        energy_changes_J = np.zeros(chain_count)
+        energy_changes_J[has_accepted_energy] = (
+            evaluated_energies_J[has_accepted_energy]
+            - accepted_energies_J[has_accepted_energy]
+        )
+        rejected = np.zeros(chain_count, dtype=bool)
+        rejected[active_chain_indices] = (
+            (
+                has_accepted_energy[active_chain_indices]
+                & (energy_changes_J[active_chain_indices] > 0.0)
+            )
+            | (
+                evaluated_minimum_contact_ratios[active_chain_indices]
+                < model.numerics.minimum_interatomic_contact_ratio
+            )
+        )
+        for chain_index in np.flatnonzero(rejected):
+            positions[chain_index] = accepted_positions[chain_index]
+            velocities[chain_index] = 0.0
+            positive_power_steps[chain_index] = 0
+            timesteps_s[chain_index] *= dynamics.initial_relaxation_timestep_decrease
+            damping[chain_index] = dynamics.initial_relaxation_initial_damping
+            stagnant_iterations[chain_index] = 0
+
+        accepted_chain_indices = active_chain_indices[~rejected[active_chain_indices]]
+        accepted_chain_tensor = torch.as_tensor(
+            accepted_chain_indices,
+            dtype=torch.long,
+        )
+        accepted_positions[accepted_chain_tensor] = positions[accepted_chain_tensor]
+        accepted_energies_J[accepted_chain_indices] = evaluated_energies_J[
+            accepted_chain_indices
+        ]
+        has_accepted_energy[accepted_chain_indices] = True
+
         force_norms_N = torch.linalg.norm(forces_N, dim=2)
         maximum_forces_N = torch.max(force_norms_N, dim=1).values.detach().numpy()
-        last_maximum_forces_N = maximum_forces_N.copy()
-        converged |= maximum_forces_N <= dynamics.initial_force_tolerance_N
+        last_maximum_forces_N[accepted_chain_indices] = maximum_forces_N[
+            accepted_chain_indices
+        ]
+        converged[accepted_chain_indices] |= (
+            maximum_forces_N[accepted_chain_indices]
+            <= dynamics.initial_force_tolerance_N
+        )
         velocities[torch.as_tensor(converged)] = 0.0
-        for chain_index in active_chain_indices:
+        for chain_index in accepted_chain_indices:
             improvement_limit_N = best_maximum_forces_N[chain_index] * (
                 1.0 - dynamics.initial_relaxation_minimum_force_improvement_fraction
             )
@@ -5243,8 +3541,10 @@ def relax_initial_configurations(
                 )
                 damping[chain_index] = dynamics.initial_relaxation_initial_damping
                 stagnant_iterations[chain_index] = 0
-        active_chain_indices = np.flatnonzero(~converged)
-        for chain_index in active_chain_indices:
+        movable_chain_indices = accepted_chain_indices[
+            ~converged[accepted_chain_indices]
+        ]
+        for chain_index in movable_chain_indices:
             timestep_s = timesteps_s[chain_index]
             velocities[chain_index] += (
                 timestep_s * forces_N[chain_index] / atomic_masses_kg[0]
@@ -5279,60 +3579,53 @@ def relax_initial_configurations(
             positions[chain_index] %= torch.diag(box_vectors[chain_index])
         iteration += 1
         if iteration % dynamics.initial_relaxation_progress_stride == 0:
-            positions_m = positions.detach().numpy()
-            pair_displacements_m = minimum_image_displacement(
-                positions_m[:, pair_i] - positions_m[:, pair_j],
-                model.system.box_vectors_m,
+            average_seconds_per_force_call = (
+                invocation_elapsed_s / invocation_force_evaluation_count
             )
-            minimum_contact_ratios = np.min(
-                np.linalg.norm(pair_displacements_m, axis=2)
-                / contact_distances_m[None, :],
-                axis=1,
-            )
-            energy_changes_J = np.zeros(chain_count)
-            if has_previous_energies:
-                energy_changes_J = energies_J.detach().numpy() - previous_energies_J
             print(
                 "[relaxation] "
                 f"elapsed_s={elapsed_s:.6f} iteration={iteration} "
                 f"force_evaluations={force_evaluation_count} "
                 f"invocation_force_evaluations={invocation_force_evaluation_count} "
-                f"seconds_per_force_call={seconds_per_force_call:.6f} "
+                f"seconds_per_force_call={average_seconds_per_force_call:.6f} "
                 f"active_chains={tuple(int(value) for value in np.flatnonzero(~converged))} "
+                f"rejected_chains={tuple(int(value) for value in np.flatnonzero(rejected))} "
                 f"maximum_forces_N={tuple(maximum_forces_N)} "
-                f"minimum_contact_ratios={tuple(minimum_contact_ratios)} "
+                "minimum_contact_ratios="
+                f"{tuple(evaluated_minimum_contact_ratios)} "
                 f"energy_changes_J={tuple(energy_changes_J)} "
                 f"timesteps_s={tuple(timesteps_s)}",
                 flush=True,
             )
             write_relaxation_checkpoint(
                 "relaxing",
-                positions,
-                velocities,
+                accepted_positions,
                 timesteps_s,
                 damping,
                 positive_power_steps,
                 best_maximum_forces_N,
+                accepted_energies_J,
+                has_accepted_energy,
                 stagnant_iterations,
                 converged,
                 force_evaluation_count,
                 iteration,
                 elapsed_s,
             )
-        previous_energies_J = energies_J.detach().numpy()
-        has_previous_energies = True
         if invocation_elapsed_s >= dynamics.initial_relaxation_maximum_elapsed_s:
             break
     final_elapsed_s = previous_elapsed_s + time.perf_counter() - relaxation_start_time
     final_stage = "relaxed" if np.all(converged) else "relaxing"
+    positions = accepted_positions.clone()
     write_relaxation_checkpoint(
         final_stage,
-        positions,
-        velocities,
+        accepted_positions,
         timesteps_s,
         damping,
         positive_power_steps,
         best_maximum_forces_N,
+        accepted_energies_J,
+        has_accepted_energy,
         stagnant_iterations,
         converged,
         force_evaluation_count,
@@ -5372,1212 +3665,1886 @@ def relax_initial_configurations(
     return final_positions_m, best_maximum_forces_N, force_evaluation_count
 
 
-def species_coordination_observable_series(
-    configurations_m: Array,
-    system: MolecularSystem,
-) -> dict[str, Array]:
-    library = _physical_library_records()
-    coordination_switches = library.basis_record["coordination_switches"]
-    lithium_atomic_number = library.species_records["Li+"]["sites"][0]["atomic_number"]
-    lithium_atom_indices: list[int] = []
-    acceptor_indices_by_species: dict[str, list[int]] = {}
-    switch_record_by_species: dict[str, dict] = {}
-    for species_name, molecule_atom_indices in zip(
-        system.molecule_species_names, system.molecule_atom_indices, strict=True
-    ):
-        species_record = library.species_records[species_name]
-        formal_charge_e = float(species_record["formal_charge_e"])
-        coordinating_indices = acceptor_indices_by_species.setdefault(species_name, [])
-        for atom_index, site_record in zip(
-            molecule_atom_indices, species_record["sites"], strict=True
-        ):
-            if int(site_record["atomic_number"]) == lithium_atomic_number:
-                lithium_atom_indices.append(int(atom_index))
-            if int(site_record["hba_count_contribution"]) > 0:
-                coordinating_indices.append(int(atom_index))
-        if formal_charge_e < 0.0:
-            switch_record_by_species[species_name] = coordination_switches["Li_anion"]
-        if formal_charge_e == 0.0:
-            switch_record_by_species[species_name] = coordination_switches["Li_ligand"]
-        if formal_charge_e > 0.0:
-            switch_record_by_species[species_name] = coordination_switches["Li_solvent"]
-    if not lithium_atom_indices:
-        raise ValueError("coordination diagnostics require at least one lithium site")
-    observable_series: dict[str, Array] = {}
-    lithium_positions = configurations_m[:, np.asarray(lithium_atom_indices)]
-    for species_name, coordinating_indices in acceptor_indices_by_species.items():
-        if not coordinating_indices:
-            continue
-        switch_record = switch_record_by_species[species_name]
-        coordinating_positions = configurations_m[:, np.asarray(coordinating_indices)]
-        displacements_m = minimum_image_displacement(
-            lithium_positions[:, :, None, :] - coordinating_positions[:, None, :, :],
-            system.box_vectors_m,
-        )
-        distances_m = np.linalg.norm(displacements_m, axis=3)
-        switch_values = 1.0 / (
-            1.0
-            + (distances_m / float(switch_record["r0_m"]))
-            ** int(switch_record["exponent"])
-        )
-        observable_series[species_name] = np.sum(switch_values, axis=(1, 2))
-    return observable_series
+PhaseSpaceObservable = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 
 
-def symmetric_psd_pseudoinverse(matrix: Array, relative_tolerance: float) -> Array:
-    symmetric = 0.5 * (matrix + matrix.T)
-    eigenvalues, eigenvectors = eigh(symmetric)
-    tolerance = relative_tolerance * float(eigenvalues[-1])
-    if eigenvalues[0] < -tolerance:
-        raise ValueError("Dirichlet matrix is not positive semidefinite")
-    active = eigenvalues > tolerance
-    return (eigenvectors[:, active] / eigenvalues[active]) @ eigenvectors[:, active].T
+def _hamiltonian_physical_forces(
+    positions_m: torch.Tensor,
+    box_vectors_m: torch.Tensor,
+    model: AnalyticalPeriodicInteratomicModel,
+) -> torch.Tensor:
+    if positions_m.ndim == 2:
+        def potential_energy_J(evaluated_positions_m: torch.Tensor) -> torch.Tensor:
+            return model._energy_tensor(evaluated_positions_m, box_vectors_m)
+
+    elif positions_m.ndim == 3:
+        def potential_energy_J(evaluated_positions_m: torch.Tensor) -> torch.Tensor:
+            (
+                fixed_energies_J,
+                ion_ion_energies_J,
+                ion_neutral_energies_J,
+                _polarization_residuals_V_m,
+            ) = model._energy_components_batch_tensor(
+                evaluated_positions_m,
+                box_vectors_m,
+            )
+            return torch.sum(
+                fixed_energies_J
+                + ion_ion_energies_J
+                + ion_neutral_energies_J
+            )
+
+    else:
+        raise ValueError("Hamiltonian phase-space positions must be rank two or three")
+    return -torch.func.grad(potential_energy_J)(positions_m)
 
 
-class AnalyticalMolecularGalerkinAssembler:
-    """Exact molecular-translation basis gradients and batched operators."""
+def _hamiltonian_liouville_action(
+    observable: PhaseSpaceObservable,
+    positions_m: torch.Tensor,
+    momenta_kg_m_s: torch.Tensor,
+    physical_forces_N: torch.Tensor,
+    model: AnalyticalPeriodicInteratomicModel,
+) -> torch.Tensor:
+    if positions_m.ndim == 2:
+        atomic_masses_kg = torch.as_tensor(
+            model.system.masses_kg[:, None],
+            dtype=TORCH_DTYPE,
+        )
+    elif positions_m.ndim == 3:
+        atomic_masses_kg = torch.as_tensor(
+            model.system.masses_kg[None, :, None],
+            dtype=TORCH_DTYPE,
+        )
+    else:
+        raise ValueError("Hamiltonian phase-space positions must be rank two or three")
+    if physical_forces_N.shape != positions_m.shape:
+        raise ValueError("Hamiltonian physical forces must match the position shape")
 
-    def __init__(
-        self,
-        system: MolecularSystem,
-        numerics: NumericalSettings,
-        basis_level: int,
-    ) -> None:
-        if basis_level < 1:
-            raise ValueError("basis_level must be at least one")
-        self.system = system
-        self.numerics = numerics
-        self.basis_level = basis_level
-        atom_count = system.positions_m.shape[0]
-        molecule_count = len(system.molecule_atom_indices)
-        atom_pair_i, atom_pair_j = np.triu_indices(atom_count, 1)
-        molecule_pair_i, molecule_pair_j = np.triu_indices(molecule_count, 1)
-        self._atom_pair_i = torch.as_tensor(atom_pair_i)
-        self._atom_pair_j = torch.as_tensor(atom_pair_j)
-        self._molecule_pair_i = torch.as_tensor(molecule_pair_i)
-        self._molecule_pair_j = torch.as_tensor(molecule_pair_j)
-        self._charges = torch.as_tensor(system.charges_C)
-        self._pair_charges = (
-            self._charges[self._atom_pair_i] * self._charges[self._atom_pair_j]
-        )
-        self._box = torch.as_tensor(system.box_vectors_m)
-        atom_pair_incidence = np.zeros((atom_pair_i.size, molecule_count))
-        atom_pair_incidence[
-            np.arange(atom_pair_i.size), system.molecule_index[atom_pair_i]
-        ] += 1.0
-        atom_pair_incidence[
-            np.arange(atom_pair_j.size), system.molecule_index[atom_pair_j]
-        ] -= 1.0
-        self._atom_pair_incidence = torch.as_tensor(atom_pair_incidence)
-        molecule_pair_incidence = np.zeros((molecule_pair_i.size, molecule_count))
-        molecule_pair_incidence[np.arange(molecule_pair_i.size), molecule_pair_i] = 1.0
-        molecule_pair_incidence[np.arange(molecule_pair_j.size), molecule_pair_j] = -1.0
-        self._molecule_pair_incidence = torch.as_tensor(molecule_pair_incidence)
-        center_weights = np.zeros((molecule_count, atom_count))
-        first_atoms: list[int] = []
-        last_atoms: list[int] = []
-        molecule_charges: list[float] = []
-        for molecule_index, atom_indices in enumerate(system.molecule_atom_indices):
-            masses_kg = system.masses_kg[atom_indices]
-            center_weights[molecule_index, atom_indices] = masses_kg / np.sum(masses_kg)
-            first_atoms.append(int(atom_indices[0]))
-            last_atoms.append(int(atom_indices[-1]))
-            molecule_charges.append(float(np.sum(system.charges_C[atom_indices])))
-        self._center_weights = torch.as_tensor(center_weights)
-        self._first_atoms = torch.as_tensor(first_atoms)
-        self._last_atoms = torch.as_tensor(last_atoms)
-        self._multi_atom_mask = torch.as_tensor(
-            [indices.size > 1 for indices in system.molecule_atom_indices]
-        )
-        self._molecule_charges = torch.as_tensor(molecule_charges, dtype=TORCH_DTYPE)
-        self._molecule_atom_index_tuples = tuple(
-            tuple(int(atom_index) for atom_index in atom_indices)
-            for atom_indices in system.molecule_atom_indices
-        )
-        self._molecule_mass_tensors = tuple(
-            torch.as_tensor(system.masses_kg[atom_indices])
-            for atom_indices in system.molecule_atom_indices
-        )
-        self._molecule_index_tensors = tuple(
-            torch.as_tensor(atom_indices)
-            for atom_indices in system.molecule_atom_indices
-        )
-        self._atom_to_molecule = torch.nn.functional.one_hot(
-            torch.as_tensor(system.molecule_index), molecule_count
-        ).to(TORCH_DTYPE)
-        self._primitive_levels = self._make_primitive_levels()
-        self._basis_exponents, self._basis_levels = self._make_basis_schema()
-        derivative_exponents = self._basis_exponents[:, None, :].repeat(
-            1, self._basis_exponents.shape[1], 1
-        )
-        derivative_exponents = derivative_exponents - torch.diag_embed(
-            (self._basis_exponents > 0).to(torch.int64)
-        )
-        self._basis_derivative_exponents = derivative_exponents
-        self.basis_count = int(self._basis_exponents.shape[0])
-        self._compiled_basis = torch.compile(
-            self._basis_tensor, backend="inductor", fullgraph=True, dynamic=False
-        )
-        self._compiled_assemble = torch.compile(
-            self._assemble_tensor, backend="inductor", fullgraph=True, dynamic=False
-        )
+    velocities_m_s = momenta_kg_m_s / atomic_masses_kg
+    _observable_value, action_value = torch.func.jvp(
+        observable,
+        (positions_m, momenta_kg_m_s),
+        (velocities_m_s, physical_forces_N),
+    )
+    return action_value
 
-    def _make_primitive_levels(self) -> tuple[int, ...]:
-        levels: list[int] = [1] * CARTESIAN_DIMENSION
-        for level_limit, multiplicity in (
-            (self.numerics.basis_radial_count, 2),
-            (self.numerics.basis_angular_order, 2),
-            (self.numerics.basis_cluster_depth, 2),
-            (self.numerics.basis_fourier_shell, 4 * CARTESIAN_DIMENSION),
-        ):
-            for level in range(1, min(level_limit, self.basis_level) + 1):
-                levels.extend([level] * multiplicity)
-        return tuple(levels)
 
-    def _make_basis_schema(self) -> tuple[torch.Tensor, torch.Tensor]:
-        primitive_count = len(self._primitive_levels)
-        candidate_limit = 2 * self.numerics.maximum_basis_size + self.basis_level
-        correlation_limit = min(self.numerics.basis_correlation_order, self.basis_level)
-        exponents: list[Array] = []
-        levels: list[int] = []
-        for level in range(1, self.basis_level + 1):
-            for primitive_index, primitive_level in enumerate(self._primitive_levels):
-                if primitive_level == level and len(exponents) < candidate_limit:
-                    exponent = np.zeros(primitive_count, dtype=np.int64)
-                    exponent[primitive_index] = 1
-                    exponents.append(exponent)
-                    levels.append(level)
-            if len(exponents) >= candidate_limit:
-                break
-            if 2 <= level <= correlation_limit:
-                available = tuple(
-                    index
-                    for index, primitive_level in enumerate(self._primitive_levels)
-                    if primitive_level <= level
-                )
-                for combination in combinations_with_replacement(available, level):
-                    exponent = np.zeros(primitive_count, dtype=np.int64)
-                    np.add.at(exponent, list(combination), 1)
-                    exponents.append(exponent)
-                    levels.append(level)
-                    if len(exponents) >= candidate_limit:
-                        break
-        return torch.as_tensor(np.stack(exponents)), torch.as_tensor(levels)
+def _negative_hamiltonian_liouville_squared_action(
+    observable: PhaseSpaceObservable,
+    positions_m: torch.Tensor,
+    box_vectors_m: torch.Tensor,
+    momenta_kg_m_s: torch.Tensor,
+    physical_forces_N: torch.Tensor,
+    model: AnalyticalPeriodicInteratomicModel,
+) -> torch.Tensor:
+    if positions_m.ndim != 3:
+        raise ValueError("squared Liouville action requires a sample batch")
+    atomic_masses_kg = torch.as_tensor(
+        model.system.masses_kg[None, :, None],
+        dtype=TORCH_DTYPE,
+    )
+    physical_velocities_m_s = momenta_kg_m_s / atomic_masses_kg
+    maximum_speed_m_s = torch.amax(
+        torch.linalg.vector_norm(physical_velocities_m_s, dim=2),
+        dim=1,
+    )
+    if bool(torch.any(maximum_speed_m_s <= 0.0)):
+        raise ValueError("squared Liouville action requires nonzero momentum")
+    difference_times_s = model.numerics.force_difference_step_m / maximum_speed_m_s
 
-    def _invariant_internal_polarization(
-        self, positions_m: torch.Tensor
+    def centered_second_action(
+        evaluated_difference_times_s: torch.Tensor,
     ) -> torch.Tensor:
-        contributions: list[torch.Tensor] = []
-        for indices, index_tensor, masses_kg in zip(
-            self._molecule_atom_index_tuples,
-            self._molecule_index_tensors,
-            self._molecule_mass_tensors,
+        position_displacements_m = (
+            evaluated_difference_times_s[:, None, None]
+            * physical_velocities_m_s
+        )
+        momentum_displacements_kg_m_s = (
+            evaluated_difference_times_s[:, None, None] * physical_forces_N
+        )
+        positive_positions_m = positions_m + position_displacements_m
+        negative_positions_m = positions_m - position_displacements_m
+        positive_momenta_kg_m_s = (
+            momenta_kg_m_s + momentum_displacements_kg_m_s
+        )
+        negative_momenta_kg_m_s = (
+            momenta_kg_m_s - momentum_displacements_kg_m_s
+        )
+        positive_forces_N = _hamiltonian_physical_forces(
+            positions_m=positive_positions_m,
+            box_vectors_m=box_vectors_m,
+            model=model,
+        )
+        negative_forces_N = _hamiltonian_physical_forces(
+            positions_m=negative_positions_m,
+            box_vectors_m=box_vectors_m,
+            model=model,
+        )
+        positive_first_action = _hamiltonian_liouville_action(
+            observable=observable,
+            positions_m=positive_positions_m,
+            momenta_kg_m_s=positive_momenta_kg_m_s,
+            physical_forces_N=positive_forces_N,
+            model=model,
+        )
+        negative_first_action = _hamiltonian_liouville_action(
+            observable=observable,
+            positions_m=negative_positions_m,
+            momenta_kg_m_s=negative_momenta_kg_m_s,
+            physical_forces_N=negative_forces_N,
+            model=model,
+        )
+        action_denominator_s = evaluated_difference_times_s
+        while action_denominator_s.ndim < positive_first_action.ndim:
+            action_denominator_s = action_denominator_s[:, None]
+        return (positive_first_action - negative_first_action) / (
+            2.0 * action_denominator_s
+        )
+
+    coarse_second_action = centered_second_action(difference_times_s)
+    fine_second_action = centered_second_action(0.5 * difference_times_s)
+    richardson_second_action = (
+        4.0 * fine_second_action - coarse_second_action
+    ) / 3.0
+    second_action_scale = max(
+        float(torch.max(torch.abs(richardson_second_action))),
+        np.finfo(float).tiny,
+    )
+    relative_difference_error = float(
+        torch.max(torch.abs(fine_second_action - coarse_second_action))
+        / second_action_scale
+    )
+    difference_tolerance = math.sqrt(
+        model.numerics.force_consistency_relative_tolerance
+    )
+    if relative_difference_error > difference_tolerance:
+        raise RuntimeError(
+            "squared Liouville directional derivative did not converge: "
+            f"relative_error={relative_difference_error:.12g}, "
+            f"tolerance={difference_tolerance:.12g}"
+        )
+    return -richardson_second_action
+
+
+def _phase_space_channel_metadata(
+    system: MolecularSystem,
+) -> tuple[tuple[str, bool], ...]:
+    species_names = tuple(sorted(set(system.molecule_species_names)))
+    reference_species_name = species_names[-1]
+    metadata: list[tuple[str, bool]] = [("charge_collective", False)]
+    molecule_indices_by_species = {
+        species_name: tuple(
+            molecule_index
+            for molecule_index, observed_species_name in enumerate(
+                system.molecule_species_names
+            )
+            if observed_species_name == species_name
+        )
+        for species_name in species_names
+    }
+    for species_name in species_names:
+        metadata.append(
+            (
+                f"molecular_species={species_name}",
+                species_name != reference_species_name,
+            )
+        )
+        molecule_indices = molecule_indices_by_species[species_name]
+        site_counts = {
+            len(system.molecule_atom_indices[molecule_index])
+            for molecule_index in molecule_indices
+        }
+        if len(site_counts) != 1:
+            raise ValueError(
+                f"species {species_name} has inconsistent molecular topology"
+            )
+        site_count = next(iter(site_counts))
+        if site_count == 1:
+            continue
+        for site_index in range(site_count):
+            metadata.append(
+                (
+                    f"atomic_site[species={species_name},site={site_index}]",
+                    site_index + 1 < site_count,
+                )
+            )
+    return tuple(metadata)
+
+
+def _momentum_primitive_descriptor(
+    system: MolecularSystem,
+    primitive_index: int,
+) -> tuple[int, int, int, int, int, bool]:
+    if primitive_index < 0:
+        raise ValueError("momentum primitive index must be nonnegative")
+    channel_metadata = _phase_space_channel_metadata(system)
+    primitive_families: list[tuple[int, int]] = [(0, 0)]
+    primitive_families.extend(
+        (channel_index, -1)
+        for channel_index, (_channel_label, permits_uniform_mode) in enumerate(
+            channel_metadata
+        )
+        if permits_uniform_mode
+    )
+    primitive_families.extend(
+        (momentum_channel_index, density_channel_index)
+        for momentum_channel_index in range(len(channel_metadata))
+        for density_channel_index in range(len(channel_metadata))
+        if (momentum_channel_index, density_channel_index) != (0, 0)
+    )
+    observed_primitive_count = 0
+    shell_index = 0
+    while True:
+        maximum_family_index = min(shell_index, len(primitive_families) - 1)
+        for family_index in range(maximum_family_index + 1):
+            momentum_channel_index, density_channel_index = primitive_families[
+                family_index
+            ]
+            if density_channel_index < 0 and shell_index != family_index:
+                continue
+            if density_channel_index < 0:
+                for momentum_axis in range(CARTESIAN_DIMENSION):
+                    if observed_primitive_count == primitive_index:
+                        return (
+                            momentum_channel_index,
+                            -1,
+                            0,
+                            -1,
+                            momentum_axis,
+                            False,
+                        )
+                    observed_primitive_count += 1
+                continue
+            harmonic_index = shell_index - family_index + 1
+            for transverse_mode in (False, True):
+                for wave_axis in range(CARTESIAN_DIMENSION):
+                    momentum_axes = (wave_axis,)
+                    if transverse_mode:
+                        momentum_axes = tuple(
+                            axis
+                            for axis in range(CARTESIAN_DIMENSION)
+                            if axis != wave_axis
+                        )
+                    for momentum_axis in momentum_axes:
+                        for sine_phase in (False, True):
+                            if observed_primitive_count == primitive_index:
+                                return (
+                                    momentum_channel_index,
+                                    density_channel_index,
+                                    harmonic_index,
+                                    wave_axis,
+                                    momentum_axis,
+                                    sine_phase,
+                                )
+                            observed_primitive_count += 1
+        shell_index += 1
+
+
+def _density_primitive_descriptor(
+    system: MolecularSystem,
+    primitive_index: int,
+) -> tuple[int, int, int, int, bool]:
+    if primitive_index < 0:
+        raise ValueError("density primitive index must be nonnegative")
+    channel_count = len(_phase_space_channel_metadata(system))
+    primitive_families = tuple(
+        combinations_with_replacement(range(channel_count), 2)
+    )
+    observed_primitive_count = 0
+    shell_index = 0
+    while True:
+        maximum_family_index = min(shell_index, len(primitive_families) - 1)
+        for family_index in range(maximum_family_index + 1):
+            first_channel_index, second_channel_index = primitive_families[
+                family_index
+            ]
+            harmonic_index = shell_index - family_index + 1
+            for wave_axis in range(CARTESIAN_DIMENSION):
+                for sine_phase in (False, True):
+                    if sine_phase and first_channel_index == second_channel_index:
+                        continue
+                    if observed_primitive_count == primitive_index:
+                        return (
+                            first_channel_index,
+                            second_channel_index,
+                            harmonic_index,
+                            wave_axis,
+                            sine_phase,
+                        )
+                    observed_primitive_count += 1
+        shell_index += 1
+
+
+@cache
+def _phase_space_basis_monomials(
+    monomial_count: int,
+) -> tuple[tuple[tuple[int, ...], tuple[int, ...]], ...]:
+    if monomial_count < 0:
+        raise ValueError("phase-space monomial count must be nonnegative")
+    monomials: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
+    additional_factor_grade = 2 * CARTESIAN_DIMENSION * CARTESIAN_DIMENSION
+    total_grade = 1
+    while len(monomials) < monomial_count:
+        maximum_factor_count = 1 + (total_grade - 1) // (
+            additional_factor_grade + 1
+        )
+        for total_factor_count in range(1, maximum_factor_count + 1):
+            primitive_grade = total_grade - additional_factor_grade * (
+                total_factor_count - 1
+            )
+            if primitive_grade < total_factor_count:
+                continue
+            for momentum_factor_count in range(1, total_factor_count + 1, 2):
+                density_factor_count = total_factor_count - momentum_factor_count
+                maximum_momentum_grade = primitive_grade - density_factor_count
+                for momentum_grade in range(
+                    momentum_factor_count,
+                    maximum_momentum_grade + 1,
+                ):
+                    density_grade = primitive_grade - momentum_grade
+                    momentum_multisets = combinations_with_replacement(
+                        range(momentum_grade), momentum_factor_count
+                    )
+                    for momentum_indices in momentum_multisets:
+                        if (
+                            sum(index + 1 for index in momentum_indices)
+                            != momentum_grade
+                        ):
+                            continue
+                        density_multisets = combinations_with_replacement(
+                            range(density_grade), density_factor_count
+                        )
+                        for density_indices in density_multisets:
+                            if (
+                                sum(index + 1 for index in density_indices)
+                                != density_grade
+                            ):
+                                continue
+                            monomials.append(
+                                (tuple(momentum_indices), tuple(density_indices))
+                            )
+                            if len(monomials) == monomial_count:
+                                return tuple(monomials)
+        total_grade += 1
+    return tuple(monomials)
+
+
+def _normalized_probabilists_hermite(
+    standardized_value: torch.Tensor,
+    polynomial_degree: int,
+) -> torch.Tensor:
+    if polynomial_degree < 0:
+        raise ValueError("Hermite polynomial degree must be nonnegative")
+    if polynomial_degree == 0:
+        return torch.ones_like(standardized_value)
+    preceding_value = torch.ones_like(standardized_value)
+    current_value = standardized_value
+    for recurrence_degree in range(1, polynomial_degree):
+        next_value = (
+            standardized_value * current_value
+            - recurrence_degree * preceding_value
+        )
+        preceding_value = current_value
+        current_value = next_value
+    return current_value / math.sqrt(math.factorial(polynomial_degree))
+
+
+def _momentum_primitive_label(
+    system: MolecularSystem,
+    primitive_index: int,
+) -> str:
+    (
+        momentum_channel_index,
+        density_channel_index,
+        harmonic_index,
+        wave_axis,
+        momentum_axis,
+        sine_phase,
+    ) = _momentum_primitive_descriptor(system, primitive_index)
+    channel_metadata = _phase_space_channel_metadata(system)
+    momentum_channel_label = channel_metadata[momentum_channel_index][0]
+    if harmonic_index == 0:
+        return (
+            f"P[{momentum_channel_label},uniform,momentum_axis={momentum_axis}]"
+        )
+    density_channel_label = channel_metadata[density_channel_index][0]
+    phase_label = "cos"
+    if sine_phase:
+        phase_label = "sin"
+    return (
+        f"P_k_rho_-k[momentum={momentum_channel_label},"
+        f"density={density_channel_label},harmonic={harmonic_index},"
+        f"wave_axis={wave_axis},"
+        f"momentum_axis={momentum_axis},phase={phase_label}]"
+    )
+
+
+def _density_primitive_label(
+    system: MolecularSystem,
+    primitive_index: int,
+) -> str:
+    (
+        first_channel_index,
+        second_channel_index,
+        harmonic_index,
+        wave_axis,
+        sine_phase,
+    ) = (
+        _density_primitive_descriptor(system, primitive_index)
+    )
+    channel_metadata = _phase_space_channel_metadata(system)
+    first_channel_label = channel_metadata[first_channel_index][0]
+    second_channel_label = channel_metadata[second_channel_index][0]
+    phase_label = "cos"
+    if sine_phase:
+        phase_label = "sin"
+    return (
+        f"rho_k_rho_-k[first={first_channel_label},second={second_channel_label},"
+        f"harmonic={harmonic_index},wave_axis={wave_axis},"
+        f"phase={phase_label}]"
+    )
+
+
+def _phase_space_basis_labels(
+    system: MolecularSystem,
+    basis_level: int,
+) -> tuple[str, ...]:
+    if basis_level <= 0:
+        raise ValueError("Hamiltonian phase-space basis level must be positive")
+    labels = [
+        f"permanent_atomic_charge_current[{axis}]"
+        for axis in range(CARTESIAN_DIMENSION)
+    ]
+    for momentum_indices, density_indices in _phase_space_basis_monomials(
+        basis_level - 1
+    ):
+        primitive_labels = [
+            "H_"
+            f"{momentum_indices.count(primitive_index)}["
+            f"{_momentum_primitive_label(system, primitive_index)}]"
+            for primitive_index in sorted(set(momentum_indices))
+        ]
+        primitive_labels.extend(
+            _density_primitive_label(system, primitive_index)
+            for primitive_index in density_indices
+        )
+        labels.append("phase_space_monomial[" + " * ".join(primitive_labels) + "]")
+    return tuple(labels)
+
+
+def _phase_space_trial_basis(
+    system: MolecularSystem,
+    basis_level: int,
+    temperature_K: float,
+    box_vectors_m: torch.Tensor,
+) -> tuple[PhaseSpaceObservable, tuple[str, ...]]:
+    if temperature_K <= 0.0:
+        raise ValueError("Hamiltonian phase-space basis temperature must be positive")
+    basis_labels = _phase_space_basis_labels(system, basis_level)
+    basis_monomials = _phase_space_basis_monomials(basis_level - 1)
+    molecule_index_tensors = tuple(
+        torch.as_tensor(atom_indices, dtype=torch.int64)
+        for atom_indices in system.molecule_atom_indices
+    )
+    molecule_mass_tensors_kg = tuple(
+        torch.as_tensor(system.masses_kg[atom_indices], dtype=TORCH_DTYPE)
+        for atom_indices in system.molecule_atom_indices
+    )
+    molecule_masses_kg = torch.as_tensor(
+        [
+            float(np.sum(system.masses_kg[atom_indices]))
+            for atom_indices in system.molecule_atom_indices
+        ],
+        dtype=TORCH_DTYPE,
+    )
+    molecule_charges_C = torch.as_tensor(
+        [
+            float(np.sum(system.charges_C[atom_indices]))
+            for atom_indices in system.molecule_atom_indices
+        ],
+        dtype=TORCH_DTYPE,
+    )
+    absolute_charge_sum_C = float(torch.sum(torch.abs(molecule_charges_C)))
+    charge_neutrality_tolerance_C = (
+        math.sqrt(np.finfo(float).eps) * absolute_charge_sum_C
+    )
+    total_molecular_charge_C = float(torch.sum(molecule_charges_C))
+    if abs(total_molecular_charge_C) > charge_neutrality_tolerance_C:
+        raise ValueError(
+            "molecular Helfand current requires a charge-neutral periodic cell: "
+            f"net_charge_C={total_molecular_charge_C:.12g}, "
+            f"tolerance_C={charge_neutrality_tolerance_C:.12g}"
+        )
+    charged_molecule_indices = torch.nonzero(
+        molecule_charges_C != 0.0,
+        as_tuple=False,
+    ).flatten()
+    if charged_molecule_indices.numel() == 0:
+        raise ValueError("molecular Helfand current is zero for every molecule")
+    species_names = tuple(sorted(set(system.molecule_species_names)))
+    molecule_indices_by_species = {
+        species_name: tuple(
+            molecule_index
+            for molecule_index, observed_species_name in enumerate(
+                system.molecule_species_names
+            )
+            if observed_species_name == species_name
+        )
+        for species_name in species_names
+    }
+    channel_sources: list[tuple[bool, torch.Tensor, torch.Tensor]] = [
+        (
+            True,
+            charged_molecule_indices,
+            molecule_charges_C[charged_molecule_indices] / E_CHARGE,
+        )
+    ]
+    for species_name in species_names:
+        molecule_indices = molecule_indices_by_species[species_name]
+        channel_sources.append(
+            (
+                True,
+                torch.as_tensor(molecule_indices, dtype=torch.int64),
+                torch.ones(len(molecule_indices), dtype=TORCH_DTYPE),
+            )
+        )
+        site_count = len(system.molecule_atom_indices[molecule_indices[0]])
+        if site_count == 1:
+            continue
+        for site_index in range(site_count):
+            atomic_indices = torch.as_tensor(
+                [
+                    int(system.molecule_atom_indices[molecule_index][site_index])
+                    for molecule_index in molecule_indices
+                ],
+                dtype=torch.int64,
+            )
+            channel_sources.append(
+                (
+                    False,
+                    atomic_indices,
+                    torch.ones(len(molecule_indices), dtype=TORCH_DTYPE),
+                )
+            )
+    if len(channel_sources) != len(_phase_space_channel_metadata(system)):
+        raise RuntimeError("phase-space channel construction is inconsistent")
+    atomic_masses_kg = torch.as_tensor(system.masses_kg, dtype=TORCH_DTYPE)
+    total_mass_kg = torch.sum(atomic_masses_kg)
+    atom_molecule_indices = torch.as_tensor(system.molecule_index, dtype=torch.int64)
+    atom_molecule_masses_kg = molecule_masses_kg[atom_molecule_indices]
+    atom_mass_fractions = atomic_masses_kg / atom_molecule_masses_kg
+    thermal_energy_J = K_B * temperature_K
+    maximum_momentum_primitive_index = max(
+        (
+            primitive_index
+            for momentum_indices, _density_indices in basis_monomials
+            for primitive_index in momentum_indices
+        ),
+        default=-1,
+    )
+    maximum_density_primitive_index = max(
+        (
+            primitive_index
+            for _momentum_indices, density_indices in basis_monomials
+            for primitive_index in density_indices
+        ),
+        default=-1,
+    )
+    momentum_primitive_descriptors = tuple(
+        _momentum_primitive_descriptor(system, primitive_index)
+        for primitive_index in range(maximum_momentum_primitive_index + 1)
+    )
+    density_primitive_descriptors = tuple(
+        _density_primitive_descriptor(system, primitive_index)
+        for primitive_index in range(maximum_density_primitive_index + 1)
+    )
+
+    def phase_space_basis(
+        evaluated_positions_m: torch.Tensor,
+        evaluated_momenta_kg_m_s: torch.Tensor,
+    ) -> torch.Tensor:
+        total_momentum_kg_m_s = torch.sum(evaluated_momenta_kg_m_s, dim=-2)
+        relative_momenta_kg_m_s = evaluated_momenta_kg_m_s - (
+            atomic_masses_kg / total_mass_kg
+        )[..., None] * total_momentum_kg_m_s[..., None, :]
+        molecular_centers_m: list[torch.Tensor] = []
+        molecular_momenta_kg_m_s: list[torch.Tensor] = []
+        for atom_indices, atom_masses_kg, molecule_mass_kg in zip(
+            molecule_index_tensors,
+            molecule_mass_tensors_kg,
+            molecule_masses_kg,
             strict=True,
         ):
-            anchor = positions_m[:, indices[0], :]
-            local_positions = anchor[:, None, :] + _torch_minimum_image(
-                positions_m[:, index_tensor, :] - anchor[:, None, :], self._box
+            anchor_position_m = evaluated_positions_m[..., atom_indices[0], :]
+            unwrapped_positions_m = anchor_position_m[..., None, :] + (
+                _torch_minimum_image(
+                    evaluated_positions_m[..., atom_indices, :]
+                    - anchor_position_m[..., None, :],
+                    box_vectors_m,
+                )
             )
-            center_m = torch.sum(
-                masses_kg[None, :, None] * local_positions, dim=1
-            ) / torch.sum(masses_kg)
-            contributions.append(
+            molecular_centers_m.append(
                 torch.sum(
-                    self._charges[index_tensor][None, :, None]
-                    * (local_positions - center_m[:, None, :]),
-                    dim=1,
+                    atom_masses_kg[..., None] * unwrapped_positions_m,
+                    dim=-2,
                 )
+                / molecule_mass_kg
             )
-        return torch.stack(contributions).sum(dim=0)
-
-    def _primitive_tensor(
-        self, positions_m: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        sample_count = positions_m.shape[0]
-        molecule_count = len(self.system.molecule_atom_indices)
-        coordinate_count = CARTESIAN_DIMENSION * molecule_count
-        values: list[torch.Tensor] = []
-        gradients: list[torch.Tensor] = []
-        zero_gradient = torch.zeros((sample_count, coordinate_count), dtype=TORCH_DTYPE)
-        internal_polarization = self._invariant_internal_polarization(positions_m)
-        for axis in range(CARTESIAN_DIMENSION):
-            values.append(internal_polarization[:, axis])
-            gradients.append(zero_gradient)
-
-        atom_displacements = _torch_minimum_image(
-            positions_m[:, self._atom_pair_i] - positions_m[:, self._atom_pair_j],
-            self._box,
+            molecular_momenta_kg_m_s.append(
+                torch.sum(relative_momenta_kg_m_s[..., atom_indices, :], dim=-2)
+            )
+        centers_m = torch.stack(molecular_centers_m, dim=-2)
+        molecular_momenta = torch.stack(molecular_momenta_kg_m_s, dim=-2)
+        standardized_molecular_momenta = molecular_momenta / torch.sqrt(
+            molecule_masses_kg[..., None] * thermal_energy_J
         )
-        atom_distances = torch.linalg.norm(atom_displacements, dim=2)
-        atom_directions = atom_displacements / atom_distances[:, :, None]
-        normalized_distance = atom_distances / self.numerics.basis_radial_cutoff_m
-        inside_cutoff = atom_distances < self.numerics.basis_radial_cutoff_m
-        cutoff = 0.5 * (torch.cos(math.pi * normalized_distance) + 1.0) * inside_cutoff
-        cutoff_derivative = (
-            -0.5
-            * math.pi
-            / self.numerics.basis_radial_cutoff_m
-            * torch.sin(math.pi * normalized_distance)
-            * inside_cutoff
+        parent_molecular_momenta = molecular_momenta[..., atom_molecule_indices, :]
+        internal_atomic_momenta = relative_momenta_kg_m_s - (
+            atom_mass_fractions[..., None] * parent_molecular_momenta
         )
-        for radial_mode in range(
-            1, min(self.numerics.basis_radial_count, self.basis_level) + 1
-        ):
-            phase = radial_mode * math.pi * normalized_distance
-            radial = torch.cos(phase) * cutoff
-            radial_derivative = (
-                -radial_mode
+        standardized_internal_momenta = internal_atomic_momenta / torch.sqrt(
+            atomic_masses_kg[..., None] * thermal_energy_J
+        )
+        inverse_box_m = torch.linalg.inv(box_vectors_m)
+        fractional_centers = torch.matmul(
+            centers_m.unsqueeze(-2), inverse_box_m.unsqueeze(-3)
+        ).squeeze(-2)
+        fractional_atomic_positions = torch.matmul(
+            evaluated_positions_m.unsqueeze(-2), inverse_box_m.unsqueeze(-3)
+        ).squeeze(-2)
+        permanent_atomic_current_C_m_s = torch.einsum(
+            "n,...na->...a",
+            torch.as_tensor(system.charges_C, dtype=TORCH_DTYPE),
+            relative_momenta_kg_m_s / atomic_masses_kg[..., None],
+        )
+        channel_fractional_positions: list[torch.Tensor] = []
+        channel_standardized_momenta: list[torch.Tensor] = []
+        channel_weights: list[torch.Tensor] = []
+        channel_normalizations: list[torch.Tensor] = []
+        for molecular_channel, particle_indices, particle_weights in channel_sources:
+            if molecular_channel:
+                channel_fractional_positions.append(
+                    fractional_centers[..., particle_indices, :]
+                )
+                channel_standardized_momenta.append(
+                    standardized_molecular_momenta[..., particle_indices, :]
+                )
+                channel_weights.append(particle_weights)
+                channel_normalizations.append(
+                    torch.linalg.vector_norm(particle_weights)
+                )
+                continue
+            channel_fractional_positions.append(
+                fractional_atomic_positions[..., particle_indices, :]
+            )
+            channel_standardized_momenta.append(
+                standardized_internal_momenta[..., particle_indices, :]
+            )
+            channel_weights.append(particle_weights)
+            channel_normalizations.append(torch.linalg.vector_norm(particle_weights))
+        momentum_primitive_values: list[torch.Tensor] = []
+        for momentum_descriptor in momentum_primitive_descriptors:
+            (
+                momentum_channel_index,
+                density_channel_index,
+                harmonic_index,
+                wave_axis,
+                momentum_axis,
+                sine_phase,
+            ) = momentum_descriptor
+            standardized_momentum_component = channel_standardized_momenta[
+                momentum_channel_index
+            ][..., momentum_axis]
+            phase_factor = torch.ones_like(standardized_momentum_component)
+            if harmonic_index != 0:
+                phase = (
+                    2.0
+                    * math.pi
+                    * harmonic_index
+                    * (
+                        channel_fractional_positions[momentum_channel_index][
+                            ..., :, None, wave_axis
+                        ]
+                        - channel_fractional_positions[density_channel_index][
+                            ..., None, :, wave_axis
+                        ]
+                    )
+                )
+                phase_factor = torch.cos(phase)
+                if sine_phase:
+                    phase_factor = torch.sin(phase)
+                standardized_momentum_component = (
+                    standardized_momentum_component[..., :, None]
+                )
+                pair_weights = (
+                    channel_weights[momentum_channel_index][:, None]
+                    * channel_weights[density_channel_index][None, :]
+                )
+                momentum_primitive_values.append(
+                    torch.sum(
+                        pair_weights
+                        * phase_factor
+                        * standardized_momentum_component,
+                        dim=(-2, -1),
+                    )
+                    / (
+                        channel_normalizations[momentum_channel_index]
+                        * channel_normalizations[density_channel_index]
+                    )
+                )
+                continue
+            momentum_primitive_values.append(
+                torch.sum(
+                    channel_weights[momentum_channel_index]
+                    * phase_factor
+                    * standardized_momentum_component,
+                    dim=-1,
+                )
+                / channel_normalizations[momentum_channel_index]
+            )
+        density_primitive_values: list[torch.Tensor] = []
+        for density_descriptor in density_primitive_descriptors:
+            (
+                first_channel_index,
+                second_channel_index,
+                harmonic_index,
+                wave_axis,
+                sine_phase,
+            ) = density_descriptor
+            phase = (
+                2.0
                 * math.pi
-                / self.numerics.basis_radial_cutoff_m
-                * torch.sin(phase)
-                * cutoff
-                + torch.cos(phase) * cutoff_derivative
-            )
-            derivative_vectors = radial_derivative[:, :, None] * atom_directions
-            radial_gradient = torch.einsum(
-                "spa,pm->sma", derivative_vectors, self._atom_pair_incidence
-            ).reshape(sample_count, coordinate_count)
-            charge_derivative_vectors = (
-                derivative_vectors * self._pair_charges[None, :, None]
-            )
-            values.extend((radial.sum(dim=1), (radial * self._pair_charges).sum(dim=1)))
-            gradients.extend(
-                (
-                    radial_gradient,
-                    torch.einsum(
-                        "spa,pm->sma",
-                        charge_derivative_vectors,
-                        self._atom_pair_incidence,
-                    ).reshape(sample_count, coordinate_count),
+                * harmonic_index
+                * (
+                    channel_fractional_positions[first_channel_index][
+                        ..., :, None, wave_axis
+                    ]
+                    - channel_fractional_positions[second_channel_index][
+                        ..., None, :, wave_axis
+                    ]
                 )
             )
+            phase_factor = torch.cos(phase)
+            if sine_phase:
+                phase_factor = torch.sin(phase)
+            pair_weights = (
+                channel_weights[first_channel_index][:, None]
+                * channel_weights[second_channel_index][None, :]
+            )
+            density_primitive_values.append(
+                torch.sum(
+                    pair_weights * phase_factor,
+                    dim=(-2, -1),
+                )
+                / (
+                    channel_normalizations[first_channel_index]
+                    * channel_normalizations[second_channel_index]
+                )
+            )
+        basis_values = [
+            permanent_atomic_current_C_m_s[..., axis]
+            for axis in range(CARTESIAN_DIMENSION)
+        ]
+        for momentum_indices, density_indices in basis_monomials:
+            monomial_value = torch.ones_like(
+                permanent_atomic_current_C_m_s[..., 0]
+            )
+            for primitive_index in sorted(set(momentum_indices)):
+                monomial_value = monomial_value * _normalized_probabilists_hermite(
+                    standardized_value=momentum_primitive_values[primitive_index],
+                    polynomial_degree=momentum_indices.count(primitive_index),
+                )
+            for primitive_index in density_indices:
+                monomial_value = (
+                    monomial_value * density_primitive_values[primitive_index]
+                )
+            basis_values.append(monomial_value)
+        return torch.stack(basis_values, dim=-1)
 
-        centers_m = torch.einsum("ma,sad->smd", self._center_weights, positions_m)
-        raw_axes = _torch_minimum_image(
-            positions_m[:, self._last_atoms] - positions_m[:, self._first_atoms],
-            self._box,
-        )
-        axes = raw_axes / torch.sqrt(
-            torch.sum(raw_axes**2, dim=2, keepdim=True) + torch.finfo(TORCH_DTYPE).tiny
-        )
-        axes = axes * self._multi_atom_mask[None, :, None]
-        molecule_displacements = _torch_minimum_image(
-            centers_m[:, self._molecule_pair_i] - centers_m[:, self._molecule_pair_j],
-            self._box,
-        )
-        molecule_distances = torch.linalg.norm(molecule_displacements, dim=2)
-        molecule_directions = molecule_displacements / molecule_distances[:, :, None]
-        first_axes = axes[:, self._molecule_pair_i]
-        second_axes = axes[:, self._molecule_pair_j]
-        projection = torch.sum(first_axes * molecule_directions, dim=2)
-        alignment = torch.sum(first_axes * second_axes, dim=2)
-        projection_derivative = (
-            first_axes - projection[:, :, None] * molecule_directions
-        ) / molecule_distances[:, :, None]
-        for angular_order in range(
-            1, min(self.numerics.basis_angular_order, self.basis_level) + 1
-        ):
-            angular_derivative = (
-                angular_order
-                * projection[:, :, None] ** (angular_order - 1)
-                * projection_derivative
-            )
-            values.extend(
-                (
-                    torch.sum(projection**angular_order, dim=1),
-                    torch.sum(alignment**angular_order, dim=1),
-                )
-            )
-            gradients.extend(
-                (
-                    torch.einsum(
-                        "spa,pm->sma",
-                        angular_derivative,
-                        self._molecule_pair_incidence,
-                    ).reshape(sample_count, coordinate_count),
-                    zero_gradient,
-                )
-            )
+    return phase_space_basis, basis_labels
 
-        full_displacements = _torch_minimum_image(
-            centers_m[:, :, None] - centers_m[:, None, :], self._box
-        )
-        full_distances = torch.linalg.norm(
-            full_displacements
-            + torch.eye(molecule_count, dtype=TORCH_DTYPE)[None, :, :, None],
-            dim=3,
-        )
-        identity = torch.eye(molecule_count, dtype=TORCH_DTYPE)
-        adjacency = torch.exp(
-            -((full_distances / self.numerics.basis_radial_cutoff_m) ** 2)
-        ) * (1.0 - identity[None])
-        pair_adjacency = adjacency[:, self._molecule_pair_i, self._molecule_pair_j]
-        pair_adjacency_derivative = (
-            -2.0
-            * pair_adjacency[:, :, None]
-            * molecule_displacements
-            / self.numerics.basis_radial_cutoff_m**2
-        )
-        cluster_power = adjacency
-        for cluster_depth in range(
-            1, min(self.numerics.basis_cluster_depth, self.basis_level) + 1
-        ):
-            trace_sensitivity = cluster_depth * torch.transpose(
-                torch.linalg.matrix_power(adjacency, cluster_depth - 1), 1, 2
-            )
-            charge_sensitivity = torch.zeros_like(adjacency)
-            for left_depth in range(cluster_depth):
-                left_vector = (
-                    torch.linalg.matrix_power(adjacency, left_depth)
-                    @ self._molecule_charges
-                )
-                right_vector = (
-                    torch.linalg.matrix_power(adjacency, cluster_depth - 1 - left_depth)
-                    @ self._molecule_charges
-                )
-                charge_sensitivity = charge_sensitivity + (
-                    left_vector[:, :, None] * right_vector[:, None, :]
-                )
-            trace_pair_sensitivity = (
-                trace_sensitivity[:, self._molecule_pair_i, self._molecule_pair_j]
-                + trace_sensitivity[:, self._molecule_pair_j, self._molecule_pair_i]
-            )
-            charge_pair_sensitivity = (
-                charge_sensitivity[:, self._molecule_pair_i, self._molecule_pair_j]
-                + charge_sensitivity[:, self._molecule_pair_j, self._molecule_pair_i]
-            )
-            values.extend(
-                (
-                    torch.diagonal(cluster_power, dim1=1, dim2=2).sum(dim=1),
-                    torch.einsum(
-                        "m,smn,n->s",
-                        self._molecule_charges,
-                        cluster_power,
-                        self._molecule_charges,
-                    ),
-                )
-            )
-            gradients.extend(
-                (
-                    torch.einsum(
-                        "sp,spa,pm->sma",
-                        trace_pair_sensitivity,
-                        pair_adjacency_derivative,
-                        self._molecule_pair_incidence,
-                    ).reshape(sample_count, coordinate_count),
-                    torch.einsum(
-                        "sp,spa,pm->sma",
-                        charge_pair_sensitivity,
-                        pair_adjacency_derivative,
-                        self._molecule_pair_incidence,
-                    ).reshape(sample_count, coordinate_count),
-                )
-            )
-            cluster_power = cluster_power @ adjacency
 
-        reciprocal_base = 2.0 * math.pi * torch.linalg.inv(self._box)
-        for shell in range(
-            1, min(self.numerics.basis_fourier_shell, self.basis_level) + 1
-        ):
-            for axis in range(CARTESIAN_DIMENSION):
-                reciprocal = shell * reciprocal_base[axis]
-                phases = positions_m @ reciprocal
-                cosine = torch.cos(phases)
-                sine = torch.sin(phases)
-                for weights, feature, derivative in (
-                    (torch.ones_like(self._charges), cosine, -sine),
-                    (torch.ones_like(self._charges), sine, cosine),
-                    (self._charges, cosine, -sine),
-                    (self._charges, sine, cosine),
-                ):
-                    atom_gradient = (
-                        weights[None, :, None]
-                        * derivative[:, :, None]
-                        * reciprocal[None, None, :]
-                    )
-                    values.append(torch.sum(weights[None] * feature, dim=1))
-                    gradients.append(
-                        torch.einsum(
-                            "sad,am->smd", atom_gradient, self._atom_to_molecule
-                        ).reshape(sample_count, coordinate_count)
-                    )
-        return torch.stack(values, dim=1), torch.stack(gradients, dim=1)
+def _evaluate_phase_space_basis_samples(
+    phase_space_samples: HamiltonianPhaseSpaceSamples,
+    model: AnalyticalPeriodicInteratomicModel,
+    basis_level: int,
+    temperature_K: float,
+    operator_batch_size: int,
+) -> HamiltonianBasisEvaluation:
+    if basis_level <= 0:
+        raise ValueError("Hamiltonian phase-space basis level must be positive")
+    if operator_batch_size <= 0:
+        raise ValueError("Hamiltonian operator batch size must be positive")
+    sample_count = phase_space_samples.configurations_m.shape[0]
+    expected_particle_shape = (
+        sample_count,
+        model.system.positions_m.shape[0],
+        CARTESIAN_DIMENSION,
+    )
+    if phase_space_samples.configurations_m.shape != expected_particle_shape:
+        raise ValueError("phase-space configurations have incompatible shape")
+    if phase_space_samples.momenta_kg_m_s.shape != expected_particle_shape:
+        raise ValueError("phase-space momenta have incompatible shape")
+    if phase_space_samples.forces_N.shape != expected_particle_shape:
+        raise ValueError("phase-space forces have incompatible shape")
+    if phase_space_samples.box_vectors_m.shape != (
+        sample_count,
+        CARTESIAN_DIMENSION,
+        CARTESIAN_DIMENSION,
+    ):
+        raise ValueError("phase-space boxes have incompatible shape")
+    if phase_space_samples.chain_indices.shape != (sample_count,):
+        raise ValueError("phase-space chain indices have incompatible shape")
+    if not all(
+        np.all(np.isfinite(values))
+        for values in (
+            phase_space_samples.configurations_m,
+            phase_space_samples.momenta_kg_m_s,
+            phase_space_samples.forces_N,
+            phase_space_samples.box_vectors_m,
+        )
+    ):
+        raise FloatingPointError("phase-space samples contain nonfinite values")
 
-    def _basis_tensor(
-        self, positions_m: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        primitive_values, primitive_gradients = self._primitive_tensor(positions_m)
-        basis_values = torch.prod(
-            primitive_values[:, None, :] ** self._basis_exponents[None, :, :],
-            dim=2,
+    basis_value_rows: list[Array] = []
+    generator_value_rows: list[Array] = []
+    negative_generator_squared_value_rows: list[Array] = []
+    current_value_rows: list[Array] = []
+    operator_start_time = time.perf_counter()
+    for batch_start in range(0, sample_count, operator_batch_size):
+        batch_stop = min(batch_start + operator_batch_size, sample_count)
+        positions_m = torch.as_tensor(
+            phase_space_samples.configurations_m[batch_start:batch_stop],
+            dtype=TORCH_DTYPE,
         )
-        product_coefficients = self._basis_exponents[None, :, :] * torch.prod(
-            primitive_values[:, None, None, :]
-            ** self._basis_derivative_exponents[None, :, :, :],
-            dim=3,
+        momenta_kg_m_s = torch.as_tensor(
+            phase_space_samples.momenta_kg_m_s[batch_start:batch_stop],
+            dtype=TORCH_DTYPE,
         )
-        basis_gradients = torch.einsum(
-            "sbp,spd->sbd", product_coefficients, primitive_gradients
+        physical_forces_N = torch.as_tensor(
+            phase_space_samples.forces_N[batch_start:batch_stop],
+            dtype=TORCH_DTYPE,
         )
-        return basis_values, basis_gradients
+        box_vectors_m = torch.as_tensor(
+            phase_space_samples.box_vectors_m[batch_start:batch_stop],
+            dtype=TORCH_DTYPE,
+        )
+        phase_space_basis, basis_labels = _phase_space_trial_basis(
+            system=model.system,
+            basis_level=basis_level,
+            temperature_K=temperature_K,
+            box_vectors_m=box_vectors_m,
+        )
 
-    def basis_values_and_gradients(
-        self, configurations_m: Array
-    ) -> tuple[Array, Array]:
-        values, gradients = self._compiled_basis(
-            torch.as_tensor(configurations_m, dtype=TORCH_DTYPE)
+        atomic_charges_C = torch.as_tensor(
+            model.system.charges_C,
+            dtype=TORCH_DTYPE,
         )
-        values = values - torch.mean(values, dim=0)
-        return values.detach().numpy(), gradients.detach().numpy()
+        atomic_masses_kg = torch.as_tensor(
+            model.system.masses_kg[None, :, None],
+            dtype=TORCH_DTYPE,
+        )
 
-    def assemble_batch(
-        self,
-        configurations_m: Array,
-        diffusion_square_roots: Array,
-        polarization_gradients: Array,
-    ) -> tuple[Array, Array, Array, Array, Array]:
-        assembled = self._compiled_assemble(
-            torch.as_tensor(configurations_m, dtype=TORCH_DTYPE),
-            torch.as_tensor(diffusion_square_roots, dtype=TORCH_DTYPE),
-            torch.as_tensor(polarization_gradients, dtype=TORCH_DTYPE),
-        )
-        return tuple(value.detach().numpy() for value in assembled)
+        def complete_charge_polarization_C_m(
+            evaluated_positions_m: torch.Tensor,
+            _evaluated_momenta_kg_m_s: torch.Tensor,
+        ) -> torch.Tensor:
+            permanent_polarization_C_m = torch.einsum(
+                "n,bna->ba",
+                atomic_charges_C,
+                evaluated_positions_m,
+            )
+            induced_polarization_C_m = model._induced_polarization_batch_tensor(
+                positions_batch_m=evaluated_positions_m,
+                box_vectors_batch_m=box_vectors_m,
+            )
+            return permanent_polarization_C_m + induced_polarization_C_m
 
-    def _assemble_tensor(
-        self,
-        configurations_m: torch.Tensor,
-        diffusion_square_roots: torch.Tensor,
-        polarization_gradients: torch.Tensor,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]:
-        _, gradients = self._basis_tensor(configurations_m)
-        factored_gradients = torch.einsum(
-            "sbd,sdr->sbr", gradients, diffusion_square_roots
-        )
-        factored_polarization = torch.einsum(
-            "ad,sdr->sar", polarization_gradients, diffusion_square_roots
-        )
-        sample_dirichlet = torch.einsum(
-            "sbr,scr->sbc", factored_gradients, factored_gradients
-        )
-        sample_coupling = torch.einsum(
-            "sbr,sar->sba", factored_gradients, factored_polarization
-        )
-        sample_direct = torch.einsum(
-            "sar,sar->sa", factored_polarization, factored_polarization
-        )
-        diagnostics = torch.cat(
-            (
-                torch.sum(factored_gradients**2, dim=2),
-                torch.einsum(
-                    "sbr,sar->sba", factored_gradients, factored_polarization
-                ).reshape(factored_gradients.shape[0], -1),
-                sample_direct,
-            ),
+        sample_basis_values = phase_space_basis(positions_m, momenta_kg_m_s)
+        physical_velocities_m_s = momenta_kg_m_s / atomic_masses_kg
+        maximum_speed_m_s = torch.amax(
+            torch.linalg.vector_norm(physical_velocities_m_s, dim=2),
             dim=1,
         )
-        complete_operator_samples = torch.cat(
-            (
-                sample_dirichlet.reshape(sample_dirichlet.shape[0], -1),
-                sample_coupling.reshape(sample_coupling.shape[0], -1),
-                sample_direct,
+        if bool(torch.any(maximum_speed_m_s <= 0.0)):
+            raise ValueError("complete polarization current requires nonzero momentum")
+        polarization_difference_times_s = (
+            model.numerics.force_difference_step_m / maximum_speed_m_s
+        )
+
+        def centered_polarization_derivative(
+            difference_times_s: torch.Tensor,
+        ) -> torch.Tensor:
+            displacements_m = (
+                difference_times_s[:, None, None] * physical_velocities_m_s
+            )
+            positive_polarization_C_m = complete_charge_polarization_C_m(
+                positions_m + displacements_m,
+                momenta_kg_m_s,
+            )
+            negative_polarization_C_m = complete_charge_polarization_C_m(
+                positions_m - displacements_m,
+                momenta_kg_m_s,
+            )
+            return (
+                positive_polarization_C_m - negative_polarization_C_m
+            ) / (2.0 * difference_times_s[:, None])
+
+        coarse_polarization_current_C_m_s = centered_polarization_derivative(
+            polarization_difference_times_s
+        )
+        fine_polarization_current_C_m_s = centered_polarization_derivative(
+            0.5 * polarization_difference_times_s
+        )
+        sample_current_values = (
+            4.0 * fine_polarization_current_C_m_s
+            - coarse_polarization_current_C_m_s
+        ) / 3.0
+        polarization_current_error_scale_C_m_s = max(
+            float(torch.max(torch.abs(sample_current_values))),
+            np.finfo(float).tiny,
+        )
+        polarization_current_relative_error = float(
+            torch.max(
+                torch.abs(
+                    fine_polarization_current_C_m_s
+                    - coarse_polarization_current_C_m_s
+                )
+            )
+            / polarization_current_error_scale_C_m_s
+        )
+        polarization_current_tolerance = math.sqrt(
+            model.numerics.force_consistency_relative_tolerance
+        )
+        if polarization_current_relative_error > polarization_current_tolerance:
+            raise RuntimeError(
+                "complete polarization-current derivative did not converge: "
+                f"relative_error={polarization_current_relative_error:.12g}, "
+                f"tolerance={polarization_current_tolerance:.12g}"
+            )
+        sample_generator_values = _hamiltonian_liouville_action(
+            observable=phase_space_basis,
+            positions_m=positions_m,
+            momenta_kg_m_s=momenta_kg_m_s,
+            physical_forces_N=physical_forces_N,
+            model=model,
+        )
+        sample_negative_generator_squared_values = (
+            _negative_hamiltonian_liouville_squared_action(
+                observable=phase_space_basis,
+                positions_m=positions_m,
+                box_vectors_m=box_vectors_m,
+                momenta_kg_m_s=momenta_kg_m_s,
+                physical_forces_N=physical_forces_N,
+                model=model,
+            )
+        )
+        basis_value_rows.append(
+            sample_basis_values.detach().numpy()
+        )
+        generator_value_rows.append(
+            sample_generator_values.detach().numpy()
+        )
+        negative_generator_squared_value_rows.append(
+            sample_negative_generator_squared_values.detach().numpy()
+        )
+        current_value_rows.append(
+            sample_current_values.detach().numpy()
+        )
+        if sample_count > operator_batch_size:
+            print(
+                "[Hamiltonian Liouville operator] "
+                f"basis_level={basis_level} "
+                f"completed_samples={batch_stop}/{sample_count} "
+                f"elapsed_s={time.perf_counter() - operator_start_time:.3f}",
+                flush=True,
+            )
+    return HamiltonianBasisEvaluation(
+        basis_level=basis_level,
+        basis_labels=basis_labels,
+        basis_values=np.concatenate(basis_value_rows, axis=0),
+        generator_values=np.concatenate(generator_value_rows, axis=0),
+        negative_generator_squared_values=np.concatenate(
+            negative_generator_squared_value_rows,
+            axis=0,
+        ),
+        current_values=np.concatenate(current_value_rows, axis=0),
+        chain_indices=phase_space_samples.chain_indices.copy(),
+    )
+
+
+def _zero_coordinate_limit_interval(
+    positive_coordinates: Array,
+    lower_values: Array,
+    upper_values: Array,
+) -> tuple[float, float, float, float]:
+    coordinates = np.asarray(positive_coordinates, dtype=float)
+    lower_bounds = np.asarray(lower_values, dtype=float)
+    upper_bounds = np.asarray(upper_values, dtype=float)
+    if coordinates.ndim != 1 or coordinates.size < 3:
+        raise ValueError("limit continuation requires at least three coordinates")
+    if lower_bounds.shape != coordinates.shape or upper_bounds.shape != coordinates.shape:
+        raise ValueError("limit continuation bounds have incompatible shape")
+    if np.any(coordinates <= 0.0) or np.any(upper_bounds < lower_bounds):
+        raise ValueError("limit continuation inputs are outside their physical domain")
+    normalized_coordinates = coordinates / float(np.max(coordinates))
+    linear_design = np.column_stack(
+        (np.ones(coordinates.size), normalized_coordinates)
+    )
+    intercept_weights = np.linalg.pinv(linear_design)[0]
+    interval_midpoints = 0.5 * (lower_bounds + upper_bounds)
+    interval_half_widths = 0.5 * (upper_bounds - lower_bounds)
+    linear_limit = float(intercept_weights @ interval_midpoints)
+    propagated_half_width = float(
+        np.sum(np.abs(intercept_weights) * interval_half_widths)
+    )
+    quadratic_design = np.column_stack(
+        (
+            np.ones(coordinates.size),
+            normalized_coordinates,
+            normalized_coordinates**2,
+        )
+    )
+    quadratic_limit = float(
+        np.linalg.pinv(quadratic_design)[0] @ interval_midpoints
+    )
+    continuation_error = abs(quadratic_limit - linear_limit)
+    total_half_width = propagated_half_width + continuation_error
+    return (
+        linear_limit,
+        linear_limit - total_half_width,
+        linear_limit + total_half_width,
+        continuation_error,
+    )
+
+
+def _solve_hamiltonian_resolvent(
+    basis_evaluation: HamiltonianBasisEvaluation,
+    basis_size: int,
+    temperature_K: float,
+    volume_m3: float,
+    independent_chain_count: int,
+    eta_values_s_inv: tuple[float, ...],
+    numerics: NumericalSettings,
+) -> HamiltonianResolventEstimate:
+    if len(eta_values_s_inv) < 3:
+        raise ValueError(
+            "Hamiltonian regularization sequence requires at least three eta values"
+        )
+    if independent_chain_count < 4 or independent_chain_count % 2 != 0:
+        raise ValueError(
+            "Hamiltonian cross-fitting requires an even number of at least four "
+            "independent chains"
+        )
+    if np.any(basis_evaluation.chain_indices < 0) or np.any(
+        basis_evaluation.chain_indices >= independent_chain_count
+    ):
+        raise ValueError("phase-space chain index is out of range")
+    if basis_size < CARTESIAN_DIMENSION or basis_size > len(
+        basis_evaluation.basis_labels
+    ):
+        raise ValueError("Hamiltonian basis size is outside the nested dictionary")
+    basis_values = basis_evaluation.basis_values[:, :basis_size]
+    generator_values = basis_evaluation.generator_values[:, :basis_size]
+    negative_generator_squared_values = (
+        basis_evaluation.negative_generator_squared_values[:, :basis_size]
+    )
+    current_values = basis_evaluation.current_values
+    parent_basis_labels = basis_evaluation.basis_labels[:basis_size]
+    if generator_values.shape != basis_values.shape:
+        raise ValueError("Hamiltonian generator values do not match the basis")
+    if negative_generator_squared_values.shape != basis_values.shape:
+        raise ValueError("Hamiltonian squared-generator values do not match the basis")
+    if current_values.shape != (
+        basis_values.shape[0],
+        CARTESIAN_DIMENSION,
+    ):
+        raise ValueError("Hamiltonian current values have incompatible shape")
+    observed_chain_indices = set(
+        int(chain_index) for chain_index in basis_evaluation.chain_indices
+    )
+    required_chain_indices = set(range(independent_chain_count))
+    if observed_chain_indices != required_chain_indices:
+        raise ValueError("Hamiltonian phase-space samples omit an independent chain")
+    even_chain_indices = tuple(range(0, independent_chain_count, 2))
+    odd_chain_indices = tuple(range(1, independent_chain_count, 2))
+    cross_fit_splits = (
+        (even_chain_indices, odd_chain_indices),
+        (odd_chain_indices, even_chain_indices),
+    )
+    inverse_temperature_per_J = 1.0 / (K_B * temperature_K)
+    intervals_S_m: list[tuple[float, float, float]] = []
+    basis_errors_S_m: list[float] = []
+    equilibrium_errors_S_m: list[float] = []
+    linear_solve_errors_S_m: list[float] = []
+    linear_solve_residuals: list[float] = []
+    conductivity_mcse_values_S_m: list[float] = []
+
+    def solve_empirical_resolvent(
+        selected_basis_values: Array,
+        selected_generator_values: Array,
+        selected_current_values: Array,
+        eta_s_inv: float,
+        conductivity_prefactor: float,
+    ) -> tuple[Array, float, float, float]:
+        selected_sample_count = selected_basis_values.shape[0]
+        overlap_matrix = (
+            selected_basis_values.T
+            @ selected_basis_values
+            / selected_sample_count
+        )
+        generator_energy_matrix = (
+            selected_generator_values.T
+            @ selected_generator_values
+            / selected_sample_count
+        )
+        current_coupling = (
+            selected_basis_values.T
+            @ selected_current_values
+            / selected_sample_count
+        )
+        basis_scales = np.sqrt(np.diag(overlap_matrix))
+        if np.any(~np.isfinite(basis_scales)) or np.any(basis_scales <= 0.0):
+            raise ValueError(
+                "Hamiltonian phase-space basis contains a zero-norm mode"
+            )
+        normalized_overlap_matrix = overlap_matrix / (
+            basis_scales[:, None] * basis_scales[None, :]
+        )
+        normalized_generator_energy_matrix = generator_energy_matrix / (
+            basis_scales[:, None] * basis_scales[None, :]
+        )
+        normalized_current_coupling = current_coupling / basis_scales[:, None]
+        overlap_cholesky = np.linalg.cholesky(normalized_overlap_matrix)
+        transformed_generator = np.linalg.solve(
+            overlap_cholesky,
+            np.linalg.solve(
+                overlap_cholesky,
+                normalized_generator_energy_matrix,
+            ).T,
+        ).T
+        transformed_generator = 0.5 * (
+            transformed_generator + transformed_generator.T
+        )
+        transformed_current_coupling = np.linalg.solve(
+            overlap_cholesky,
+            normalized_current_coupling,
+        )
+        transformed_resolvent_matrix = (
+            eta_s_inv**2 * np.eye(basis_size, dtype=float)
+            + transformed_generator
+        )
+        resolvent_cholesky = np.linalg.cholesky(transformed_resolvent_matrix)
+        transformed_coefficients = np.linalg.solve(
+            resolvent_cholesky.T,
+            np.linalg.solve(
+                resolvent_cholesky,
+                transformed_current_coupling,
             ),
-            dim=1,
+        )
+        normalized_coefficients = np.linalg.solve(
+            overlap_cholesky.T,
+            transformed_coefficients,
+        )
+        coefficient_matrix = normalized_coefficients / basis_scales[:, None]
+        transformed_linear_residual = (
+            transformed_resolvent_matrix @ transformed_coefficients
+            - transformed_current_coupling
+        )
+        transformed_coupling_norm = max(
+            float(np.linalg.norm(transformed_current_coupling)),
+            np.finfo(float).tiny,
+        )
+        relative_linear_residual = float(
+            np.linalg.norm(transformed_linear_residual)
+            / transformed_coupling_norm
+        )
+        transformed_linear_error_solution = np.linalg.solve(
+            resolvent_cholesky.T,
+            np.linalg.solve(
+                resolvent_cholesky,
+                transformed_linear_residual,
+            ),
+        )
+        linear_solve_error_S_m = conductivity_prefactor * abs(
+            float(
+                np.sum(
+                    transformed_linear_residual
+                    * transformed_linear_error_solution
+                )
+            )
+        )
+        conductivity_S_m = conductivity_prefactor * float(
+            np.sum(current_coupling * coefficient_matrix)
         )
         return (
-            sample_dirichlet.sum(dim=0),
-            sample_coupling.sum(dim=0),
-            sample_direct.sum(dim=0),
-            diagnostics,
-            complete_operator_samples,
+            coefficient_matrix,
+            conductivity_S_m,
+            linear_solve_error_S_m,
+            relative_linear_residual,
         )
 
+    for eta_s_inv in eta_values_s_inv:
+        conductivity_prefactor = inverse_temperature_per_J * eta_s_inv / (
+            CARTESIAN_DIMENSION * volume_m3
+        )
+        residual_prefactor = inverse_temperature_per_J / (
+            CARTESIAN_DIMENSION * volume_m3 * eta_s_inv
+        )
+        held_out_chain_lower_values_S_m: list[float] = []
+        held_out_chain_upper_values_S_m: list[float] = []
+        fold_linear_solve_errors_S_m: list[float] = []
+        fold_relative_linear_residuals: list[float] = []
+        for training_chain_indices, validation_chain_indices in cross_fit_splits:
+            training_mask = np.isin(
+                basis_evaluation.chain_indices,
+                training_chain_indices,
+            )
+            (
+                coefficient_matrix,
+                _training_resolvent_iterate_S_m,
+                fold_linear_solve_error_S_m,
+                fold_relative_linear_residual,
+            ) = solve_empirical_resolvent(
+                selected_basis_values=basis_values[training_mask],
+                selected_generator_values=generator_values[training_mask],
+                selected_current_values=current_values[training_mask],
+                eta_s_inv=eta_s_inv,
+                conductivity_prefactor=conductivity_prefactor,
+            )
+            fold_linear_solve_errors_S_m.append(fold_linear_solve_error_S_m)
+            fold_relative_linear_residuals.append(fold_relative_linear_residual)
+            for validation_chain_index in validation_chain_indices:
+                validation_mask = (
+                    basis_evaluation.chain_indices == validation_chain_index
+                )
+                validation_basis_values = basis_values[validation_mask]
+                validation_generator_values = generator_values[validation_mask]
+                validation_negative_generator_squared_values = (
+                    negative_generator_squared_values[validation_mask]
+                )
+                validation_current_values = current_values[validation_mask]
+                validation_trial_values = (
+                    validation_basis_values @ coefficient_matrix
+                )
+                validation_trial_generator_values = (
+                    validation_generator_values @ coefficient_matrix
+                )
+                validation_trial_negative_generator_squared_values = (
+                    validation_negative_generator_squared_values
+                    @ coefficient_matrix
+                )
+                validation_variational_samples_S_m = conductivity_prefactor * (
+                    2.0
+                    * np.sum(
+                        validation_current_values * validation_trial_values,
+                        axis=1,
+                    )
+                    - eta_s_inv**2
+                    * np.sum(validation_trial_values**2, axis=1)
+                    - np.sum(validation_trial_generator_values**2, axis=1)
+                )
+                validation_full_residual = (
+                    validation_current_values
+                    - eta_s_inv**2 * validation_trial_values
+                    - validation_trial_negative_generator_squared_values
+                )
+                validation_residual_errors_S_m = residual_prefactor * np.sum(
+                    validation_full_residual**2,
+                    axis=1,
+                )
+                held_out_chain_lower_values_S_m.append(
+                    float(np.mean(validation_variational_samples_S_m))
+                )
+                held_out_chain_upper_values_S_m.append(
+                    float(
+                        np.mean(
+                            validation_variational_samples_S_m
+                            + validation_residual_errors_S_m
+                        )
+                    )
+                )
+        held_out_lower_mean_S_m = float(
+            np.mean(held_out_chain_lower_values_S_m)
+        )
+        held_out_upper_mean_S_m = float(
+            np.mean(held_out_chain_upper_values_S_m)
+        )
+        lower_mcse_S_m = float(
+            np.std(held_out_chain_lower_values_S_m, ddof=1)
+            / math.sqrt(independent_chain_count)
+        )
+        upper_mcse_S_m = float(
+            np.std(held_out_chain_upper_values_S_m, ddof=1)
+            / math.sqrt(independent_chain_count)
+        )
+        lower_equilibrium_error_S_m = (
+            numerics.equilibrium_standard_error_multiplier * lower_mcse_S_m
+        )
+        upper_equilibrium_error_S_m = (
+            numerics.equilibrium_standard_error_multiplier * upper_mcse_S_m
+        )
+        linear_solve_error_S_m = max(fold_linear_solve_errors_S_m)
+        lower_bound_S_m = (
+            held_out_lower_mean_S_m
+            - lower_equilibrium_error_S_m
+            - linear_solve_error_S_m
+        )
+        upper_bound_S_m = (
+            held_out_upper_mean_S_m
+            + upper_equilibrium_error_S_m
+            + linear_solve_error_S_m
+        )
+        if not math.isfinite(lower_bound_S_m) or not math.isfinite(upper_bound_S_m):
+            raise FloatingPointError("Hamiltonian resolvent interval is nonfinite")
+        if upper_bound_S_m < lower_bound_S_m:
+            raise RuntimeError("Hamiltonian resolvent interval is inverted")
+        held_out_chain_midpoints_S_m = 0.5 * (
+            np.asarray(held_out_chain_lower_values_S_m)
+            + np.asarray(held_out_chain_upper_values_S_m)
+        )
+        conductivity_mcse_S_m = float(
+            np.std(held_out_chain_midpoints_S_m, ddof=1)
+            / math.sqrt(independent_chain_count)
+        )
+        intervals_S_m.append(
+            (
+                float(eta_s_inv),
+                float(lower_bound_S_m),
+                float(upper_bound_S_m),
+            )
+        )
+        basis_errors_S_m.append(float(upper_bound_S_m - lower_bound_S_m))
+        equilibrium_errors_S_m.append(
+            float(
+                max(
+                    lower_equilibrium_error_S_m,
+                    upper_equilibrium_error_S_m,
+                )
+            )
+        )
+        linear_solve_residuals.append(max(fold_relative_linear_residuals))
+        linear_solve_errors_S_m.append(linear_solve_error_S_m)
+        conductivity_mcse_values_S_m.append(conductivity_mcse_S_m)
+    (
+        zero_frequency_iterate_S_m,
+        zero_frequency_lower_bound_S_m,
+        zero_frequency_upper_bound_S_m,
+        eta_continuation_error_S_m,
+    ) = _zero_coordinate_limit_interval(
+        positive_coordinates=np.asarray(eta_values_s_inv),
+        lower_values=np.asarray(
+            [interval[1] for interval in intervals_S_m],
+        ),
+        upper_values=np.asarray(
+            [interval[2] for interval in intervals_S_m],
+        ),
+    )
+    if len(parent_basis_labels) != basis_values.shape[1]:
+        raise RuntimeError("Hamiltonian phase-space basis labels are inconsistent")
+    return HamiltonianResolventEstimate(
+        resolvent_iterate_S_m=zero_frequency_iterate_S_m,
+        lower_bound_S_m=zero_frequency_lower_bound_S_m,
+        upper_bound_S_m=zero_frequency_upper_bound_S_m,
+        intervals_S_m=tuple(intervals_S_m),
+        basis_error_S_m=basis_errors_S_m[-1],
+        eta_continuation_error_S_m=eta_continuation_error_S_m,
+        equilibrium_error_S_m=equilibrium_errors_S_m[-1],
+        linear_solve_error_S_m=linear_solve_errors_S_m[-1],
+        linear_solve_relative_residual=max(linear_solve_residuals),
+        conductivity_mcse_S_m=conductivity_mcse_values_S_m[-1],
+        basis_size=len(parent_basis_labels),
+        basis_labels=parent_basis_labels,
+        finite_eta_precision_reached=(
+            max(basis_errors_S_m) <= numerics.conductivity_tolerance_S_m
+        ),
+    )
 
-def maximum_chain_operator_relative_disagreement(
-    chain_statistics: tuple[tuple[Array, Array, Array], ...],
-    eigenvalue_relative_tolerance: float,
-    maximum_basis_size: int,
-) -> float:
-    pooled_dirichlet = np.mean(
-        np.stack(tuple(statistics[0] for statistics in chain_statistics)), axis=0
+
+def _concatenate_hamiltonian_phase_space_samples(
+    sample_blocks: list[HamiltonianPhaseSpaceSamples],
+) -> HamiltonianPhaseSpaceSamples:
+    if not sample_blocks:
+        raise ValueError("Hamiltonian resolvent requires phase-space samples")
+    return HamiltonianPhaseSpaceSamples(
+        configurations_m=np.concatenate(
+            [block.configurations_m for block in sample_blocks],
+            axis=0,
+        ),
+        box_vectors_m=np.concatenate(
+            [block.box_vectors_m for block in sample_blocks],
+            axis=0,
+        ),
+        momenta_kg_m_s=np.concatenate(
+            [block.momenta_kg_m_s for block in sample_blocks],
+            axis=0,
+        ),
+        forces_N=np.concatenate(
+            [block.forces_N for block in sample_blocks],
+            axis=0,
+        ),
+        chain_indices=np.concatenate(
+            [block.chain_indices for block in sample_blocks],
+            axis=0,
+        ),
     )
-    pooled_coupling = np.mean(
-        np.stack(tuple(statistics[1] for statistics in chain_statistics)), axis=0
-    )
-    pooled_direct = np.mean(
-        np.stack(tuple(statistics[2] for statistics in chain_statistics)), axis=0
-    )
-    pooled_diagonal = np.diag(pooled_dirichlet)
-    diagonal_scale = max(float(np.max(pooled_diagonal)), np.finfo(float).tiny)
-    active_basis = pooled_diagonal > (eigenvalue_relative_tolerance * diagonal_scale)
-    if not np.any(active_basis):
-        raise ValueError("pooled chain Dirichlet operator has no active basis modes")
-    basis_scales = np.sqrt(pooled_diagonal[active_basis])
-    normalized_pooled_coupling = pooled_coupling[active_basis] / basis_scales[:, None]
-    candidate_scores = np.sum(normalized_pooled_coupling**2, axis=1)
-    selected_count = min(maximum_basis_size, candidate_scores.size)
-    selected_indices = np.argsort(candidate_scores)[-selected_count:]
-    normalized_pooled_dirichlet = pooled_dirichlet[
-        np.ix_(active_basis, active_basis)
-    ] / (basis_scales[:, None] * basis_scales[None, :])
-    selected_pooled_dirichlet = normalized_pooled_dirichlet[
-        np.ix_(selected_indices, selected_indices)
-    ]
-    selected_pooled_coupling = normalized_pooled_coupling[selected_indices]
-    pooled_inverse = symmetric_psd_pseudoinverse(
-        selected_pooled_dirichlet,
-        eigenvalue_relative_tolerance,
-    )
-    pooled_correction = (
-        selected_pooled_coupling.T @ pooled_inverse @ selected_pooled_coupling
-    )
-    direct_scale = max(float(np.linalg.norm(pooled_direct)), np.finfo(float).tiny)
-    maximum_disagreement = 0.0
-    for chain_dirichlet, chain_coupling, chain_direct in chain_statistics:
-        normalized_chain_coupling = chain_coupling[active_basis] / basis_scales[:, None]
-        normalized_chain_dirichlet = chain_dirichlet[
-            np.ix_(active_basis, active_basis)
-        ] / (basis_scales[:, None] * basis_scales[None, :])
-        selected_chain_dirichlet = normalized_chain_dirichlet[
-            np.ix_(selected_indices, selected_indices)
-        ]
-        selected_chain_coupling = normalized_chain_coupling[selected_indices]
-        chain_inverse = symmetric_psd_pseudoinverse(
-            selected_chain_dirichlet,
-            eigenvalue_relative_tolerance,
-        )
-        chain_correction = (
-            selected_chain_coupling.T @ chain_inverse @ selected_chain_coupling
-        )
-        direct_disagreement = float(
-            np.linalg.norm(chain_direct - pooled_direct) / direct_scale
-        )
-        correction_disagreement = float(
-            np.linalg.norm(chain_correction - pooled_correction) / direct_scale
-        )
-        maximum_disagreement = max(
-            maximum_disagreement,
-            direct_disagreement,
-            correction_disagreement,
-        )
-    return maximum_disagreement
 
 
-def projected_conductivity_sequence(
+def _concatenate_hamiltonian_basis_evaluations(
+    first_evaluation: HamiltonianBasisEvaluation,
+    second_evaluation: HamiltonianBasisEvaluation,
+) -> HamiltonianBasisEvaluation:
+    if first_evaluation.basis_level != second_evaluation.basis_level:
+        raise ValueError("Hamiltonian basis levels cannot be concatenated")
+    if first_evaluation.basis_labels != second_evaluation.basis_labels:
+        raise ValueError("Hamiltonian basis labels cannot be concatenated")
+    return HamiltonianBasisEvaluation(
+        basis_level=first_evaluation.basis_level,
+        basis_labels=first_evaluation.basis_labels,
+        basis_values=np.concatenate(
+            (first_evaluation.basis_values, second_evaluation.basis_values),
+            axis=0,
+        ),
+        generator_values=np.concatenate(
+            (first_evaluation.generator_values, second_evaluation.generator_values),
+            axis=0,
+        ),
+        negative_generator_squared_values=np.concatenate(
+            (
+                first_evaluation.negative_generator_squared_values,
+                second_evaluation.negative_generator_squared_values,
+            ),
+            axis=0,
+        ),
+        current_values=np.concatenate(
+            (first_evaluation.current_values, second_evaluation.current_values),
+            axis=0,
+        ),
+        chain_indices=np.concatenate(
+            (first_evaluation.chain_indices, second_evaluation.chain_indices),
+            axis=0,
+        ),
+    )
+
+
+def _write_hamiltonian_resolvent_checkpoint(
+    checkpoint_path: Path,
+    checkpoint_schema: str,
+    checkpoint_fingerprint: str,
+    state: IonicHrexState,
+    phase_space_blocks: list[HamiltonianPhaseSpaceSamples],
+    basis_evaluations: tuple[HamiltonianBasisEvaluation, ...],
+    completed_refinement_blocks: int,
+    basis_level: int,
+) -> None:
+    if len(basis_evaluations) > 1:
+        raise ValueError("checkpoint accepts one accumulated basis evaluation")
+    if basis_evaluations and basis_evaluations[0].basis_level != basis_level:
+        raise ValueError("checkpoint basis level and evaluation disagree")
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_checkpoint_path = checkpoint_path.with_suffix(
+        f"{checkpoint_path.suffix}.tmp"
+    )
+    checkpoint_payload = {
+        "schema": checkpoint_schema,
+        "fingerprint": checkpoint_fingerprint,
+        "state": asdict(state),
+        "phase_space_blocks": tuple(asdict(block) for block in phase_space_blocks),
+        "basis_evaluations": tuple(
+            asdict(basis_evaluation) for basis_evaluation in basis_evaluations
+        ),
+        "completed_refinement_blocks": completed_refinement_blocks,
+        "basis_level": basis_level,
+    }
+    with temporary_checkpoint_path.open("wb") as checkpoint_file:
+        pickle.dump(checkpoint_payload, checkpoint_file)
+    os.replace(temporary_checkpoint_path, checkpoint_path)
+
+
+def hamiltonian_green_kubo_sequence(
     model: AnalyticalPeriodicInteratomicModel,
     state: IonicHrexState,
     settings: IonicHrexSettings,
-    equilibrium_samples_per_batch: int,
-    equilibrium_maximum_refinement_batches: int,
     system: MolecularSystem,
     temperature_K: float,
-    molecular_memory: MolecularMemoryOperator,
+    dynamics: DynamicsSettings,
     numerics: NumericalSettings,
-    operator_checkpoint_directory: Path,
-) -> tuple[
-    float,
-    float,
-    tuple[float, ...],
-    tuple[float, ...],
-    int,
-    float,
-    float,
-    float,
-    int,
-    bool,
-    tuple[tuple[str, float], ...],
-    bool,
-    bool,
-]:
-    if settings.independent_ladder_count < 2:
-        raise ValueError("projection requires at least two independent chains")
-    if equilibrium_samples_per_batch <= 0:
-        raise ValueError("operator samples per refinement batch must be positive")
-    operator_checkpoint_directory.mkdir(parents=True, exist_ok=True)
-    sampling_start_s = time.perf_counter()
-    warmup_block_count = math.ceil(
-        settings.warmup_cycle_count / settings.block_cycle_count
-    )
-    for warmup_block_index in range(warmup_block_count):
-        block_cycle_count = min(
-            settings.block_cycle_count,
-            settings.warmup_cycle_count
-            - warmup_block_index * settings.block_cycle_count,
+    checkpoint_path: Path,
+    checkpoint_fingerprint: str,
+) -> tuple[HamiltonianResolventEstimate, int]:
+    phase_space_blocks: list[HamiltonianPhaseSpaceSamples] = []
+    basis_evaluations: list[HamiltonianBasisEvaluation] = []
+    completed_refinement_blocks = 0
+    basis_level = 1
+    checkpoint_schema = "hamiltonian_phase_space_resolvent_v7"
+    if checkpoint_path.is_file():
+        with checkpoint_path.open("rb") as checkpoint_file:
+            checkpoint_payload = pickle.load(checkpoint_file)
+        if (
+            "schema" not in checkpoint_payload
+            or checkpoint_payload["schema"] != checkpoint_schema
+        ):
+            raise ValueError(
+                "Hamiltonian resolvent checkpoint uses the retired operator schema; "
+                "remove it and restart from the retained initialization checkpoint"
+            )
+        if checkpoint_payload["fingerprint"] != checkpoint_fingerprint:
+            raise ValueError(
+                "Hamiltonian resolvent checkpoint does not match the calculation"
+            )
+        state_record = checkpoint_payload["state"]
+        state = IonicHrexState(
+            positions_m=state_record["positions_m"],
+            boxes_m=state_record["boxes_m"],
+            component_energies_J=state_record["component_energies_J"],
+            momenta_kg_m_s=state_record["momenta_kg_m_s"],
+            momentum_refresh_required=state_record["momentum_refresh_required"],
+            auxiliary_masses_kg=state_record["auxiliary_masses_kg"],
+            walker_identifiers=state_record["walker_identifiers"],
+            visited_lowest_lambda=state_record["visited_lowest_lambda"],
+            completed_round_trips=state_record["completed_round_trips"],
+            round_trip_phase=state_record["round_trip_phase"],
+            hmc_step_sizes_s=state_record["hmc_step_sizes_s"],
+            hmc_attempts=state_record["hmc_attempts"],
+            hmc_acceptances=state_record["hmc_acceptances"],
+            hmc_expected_acceptance_sums=state_record[
+                "hmc_expected_acceptance_sums"
+            ],
+            hmc_absolute_energy_error_over_kbt_sums=state_record[
+                "hmc_absolute_energy_error_over_kbt_sums"
+            ],
+            hmc_molecular_com_squared_displacement_sums_m2=state_record[
+                "hmc_molecular_com_squared_displacement_sums_m2"
+            ],
+            exchange_attempts=state_record["exchange_attempts"],
+            exchange_acceptances=state_record["exchange_acceptances"],
+            exchange_expected_acceptance_sums=state_record[
+                "exchange_expected_acceptance_sums"
+            ],
+            cycle_index=int(state_record["cycle_index"]),
+            random_generator_state=state_record["random_generator_state"],
         )
-        block_start_s = time.perf_counter()
+        phase_space_blocks.extend(
+            HamiltonianPhaseSpaceSamples(
+                configurations_m=block_record["configurations_m"],
+                box_vectors_m=block_record["box_vectors_m"],
+                momenta_kg_m_s=block_record["momenta_kg_m_s"],
+                forces_N=block_record["forces_N"],
+                chain_indices=block_record["chain_indices"],
+            )
+            for block_record in checkpoint_payload["phase_space_blocks"]
+        )
+        basis_evaluations.extend(
+            HamiltonianBasisEvaluation(
+                basis_level=int(evaluation_record["basis_level"]),
+                basis_labels=tuple(evaluation_record["basis_labels"]),
+                basis_values=evaluation_record["basis_values"],
+                generator_values=evaluation_record["generator_values"],
+                negative_generator_squared_values=evaluation_record[
+                    "negative_generator_squared_values"
+                ],
+                current_values=evaluation_record["current_values"],
+                chain_indices=evaluation_record["chain_indices"],
+            )
+            for evaluation_record in checkpoint_payload["basis_evaluations"]
+        )
+        completed_refinement_blocks = int(
+            checkpoint_payload["completed_refinement_blocks"]
+        )
+        basis_level = int(checkpoint_payload["basis_level"])
+        expected_basis_labels = _phase_space_basis_labels(system, basis_level)
+        if any(
+            evaluation.basis_labels != expected_basis_labels
+            for evaluation in basis_evaluations
+        ):
+            raise ValueError(
+                "Hamiltonian checkpoint basis definition does not match the source"
+            )
+        if len(basis_evaluations) > 1:
+            raise ValueError(
+                "Hamiltonian checkpoint contains multiple accumulated evaluations"
+            )
+        if len(phase_space_blocks) != completed_refinement_blocks:
+            raise ValueError(
+                "Hamiltonian checkpoint block count and sample blocks disagree"
+            )
+        if basis_evaluations and completed_refinement_blocks < (
+            dynamics.equilibrium_maximum_refinement_batches
+        ):
+            raise ValueError(
+                "Hamiltonian checkpoint evaluated operators before equilibrium "
+                "sampling completed"
+            )
+        print(
+            "[Hamiltonian resolvent restart] "
+            f"blocks={completed_refinement_blocks} "
+            f"basis_level={basis_level} "
+            f"checkpoint={checkpoint_path}",
+            flush=True,
+        )
+    if not checkpoint_path.is_file():
+        warmup_start_s = time.perf_counter()
         state, warmup_block = advance_ionic_hrex(
             model=model,
             state=state,
             settings=settings,
             temperature_K=temperature_K,
-            cycle_count=block_cycle_count,
+            cycle_count=settings.warmup_cycle_count,
             attempt_exchange=len(settings.lambdas) > 1,
             retain_samples=False,
         )
+        warmup_elapsed_s = time.perf_counter() - warmup_start_s
         _report_hrex_block(
-            stage="nvt-burn-in",
-            block_index=warmup_block_index + 1,
-            block_elapsed_s=time.perf_counter() - block_start_s,
-            total_elapsed_s=time.perf_counter() - sampling_start_s,
+            stage="Hamiltonian-resolvent warmup",
+            block_index=0,
+            block_elapsed_s=warmup_elapsed_s,
+            total_elapsed_s=warmup_elapsed_s,
             state=state,
             settings=settings,
             block=warmup_block,
         )
-    _reset_hrex_round_trip_tracking(
-        state=state,
-        replica_count=len(settings.lambdas),
-        reset_walker_identifiers=False,
-    )
-    state.exchange_attempts.fill(0)
-    state.exchange_acceptances.fill(0)
-    state.exchange_expected_acceptance_sums.fill(0.0)
-    state.hmc_attempts.fill(0)
-    state.hmc_acceptances.fill(0)
-    state.hmc_expected_acceptance_sums.fill(0.0)
-    state.hmc_absolute_energy_error_over_kbt_sums.fill(0.0)
-    state.hmc_molecular_com_squared_displacement_sums_m2.fill(0.0)
-    unique_chain_indices = np.arange(settings.independent_ladder_count)
-    maximum_basis_level = max(
-        numerics.basis_radial_count,
-        numerics.basis_fourier_shell,
-        numerics.basis_angular_order,
-        numerics.basis_cluster_depth,
-        numerics.basis_correlation_order,
-    )
-    galerkin_assembler = AnalyticalMolecularGalerkinAssembler(
-        system=system,
-        numerics=numerics,
-        basis_level=maximum_basis_level,
-    )
-    polarization_gradients = np.zeros(
-        (CARTESIAN_DIMENSION, CARTESIAN_DIMENSION * len(system.molecule_atom_indices))
-    )
-    for molecule_index, molecule_atom_indices in enumerate(
-        system.molecule_atom_indices
+    sequence_start_s = time.perf_counter()
+    for refinement_block_index in range(
+        completed_refinement_blocks,
+        dynamics.equilibrium_maximum_refinement_batches,
     ):
-        molecule_slice = slice(
-            CARTESIAN_DIMENSION * molecule_index,
-            CARTESIAN_DIMENSION * (molecule_index + 1),
-        )
-        molecular_charge_C = float(np.sum(system.charges_C[molecule_atom_indices]))
-        polarization_gradients[:, molecule_slice] = molecular_charge_C * np.eye(
-            CARTESIAN_DIMENSION
-        )
-    cumulative_chain_dirichlet: list[Array] = []
-    cumulative_chain_coupling: list[Array] = []
-    cumulative_chain_direct: list[Array] = []
-    chain_operator_series: list[list[Array]] = [
-        [] for _chain_index in unique_chain_indices
-    ]
-    chain_complete_operator_series: list[list[Array]] = [
-        [] for _chain_index in unique_chain_indices
-    ]
-    chain_operator_blocks: list[list[tuple[Array, Array, Array, int]]] = [
-        [] for _chain_index in unique_chain_indices
-    ]
-    admitted_chain_statistics: tuple[tuple[Array, Array, Array], ...] = ()
-    admitted_samples_per_chain = 0
-    operator_effective_sample_size = 0.0
-    maximum_split_rhat = math.inf
-    projection_throughput_reported = False
-    diagnostic_pilot_sample_count = MINIMUM_OPERATOR_DIAGNOSTIC_PILOT_SAMPLES
-    diagnostic_bases: list[OperatorDiagnosticBasis] = []
-    online_block_conductivities_by_chain_S_m: list[list[float]] = [
-        [] for _chain_index in unique_chain_indices
-    ]
-    online_conductivity_estimates_S_m: list[float] = []
-    online_operator_disagreements: list[float] = []
-    previous_provisional_conductivity_S_m = math.inf
-    operator_diagnostics_certified = False
-    molecular_charges_C = np.asarray(
-        tuple(
-            np.sum(system.charges_C[molecule_atom_indices])
-            for molecule_atom_indices in system.molecule_atom_indices
-        )
-    )
-    ionic_species = tuple(
-        sorted(
-            {
-                species_name
-                for species_name, molecular_charge_C in zip(
-                    system.molecule_species_names,
-                    molecular_charges_C,
-                    strict=True,
-                )
-                if molecular_charge_C != 0.0
-            }
-        )
-    )
-    species_direct_sums_S_m = {
-        f"{first_species}|{second_species}": 0.0
-        for first_species, second_species in combinations_with_replacement(
-            ionic_species, 2
-        )
-    }
-    molecular_diffusion_sample_count = 0
-    operator_conductivity_prefactor = 1.0 / (
-        3.0 * K_B * temperature_K * abs(np.linalg.det(system.box_vectors_m))
-    )
-    for refinement_batch in range(1, equilibrium_maximum_refinement_batches + 1):
-        samples_per_chain = equilibrium_samples_per_batch * refinement_batch
-        production_cycle_count = (
-            equilibrium_samples_per_batch * settings.measurement_stride
-        )
         block_start_s = time.perf_counter()
-        state, production_block = advance_ionic_hrex(
+        state, sampling_block = advance_ionic_hrex(
             model=model,
             state=state,
             settings=settings,
             temperature_K=temperature_K,
-            cycle_count=production_cycle_count,
+            cycle_count=settings.block_cycle_count,
             attempt_exchange=len(settings.lambdas) > 1,
             retain_samples=True,
         )
+        sampling_elapsed_s = time.perf_counter() - block_start_s
         _report_hrex_block(
-            stage="nvt-operator-production",
-            block_index=refinement_batch,
-            block_elapsed_s=time.perf_counter() - block_start_s,
-            total_elapsed_s=time.perf_counter() - sampling_start_s,
+            stage="Hamiltonian-resolvent production",
+            block_index=refinement_block_index + 1,
+            block_elapsed_s=sampling_elapsed_s,
+            total_elapsed_s=time.perf_counter() - sequence_start_s,
             state=state,
             settings=settings,
-            block=production_block,
+            block=sampling_block,
         )
-        for chain_position, chain_index in enumerate(unique_chain_indices):
-            chain_mask = production_block.physical_ladder_indices == chain_index
-            batch_configurations_m = production_block.physical_configurations_m[
-                chain_mask
-            ]
-            if batch_configurations_m.shape[0] != equilibrium_samples_per_batch:
-                raise ValueError(
-                    "NVT operator block did not retain the configured samples "
-                    f"for chain {chain_index}: "
-                    f"retained={batch_configurations_m.shape[0]}, "
-                    f"required={equilibrium_samples_per_batch}"
-                )
-            molecular_diffusions_m2_s = (
-                configuration_conditioned_molecular_diffusion_batch(
-                    positions_batch_m=batch_configurations_m,
-                    system=system,
-                    molecular_memory=molecular_memory,
-                )
-            )
-            molecular_diffusion_blocks_m2_s = molecular_diffusions_m2_s.reshape(
-                (
-                    molecular_diffusions_m2_s.shape[0],
-                    len(system.molecule_atom_indices),
-                    CARTESIAN_DIMENSION,
-                    len(system.molecule_atom_indices),
-                    CARTESIAN_DIMENSION,
-                )
-            )
-            charge_weighted_diffusion_traces_C2_m2_s = np.trace(
-                molecular_diffusion_blocks_m2_s,
-                axis1=2,
-                axis2=4,
-            ) * (
-                molecular_charges_C[None, :, None] * molecular_charges_C[None, None, :]
-            )
-            for first_species, second_species in combinations_with_replacement(
-                ionic_species, 2
-            ):
-                first_indices = np.flatnonzero(
-                    np.asarray(system.molecule_species_names) == first_species
-                )
-                second_indices = np.flatnonzero(
-                    np.asarray(system.molecule_species_names) == second_species
-                )
-                contribution = np.sum(
-                    charge_weighted_diffusion_traces_C2_m2_s[
-                        :, first_indices[:, None], second_indices[None, :]
-                    ]
-                )
-                if first_species != second_species:
-                    contribution += np.sum(
-                        charge_weighted_diffusion_traces_C2_m2_s[
-                            :, second_indices[:, None], first_indices[None, :]
-                        ]
-                    )
-                species_direct_sums_S_m[f"{first_species}|{second_species}"] += (
-                    operator_conductivity_prefactor * float(contribution)
-                )
-            molecular_diffusion_sample_count += molecular_diffusions_m2_s.shape[0]
-            molecular_axis_diffusions_m2_s = molecular_diffusions_m2_s[
-                :, ::CARTESIAN_DIMENSION, ::CARTESIAN_DIMENSION
-            ]
-            diffusion_eigenvalues, diffusion_eigenvectors = np.linalg.eigh(
-                molecular_axis_diffusions_m2_s
-            )
-            diffusion_scales = np.maximum(
-                np.max(diffusion_eigenvalues, axis=1), np.finfo(float).tiny
-            )
-            retained_diffusion_modes = diffusion_eigenvalues > (
-                numerics.eigenvalue_relative_tolerance * diffusion_scales[:, None]
-            )
-            molecular_diffusion_square_roots = (
-                diffusion_eigenvectors
-                * np.sqrt(
-                    np.where(retained_diffusion_modes, diffusion_eigenvalues, 0.0)
-                )[:, None, :]
-            )
-            diffusion_square_roots = np.einsum(
-                "bij,ac->biajc",
-                molecular_diffusion_square_roots,
-                np.eye(CARTESIAN_DIMENSION),
-            ).reshape(
-                molecular_diffusions_m2_s.shape[0],
-                CARTESIAN_DIMENSION * len(system.molecule_atom_indices),
-                CARTESIAN_DIMENSION * len(system.molecule_atom_indices),
-            )
-            assembly_start_s = time.perf_counter()
-            (
-                batch_dirichlet,
-                batch_coupling,
-                batch_direct,
-                batch_diagnostics,
-                batch_complete_operators,
-            ) = galerkin_assembler.assemble_batch(
-                configurations_m=batch_configurations_m,
-                diffusion_square_roots=diffusion_square_roots,
-                polarization_gradients=polarization_gradients,
-            )
-            if not projection_throughput_reported:
-                throughput_elapsed_s = time.perf_counter() - assembly_start_s
-                configurations_per_s = (
-                    batch_configurations_m.shape[0] / throughput_elapsed_s
-                )
-                print(
-                    "[operator assembly] "
-                    f"configurations_per_s={configurations_per_s:.12g} "
-                    f"batch_configurations={batch_configurations_m.shape[0]}",
-                    flush=True,
-                )
-                projection_throughput_reported = True
-            basis_count = galerkin_assembler.basis_count
-            if not cumulative_chain_dirichlet:
-                cumulative_chain_dirichlet.extend(
-                    np.zeros((basis_count, basis_count))
-                    for _chain_index in unique_chain_indices
-                )
-                cumulative_chain_coupling.extend(
-                    np.zeros((basis_count, CARTESIAN_DIMENSION))
-                    for _chain_index in unique_chain_indices
-                )
-                cumulative_chain_direct.extend(
-                    np.zeros(CARTESIAN_DIMENSION)
-                    for _chain_index in unique_chain_indices
-                )
-            cumulative_chain_dirichlet[chain_position] += batch_dirichlet
-            cumulative_chain_coupling[chain_position] += batch_coupling
-            cumulative_chain_direct[chain_position] += batch_direct
-            chain_operator_series[chain_position].extend(batch_diagnostics)
-            chain_complete_operator_series[chain_position].extend(
-                batch_complete_operators
-            )
-            np.savez_compressed(
-                operator_checkpoint_directory
-                / (
-                    f"refinement_{refinement_batch:04d}_"
-                    f"chain_{chain_index:04d}.npz"
-                ),
-                physical_configurations_m=batch_configurations_m,
-                physical_box_vectors_by_sample_m=(
-                    production_block.physical_box_vectors_by_sample_m[chain_mask]
-                ),
-                molecular_diffusions_m2_s=molecular_diffusions_m2_s,
-                complete_operator_samples=batch_complete_operators,
-                chain_index=np.asarray(chain_index),
-                refinement_batch=np.asarray(refinement_batch),
-            )
-            chain_operator_blocks[chain_position].append(
-                (
-                    batch_dirichlet,
-                    batch_coupling,
-                    batch_direct,
-                    int(batch_configurations_m.shape[0]),
-                )
-            )
-        write_json_object(
-            operator_checkpoint_directory / "manifest.json",
-            {
-                "completed_refinement_batch": refinement_batch,
-                "chain_count": int(unique_chain_indices.size),
-                "samples_per_chain": samples_per_chain,
-                "basis_count": galerkin_assembler.basis_count,
-            },
-            "conductivity operator checkpoint manifest",
+        expected_configuration_count = (
+            settings.independent_ladder_count * dynamics.equilibrium_sample_count
         )
-        chain_statistics = tuple(
-            (
-                cumulative_chain_dirichlet[chain_position] / samples_per_chain,
-                cumulative_chain_coupling[chain_position] / samples_per_chain,
-                cumulative_chain_direct[chain_position] / samples_per_chain,
+        if sampling_block.physical_configurations_m.shape[0] != (
+            expected_configuration_count
+        ):
+            raise ValueError(
+                "Hamiltonian operator block did not retain the configured number "
+                f"of configurations: observed="
+                f"{sampling_block.physical_configurations_m.shape[0]}, "
+                f"expected={expected_configuration_count}"
             )
-            for chain_position in range(unique_chain_indices.size)
-        )
-        maximum_relative_disagreement = maximum_chain_operator_relative_disagreement(
-            chain_statistics=chain_statistics,
-            eigenvalue_relative_tolerance=(numerics.eigenvalue_relative_tolerance),
-            maximum_basis_size=numerics.maximum_basis_size,
-        )
-        pooled_dirichlet = np.mean(
-            np.stack(tuple(values[0] for values in chain_statistics)), axis=0
-        )
-        pooled_coupling = np.mean(
-            np.stack(tuple(values[1] for values in chain_statistics)), axis=0
-        )
-        pooled_direct_axes = np.mean(
-            np.stack(tuple(values[2] for values in chain_statistics)), axis=0
-        )
-        volume_m3 = abs(np.linalg.det(system.box_vectors_m))
-        conductivity_prefactor = 1.0 / (3.0 * K_B * temperature_K * volume_m3)
-        pooled_dirichlet_diagonal = np.diag(pooled_dirichlet)
-        online_active_basis = pooled_dirichlet_diagonal > 0.0
-        if not np.any(online_active_basis):
-            raise ValueError("pooled operator has zero Dirichlet energy")
-        online_basis_scales = np.sqrt(pooled_dirichlet_diagonal[online_active_basis])
-        normalized_pooled_dirichlet = pooled_dirichlet[
-            np.ix_(online_active_basis, online_active_basis)
-        ] / (online_basis_scales[:, None] * online_basis_scales[None, :])
-        normalized_pooled_coupling = (
-            pooled_coupling[online_active_basis] / online_basis_scales[:, None]
-        )
-        provisional_direct_S_m = conductivity_prefactor * float(
-            np.sum(pooled_direct_axes)
-        )
-        provisional_correction_S_m = conductivity_prefactor * float(
-            np.trace(
-                normalized_pooled_coupling.T
-                @ symmetric_psd_pseudoinverse(
-                    normalized_pooled_dirichlet,
-                    numerics.eigenvalue_relative_tolerance,
-                )
-                @ normalized_pooled_coupling
+        if (
+            sampling_block.physical_momenta_kg_m_s.shape
+            != sampling_block.physical_configurations_m.shape
+        ):
+            raise ValueError(
+                "Hamiltonian operator block did not retain one canonical momentum "
+                "sample per configuration"
+            )
+        if (
+            sampling_block.physical_forces_N.shape
+            != sampling_block.physical_configurations_m.shape
+        ):
+            raise ValueError(
+                "Hamiltonian operator block did not retain one physical force "
+                "sample per configuration"
+            )
+        phase_space_blocks.append(
+            HamiltonianPhaseSpaceSamples(
+                configurations_m=sampling_block.physical_configurations_m,
+                box_vectors_m=sampling_block.physical_box_vectors_by_sample_m,
+                momenta_kg_m_s=sampling_block.physical_momenta_kg_m_s,
+                forces_N=sampling_block.physical_forces_N,
+                chain_indices=sampling_block.physical_ladder_indices,
             )
         )
-        provisional_conductivity_S_m = (
-            provisional_direct_S_m - provisional_correction_S_m
+        completed_refinement_blocks = refinement_block_index + 1
+        _write_hamiltonian_resolvent_checkpoint(
+            checkpoint_path=checkpoint_path,
+            checkpoint_schema=checkpoint_schema,
+            checkpoint_fingerprint=checkpoint_fingerprint,
+            state=state,
+            phase_space_blocks=phase_space_blocks,
+            basis_evaluations=tuple(basis_evaluations),
+            completed_refinement_blocks=completed_refinement_blocks,
+            basis_level=basis_level,
         )
-        online_conductivity_estimates_S_m.append(provisional_conductivity_S_m)
-        online_operator_disagreements.append(maximum_relative_disagreement)
-        for chain_position, chain_blocks in enumerate(chain_operator_blocks):
-            (
-                block_dirichlet_sum,
-                block_coupling_sum,
-                block_direct_sum,
+    if not phase_space_blocks:
+        raise RuntimeError("Hamiltonian equilibrium sequence retained no samples")
+    accumulated_phase_space_samples = _concatenate_hamiltonian_phase_space_samples(
+        phase_space_blocks
+    )
+    sample_count = accumulated_phase_space_samples.configurations_m.shape[0]
+    samples_per_chain = int(sample_count / settings.independent_ladder_count)
+    minimum_training_sample_count = min(
+        int(
+            np.sum(
+                np.isin(
+                    accumulated_phase_space_samples.chain_indices,
+                    tuple(range(parity, settings.independent_ladder_count, 2)),
+                )
+            )
+        )
+        for parity in (0, 1)
+    )
+    configured_basis_level = dynamics.equilibrium_maximum_refinement_batches
+    if not basis_evaluations:
+        basis_level = configured_basis_level
+    if basis_level != configured_basis_level:
+        raise ValueError(
+            "checkpoint basis level does not match the configured nested sequence"
+        )
+    configured_basis_size = len(_phase_space_basis_labels(system, basis_level))
+    if minimum_training_sample_count < configured_basis_size:
+        raise RuntimeError(
+            "Hamiltonian equilibrium budget is smaller than the predetermined "
+            "nested basis: "
+            f"training_samples={minimum_training_sample_count}, "
+            f"basis_size={configured_basis_size}"
+        )
+    evaluated_sample_count = 0
+    if basis_evaluations:
+        evaluated_sample_count = basis_evaluations[0].basis_values.shape[0]
+    block_sample_start = 0
+    for phase_space_block in phase_space_blocks:
+        block_sample_count = phase_space_block.configurations_m.shape[0]
+        block_sample_stop = block_sample_start + block_sample_count
+        if block_sample_stop <= evaluated_sample_count:
+            block_sample_start = block_sample_stop
+            continue
+        local_sample_start = max(
+            evaluated_sample_count - block_sample_start,
+            0,
+        )
+        for operator_batch_start in range(
+            local_sample_start,
+            block_sample_count,
+            dynamics.resolvent_operator_batch_size,
+        ):
+            operator_batch_stop = min(
+                operator_batch_start + dynamics.resolvent_operator_batch_size,
                 block_sample_count,
-            ) = chain_blocks[-1]
-            block_dirichlet = block_dirichlet_sum / block_sample_count
-            block_coupling = block_coupling_sum / block_sample_count
-            block_direct = block_direct_sum / block_sample_count
-            normalized_block_dirichlet = block_dirichlet[
-                np.ix_(online_active_basis, online_active_basis)
-            ] / (online_basis_scales[:, None] * online_basis_scales[None, :])
-            normalized_block_coupling = (
-                block_coupling[online_active_basis] / online_basis_scales[:, None]
             )
-            block_correction_S_m = conductivity_prefactor * float(
-                np.trace(
-                    normalized_block_coupling.T
-                    @ symmetric_psd_pseudoinverse(
-                        normalized_block_dirichlet,
-                        numerics.eigenvalue_relative_tolerance,
-                    )
-                    @ normalized_block_coupling
-                )
+            operator_phase_space_samples = HamiltonianPhaseSpaceSamples(
+                configurations_m=phase_space_block.configurations_m[
+                    operator_batch_start:operator_batch_stop
+                ],
+                box_vectors_m=phase_space_block.box_vectors_m[
+                    operator_batch_start:operator_batch_stop
+                ],
+                momenta_kg_m_s=phase_space_block.momenta_kg_m_s[
+                    operator_batch_start:operator_batch_stop
+                ],
+                forces_N=phase_space_block.forces_N[
+                    operator_batch_start:operator_batch_stop
+                ],
+                chain_indices=phase_space_block.chain_indices[
+                    operator_batch_start:operator_batch_stop
+                ],
             )
-            online_block_conductivities_by_chain_S_m[chain_position].append(
-                conductivity_prefactor * float(np.sum(block_direct))
-                - block_correction_S_m
+            operator_evaluation = _evaluate_phase_space_basis_samples(
+                phase_space_samples=operator_phase_space_samples,
+                model=model,
+                basis_level=basis_level,
+                temperature_K=temperature_K,
+                operator_batch_size=dynamics.resolvent_operator_batch_size,
             )
-        provisional_conductivity_mcse_S_m = math.inf
-        if unique_chain_indices.size > 1:
-            chain_mean_conductivities_S_m = np.asarray(
-                tuple(
-                    np.mean(chain_block_conductivities_S_m)
-                    for chain_block_conductivities_S_m in (
-                        online_block_conductivities_by_chain_S_m
-                    )
+            evaluation_already_started = bool(basis_evaluations)
+            if evaluation_already_started:
+                basis_evaluations[0] = _concatenate_hamiltonian_basis_evaluations(
+                    first_evaluation=basis_evaluations[0],
+                    second_evaluation=operator_evaluation,
                 )
+            if not evaluation_already_started:
+                basis_evaluations.append(operator_evaluation)
+            evaluated_sample_count = (
+                block_sample_start + operator_batch_stop
             )
-            provisional_conductivity_mcse_S_m = float(
-                np.std(chain_mean_conductivities_S_m, ddof=1)
-                / math.sqrt(unique_chain_indices.size)
+            _write_hamiltonian_resolvent_checkpoint(
+                checkpoint_path=checkpoint_path,
+                checkpoint_schema=checkpoint_schema,
+                checkpoint_fingerprint=checkpoint_fingerprint,
+                state=state,
+                phase_space_blocks=phase_space_blocks,
+                basis_evaluations=tuple(basis_evaluations),
+                completed_refinement_blocks=completed_refinement_blocks,
+                basis_level=basis_level,
             )
-        provisional_conductivity_change_S_m = abs(
-            provisional_conductivity_S_m - previous_provisional_conductivity_S_m
-        )
-        conductivity_precision_reached = (
-            refinement_batch > 1
-            and provisional_conductivity_mcse_S_m <= numerics.conductivity_tolerance_S_m
-            and provisional_conductivity_change_S_m
-            <= numerics.conductivity_tolerance_S_m
-        )
-        print(
-            "[conductivity estimate] "
-            f"refinement_batch={refinement_batch} "
-            f"samples_per_chain={samples_per_chain} "
-            f"conductivity_S_m={provisional_conductivity_S_m:.12g} "
-            f"direct_S_m={provisional_direct_S_m:.12g} "
-            f"correction_S_m={provisional_correction_S_m:.12g} "
-            f"mcse_S_m={provisional_conductivity_mcse_S_m:.12g} "
-            f"change_S_m={provisional_conductivity_change_S_m:.12g} "
-            f"precision_reached={conductivity_precision_reached}",
-            flush=True,
-        )
-        previous_provisional_conductivity_S_m = provisional_conductivity_S_m
-        current_operator_chains = np.asarray(
-            tuple(
-                np.asarray(series[:samples_per_chain])
-                for series in chain_operator_series
-            )
-        )
-        if not diagnostic_bases and samples_per_chain >= diagnostic_pilot_sample_count:
-            diagnostic_bases.append(
-                fit_operator_diagnostic_basis(
-                    chain_operator_series=current_operator_chains[
-                        :, :diagnostic_pilot_sample_count
-                    ],
-                    eigenvalue_relative_tolerance=(
-                        numerics.eigenvalue_relative_tolerance
-                    ),
-                    maximum_mode_count=numerics.maximum_basis_size,
-                )
-            )
-        operator_certified = False
-        influence_rhat = math.inf
-        influence_effective_sample_size = 0.0
-        if diagnostic_bases:
-            diagnostic_basis = diagnostic_bases[0]
-            diagnostic_operator_chains = (
-                current_operator_chains[:, diagnostic_pilot_sample_count:]
-                - diagnostic_basis.mean
-            ) @ diagnostic_basis.loadings
-            if diagnostic_operator_chains.shape[1] >= 4:
-                operator_effective_sample_size = (
-                    multivariate_batch_means_effective_sample_size(
-                        diagnostic_operator_chains
-                    )
-                )
-                mode_diagnostics = fixed_operator_mode_diagnostics(
-                    chain_operator_series=current_operator_chains[
-                        :, diagnostic_pilot_sample_count:
-                    ],
-                    diagnostic_basis=diagnostic_basis,
-                    dirichlet_diagonal_count=basis_count,
-                    coupling_count=basis_count * CARTESIAN_DIMENSION,
-                    direct_count=CARTESIAN_DIMENSION,
-                )
-                maximum_split_rhat = max(
-                    max(mode.bulk_rhat, mode.folded_rhat) for mode in mode_diagnostics
-                )
-                current_complete_operator_chains = np.asarray(
-                    tuple(
-                        np.asarray(series[:samples_per_chain])
-                        for series in chain_complete_operator_series
-                    )
-                )
-                influence_diagnostic = conductivity_influence_diagnostic(
-                    chain_complete_operator_series=(
-                        current_complete_operator_chains[
-                            :, diagnostic_pilot_sample_count:
-                        ]
-                    ),
-                    basis_count=basis_count,
-                    temperature_K=temperature_K,
-                    volume_m3=abs(np.linalg.det(system.box_vectors_m)),
-                    eigenvalue_relative_tolerance=(
-                        numerics.eigenvalue_relative_tolerance
-                    ),
-                )
-                influence_rhat = max(
-                    influence_diagnostic.bulk_rhat,
-                    influence_diagnostic.folded_rhat,
-                )
-                influence_effective_sample_size = (
-                    influence_diagnostic.effective_sample_size
-                )
-                operator_certified = (
-                    maximum_relative_disagreement
-                    <= numerics.equilibrium_observable_relative_tolerance
-                    and operator_effective_sample_size
-                    >= numerics.minimum_effective_sample_size
-                    and maximum_split_rhat <= numerics.maximum_split_rhat
-                    and influence_rhat <= numerics.maximum_split_rhat
-                    and influence_effective_sample_size
-                    >= numerics.minimum_effective_sample_size
-                )
-        operator_diagnostics_certified = operator_certified
-        print(
-            "[operator diagnostics] "
-            f"refinement_batch={refinement_batch} "
-            f"relative_disagreement={maximum_relative_disagreement:.12g} "
-            f"effective_sample_size={operator_effective_sample_size:.12g} "
-            f"maximum_split_rhat={maximum_split_rhat:.12g} "
-            f"influence_effective_sample_size={influence_effective_sample_size:.12g} "
-            f"influence_rhat={influence_rhat:.12g} "
-            f"certified={operator_certified}",
-            flush=True,
-        )
-        if conductivity_precision_reached:
-            admitted_chain_statistics = chain_statistics
-            admitted_samples_per_chain = samples_per_chain
-            break
-    if not admitted_chain_statistics:
-        raise ValueError(
-            "conductivity estimate did not reach the configured block precision "
-            "within the refinement limit: "
-            f"conductivity_mcse_S_m={provisional_conductivity_mcse_S_m:.12g}, "
-            f"conductivity_change_S_m={provisional_conductivity_change_S_m:.12g}, "
-            f"tolerance_S_m={numerics.conductivity_tolerance_S_m:.12g}, "
-            f"refinement_batches={equilibrium_maximum_refinement_batches}"
-        )
-    conductivity = provisional_conductivity_S_m
-    direct = provisional_direct_S_m
-    history = tuple(online_conductivity_estimates_S_m)
-    residuals = tuple(online_operator_disagreements)
-    basis_size = int(np.count_nonzero(online_active_basis))
-    conductivity_mcse_S_m = provisional_conductivity_mcse_S_m
-    basis_diagnostics_certified = conductivity_precision_reached
-    species_direct_contributions_S_m = tuple(
-        (
-            species_pair,
-            contribution_sum_S_m / molecular_diffusion_sample_count,
-        )
-        for species_pair, contribution_sum_S_m in sorted(
-            species_direct_sums_S_m.items()
-        )
-    )
-    decomposed_direct_S_m = sum(
-        contribution for _species_pair, contribution in species_direct_contributions_S_m
-    )
-    direct_decomposition_scale_S_m = max(abs(direct), np.finfo(float).tiny)
-    if abs(decomposed_direct_S_m - direct) / direct_decomposition_scale_S_m > math.sqrt(
-        np.finfo(float).eps
+        block_sample_start = block_sample_stop
+    basis_evaluation = basis_evaluations[0]
+    if basis_evaluation.basis_level != basis_level:
+        raise ValueError("checkpoint basis level and evaluation disagree")
+    if basis_evaluation.basis_values.shape[0] != sample_count:
+        raise ValueError("checkpoint basis evaluation omits equilibrium samples")
+    nested_basis_estimates: list[HamiltonianResolventEstimate] = []
+    for nested_basis_size in range(
+        CARTESIAN_DIMENSION,
+        len(basis_evaluation.basis_labels) + 1,
     ):
-        raise ValueError(
-            "species direct-conductivity decomposition does not reproduce the "
-            "pooled direct term"
+        current_estimate = _solve_hamiltonian_resolvent(
+            basis_evaluation=basis_evaluation,
+            basis_size=nested_basis_size,
+            temperature_K=temperature_K,
+            volume_m3=float(abs(np.linalg.det(system.box_vectors_m))),
+            independent_chain_count=settings.independent_ladder_count,
+            eta_values_s_inv=numerics.resolvent_eta_values_s_inv,
+            numerics=numerics,
         )
-    return (
-        conductivity,
-        direct,
-        history,
-        residuals,
-        basis_size,
-        operator_effective_sample_size,
-        maximum_split_rhat,
-        conductivity_mcse_S_m,
-        admitted_samples_per_chain,
-        operator_diagnostics_certified,
-        species_direct_contributions_S_m,
-        conductivity_precision_reached,
-        basis_diagnostics_certified,
+        nested_basis_estimates.append(current_estimate)
+        print(
+            "[Hamiltonian nested basis] "
+            f"basis_size={nested_basis_size} "
+            f"lower_S_m={current_estimate.lower_bound_S_m:.12g} "
+            f"upper_S_m={current_estimate.upper_bound_S_m:.12g} "
+            f"basis_error_S_m={current_estimate.basis_error_S_m:.12g} "
+            "finite_eta_precision_reached="
+            f"{current_estimate.finite_eta_precision_reached}",
+            flush=True,
+        )
+        if current_estimate.finite_eta_precision_reached:
+            break
+    if not nested_basis_estimates:
+        raise RuntimeError("Hamiltonian nested basis sequence did not execute")
+    current_estimate = nested_basis_estimates[-1]
+    basis_evaluations[0] = basis_evaluation
+    _write_hamiltonian_resolvent_checkpoint(
+        checkpoint_path=checkpoint_path,
+        checkpoint_schema=checkpoint_schema,
+        checkpoint_fingerprint=checkpoint_fingerprint,
+        state=state,
+        phase_space_blocks=phase_space_blocks,
+        basis_evaluations=tuple(basis_evaluations),
+        completed_refinement_blocks=completed_refinement_blocks,
+        basis_level=basis_level,
     )
+    print(
+        "[Hamiltonian Green-Kubo] "
+        f"samples_per_chain={samples_per_chain} "
+        f"basis_level={basis_level} "
+        f"basis_size={current_estimate.basis_size} "
+        f"resolvent_iterate_S_m={current_estimate.resolvent_iterate_S_m:.12g} "
+        f"lower_S_m={current_estimate.lower_bound_S_m:.12g} "
+        f"upper_S_m={current_estimate.upper_bound_S_m:.12g} "
+        f"basis_error_S_m={current_estimate.basis_error_S_m:.12g} "
+        f"eta_continuation_error_S_m="
+        f"{current_estimate.eta_continuation_error_S_m:.12g} "
+        f"equilibrium_error_S_m={current_estimate.equilibrium_error_S_m:.12g} "
+        f"linear_solve_error_S_m={current_estimate.linear_solve_error_S_m:.12g} "
+        f"mcse_S_m={current_estimate.conductivity_mcse_S_m:.12g} "
+        f"eta_intervals={current_estimate.intervals_S_m} "
+        "finite_eta_precision_reached="
+        f"{current_estimate.finite_eta_precision_reached}",
+        flush=True,
+    )
+    return current_estimate, samples_per_chain
 
 
 def validate_force_consistency(
@@ -6589,21 +5556,33 @@ def validate_force_consistency(
     random_generator = np.random.default_rng(random_seed)
     direction = random_generator.normal(size=positions_m.shape)
     direction /= np.linalg.norm(direction)
-    displacement = numerics.force_difference_step_m * direction
-    positive_energy = model.energy_J(
-        positions_m + displacement, model.system.box_vectors_m
+    displacement_m = numerics.force_difference_step_m * direction
+    positive_energy_J = model.energy_J(
+        positions_m + displacement_m,
+        model.system.box_vectors_m,
     )
-    negative_energy = model.energy_J(
-        positions_m - displacement, model.system.box_vectors_m
+    negative_energy_J = model.energy_J(
+        positions_m - displacement_m,
+        model.system.box_vectors_m,
     )
-    finite_difference = (positive_energy - negative_energy) / (
-        2.0 * numerics.force_difference_step_m
+    finite_difference_directional_derivative_N = (
+        positive_energy_J - negative_energy_J
+    ) / (2.0 * numerics.force_difference_step_m)
+    analytical_directional_derivative_N = -float(
+        np.sum(
+            model.forces_N(positions_m, model.system.box_vectors_m)
+            * direction
+        )
     )
-    analytical = -float(
-        np.sum(model.forces_N(positions_m, model.system.box_vectors_m) * direction)
+    comparison_scale_N = max(
+        abs(finite_difference_directional_derivative_N),
+        abs(analytical_directional_derivative_N),
+        np.finfo(float).tiny,
     )
-    scale = max(abs(finite_difference), abs(analytical), np.finfo(float).tiny)
-    relative_error = abs(finite_difference - analytical) / scale
+    relative_error = abs(
+        finite_difference_directional_derivative_N
+        - analytical_directional_derivative_N
+    ) / comparison_scale_N
     if relative_error > numerics.force_consistency_relative_tolerance:
         raise ValueError(
             f"force directional derivative relative error {relative_error:.6e} "
@@ -6617,7 +5596,11 @@ def _validate_settings(
 ) -> None:
     dynamics_record = asdict(dynamics)
     hrex_lambdas = tuple(dynamics_record.pop("ionic_hrex_lambdas"))
-    values = tuple(dynamics_record.values()) + tuple(asdict(numerics).values())
+    numerics_record = asdict(numerics)
+    resolvent_eta_values_s_inv = tuple(
+        numerics_record.pop("resolvent_eta_values_s_inv")
+    )
+    values = tuple(dynamics_record.values()) + tuple(numerics_record.values())
     if any(float(value) <= 0.0 for value in values):
         raise ValueError(
             "all dynamics settings and numerical settings must be positive"
@@ -6630,7 +5613,6 @@ def _validate_settings(
         dynamics.initial_relaxation_damping_decrease,
         dynamics.initial_relaxation_minimum_force_improvement_fraction,
         numerics.ewald_reciprocal_relative_tolerance,
-        numerics.memory_psd_relative_tolerance,
         numerics.minimum_interatomic_contact_ratio,
     )
     if any(value >= 1.0 for value in fractions):
@@ -6647,36 +5629,62 @@ def _validate_settings(
         dynamics.equilibrium_chain_count / dynamics.force_batch_size
     ):
         raise ValueError("relaxation budget cannot complete one exact-shape preflight")
-    if not (
-        numerics.pressure_log_volume_derivative_check_step
-        < numerics.pressure_log_volume_derivative_step
-    ):
-        raise ValueError(
-            "pressure derivative check step must be smaller than the primary step"
-        )
     if not (numerics.lennard_jones_switch_start_m < numerics.lennard_jones_cutoff_m):
         raise ValueError("Lennard-Jones switch start must be below the cutoff")
+    if len(resolvent_eta_values_s_inv) < 3 or any(
+        eta_s_inv <= 0.0 for eta_s_inv in resolvent_eta_values_s_inv
+    ):
+        raise ValueError("at least three positive resolvent eta values are required")
+    if any(
+        next_eta_s_inv >= eta_s_inv
+        for eta_s_inv, next_eta_s_inv in zip(
+            resolvent_eta_values_s_inv[:-1],
+            resolvent_eta_values_s_inv[1:],
+            strict=True,
+        )
+    ):
+        raise ValueError("resolvent eta values must be strictly decreasing")
+    if (
+        dynamics.equilibrium_chain_count < 4
+        or dynamics.equilibrium_chain_count % 2 != 0
+    ):
+        raise ValueError(
+            "Hamiltonian cross-fitted equilibrium integration requires an even "
+            "number of at least four chains"
+        )
+    if dynamics.hrex_block_cycle_count != (
+        dynamics.equilibrium_sample_count * dynamics.hrex_measurement_stride
+    ):
+        raise ValueError(
+            "HREX block cycles must retain exactly equilibrium_sample_count "
+            "configurations per independent chain"
+        )
 
 
-def compute_first_principles_conductivity(
+def _compute_finite_cell_resolvent(
     recipe: ElectrolyteRecipeModel,
+    recipe_realization: IntegerRecipeRealization,
     temperature_K: float,
     liquid_density_kg_m3: float,
     density_source: str,
-    minimum_explicit_molecule_count: int,
     dynamics: DynamicsSettings,
     numerics: NumericalSettings,
     random_seed: int,
     initialization_checkpoint_path: Path,
-) -> ConductivityResult:
+) -> tuple[
+    HamiltonianResolventEstimate,
+    IntegerRecipeRealization,
+    float,
+    float,
+]:
     _validate_settings(dynamics, numerics)
     if (
         temperature_K <= 0.0
         or liquid_density_kg_m3 <= 0.0
-        or minimum_explicit_molecule_count <= 0
+        or recipe_realization.explicit_molecule_count <= 0
     ):
         raise ValueError(
-            "temperature, liquid density, and minimum molecule count must be positive"
+            "temperature, liquid density, and realized molecule count must be positive"
         )
     if not density_source.strip():
         raise ValueError("density source must identify the imposed NVT state")
@@ -6688,29 +5696,25 @@ def compute_first_principles_conductivity(
     )
     sampling_random_seed = int(seed_sequences[-1].generate_state(1)[0])
     checkpoint_dynamics_record = asdict(dynamics)
-    for runtime_control_name in (
-        "initial_relaxation_maximum_force_evaluations",
-        "initial_relaxation_maximum_elapsed_s",
-        "initial_relaxation_maximum_stagnant_iterations",
-        "initial_relaxation_progress_stride",
-        "force_batch_size",
-        "initial_force_tolerance_N",
-        "equilibrium_sample_count",
-        "equilibrium_maximum_refinement_batches",
-        "hamiltonian_timestep_s",
-        "ionic_hrex_lambdas",
-        "hmc_steps_min",
-        "hmc_steps_max",
-        "hmc_momentum_persistence",
-        "hmc_full_refresh_stride",
-        "exchange_stride",
-        "hrex_warmup_cycle_count",
-        "hrex_measurement_stride",
-        "hrex_block_cycle_count",
-    ):
-        checkpoint_dynamics_record.pop(runtime_control_name)
     checkpoint_numerics_record = asdict(numerics)
-    request_fingerprint_record = {
+    initialization_dynamics_keys = {
+        field_name
+        for field_name in checkpoint_dynamics_record
+        if field_name.startswith("initial_relaxation_")
+    }
+    initialization_dynamics_keys.update(
+        {
+            "force_batch_size",
+            "initial_force_tolerance_N",
+            "equilibrium_chain_count",
+            "solvent_volume_fraction_tolerance",
+            "salt_molarity_tolerance_mol_L",
+            "additive_weight_fraction_tolerance",
+            "maximum_explicit_molecule_count",
+            "maximum_atom_count",
+        }
+    )
+    initialization_fingerprint_record = {
         "recipe": {
             "solvents": dict(recipe.solvents),
             "salts": dict(recipe.salts),
@@ -6718,15 +5722,41 @@ def compute_first_principles_conductivity(
         },
         "temperature_K": temperature_K,
         "liquid_density_kg_m3": liquid_density_kg_m3,
-        "minimum_explicit_molecule_count": minimum_explicit_molecule_count,
+        "recipe_realization": asdict(recipe_realization),
+        "dynamics": {
+            field_name: checkpoint_dynamics_record[field_name]
+            for field_name in sorted(initialization_dynamics_keys)
+        },
+        "numerics": {
+            field_name: field_value
+            for field_name, field_value in checkpoint_numerics_record.items()
+            if field_name
+            not in {
+                "resolvent_eta_values_s_inv",
+                "equilibrium_standard_error_multiplier",
+                "conductivity_tolerance_S_m",
+            }
+        },
+        "packing_random_seeds": packing_random_seeds,
+        "initialization_schema": "hamiltonian_initialization_v2",
+    }
+    initialization_checkpoint_fingerprint = hashlib.sha256(
+        json.dumps(
+            initialization_fingerprint_record,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    resolvent_fingerprint_record = {
+        "initialization_fingerprint": initialization_checkpoint_fingerprint,
         "dynamics": checkpoint_dynamics_record,
         "numerics": checkpoint_numerics_record,
-        "packing_random_seeds": packing_random_seeds,
         "sampling_random_seed": sampling_random_seed,
+        "resolvent_schema": "hamiltonian_phase_space_resolvent_v7",
     }
-    checkpoint_fingerprint = hashlib.sha256(
+    resolvent_checkpoint_fingerprint = hashlib.sha256(
         json.dumps(
-            request_fingerprint_record,
+            resolvent_fingerprint_record,
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
@@ -6734,26 +5764,27 @@ def compute_first_principles_conductivity(
     if initialization_checkpoint_path.is_file():
         with initialization_checkpoint_path.open("rb") as checkpoint_file:
             checkpoint_payload = pickle.load(checkpoint_file)
-        if checkpoint_payload["fingerprint"] != checkpoint_fingerprint:
+        if (
+            "schema" not in checkpoint_payload
+            or checkpoint_payload["schema"] != "hamiltonian_initialization_v2"
+        ):
+            raise ValueError(
+                "initialization checkpoint uses a retired serialization schema"
+            )
+        if (
+            checkpoint_payload["fingerprint"]
+            != initialization_checkpoint_fingerprint
+        ):
             raise ValueError(
                 "initialization checkpoint does not match the requested calculation"
             )
-        recipe_realization = checkpoint_payload["metadata"]["recipe_realization"]
-    else:
-        recipe_realization = select_integer_recipe_realization(
-            recipe=recipe,
-            liquid_density_kg_m3=liquid_density_kg_m3,
-            solvent_volume_fraction_tolerance=(
-                dynamics.solvent_volume_fraction_tolerance
-            ),
-            salt_molarity_tolerance_mol_L=dynamics.salt_molarity_tolerance_mol_L,
-            additive_weight_fraction_tolerance=(
-                dynamics.additive_weight_fraction_tolerance
-            ),
-            minimum_explicit_molecule_count=minimum_explicit_molecule_count,
-            maximum_explicit_molecule_count=(dynamics.maximum_explicit_molecule_count),
-            maximum_atom_count=dynamics.maximum_atom_count,
+        checkpoint_recipe_realization = _integer_recipe_realization_from_checkpoint_record(
+            checkpoint_payload["metadata"]["recipe_realization"]
         )
+        if checkpoint_recipe_realization != recipe_realization:
+            raise ValueError(
+                "initialization checkpoint realization differs from the requested cell"
+            )
     density_conditioned_length_m = recipe_realization.density_conditioned_volume_m3 ** (
         1.0 / CARTESIAN_DIMENSION
     )
@@ -6783,11 +5814,17 @@ def compute_first_principles_conductivity(
     if initialization_checkpoint_path.is_file():
         with initialization_checkpoint_path.open("rb") as checkpoint_file:
             checkpoint_payload = pickle.load(checkpoint_file)
-        if checkpoint_payload["fingerprint"] != checkpoint_fingerprint:
+        if (
+            checkpoint_payload["fingerprint"]
+            != initialization_checkpoint_fingerprint
+        ):
             raise ValueError(
                 "initialization checkpoint does not match the requested calculation"
             )
-        density_conditioned_systems.extend(checkpoint_payload["systems"])
+        density_conditioned_systems.extend(
+            _molecular_system_from_checkpoint_record(system_record)
+            for system_record in checkpoint_payload["systems"]
+        )
         initialization_checkpoint_metadata = checkpoint_payload["metadata"]
         print(
             "[initialization restart] "
@@ -6823,7 +5860,7 @@ def compute_first_principles_conductivity(
         ):
             topology_hasher.update(np.ascontiguousarray(topology_array).tobytes())
         checkpoint_metadata = {
-            "recipe_realization": recipe_realization,
+            "recipe_realization": asdict(recipe_realization),
             "formula_unit_counts": recipe_realization.formula_unit_counts,
             "explicit_species_counts": recipe_realization.explicit_species_counts,
             "explicit_molecule_count": recipe_realization.explicit_molecule_count,
@@ -6846,14 +5883,20 @@ def compute_first_principles_conductivity(
             f"{initialization_checkpoint_path.suffix}.tmp"
         )
         packed_checkpoint_payload = {
-            "fingerprint": checkpoint_fingerprint,
+            "schema": "hamiltonian_initialization_v2",
+            "fingerprint": initialization_checkpoint_fingerprint,
             "metadata": checkpoint_metadata,
             "stage": "packed",
-            "systems": tuple(density_conditioned_systems),
+            "systems": tuple(
+                asdict(system) for system in density_conditioned_systems
+            ),
             "velocities_m_s": np.zeros_like(
                 np.stack(
                     tuple(system.positions_m for system in density_conditioned_systems)
                 )
+            ),
+            "accepted_positions_m": np.stack(
+                tuple(system.positions_m for system in density_conditioned_systems)
             ),
             "timesteps_s": np.full(
                 dynamics.equilibrium_chain_count,
@@ -6870,6 +5913,11 @@ def compute_first_principles_conductivity(
             "best_maximum_forces_N": np.full(
                 dynamics.equilibrium_chain_count,
                 np.inf,
+            ),
+            "accepted_energies_J": np.zeros(dynamics.equilibrium_chain_count),
+            "has_accepted_energy": np.zeros(
+                dynamics.equilibrium_chain_count,
+                dtype=bool,
             ),
             "stagnant_iterations": np.zeros(
                 dynamics.equilibrium_chain_count,
@@ -6910,7 +5958,7 @@ def compute_first_principles_conductivity(
         initial_systems=tuple(density_conditioned_systems),
         dynamics=dynamics,
         checkpoint_path=initialization_checkpoint_path,
-        checkpoint_fingerprint=checkpoint_fingerprint,
+        checkpoint_fingerprint=initialization_checkpoint_fingerprint,
         checkpoint_metadata=initialization_checkpoint_metadata,
     )
     relaxed_systems: list[MolecularSystem] = []
@@ -6957,191 +6005,302 @@ def compute_first_principles_conductivity(
         ),
         initial_box_vectors_by_ladder_m=initial_boxes_by_ladder_m,
     )
-    molecular_memory = fit_transferable_molecular_memory_operator(
-        system=relaxed_system,
-        temperature_K=temperature_K,
-        operator_data_root=(
-            Path(__file__).parent / "physical_library" / "lammps_operator_data"
-        ),
-        eigenvalue_relative_tolerance=numerics.eigenvalue_relative_tolerance,
-    )
-    molecular_self_frictions_by_species_kg_s = tuple(
-        (
-            species_name,
-            float(
-                np.mean(
-                    molecular_memory.molecular_self_frictions_kg_s[
-                        np.asarray(relaxed_system.molecule_species_names)
-                        == species_name
-                    ]
-                )
+    resolvent_estimate, equilibrium_samples_per_chain = (
+        hamiltonian_green_kubo_sequence(
+            model=interaction_model,
+            state=sampling_state,
+            settings=hrex_settings,
+            system=relaxed_system,
+            temperature_K=temperature_K,
+            dynamics=dynamics,
+            numerics=numerics,
+            checkpoint_path=initialization_checkpoint_path.with_suffix(
+                ".hamiltonian_resolvent.pkl"
             ),
+            checkpoint_fingerprint=resolvent_checkpoint_fingerprint,
         )
-        for species_name in sorted(set(relaxed_system.molecule_species_names))
-    )
-    memory_descriptor_leverage_by_species = tuple(
-        (
-            species_name,
-            float(
-                np.mean(
-                    molecular_memory.molecular_descriptor_leverages[
-                        np.asarray(relaxed_system.molecule_species_names)
-                        == species_name
-                    ]
-                )
-            ),
-        )
-        for species_name in sorted(set(relaxed_system.molecule_species_names))
-    )
-    pair_friction_values_by_species: dict[str, list[float]] = {}
-    pair_leverage_values_by_species: dict[str, list[float]] = {}
-    for pair_index, (first_molecule, second_molecule) in enumerate(
-        combinations(range(len(relaxed_system.molecule_atom_indices)), 2)
-    ):
-        first_species = relaxed_system.molecule_species_names[first_molecule]
-        second_species = relaxed_system.molecule_species_names[second_molecule]
-        species_pair = "|".join(sorted((first_species, second_species)))
-        if species_pair not in pair_friction_values_by_species:
-            pair_friction_values_by_species[species_pair] = []
-            pair_leverage_values_by_species[species_pair] = []
-        pair_friction_values_by_species[species_pair].append(
-            float(
-                molecular_memory.molecular_pair_frictions_kg_s[
-                    first_molecule, second_molecule
-                ]
-            )
-        )
-        pair_leverage_values_by_species[species_pair].append(
-            float(molecular_memory.molecular_pair_descriptor_leverages[pair_index])
-        )
-    molecular_pair_frictions_by_species_kg_s = tuple(
-        (species_pair, float(np.mean(pair_friction_values)))
-        for species_pair, pair_friction_values in sorted(
-            pair_friction_values_by_species.items()
-        )
-    )
-    memory_pair_descriptor_leverage_by_species = tuple(
-        (species_pair, float(np.mean(pair_leverages)))
-        for species_pair, pair_leverages in sorted(
-            pair_leverage_values_by_species.items()
-        )
-    )
-    print(
-        "[memory model] "
-        f"conditional_fit_relative_error={molecular_memory.conditional_kernel_fit_relative_error:.12g} "
-        f"conditional_heldout_relative_error={molecular_memory.conditional_kernel_heldout_relative_error:.12g} "
-        f"self_frictions_kg_s={molecular_self_frictions_by_species_kg_s} "
-        f"pair_frictions_kg_s={molecular_pair_frictions_by_species_kg_s} "
-        f"self_descriptor_leverage={memory_descriptor_leverage_by_species} "
-        f"pair_descriptor_leverage={memory_pair_descriptor_leverage_by_species}",
-        flush=True,
-    )
-    (
-        conductivity,
-        direct,
-        history,
-        residuals,
-        basis_size,
-        operator_effective_sample_size,
-        maximum_split_rhat,
-        conductivity_mcse_S_m,
-        equilibrium_samples_per_chain,
-        operator_diagnostics_certified,
-        species_direct_contributions_S_m,
-        conductivity_precision_reached,
-        basis_diagnostics_certified,
-    ) = projected_conductivity_sequence(
-        model=interaction_model,
-        state=sampling_state,
-        settings=hrex_settings,
-        equilibrium_samples_per_batch=dynamics.equilibrium_sample_count,
-        equilibrium_maximum_refinement_batches=(
-            dynamics.equilibrium_maximum_refinement_batches
-        ),
-        system=relaxed_system,
-        temperature_K=temperature_K,
-        molecular_memory=molecular_memory,
-        numerics=numerics,
-        operator_checkpoint_directory=initialization_checkpoint_path.with_suffix(
-            ".operator_corpus"
-        ),
     )
     conditioned_volume_m3 = float(abs(np.linalg.det(relaxed_system.box_vectors_m)))
     conditioned_density_g_cm3 = float(
-        np.sum(relaxed_system.masses_kg) / conditioned_volume_m3 / KG_M3_PER_G_ML
+        np.sum(relaxed_system.masses_kg)
+        / conditioned_volume_m3
+        / KG_M3_PER_G_ML
+    )
+    if equilibrium_samples_per_chain <= 0:
+        raise RuntimeError("finite-cell resolvent retained no equilibrium samples")
+    return (
+        resolvent_estimate,
+        recipe_realization,
+        conditioned_volume_m3,
+        conditioned_density_g_cm3,
+    )
+
+
+def compute_first_principles_conductivity(
+    recipe: ElectrolyteRecipeModel,
+    temperature_K: float,
+    liquid_density_kg_m3: float,
+    density_source: str,
+    minimum_explicit_molecule_count: int,
+    dynamics: DynamicsSettings,
+    numerics: NumericalSettings,
+    random_seed: int,
+    initialization_checkpoint_path: Path,
+) -> ConductivityResult:
+    _validate_settings(dynamics, numerics)
+    base_realization = select_integer_recipe_realization(
+        recipe=recipe,
+        liquid_density_kg_m3=liquid_density_kg_m3,
+        solvent_volume_fraction_tolerance=(
+            dynamics.solvent_volume_fraction_tolerance
+        ),
+        salt_molarity_tolerance_mol_L=dynamics.salt_molarity_tolerance_mol_L,
+        additive_weight_fraction_tolerance=(
+            dynamics.additive_weight_fraction_tolerance
+        ),
+        minimum_explicit_molecule_count=minimum_explicit_molecule_count,
+        maximum_explicit_molecule_count=dynamics.maximum_explicit_molecule_count,
+        maximum_atom_count=dynamics.maximum_atom_count,
+    )
+    maximum_molecule_multiplier = (
+        dynamics.maximum_explicit_molecule_count
+        // base_realization.explicit_molecule_count
+    )
+    maximum_atom_multiplier = dynamics.maximum_atom_count // base_realization.atom_count
+    maximum_length_multiplier = int(
+        math.floor(
+            (
+                numerics.ewald_maximum_box_length_m**3
+                / base_realization.density_conditioned_volume_m3
+            )
+        )
+    )
+    cell_multiplier_count = min(
+        maximum_molecule_multiplier,
+        maximum_atom_multiplier,
+        maximum_length_multiplier,
+    )
+    if cell_multiplier_count < 3:
+        raise ValueError(
+            "bulk Green-Kubo continuation requires three composition-preserving "
+            "cells within the configured molecule, atom, and Ewald limits"
+        )
+    cell_results: list[
+        tuple[
+            HamiltonianResolventEstimate,
+            IntegerRecipeRealization,
+            float,
+            float,
+        ]
+    ] = []
+    for cell_multiplier in range(1, cell_multiplier_count + 1):
+        scaled_realization = IntegerRecipeRealization(
+            formula_unit_counts=tuple(
+                (species_name, count * cell_multiplier)
+                for species_name, count in base_realization.formula_unit_counts
+            ),
+            explicit_species_counts=tuple(
+                (species_name, count * cell_multiplier)
+                for species_name, count in base_realization.explicit_species_counts
+            ),
+            explicit_molecule_count=(
+                base_realization.explicit_molecule_count * cell_multiplier
+            ),
+            atom_count=base_realization.atom_count * cell_multiplier,
+            cell_mass_kg=base_realization.cell_mass_kg * cell_multiplier,
+            density_conditioned_volume_m3=(
+                base_realization.density_conditioned_volume_m3 * cell_multiplier
+            ),
+            realized_solvent_volume_fractions=(
+                base_realization.realized_solvent_volume_fractions
+            ),
+            realized_salt_molarities_mol_L=(
+                base_realization.realized_salt_molarities_mol_L
+            ),
+            realized_additive_weight_fractions=(
+                base_realization.realized_additive_weight_fractions
+            ),
+            native_unit_deviations=base_realization.native_unit_deviations,
+        )
+        cell_seed = int(
+            np.random.SeedSequence((random_seed, cell_multiplier)).generate_state(1)[0]
+        )
+        cell_checkpoint_path = initialization_checkpoint_path.with_name(
+            f"{initialization_checkpoint_path.stem}.cell_{cell_multiplier}"
+            f"{initialization_checkpoint_path.suffix}"
+        )
+        cell_result = _compute_finite_cell_resolvent(
+            recipe=recipe,
+            recipe_realization=scaled_realization,
+            temperature_K=temperature_K,
+            liquid_density_kg_m3=liquid_density_kg_m3,
+            density_source=density_source,
+            dynamics=dynamics,
+            numerics=numerics,
+            random_seed=cell_seed,
+            initialization_checkpoint_path=cell_checkpoint_path,
+        )
+        cell_results.append(cell_result)
+        if not cell_result[0].finite_eta_precision_reached:
+            raise RuntimeError(
+                "finite-cell Green-Kubo basis and equilibrium budget ended before "
+                "the full-residual interval reached the configured tolerance: "
+                f"cell_multiplier={cell_multiplier}, "
+                f"interval_width_S_m="
+                f"{cell_result[0].upper_bound_S_m - cell_result[0].lower_bound_S_m:.12g}, "
+                f"tolerance_S_m={numerics.conductivity_tolerance_S_m:.12g}"
+            )
+    inverse_box_lengths_per_m = np.asarray(
+        [cell_result[2] ** (-1.0 / CARTESIAN_DIMENSION) for cell_result in cell_results]
+    )
+    bulk_eta_intervals_S_m: list[tuple[float, float, float]] = []
+    finite_cell_errors_S_m: list[float] = []
+    for eta_index, eta_s_inv in enumerate(numerics.resolvent_eta_values_s_inv):
+        (
+            bulk_eta_iterate_S_m,
+            bulk_eta_lower_bound_S_m,
+            bulk_eta_upper_bound_S_m,
+            finite_cell_error_S_m,
+        ) = _zero_coordinate_limit_interval(
+            positive_coordinates=inverse_box_lengths_per_m,
+            lower_values=np.asarray(
+                [
+                    cell_result[0].intervals_S_m[eta_index][1]
+                    for cell_result in cell_results
+                ]
+            ),
+            upper_values=np.asarray(
+                [
+                    cell_result[0].intervals_S_m[eta_index][2]
+                    for cell_result in cell_results
+                ]
+            ),
+        )
+        if not (
+            bulk_eta_lower_bound_S_m
+            <= bulk_eta_iterate_S_m
+            <= bulk_eta_upper_bound_S_m
+        ):
+            raise RuntimeError("bulk eta continuation produced an invalid interval")
+        bulk_eta_intervals_S_m.append(
+            (
+                eta_s_inv,
+                bulk_eta_lower_bound_S_m,
+                bulk_eta_upper_bound_S_m,
+            )
+        )
+        finite_cell_errors_S_m.append(finite_cell_error_S_m)
+    (
+        conductivity_S_m,
+        conductivity_lower_bound_S_m,
+        conductivity_upper_bound_S_m,
+        eta_continuation_error_S_m,
+    ) = _zero_coordinate_limit_interval(
+        positive_coordinates=np.asarray(numerics.resolvent_eta_values_s_inv),
+        lower_values=np.asarray(
+            [interval[1] for interval in bulk_eta_intervals_S_m]
+        ),
+        upper_values=np.asarray(
+            [interval[2] for interval in bulk_eta_intervals_S_m]
+        ),
+    )
+    final_interval_width_S_m = (
+        conductivity_upper_bound_S_m - conductivity_lower_bound_S_m
+    )
+    if final_interval_width_S_m > numerics.conductivity_tolerance_S_m:
+        raise RuntimeError(
+            "bulk dc Green-Kubo sequence ended before the configured tolerance: "
+            f"iterate_S_m={conductivity_S_m:.12g}, "
+            f"lower_S_m={conductivity_lower_bound_S_m:.12g}, "
+            f"upper_S_m={conductivity_upper_bound_S_m:.12g}, "
+            f"tolerance_S_m={numerics.conductivity_tolerance_S_m:.12g}"
+        )
+    largest_cell_estimate, largest_realization, largest_volume_m3, largest_density = (
+        cell_results[-1]
     )
     return ConductivityResult(
-        conductivity_S_m=conductivity,
-        direct_current_term_S_m=direct,
-        projected_correction_S_m=direct - conductivity,
-        conditioned_volume_m3=conditioned_volume_m3,
-        conditioned_density_g_cm3=conditioned_density_g_cm3,
-        thermodynamic_state="NVT density-conditioned",
+        conductivity_S_m=conductivity_S_m,
+        conductivity_lower_bound_S_m=conductivity_lower_bound_S_m,
+        conductivity_upper_bound_S_m=conductivity_upper_bound_S_m,
+        conditioned_volume_m3=largest_volume_m3,
+        conditioned_density_g_cm3=largest_density,
+        thermodynamic_state="bulk dc Green-Kubo limit at imposed NVT density",
         density_source=density_source,
-        integrated_memory_eigenvalues_kg_s=tuple(
-            float(value)
-            for value in np.linalg.eigvalsh(molecular_memory.integrated_friction_kg_s)
+        generator_name="Hamiltonian Liouville",
+        current_definition=(
+            "Liouville derivative of permanent atomic plus induced-dipole "
+            "polarization"
         ),
-        diffusion_eigenvalues_m2_s=tuple(
-            float(value)
-            for value in np.linalg.eigvalsh(molecular_memory.diffusion_m2_s)
+        interval_definition=(
+            "cross-fitted full-residual nested Galerkin intervals with inverse-box-"
+            "length and zero-frequency continuation"
         ),
-        basis_size=basis_size,
-        basis_conductivities_S_m=history,
-        residual_history=residuals,
-        maximum_residual_score=residuals[-1],
+        interval_is_deterministic=False,
+        basis_size=largest_cell_estimate.basis_size,
+        basis_labels=largest_cell_estimate.basis_labels,
+        resolvent_intervals_S_m=tuple(bulk_eta_intervals_S_m),
+        cell_conductivities_S_m=tuple(
+            (
+                cell_result[2],
+                cell_result[0].resolvent_iterate_S_m,
+                cell_result[0].lower_bound_S_m,
+                cell_result[0].upper_bound_S_m,
+            )
+            for cell_result in cell_results
+        ),
+        basis_error_S_m=max(
+            cell_result[0].basis_error_S_m for cell_result in cell_results
+        ),
+        eta_continuation_error_S_m=eta_continuation_error_S_m,
+        finite_cell_error_S_m=max(finite_cell_errors_S_m),
+        equilibrium_error_S_m=max(
+            cell_result[0].equilibrium_error_S_m for cell_result in cell_results
+        ),
+        linear_solve_error_S_m=max(
+            cell_result[0].linear_solve_error_S_m for cell_result in cell_results
+        ),
+        linear_solve_relative_residual=max(
+            cell_result[0].linear_solve_relative_residual
+            for cell_result in cell_results
+        ),
         equilibrium_sample_count=(
-            dynamics.equilibrium_chain_count * equilibrium_samples_per_chain
+            dynamics.equilibrium_chain_count
+            * dynamics.equilibrium_sample_count
+            * dynamics.equilibrium_maximum_refinement_batches
+            * len(cell_results)
         ),
-        equilibrium_chain_count=dynamics.equilibrium_chain_count,
-        memory_sample_count=molecular_memory.sample_count,
-        effective_sample_size=operator_effective_sample_size,
-        maximum_split_rhat=maximum_split_rhat,
-        conductivity_mcse_S_m=conductivity_mcse_S_m,
-        conductivity_precision_reached=conductivity_precision_reached,
-        basis_diagnostics_certified=basis_diagnostics_certified,
-        operator_diagnostics_certified=operator_diagnostics_certified,
-        species_direct_contributions_S_m=species_direct_contributions_S_m,
-        molecular_self_frictions_by_species_kg_s=(
-            molecular_self_frictions_by_species_kg_s
+        equilibrium_chain_count=(
+            dynamics.equilibrium_chain_count * len(cell_results)
         ),
-        molecular_pair_frictions_by_species_kg_s=(
-            molecular_pair_frictions_by_species_kg_s
+        conductivity_mcse_S_m=max(
+            cell_result[0].conductivity_mcse_S_m for cell_result in cell_results
         ),
-        memory_descriptor_leverage_by_species=(memory_descriptor_leverage_by_species),
-        memory_pair_descriptor_leverage_by_species=(
-            memory_pair_descriptor_leverage_by_species
-        ),
-        memory_conditional_fit_relative_error=(
-            molecular_memory.conditional_kernel_fit_relative_error
-        ),
-        memory_conditional_heldout_relative_error=(
-            molecular_memory.conditional_kernel_heldout_relative_error
-        ),
-        realized_formula_unit_counts=recipe_realization.formula_unit_counts,
-        realized_molecule_counts=recipe_realization.explicit_species_counts,
-        realized_atom_count=recipe_realization.atom_count,
+        finite_eta_resolvent_precision_reached=True,
+        conductivity_precision_reached=True,
+        realized_formula_unit_counts=largest_realization.formula_unit_counts,
+        realized_molecule_counts=largest_realization.explicit_species_counts,
+        realized_atom_count=largest_realization.atom_count,
         realized_solvent_volume_fractions=(
-            recipe_realization.realized_solvent_volume_fractions
+            largest_realization.realized_solvent_volume_fractions
         ),
         realized_salt_molarities_mol_L=(
-            recipe_realization.realized_salt_molarities_mol_L
+            largest_realization.realized_salt_molarities_mol_L
         ),
         realized_additive_weight_fractions=(
-            recipe_realization.realized_additive_weight_fractions
+            largest_realization.realized_additive_weight_fractions
         ),
-        realized_native_unit_deviations=recipe_realization.native_unit_deviations,
+        realized_native_unit_deviations=largest_realization.native_unit_deviations,
     )
 
 
 @dataclass(frozen=True)
 class BatchedHmcTransitionResult:
     positions_m: Array
+    forces_N: Array
     momenta_kg_m_s: Array
     accepted: Array
     log_acceptance_probabilities: Array
     energy_errors_over_kbt: Array
-    relative_energy_errors: Array
     component_energies_J: Array
     force_evaluation_count: int
 
@@ -7190,10 +6349,10 @@ class IonicHrexState:
 @dataclass(frozen=True)
 class IonicHrexBlock:
     physical_configurations_m: Array
+    physical_momenta_kg_m_s: Array
+    physical_forces_N: Array
     physical_box_vectors_by_sample_m: Array
     physical_ladder_indices: Array
-    sampled_volumes_m3: Array
-    sampled_energies_J: Array
     cycle_count: int
     force_evaluation_count: int
     hmc_expected_acceptance_by_cycle_and_state: Array
@@ -7212,33 +6371,8 @@ class IonicMolecularSystem(Protocol):
     molecule_species_names: tuple[str, ...]
 
 
-class TemperedComponents(Protocol):
-    fixed_J: float
-    ion_ion_J: float
-    ion_neutral_J: float
-
-
 class IonicTemperedModel(Protocol):
     system: IonicMolecularSystem
-
-    def tempered_energy_for_configuration_J(
-        self, positions_m: Array, box_vectors_m: Array, lambda_value: float
-    ) -> float: ...
-
-    def tempered_forces_N(
-        self, positions_m: Array, box_vectors_m: Array, lambda_value: float
-    ) -> Array: ...
-
-    def energy_components_J(
-        self, positions_m: Array, box_vectors_m: Array
-    ) -> TemperedComponents: ...
-
-    def energy_force_batch(
-        self,
-        positions_batch_m: Array,
-        box_vectors_batch_m: Array,
-        lambda_values: Array,
-    ): ...
 
     def energy_force_components_batch(
         self,
@@ -7384,6 +6518,9 @@ def batched_hmc_transition(
     accepted_positions_m = np.where(
         accepted[:, None, None], proposed_positions_m, positions_batch_m
     )
+    accepted_forces_N = np.where(
+        accepted[:, None, None], final_state.forces_N, initial_state.forces_N
+    )
     proposed_momenta_kg_m_s = (
         auxiliary_masses_kg[None, :, None] * proposed_velocities_m_s
     )
@@ -7411,17 +6548,13 @@ def batched_hmc_transition(
     retained_components_J = np.where(
         accepted[:, None], final_components_J, initial_components_J
     )
-    energy_scales_J = np.maximum(
-        np.abs(initial_state.energy_J + initial_kinetic_energies_J),
-        np.finfo(float).tiny,
-    )
     return BatchedHmcTransitionResult(
         positions_m=accepted_positions_m,
+        forces_N=accepted_forces_N,
         momenta_kg_m_s=retained_momenta_kg_m_s,
         accepted=accepted,
         log_acceptance_probabilities=log_acceptance_probabilities,
         energy_errors_over_kbt=energy_errors_J / (K_B * temperature_K),
-        relative_energy_errors=np.abs(energy_errors_J) / energy_scales_J,
         component_energies_J=retained_components_J,
         force_evaluation_count=force_evaluation_count,
     )
@@ -7494,6 +6627,7 @@ def _run_exchange_round(
     replica_box_vectors_m: Array,
     component_arrays_J: Array,
     replica_momenta_kg_m_s: Array,
+    replica_forces_N: Array,
     lambdas: tuple[float, ...],
     beta_per_J: float,
     exchange_offset: int,
@@ -7531,6 +6665,9 @@ def _run_exchange_round(
             replica_momenta_kg_m_s[[first_replica, second_replica]] = (
                 replica_momenta_kg_m_s[[second_replica, first_replica]]
             )
+            replica_forces_N[[first_replica, second_replica]] = replica_forces_N[
+                [second_replica, first_replica]
+            ]
             exchanged_walker_identifier = walker_identifiers[first_replica]
             walker_identifiers[first_replica] = walker_identifiers[second_replica]
             walker_identifiers[second_replica] = exchanged_walker_identifier
@@ -7612,22 +6749,6 @@ def initialize_ionic_hrex_state(
     )
 
 
-def _reset_hrex_round_trip_tracking(
-    state: IonicHrexState,
-    replica_count: int,
-    reset_walker_identifiers: bool,
-) -> None:
-    ladder_count = state.walker_identifiers.shape[0]
-    if reset_walker_identifiers:
-        state.walker_identifiers = np.tile(np.arange(replica_count), (ladder_count, 1))
-    state.visited_lowest_lambda = np.zeros((ladder_count, replica_count), dtype=bool)
-    state.completed_round_trips = np.zeros((ladder_count, replica_count), dtype=int)
-    state.round_trip_phase = np.zeros((ladder_count, replica_count), dtype=np.int8)
-    for ladder_index in range(ladder_count):
-        physical_walker = state.walker_identifiers[ladder_index, 0]
-        state.round_trip_phase[ladder_index, physical_walker] = 1
-
-
 def _update_hrex_round_trip_tracking(state: IonicHrexState) -> None:
     ladder_count, replica_count = state.walker_identifiers.shape
     for ladder_index in range(ladder_count):
@@ -7666,10 +6787,10 @@ def advance_ionic_hrex(
     beta_per_J = 1.0 / (K_B * temperature_K)
     physical_indices = np.arange(ladder_count) * replica_count
     configurations: list[Array] = []
+    retained_momenta_kg_m_s: list[Array] = []
+    retained_forces_N: list[Array] = []
     boxes: list[Array] = []
     ladder_indices: list[int] = []
-    volumes: list[float] = []
-    energies: list[float] = []
     force_evaluation_count = 0
     expected_hmc_acceptance_rows: list[Array] = []
     realized_hmc_acceptance_rows: list[Array] = []
@@ -7707,6 +6828,7 @@ def advance_ionic_hrex(
         state.momenta_kg_m_s = transition.momenta_kg_m_s
         state.momentum_refresh_required.fill(False)
         state.component_energies_J = transition.component_energies_J
+        current_forces_N = transition.forces_N.copy()
         state.hmc_attempts += 1
         state.hmc_acceptances += transition.accepted.reshape(
             ladder_count, replica_count
@@ -7765,6 +6887,7 @@ def advance_ionic_hrex(
                         state.boxes_m[ladder_slice],
                         state.component_energies_J[ladder_slice],
                         state.momenta_kg_m_s[ladder_slice],
+                        current_forces_N[ladder_slice],
                         settings.lambdas,
                         beta_per_J,
                         exchange_offset,
@@ -7777,24 +6900,33 @@ def advance_ionic_hrex(
         if replica_count > 1:
             _update_hrex_round_trip_tracking(state)
         if retain_samples and absolute_cycle_index % settings.measurement_stride == 0:
+            physical_forces_by_ladder_N = current_forces_N[physical_indices]
+            if replica_count > 1:
+                physical_force_result = model.energy_force_components_batch(
+                    positions_batch_m=state.positions_m[physical_indices],
+                    box_vectors_batch_m=state.boxes_m[physical_indices],
+                    lambda_values=np.ones(ladder_count),
+                )
+                physical_forces_by_ladder_N = physical_force_result.forces_N
+                force_evaluation_count += 1
             for ladder_index, physical_index in enumerate(physical_indices):
                 configurations.append(state.positions_m[physical_index].copy())
+                retained_momenta_kg_m_s.append(
+                    state.momenta_kg_m_s[physical_index].copy()
+                )
+                retained_forces_N.append(
+                    physical_forces_by_ladder_N[ladder_index].copy()
+                )
                 boxes.append(state.boxes_m[physical_index].copy())
                 ladder_indices.append(ladder_index)
-                volumes.append(abs(np.linalg.det(state.boxes_m[physical_index])))
-                energies.append(
-                    _tempered_energy_from_components_J(
-                        state.component_energies_J[physical_index], 1.0
-                    )
-                )
     state.cycle_index += cycle_count
     state.random_generator_state = random_generator.bit_generator.state
     return state, IonicHrexBlock(
         physical_configurations_m=np.asarray(configurations),
+        physical_momenta_kg_m_s=np.asarray(retained_momenta_kg_m_s),
+        physical_forces_N=np.asarray(retained_forces_N),
         physical_box_vectors_by_sample_m=np.asarray(boxes),
         physical_ladder_indices=np.asarray(ladder_indices, dtype=int),
-        sampled_volumes_m3=np.asarray(volumes),
-        sampled_energies_J=np.asarray(energies),
         cycle_count=cycle_count,
         force_evaluation_count=force_evaluation_count,
         hmc_expected_acceptance_by_cycle_and_state=np.asarray(
@@ -7813,8 +6945,123 @@ def advance_ionic_hrex(
 
 
 def _settings_from_record(record: dict) -> tuple[DynamicsSettings, NumericalSettings]:
-    return DynamicsSettings(**record["dynamics"]), NumericalSettings(
-        **record["numerics"]
+    dynamics_record = record["dynamics"]
+    numerics_record = record["numerics"]
+    return DynamicsSettings(
+        initial_relaxation_maximum_force_evaluations=int(
+            dynamics_record["initial_relaxation_maximum_force_evaluations"]
+        ),
+        initial_relaxation_timestep_s=float(
+            dynamics_record["initial_relaxation_timestep_s"]
+        ),
+        initial_relaxation_maximum_timestep_s=float(
+            dynamics_record["initial_relaxation_maximum_timestep_s"]
+        ),
+        initial_relaxation_initial_damping=float(
+            dynamics_record["initial_relaxation_initial_damping"]
+        ),
+        initial_relaxation_timestep_increase=float(
+            dynamics_record["initial_relaxation_timestep_increase"]
+        ),
+        initial_relaxation_timestep_decrease=float(
+            dynamics_record["initial_relaxation_timestep_decrease"]
+        ),
+        initial_relaxation_damping_decrease=float(
+            dynamics_record["initial_relaxation_damping_decrease"]
+        ),
+        initial_relaxation_positive_power_steps=int(
+            dynamics_record["initial_relaxation_positive_power_steps"]
+        ),
+        initial_relaxation_maximum_elapsed_s=float(
+            dynamics_record["initial_relaxation_maximum_elapsed_s"]
+        ),
+        initial_relaxation_maximum_stagnant_iterations=int(
+            dynamics_record["initial_relaxation_maximum_stagnant_iterations"]
+        ),
+        initial_relaxation_minimum_force_improvement_fraction=float(
+            dynamics_record["initial_relaxation_minimum_force_improvement_fraction"]
+        ),
+        initial_relaxation_progress_stride=int(
+            dynamics_record["initial_relaxation_progress_stride"]
+        ),
+        force_batch_size=int(dynamics_record["force_batch_size"]),
+        resolvent_operator_batch_size=int(
+            dynamics_record["resolvent_operator_batch_size"]
+        ),
+        initial_force_tolerance_N=float(
+            dynamics_record["initial_force_tolerance_N"]
+        ),
+        equilibrium_sample_count=int(dynamics_record["equilibrium_sample_count"]),
+        equilibrium_chain_count=int(dynamics_record["equilibrium_chain_count"]),
+        equilibrium_maximum_refinement_batches=int(
+            dynamics_record["equilibrium_maximum_refinement_batches"]
+        ),
+        hamiltonian_timestep_s=float(dynamics_record["hamiltonian_timestep_s"]),
+        ionic_hrex_lambdas=tuple(
+            float(value) for value in dynamics_record["ionic_hrex_lambdas"]
+        ),
+        hmc_steps_min=int(dynamics_record["hmc_steps_min"]),
+        hmc_steps_max=int(dynamics_record["hmc_steps_max"]),
+        hmc_momentum_persistence=float(
+            dynamics_record["hmc_momentum_persistence"]
+        ),
+        hmc_full_refresh_stride=int(
+            dynamics_record["hmc_full_refresh_stride"]
+        ),
+        exchange_stride=int(dynamics_record["exchange_stride"]),
+        hrex_warmup_cycle_count=int(dynamics_record["hrex_warmup_cycle_count"]),
+        hrex_measurement_stride=int(dynamics_record["hrex_measurement_stride"]),
+        hrex_block_cycle_count=int(dynamics_record["hrex_block_cycle_count"]),
+        solvent_volume_fraction_tolerance=float(
+            dynamics_record["solvent_volume_fraction_tolerance"]
+        ),
+        salt_molarity_tolerance_mol_L=float(
+            dynamics_record["salt_molarity_tolerance_mol_L"]
+        ),
+        additive_weight_fraction_tolerance=float(
+            dynamics_record["additive_weight_fraction_tolerance"]
+        ),
+        maximum_explicit_molecule_count=int(
+            dynamics_record["maximum_explicit_molecule_count"]
+        ),
+        maximum_atom_count=int(dynamics_record["maximum_atom_count"]),
+    ), NumericalSettings(
+        initial_placement_attempts_per_molecule=int(
+            numerics_record["initial_placement_attempts_per_molecule"]
+        ),
+        ewald_splitting_per_m=float(numerics_record["ewald_splitting_per_m"]),
+        ewald_reciprocal_relative_tolerance=float(
+            numerics_record["ewald_reciprocal_relative_tolerance"]
+        ),
+        ewald_maximum_box_length_m=float(
+            numerics_record["ewald_maximum_box_length_m"]
+        ),
+        lennard_jones_switch_start_m=float(
+            numerics_record["lennard_jones_switch_start_m"]
+        ),
+        lennard_jones_cutoff_m=float(numerics_record["lennard_jones_cutoff_m"]),
+        dispersion_tail_quadrature_order=int(
+            numerics_record["dispersion_tail_quadrature_order"]
+        ),
+        polarization_residual_tolerance_V_m=float(
+            numerics_record["polarization_residual_tolerance_V_m"]
+        ),
+        force_difference_step_m=float(numerics_record["force_difference_step_m"]),
+        force_consistency_relative_tolerance=float(
+            numerics_record["force_consistency_relative_tolerance"]
+        ),
+        resolvent_eta_values_s_inv=tuple(
+            float(value) for value in numerics_record["resolvent_eta_values_s_inv"]
+        ),
+        equilibrium_standard_error_multiplier=float(
+            numerics_record["equilibrium_standard_error_multiplier"]
+        ),
+        conductivity_tolerance_S_m=float(
+            numerics_record["conductivity_tolerance_S_m"]
+        ),
+        minimum_interatomic_contact_ratio=float(
+            numerics_record["minimum_interatomic_contact_ratio"]
+        ),
     )
 
 
@@ -7853,15 +7100,21 @@ def main() -> int:
     print(
         f"conductivity = {result.conductivity_S_m:.8g} S/m ({result.conductivity_S_m * S_M_TO_MS_CM:.8g} mS/cm)"
     )
-    print(f"direct = {result.direct_current_term_S_m:.8g} S/m")
-    print(f"projected correction = {result.projected_correction_S_m:.8g} S/m")
+    print(
+        "conductivity interval = "
+        f"[{result.conductivity_lower_bound_S_m:.8g}, "
+        f"{result.conductivity_upper_bound_S_m:.8g}] S/m"
+    )
     print(f"thermodynamic state = {result.thermodynamic_state}")
     print(f"density source = {result.density_source}")
+    print(f"generator = {result.generator_name}")
+    print(f"current = {result.current_definition}")
+    print(f"interval definition = {result.interval_definition}")
+    print(f"interval is deterministic = {result.interval_is_deterministic}")
     print(f"conditioned volume = {result.conditioned_volume_m3:.8g} m3")
     print(f"conditioned density = {result.conditioned_density_g_cm3:.8g} g/cm3")
-    print(f"basis sequence = {result.basis_conductivities_S_m}")
-    print(f"residual sequence = {result.residual_history}")
-    print(f"species direct contributions = {result.species_direct_contributions_S_m}")
+    print(f"resolvent intervals = {result.resolvent_intervals_S_m}")
+    print(f"cell conductivities = {result.cell_conductivities_S_m}")
     print(
         "realized recipe = "
         f"counts {result.realized_molecule_counts}; "
@@ -7870,25 +7123,21 @@ def main() -> int:
         f"additives wt {result.realized_additive_weight_fractions}"
     )
     print(
-        "memory regression = "
-        f"fit error {result.memory_conditional_fit_relative_error:.6g}; "
-        f"heldout error {result.memory_conditional_heldout_relative_error:.6g}; "
-        f"self frictions {result.molecular_self_frictions_by_species_kg_s}; "
-        f"pair frictions {result.molecular_pair_frictions_by_species_kg_s}; "
-        f"self leverage {result.memory_descriptor_leverage_by_species}; "
-        f"pair leverage {result.memory_pair_descriptor_leverage_by_species}"
-    )
-    print(
         f"basis size = {result.basis_size}; equilibrium samples = "
-        f"{result.equilibrium_sample_count}; memory samples = "
-        f"{result.memory_sample_count}; ESS = {result.effective_sample_size:.6g}"
-        f"; split-Rhat = {result.maximum_split_rhat:.6g}"
+        f"{result.equilibrium_sample_count}"
+        f"; basis error = {result.basis_error_S_m:.6g} S/m"
         f"; conductivity MCSE = {result.conductivity_mcse_S_m:.6g} S/m"
+        f"; equilibrium interval expansion = "
+        f"{result.equilibrium_error_S_m:.6g} S/m"
+        f"; eta continuation error = "
+        f"{result.eta_continuation_error_S_m:.6g} S/m"
+        f"; finite cell error = {result.finite_cell_error_S_m:.6g} S/m"
+        f"; linear solve error = {result.linear_solve_error_S_m:.6g} S/m"
+        f"; linear residual = {result.linear_solve_relative_residual:.6g}"
+        f"; finite eta resolvent precision reached = "
+        f"{result.finite_eta_resolvent_precision_reached}"
         f"; conductivity precision reached = "
         f"{result.conductivity_precision_reached}"
-        f"; basis diagnostics certified = {result.basis_diagnostics_certified}"
-        f"; operator diagnostics certified = "
-        f"{result.operator_diagnostics_certified}"
     )
     return 0
 
